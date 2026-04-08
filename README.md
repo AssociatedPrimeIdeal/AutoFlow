@@ -13,7 +13,10 @@ pip install numpy scipy scikit-image pyvista pyvistaqt PyQt5 matplotlib h5py
 
 ## Running Script
 
-看./demo/
+See `./demo.ipynb` for example workflows, including:
+
+- a demo showing how to run the pipeline on an aortic dataset
+- demo examples for three phantom datasets
 
 ## Running Software
 
