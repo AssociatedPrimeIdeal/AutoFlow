@@ -8,7 +8,7 @@
 ## Installation
 
 ```bash
-pip install numpy scipy scikit-image pyvista pyvistaqt PyQt5 matplotlib h5py
+pip install numpy scipy scikit-image networkx pyvista pyvistaqt PyQt5 matplotlib h5py imageio Pillow
 ```
 
 ## Running Script
