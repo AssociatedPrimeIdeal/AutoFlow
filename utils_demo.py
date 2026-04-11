@@ -637,7 +637,6 @@ def _tke_max(ws):
         return max(float(np.nanmax(np.asarray(tke_mesh.cell_data["TKE"], dtype=float))), 1e-6)
     return 1e-6
 
-
 def render_tke_video(
     ws,
     out_dir,
@@ -648,8 +647,7 @@ def render_tke_video(
     tke_clim=None,
     tke_bar_cfg=None,
 ):
-    tke_mesh = ws.derived.tke_volume
-    if tke_mesh is None:
+    if ws.derived.tke_array is None and ws.derived.tke_volume is None:
         return None
     _, surf = _build_union_surface(ws, smoothing_iteration=smoothing_iteration)
     if surf is None or surf.n_points == 0:
@@ -664,21 +662,39 @@ def render_tke_video(
         p.clear()
         p.set_background("white")
         p.add_mesh(surf, opacity=0.08, color="white")
-        p.add_mesh(
-            tke_mesh,
-            scalars="TKE",
-            cmap="hot",
-            clim=clim,
-            show_scalar_bar=True,
-            scalar_bar_args=_scalar_bar_args("TKE (J/m³)", tke_bar_cfg),
-        )
+        if ws.derived.tke_array is not None:
+            arr = np.asarray(ws.derived.tke_array, dtype=np.float32)
+            if arr.ndim == 4:
+                vol_t = arr[..., min(max(0, t), arr.shape[3] - 1)]
+            else:
+                vol_t = arr
+            tke_mesh = create_uniform_grid(vol_t, ws.resolution, origin=ws.origin, name="TKE")
+            mesh_union = create_uniform_grid(np.max(ws.segmask_binary > 0, axis=-1), ws.resolution, origin=ws.origin)
+            mesh_union = mesh_union.threshold(0.1)
+            tke_mesh = mesh_union.sample(tke_mesh)
+            p.add_mesh(
+                tke_mesh,
+                scalars="TKE",
+                cmap="hot",
+                clim=clim,
+                show_scalar_bar=True,
+                scalar_bar_args=_scalar_bar_args("TKE (J/m³)", tke_bar_cfg),
+            )
+        else:
+            p.add_mesh(
+                ws.derived.tke_volume,
+                scalars="TKE",
+                cmap="hot",
+                clim=clim,
+                show_scalar_bar=True,
+                scalar_bar_args=_scalar_bar_args("TKE (J/m³)", tke_bar_cfg),
+            )
         p.add_text(f"t={t}", position="upper_left", font_size=14, color="black")
         p.camera_position = camera_position
         p.render()
         frames.append(np.asarray(p.screenshot(return_img=True)))
     p.close()
     return _write_video(frames, os.path.join(out_dir, "tke_video.mp4"), fps=fps)
-
 
 def _format_path_group(v):
     if v is None:
@@ -872,6 +888,8 @@ def process_single(
         print("[7/7] Compute Derived Metrics (WSS/TKE)...")
         dp = ws.derived_params
         engine.preprocess(ws)
+        loaded_tke = ws.derived.tke_array
+
         result = compute_derived_metrics(
             flow=ws.flow_raw * ws.segmask_binary[..., None],
             mask4d=ws.segmask_binary,
@@ -886,6 +904,7 @@ def process_single(
             tube_radius=dp.tube_radius,
             rho=dp.rho,
             save_pixelwise=True,
+            tke_array=loaded_tke,
         )
         ws.derived.wss_surfaces = result["wss_surfaces"]
         ws.derived.wss_volume = result.get("wss_volume")

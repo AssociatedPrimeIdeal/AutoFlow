@@ -63,6 +63,7 @@ class PipelineEngine:
         ws.current_t = 0
         ws.flow_raw = flow
         ws.mag_raw = mag
+        ws.derived.tke_array = np.asarray(data["tke_array"], dtype=np.float32) if "tke_array" in data else None
         ws.data_loaded = True
 
         ws.remove_object_by_data_key("segmask_raw_surface")
@@ -370,14 +371,17 @@ class PipelineEngine:
         self._save_planes_json(ws)
         ws.pipeline.mark_done(StepId.COMPUTE_PLANE_METRICS)
         return StepResult(StepId.COMPUTE_PLANE_METRICS, True, False, msg)
-
+    
     def _step_compute_derived_metrics(self, ws):
         if not ws.has_flow():
             return StepResult(StepId.COMPUTE_DERIVED_METRICS, True, True, "Derived metrics skipped: no flow")
         self.preprocess(ws)
         dp = ws.derived_params
+        loaded_tke = ws.derived.tke_array
         result = compute_derived_metrics(
-            flow=ws.flow_raw * ws.segmask_binary[..., None], mask4d=ws.segmask_binary, spacing=ws.resolution,
+            flow=ws.flow_raw * ws.segmask_binary[..., None],
+            mask4d=ws.segmask_binary,
+            spacing=ws.resolution,
             origin=ws.origin,
             smoothing_iteration=dp.smoothing_iteration,
             viscosity=dp.viscosity,
@@ -387,7 +391,9 @@ class PipelineEngine:
             step_size=dp.step_size,
             tube_radius=dp.tube_radius,
             rho=dp.rho,
-            save_pixelwise=False)
+            save_pixelwise=False,
+            tke_array=loaded_tke,
+        )
         ws.derived.wss_surfaces = result["wss_surfaces"]
         ws.derived.wss_volume = result.get("wss_volume")
         ws.derived.tke_volume = result["tke_volume"]
@@ -404,9 +410,8 @@ class PipelineEngine:
                       show_scalar_bar=True, scalar_bar_title="WSS (Pa)")
         ws.add_object(name="tke_volume", kind=ObjectKind.METRIC,
                       data_key="tke_volume", visible=False, opacity=0.5,
-                      scalars="TKE", cmap="hot", clim=(0.0, tke_max if tke_max > 0 else 1.0),
-                      show_scalar_bar=True, scalar_bar_title="TKE (J/m\u00b3)")
-
+                      scalars="TKE", cmap="hot", clim=(0.0, tke_max if tke_max > 0 else 1.0), dynamic=True,
+                      show_scalar_bar=True, scalar_bar_title="TKE (J/m³)")
         msg = f"Derived: Nt={len(ws.derived.wss_surfaces)}"
         ws.pipeline.mark_done(StepId.COMPUTE_DERIVED_METRICS)
         return StepResult(StepId.COMPUTE_DERIVED_METRICS, True, False, msg)

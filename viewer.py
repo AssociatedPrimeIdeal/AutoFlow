@@ -9,6 +9,7 @@ from algorithms import (
     generate_seed_points,
     generate_streamlines_at_t,
     generate_streamlines_from_plane_at_t,
+    create_uniform_grid,
 )
 
 
@@ -562,6 +563,31 @@ class SceneController:
             return ws.derived.wss_surfaces[min(max(0, t), len(ws.derived.wss_surfaces) - 1)]
 
         if data_key == "tke_volume":
+            if ws.derived.tke_array is not None:
+                def _build_tke_t():
+                    arr = np.asarray(ws.derived.tke_array, dtype=np.float32)
+                    if arr.ndim == 4:
+                        vol_t = arr[..., min(max(0, int(t)), arr.shape[3] - 1)]
+                    else:
+                        vol_t = arr
+                    if ws.segmask_binary is not None:
+                        if ws.segmask_binary.ndim == 4:
+                            mask_t = ws.segmask_binary[..., min(max(0, int(t)), ws.segmask_binary.shape[3] - 1)]
+                        else:
+                            mask_t = ws.segmask_binary
+                    elif ws.segmask_3d is not None:
+                        mask_t = ws.segmask_3d
+                    else:
+                        mask_t = np.ones(vol_t.shape, dtype=bool)
+                    vol_t = vol_t * np.asarray(mask_t, dtype=np.float32)
+
+                    tke_grid = create_uniform_grid(vol_t, sp, origin=org, name="TKE")
+                    mask_grid = create_uniform_grid(np.asarray(mask_t, dtype=np.float32), sp, origin=org, name="mask")
+                    mask_mesh = mask_grid.threshold(0.1, scalars="mask")
+                    if mask_mesh is None or mask_mesh.n_cells == 0:
+                        return None
+                    return mask_mesh.sample(tke_grid)
+                return self._cached(data_key, t, _build_tke_t)
             return ws.derived.tke_volume
 
         if data_key == "derived_streamlines_live":

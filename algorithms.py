@@ -170,29 +170,61 @@ def _target_bbox_to_source_slices(shape_raw, spatial_order, target_spatial_order
             out[raw_axis] = slice(s, e)
     return tuple(out)
 
+def _sigma_from_complex(img_complex, venc):
+    venc = np.asarray(venc, dtype=np.float32)
+    if venc.ndim == 0:
+        venc = np.full(3, float(venc), dtype=np.float32)
+    ref = np.abs(img_complex[..., 0]).astype(np.float32)
+    enc = np.abs(img_complex[..., 1:4]).astype(np.float32)
+    kv = np.pi / venc.reshape((1, 1, 1, 1, 3))
+    ratio = ref[..., None] / np.clip(enc, 1e-12, None)
+    ratio = np.clip(ratio, 1.0, None)
+    sigma = np.sqrt(2.0 * np.log(ratio)) / kv
+    sigma = np.nan_to_num(sigma, nan=0.0, posinf=0.0, neginf=0.0)
+    return sigma.astype(np.float32)
 
+def _reorient_component_abs(arr, spatial_order, target_spatial_order, venc_order, target_venc_order):
+    spatial_order = [s.upper() for s in spatial_order]
+    venc_order = [v.upper() for v in venc_order]
+    target_spatial_order = [s.upper() for s in target_spatial_order]
+    target_venc_order = [v.upper() for v in target_venc_order]
+
+    arr_r, src_pos = _permute_spatial(arr, spatial_order, target_spatial_order, spatial_axes=(0, 1, 2))
+    flip_axes = [i for i in range(3) if _need_flip(spatial_order[src_pos[i]], target_spatial_order[i])]
+    arr_r = _flip_axes(arr_r, flip_axes)
+
+    vb = [_axis_pair(v) for v in venc_order]
+    tb = [_axis_pair(v) for v in target_venc_order]
+    comp_perm = np.array([vb.index(x) for x in tb], dtype=int)
+
+    return arr_r[..., comp_perm]
 def load_h5_data(path):
     target_spatial_order = ("LR", "AP", "FH")
     target_venc_order = ("LR", "AP", "FH")
     with h5py.File(path, "r") as g:
-        if "img" not in g or "segmask" not in g:
-            raise ValueError(f"h5 must contain img and segmask: {path}")
+        if "img_complex" not in g or "segmask" not in g:
+            raise ValueError(f"h5 must contain img_complex and segmask: {path}")
         VENC = g["VENC"][:] if "VENC" in g else np.array([150, 150, 150], dtype=float)
         resolution = g["Resolution"][:] if "Resolution" in g else np.array([1, 1, 1], dtype=float)
         origin = np.array([0.0, 0.0, 0.0], dtype=float)
         rr = float(g["RR"][()]) if "RR" in g else 1000.0
         spatial_order = g["SpatialOrder"][:].astype(str) if "SpatialOrder" in g else np.array(["FH", "AP", "LR"])
         venc_order = g["VENCOrder"][:].astype(str) if "VENCOrder" in g else np.array(["FH", "AP", "LR"])
+
         segmask_ds = g["segmask"]
         segmask_full = segmask_ds[:].astype(np.int16)
         segmask_target = _reorient_spatial_only(segmask_full, spatial_order, target_spatial_order)
         bbox_target = _compute_spatial_bbox(segmask_target, pad=2)
         src_slices = _target_bbox_to_source_slices(segmask_full.shape[:3], spatial_order, target_spatial_order, bbox_target)
         segmask = segmask_ds[src_slices + (slice(None),) * (segmask_ds.ndim - 3)].astype(np.int16)
-        img_ds = g["img"]
-        img = img_ds[src_slices + (slice(None),) * (img_ds.ndim - 3)].astype(np.float32)
-        mag = img[..., 0]
-        flow_raw = img[..., 1:4]
+
+        img_ds = g["img_complex"]
+        img_complex = img_ds[src_slices + (slice(None),) * (img_ds.ndim - 3)]
+
+        mag = np.abs(img_complex[..., 0]).astype(np.float32)
+        flow_raw = np.angle(img_complex[..., 1:4] * np.conj(img_complex[..., 0][..., None])).astype(np.float32)
+        sigma_raw = _sigma_from_complex(img_complex, VENC)
+
         flow, mag_out, seg_r, venc_new, res_new = reorient(
             mag, flow_raw, segmask, venc=VENC, resolution=resolution,
             spatial_order=spatial_order, venc_order=venc_order,
@@ -200,7 +232,17 @@ def load_h5_data(path):
             target_venc_order=target_venc_order,
             return_velocity=True,
         )
+        sigma = _reorient_component_abs(
+            sigma_raw,
+            spatial_order=spatial_order,
+            target_spatial_order=target_spatial_order,
+            venc_order=venc_order,
+            target_venc_order=target_venc_order,
+        ).astype(np.float32)
+
         flow, mag_out, seg_r = _ensure_flow_mag_time_and_segmask(flow, mag_out, seg_r)
+        tke_array = (0.5 * 1060.0 * np.sum((sigma / 100.0) ** 2, axis=-1)).astype(np.float32)
+
         return {
             "flow": flow,
             "mag": mag_out,
@@ -209,8 +251,9 @@ def load_h5_data(path):
             "origin": origin,
             "venc": np.asarray(venc_new, dtype=float),
             "rr": float(rr),
+            "sigma": sigma,
+            "tke_array": tke_array,
         }
-
 
 def filter_segmask_labels(segmask_raw, labels_to_keep=None, labels_to_remove=None):
     return np.asarray(segmask_raw).copy()
@@ -588,33 +631,35 @@ def segment_vessels_from_graph_and_mask(segmask_3d, graph, resolution, flow_xyzt
     degree = dict(G.degree())
     endpoints = [n for n, d in degree.items() if d == 1]
     branch_nodes = [n for n, d in degree.items() if d >= 3]
-    keynodes = endpoints + branch_nodes
-    if len(keynodes) < 2:
-        pts = np.asarray(graph.points, dtype=float)
-        if len(pts) >= 2:
-            node_paths = [list(range(len(pts)))]
-            point_paths = [pts]
-            forks = []
-            path_info = build_path_info(node_paths, pts, forks)
-            labels = np.zeros(mask3d.shape, dtype=np.int16)
-            labels[mask3d > 0] = 1
-            return labels, point_paths, node_paths, path_info, forks
-        return mask3d.astype(np.int16), [], [], [], []
+    keynodes = set(endpoints + branch_nodes)
 
     node_paths = []
-    seen = set()
-    for i in range(len(keynodes)):
-        for j in range(i + 1, len(keynodes)):
-            a, b = keynodes[i], keynodes[j]
-            if nx.has_path(G, a, b):
-                p = nx.shortest_path(G, a, b)
-                if not any(x in keynodes for x in p[1:-1]):
-                    key = tuple(int(x) for x in p)
-                    rkey = tuple(int(x) for x in p[::-1])
-                    if key not in seen and rkey not in seen:
-                        seen.add(key)
-                        node_paths.append(list(key))
+    visited_edges = set()
 
+    for start in keynodes:
+        for curr in G.neighbors(start):
+            edge0 = tuple(sorted((start, curr)))
+            if edge0 in visited_edges:
+                continue
+
+            path = [start, curr]
+            visited_edges.add(edge0)
+            prev = start
+
+            while curr not in keynodes:
+                nbrs = list(G.neighbors(curr))
+                if len(nbrs) != 2:
+                    break
+                nxt = nbrs[0] if nbrs[0] != prev else nbrs[1]
+                edge = tuple(sorted((curr, nxt)))
+                if edge in visited_edges:
+                    break
+                path.append(nxt)
+                visited_edges.add(edge)
+                prev, curr = curr, nxt
+
+            if curr in keynodes:
+                node_paths.append(path)
     node_paths = _orient_node_paths_by_flow(
         node_paths, np.asarray(graph.points, dtype=float),
         flow_xyzt3=flow_xyzt3, segmask_binary_4d=segmask_binary_4d,
@@ -1254,32 +1299,32 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
                             inward_distance=0.6, parabolic_fitting=True,
                             no_slip_condition=True, step_size=5,
                             tube_radius=0.1, rho=1060.0,
-                            save_pixelwise=False):
+                            save_pixelwise=False, tke_array=None, sigma=None):
     mask4d = np.asarray(mask4d, dtype=bool)
     flow = np.asarray(flow, dtype=float)
     if mask4d.ndim == 3:
         mask4d = mask4d[..., np.newaxis]
     Nt = int(mask4d.shape[-1])
 
-    vx = flow[..., 0] / 100.0
-    vy = flow[..., 1] / 100.0
-    vz = flow[..., 2] / 100.0
+    if tke_array is None:
+        if sigma is None:
+            raise ValueError("tke_array or sigma is required")
+        tke_array = 0.5 * float(rho) * np.sum((np.asarray(sigma, dtype=float) / 100.0) ** 2, axis=-1)
 
-    valid_count = np.sum(mask4d, axis=-1).astype(float)
-    valid_count_safe = np.maximum(valid_count, 1.0)
+    tke_array = np.asarray(tke_array, dtype=np.float32)
+    if tke_array.ndim == 3:
+        tke_array = np.repeat(tke_array[..., None], Nt, axis=3)
+    elif tke_array.ndim == 4 and tke_array.shape[3] == 1 and Nt > 1:
+        tke_array = np.repeat(tke_array, Nt, axis=3)
+    elif tke_array.ndim != 4:
+        raise ValueError(f"tke_array must be XYZ or XYZT, got {tke_array.shape}")
+    if tke_array.shape[3] != Nt:
+        raise ValueError(f"tke_array time dimension {tke_array.shape[3]} does not match mask {Nt}")
 
-    mean_vx = np.sum(vx * mask4d, axis=-1) / valid_count_safe
-    mean_vy = np.sum(vy * mask4d, axis=-1) / valid_count_safe
-    mean_vz = np.sum(vz * mask4d, axis=-1) / valid_count_safe
+    tke_array = tke_array * mask4d.astype(np.float32)
+    tke_peak = np.max(tke_array, axis=3)
 
-    var_vx = np.sum(((vx - mean_vx[..., None]) ** 2) * mask4d, axis=-1) / valid_count_safe
-    var_vy = np.sum(((vy - mean_vy[..., None]) ** 2) * mask4d, axis=-1) / valid_count_safe
-    var_vz = np.sum(((vz - mean_vz[..., None]) ** 2) * mask4d, axis=-1) / valid_count_safe
-
-    tke_map = 0.5 * float(rho) * (var_vx + var_vy + var_vz)
-    tke_map[valid_count < 2] = 0.0
-
-    TKE = create_uniform_grid(tke_map, spacing, origin=origin, name="TKE")
+    TKE = create_uniform_grid(tke_peak, spacing, origin=origin, name="TKE")
     mesh_union = create_uniform_grid(np.max(mask4d > 0, axis=-1), spacing, origin=origin)
     mesh_union = mesh_union.threshold(0.1)
     TKE = mesh_union.sample(TKE)
@@ -1314,22 +1359,22 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
         "wss_surfaces": surfs,
         "wss_volume": wss_volume,
         "tke_volume": TKE,
-        "tke_array": np.asarray(tke_map, dtype=np.float32),
+        "tke_array": tke_array,
+        "tke_peak": np.asarray(tke_peak, dtype=np.float32),
         "streamlines": [],
         "tube_radius": float(tube_radius),
     }
     if save_pixelwise:
         result["pixelwise_export"] = {
             "wss": np.asarray(wss_volume, dtype=np.float32),
-            "tke": np.asarray(tke_map, dtype=np.float32),
+            "tke": np.asarray(tke_peak, dtype=np.float32),
+            "tke_time": np.asarray(tke_array, dtype=np.float32),
             "spacing": np.asarray(spacing, dtype=np.float32),
             "origin": np.asarray(origin, dtype=np.float32),
         }
     else:
         result["pixelwise_export"] = {}
     return result
-
-
 def _compute_single_plane_metric(args):
     flow, mask, spacing, origin, plane, Nt, RR, branch_grid, target_label, path_info = args
     normal = np.asarray(plane.normal, dtype=float).reshape(3)

@@ -229,11 +229,22 @@ class OrthoViewer(QtWidgets.QWidget):
         cmap, clim = self._scene_style("wss_surface_live", "jet", None)
         return vol, "WSS (Pa)", {"cmap": cmap, "clim": clim}
 
-    def _get_tke_volume(self):
+    def _get_tke_volume(self, t):
         ws = self.workspace
         if ws.derived.tke_array is not None:
+            arr = np.asarray(ws.derived.tke_array, dtype=float)
+            if arr.ndim == 4:
+                vol = arr[..., min(max(0, int(t)), arr.shape[3] - 1)]
+            else:
+                vol = arr
+            if ws.segmask_binary is not None:
+                if ws.segmask_binary.ndim == 4:
+                    mask_t = ws.segmask_binary[..., min(max(0, int(t)), ws.segmask_binary.shape[3] - 1)]
+                else:
+                    mask_t = ws.segmask_binary
+                vol = vol * np.asarray(mask_t, dtype=float)
             cmap, clim = self._scene_style("tke_volume", "hot", None)
-            return np.asarray(ws.derived.tke_array, dtype=float), "TKE (J/m³)", {"cmap": cmap, "clim": clim}
+            return vol, "TKE (J/m³)", {"cmap": cmap, "clim": clim}
         if ws.derived.tke_volume is None:
             return None, "TKE (no data)", {"cmap": "hot", "clim": None}
         shape = self._get_volume_shape()
@@ -258,7 +269,6 @@ class OrthoViewer(QtWidgets.QWidget):
         np.maximum.at(tgt, flat, vals)
         cmap, clim = self._scene_style("tke_volume", "hot", None)
         return vol, "TKE (J/m³)", {"cmap": cmap, "clim": clim}
-
     def _get_scalar_slice(self, t):
         ws = self.workspace
         content_idx = self.combo_content.currentIndex()
@@ -287,7 +297,7 @@ class OrthoViewer(QtWidgets.QWidget):
         if content_idx == 6:
             return self._get_wss_volume(t)
         if content_idx == 7:
-            return self._get_tke_volume()
+            return self._get_tke_volume(t)
         return None, "", {"cmap": "gray", "clim": None}
 
     def _get_mask_3d(self):
