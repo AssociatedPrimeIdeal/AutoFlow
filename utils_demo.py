@@ -228,7 +228,14 @@ def _camera_from_view(poly, view, distance_scale=1.0):
     az, el = _resolve_view(view)
     return _camera_from_scene(poly, az, el, distance_scale)
 
+def _time_and_azimuth(frame_idx, rotation_frames, n_time, time_repeat=1):
+    rotation_frames = int(max(rotation_frames, 1))
+    n_time = int(max(n_time, 1))
+    time_repeat = int(max(time_repeat, 1))
 
+    t = (frame_idx // time_repeat) % n_time
+    az = 360.0 * (frame_idx % rotation_frames) / rotation_frames
+    return t, az
 def _build_union_surface(ws, smoothing_iteration=200):
     if ws.segmask_binary is not None:
         mask3d = np.any(np.asarray(ws.segmask_binary, dtype=bool), axis=3)
@@ -495,12 +502,18 @@ def render_wss_video(
     distance_scale=1.0,
     wss_clim=None,
     wss_bar_cfg=None,
+    rotate=False,
+    rotation_frames=None,
+    elevation_deg=None,
+    time_repeat=1
 ):
     if not ws.derived.wss_surfaces:
         return None
+
     _, context_surf = _build_union_surface(ws, smoothing_iteration=smoothing_iteration)
     if context_surf is None or context_surf.n_points == 0:
         return None
+
     wss_max = 0.0
     for surf in ws.derived.wss_surfaces:
         if surf is not None and surf.n_points > 0 and "wss" in surf.point_data:
@@ -509,13 +522,41 @@ def render_wss_video(
                 wss_max = max(wss_max, float(np.nanmax(vals)))
     wss_max = max(wss_max, 1e-6)
     clim = wss_clim if wss_clim is not None else (0.0, wss_max)
-    camera_position = _camera_from_view(context_surf, view, distance_scale)
+
+    az0, el0 = _resolve_view(view)
+    if elevation_deg is None:
+        elevation_deg = el0
+
+    n_time = int(max(ws.time_count(), 1))
+    if rotate:
+        base_frames = n_time * int(max(time_repeat, 1))
+        if rotation_frames is not None:
+            total_frames = max(int(rotation_frames), base_frames)
+        else:
+            total_frames = base_frames
+    else:
+        total_frames = n_time * int(max(time_repeat, 1))
+
     p = _make_plotter()
     frames = []
-    for t in range(int(max(ws.time_count(), 1))):
+
+    for frame_idx in range(total_frames):
+        if rotate:
+            t, az = _time_and_azimuth(
+                frame_idx,
+                rotation_frames=rotation_frames if rotation_frames is not None else total_frames,
+                n_time=n_time,
+                time_repeat=time_repeat,
+            )
+            camera_position = _orbit_camera(context_surf, az, elevation_deg, distance_scale)
+        else:
+            t = min(frame_idx, n_time - 1)
+            camera_position = _camera_from_view(context_surf, view, distance_scale)
+
         p.clear()
         p.set_background("white")
         p.add_mesh(context_surf, opacity=0.08, color="white")
+
         surf = ws.derived.wss_surfaces[min(max(0, t), len(ws.derived.wss_surfaces) - 1)]
         if surf is not None and surf.n_points > 0 and "wss" in surf.point_data:
             p.add_mesh(
@@ -526,13 +567,20 @@ def render_wss_video(
                 show_scalar_bar=True,
                 scalar_bar_args=_scalar_bar_args("WSS (Pa)", wss_bar_cfg),
             )
-        p.add_text(f"t={t}", position="upper_left", font_size=14, color="black")
+
+        if rotate:
+            txt = f"t={t} | rot {frame_idx + 1}/{total_frames}"
+        else:
+            txt = f"t={t}"
+
+        p.add_text(txt, position="upper_left", font_size=14, color="black")
         p.camera_position = camera_position
         p.render()
         frames.append(np.asarray(p.screenshot(return_img=True)))
-    p.close()
-    return _write_video(frames, os.path.join(out_dir, "wss_video.mp4"), fps=fps)
 
+    p.close()
+    suffix = "rotate" if rotate else "video"
+    return _write_video(frames, os.path.join(out_dir, f"wss_{suffix}.mp4"), fps=fps)
 
 def _streamline_speed_max(ws):
     if ws.flow_raw is None:
@@ -568,12 +616,18 @@ def render_streamlines_video(
     distance_scale=1.0,
     streamline_clim=None,
     streamline_bar_cfg=None,
+    rotate=False,
+    rotation_frames=None,
+    elevation_deg=None,
+    time_repeat=1
 ):
     if ws.flow_raw is None or ws.segmask_binary is None or ws.segmask_3d is None:
         return None
+
     mesh, surf = _build_union_surface(ws, smoothing_iteration=smoothing_iteration)
     if mesh is None or surf is None or surf.n_points == 0:
         return None
+
     seeds = generate_seed_points(
         ws.segmask_3d,
         ws.resolution,
@@ -582,13 +636,45 @@ def render_streamlines_video(
         rng_seed=ws.streamline_params.rng_seed,
         min_seeds=50,
     )
+
     v_max = _streamline_speed_max(ws)
     clim = streamline_clim if streamline_clim is not None else (0.0, v_max)
-    camera_position = _camera_from_view(surf, view, distance_scale)
+
+    az0, el0 = _resolve_view(view)
+    if elevation_deg is None:
+        elevation_deg = el0
+
+    n_time = int(max(ws.time_count(), 1))
+    if rotate:
+        base_frames = n_time * int(max(time_repeat, 1))
+        if rotation_frames is not None:
+            total_frames = max(int(rotation_frames), base_frames)
+        else:
+            total_frames = base_frames
+    else:
+        total_frames = n_time * int(max(time_repeat, 1))
+
     p = _make_plotter()
     frames = []
-    for t in range(int(max(ws.time_count(), 1))):
-        mask_t = np.asarray(ws.segmask_binary[..., min(max(0, t), ws.segmask_binary.shape[3] - 1)], dtype=bool)
+
+    for frame_idx in range(total_frames):
+        if rotate:
+            t, az = _time_and_azimuth(
+                frame_idx,
+                rotation_frames=rotation_frames if rotation_frames is not None else total_frames,
+                n_time=n_time,
+                time_repeat=time_repeat,
+            )
+            camera_position = _orbit_camera(surf, az, elevation_deg, distance_scale)
+        else:
+            t = min(frame_idx, n_time - 1)
+            camera_position = _camera_from_view(surf, view, distance_scale)
+
+        mask_t = np.asarray(
+            ws.segmask_binary[..., min(max(0, t), ws.segmask_binary.shape[3] - 1)],
+            dtype=bool,
+        )
+
         sl = generate_streamlines_at_t(
             ws.flow_raw,
             t,
@@ -603,9 +689,11 @@ def render_streamlines_video(
             rng_seed=ws.streamline_params.rng_seed,
         )
         sl = _ensure_streamline_scalars(sl)
+
         p.clear()
         p.set_background("white")
         p.add_mesh(surf, opacity=0.18, color="lightgray")
+
         if sl is not None and sl.n_points > 0:
             p.add_mesh(
                 sl,
@@ -617,13 +705,20 @@ def render_streamlines_video(
                 render_lines_as_tubes=True,
                 line_width=3,
             )
-        p.add_text(f"t={t}", position="upper_left", font_size=14, color="black")
+
+        if rotate:
+            txt = f"t={t} | rot {frame_idx + 1}/{total_frames}"
+        else:
+            txt = f"t={t}"
+
+        p.add_text(txt, position="upper_left", font_size=14, color="black")
         p.camera_position = camera_position
         p.render()
         frames.append(np.asarray(p.screenshot(return_img=True)))
-    p.close()
-    return _write_video(frames, os.path.join(out_dir, "streamlines_video.mp4"), fps=fps)
 
+    p.close()
+    suffix = "rotate" if rotate else "video"
+    return _write_video(frames, os.path.join(out_dir, f"streamlines_{suffix}.mp4"), fps=fps)
 
 def _tke_max(ws):
     if ws.derived.tke_array is not None:
@@ -646,22 +741,55 @@ def render_tke_video(
     distance_scale=1.0,
     tke_clim=None,
     tke_bar_cfg=None,
+    rotate=False,
+    rotation_frames=None,
+    elevation_deg=None,
+    time_repeat=1
 ):
     if ws.derived.tke_array is None and ws.derived.tke_volume is None:
         return None
+
     _, surf = _build_union_surface(ws, smoothing_iteration=smoothing_iteration)
     if surf is None or surf.n_points == 0:
         return None
+
     tke_max = _tke_max(ws)
     clim = tke_clim if tke_clim is not None else (0.0, tke_max)
-    camera_position = _camera_from_view(surf, view, distance_scale)
+
+    az0, el0 = _resolve_view(view)
+    if elevation_deg is None:
+        elevation_deg = el0
+
+    n_time = int(max(ws.time_count(), 1))
+    if rotate:
+        base_frames = n_time * int(max(time_repeat, 1))
+        if rotation_frames is not None:
+            total_frames = max(int(rotation_frames), base_frames)
+        else:
+            total_frames = base_frames
+    else:
+        total_frames = n_time * int(max(time_repeat, 1))
+
     p = _make_plotter()
     frames = []
-    n_frames = int(max(ws.time_count(), 1))
-    for t in range(n_frames):
+
+    for frame_idx in range(total_frames):
+        if rotate:
+            t, az = _time_and_azimuth(
+                frame_idx,
+                rotation_frames=rotation_frames if rotation_frames is not None else total_frames,
+                n_time=n_time,
+                time_repeat=time_repeat,
+            )
+            camera_position = _orbit_camera(surf, az, elevation_deg, distance_scale)
+        else:
+            t = min(frame_idx, n_time - 1)
+            camera_position = _camera_from_view(surf, view, distance_scale)
+
         p.clear()
         p.set_background("white")
         p.add_mesh(surf, opacity=0.08, color="white")
+
         if ws.derived.tke_array is not None:
             arr = np.asarray(ws.derived.tke_array, dtype=np.float32)
             if arr.ndim == 4:
@@ -669,7 +797,11 @@ def render_tke_video(
             else:
                 vol_t = arr
             tke_mesh = create_uniform_grid(vol_t, ws.resolution, origin=ws.origin, name="TKE")
-            mesh_union = create_uniform_grid(np.max(ws.segmask_binary > 0, axis=-1), ws.resolution, origin=ws.origin)
+            mesh_union = create_uniform_grid(
+                np.max(ws.segmask_binary > 0, axis=-1),
+                ws.resolution,
+                origin=ws.origin,
+            )
             mesh_union = mesh_union.threshold(0.1)
             tke_mesh = mesh_union.sample(tke_mesh)
             p.add_mesh(
@@ -689,13 +821,20 @@ def render_tke_video(
                 show_scalar_bar=True,
                 scalar_bar_args=_scalar_bar_args("TKE (J/m³)", tke_bar_cfg),
             )
-        p.add_text(f"t={t}", position="upper_left", font_size=14, color="black")
+
+        if rotate:
+            txt = f"t={t} | rot {frame_idx + 1}/{total_frames}"
+        else:
+            txt = f"t={t}"
+
+        p.add_text(txt, position="upper_left", font_size=14, color="black")
         p.camera_position = camera_position
         p.render()
         frames.append(np.asarray(p.screenshot(return_img=True)))
-    p.close()
-    return _write_video(frames, os.path.join(out_dir, "tke_video.mp4"), fps=fps)
 
+    p.close()
+    suffix = "rotate" if rotate else "video"
+    return _write_video(frames, os.path.join(out_dir, f"tke_{suffix}.mp4"), fps=fps)
 def _format_path_group(v):
     if v is None:
         return "?"
@@ -802,10 +941,14 @@ def process_single(
     out_dir,
     workspace=None,
     skip_derived=False,
+    skip_plane_metrics=False,
     use_multithread=False,
     reuse_planes_path="",
     fps=24,
     plane_rotation_frames=180,
+    rotate_dynamic_video=False,
+    dynamic_rotation_frames=180,
+    dynamic_rotation_elevation_deg=None,
     make_plane_video=True,
     make_wss_video=True,
     make_streamlines_video=True,
@@ -820,6 +963,7 @@ def process_single(
     tke_bar_cfg=None,
     streamline_clim=None,
     streamline_bar_cfg=None,
+    dynamic_time_repeat=1,
 ):
     print(f"\n{'=' * 60}")
     print(f"Processing: {h5_path}")
@@ -873,13 +1017,20 @@ def process_single(
     print(f"  -> Step 5 took {_time.time() - _t0:.2f}s")
 
     _t0 = _time.time()
-    print("[6/7] Calculate & Save Metrics...")
-    _, _, metric_msg = engine._compute_plane_metrics_internal(ws, save=True, use_multithread=use_multithread)
-    print(f"  -> {metric_msg}")
-    try:
-        engine._save_planes_json(ws)
-    except Exception:
-        pass
+    if skip_plane_metrics:
+        print("[6/7] Skipped plane metrics")
+    else:
+        print("[6/7] Calculate & Save Metrics...")
+        _, _, metric_msg = engine._compute_plane_metrics_internal(
+            ws,
+            save=True,
+            use_multithread=use_multithread,
+        )
+        print(f"  -> {metric_msg}")
+        try:
+            engine._save_planes_json(ws)
+        except Exception:
+            pass
     print(f"  -> Step 6 took {_time.time() - _t0:.2f}s")
 
     _t0 = _time.time()
@@ -958,6 +1109,10 @@ def process_single(
                 distance_scale=camera_distance_scale,
                 streamline_clim=streamline_clim,
                 streamline_bar_cfg=streamline_bar_cfg,
+                rotate=rotate_dynamic_video,
+                rotation_frames=dynamic_rotation_frames,
+                elevation_deg=dynamic_rotation_elevation_deg,
+                time_repeat=dynamic_time_repeat,
             )
             if video_paths["streamlines"]:
                 print(f"Streamlines video saved: {video_paths['streamlines']}")
@@ -977,6 +1132,10 @@ def process_single(
                 distance_scale=camera_distance_scale,
                 wss_clim=wss_clim,
                 wss_bar_cfg=wss_bar_cfg,
+                rotate=rotate_dynamic_video,
+                rotation_frames=dynamic_rotation_frames,
+                elevation_deg=dynamic_rotation_elevation_deg,
+                time_repeat=dynamic_time_repeat,
             )
             if video_paths["wss"]:
                 print(f"WSS video saved: {video_paths['wss']}")
@@ -996,6 +1155,10 @@ def process_single(
                 distance_scale=camera_distance_scale,
                 tke_clim=tke_clim,
                 tke_bar_cfg=tke_bar_cfg,
+                rotate=rotate_dynamic_video,
+                rotation_frames=dynamic_rotation_frames,
+                elevation_deg=dynamic_rotation_elevation_deg,
+                time_repeat=dynamic_time_repeat,
             )
             if video_paths["tke"]:
                 print(f"TKE video saved: {video_paths['tke']}")
@@ -1003,8 +1166,10 @@ def process_single(
             print("[WARN] TKE video failed")
             print(traceback.format_exc())
             video_paths["tke"] = ""
+    table_rows, raw_metrics, qc_data = (None, None, None)
+    if not skip_plane_metrics:
+        table_rows, raw_metrics, qc_data = load_metrics_from_output(out_dir)
 
-    table_rows, raw_metrics, qc_data = load_metrics_from_output(out_dir)
     if table_rows:
         print("\n  === Plane Metrics Summary ===")
         print_metrics_summary(table_rows)
@@ -1064,6 +1229,7 @@ def build_base_workspace():
     ws.streamline_params.max_steps = 2000
     ws.streamline_params.min_seeds = 50
     ws.streamline_params.seed_ratio = globals().get("SEED_RATIO", 50.0)
+    ws.streamline_params.tube_radius = globals().get("TUBE_RADIUS", 0.05)
     return ws
 
 
@@ -1071,7 +1237,7 @@ def run_batch():
     inputs = globals().get("INPUT", None)
     if inputs is None:
         raise ValueError("INPUT is not defined.")
-
+    dynamic_time_repeat = globals().get("DYNAMIC_TIME_REPEAT", 1)
     output_dir = globals().get("OUTPUT_DIR", "./batch_output")
     skip_derived = globals().get("SKIP_DERIVED", False)
     use_multithread = globals().get("USE_MULTITHREAD", True)
@@ -1084,7 +1250,10 @@ def run_batch():
     make_tke_video = globals().get("MAKE_TKE_VIDEO", True)
     camera_view = globals().get("CAMERA_VIEW", "posterior")
     camera_distance_scale = globals().get("CAMERA_DISTANCE_SCALE", 1.5)
-
+    skip_plane_metrics = globals().get("SKIP_PLANE_METRICS", False)
+    rotate_dynamic_video = globals().get("ROTATE_DYNAMIC_VIDEO", False)
+    dynamic_rotation_frames = globals().get("DYNAMIC_ROTATION_FRAMES", 180)
+    dynamic_rotation_elevation_deg = globals().get("DYNAMIC_ROTATION_ELEVATION_DEG", None)
     add_plane_idx = globals().get("ADD_PLANE_IDX", False)
     add_path_idx = globals().get("ADD_PATH_IDX", False)
 
@@ -1148,6 +1317,11 @@ def run_batch():
                 tke_bar_cfg=tke_bar_cfg,
                 streamline_clim=streamline_clim,
                 streamline_bar_cfg=streamline_bar_cfg,
+                skip_plane_metrics=skip_plane_metrics,
+                rotate_dynamic_video=rotate_dynamic_video,
+                dynamic_rotation_frames=dynamic_rotation_frames,
+                dynamic_rotation_elevation_deg=dynamic_rotation_elevation_deg,
+                dynamic_time_repeat=dynamic_time_repeat,
             )
             results.append({"file": path, "status": "ok", "summary": summary})
         except Exception:
