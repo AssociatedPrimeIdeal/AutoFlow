@@ -1,9 +1,11 @@
 # AutoFlow
-The following gif shows a demo case, including:
-- automated placed planes
+The GIF below showcases a demo case processed by **AutoFlow** on the demo data, highlighting a series of automatically generated results, including:
+
+- automated plane placement
 - streamline visualization
 - wall shear stress (WSS)
 - turbulent kinetic energy (TKE)
+
 ![Demo](./demo.gif)
 
 ## Requirements
