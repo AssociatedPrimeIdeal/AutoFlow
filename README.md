@@ -31,7 +31,7 @@ See `./demo.ipynb` for example workflows, including:
 ```bash
 python app.py
 ```
-
+![app](https://github.com/user-attachments/assets/2a668f0c-f98d-4168-9e84-79fa3949adb2)
 1. **File → Open Data** to load an HDF5 file containing `img_complex`, `segmask`, `Resolution`, `VENC`, `RR`, `SpatialOrder`, and `VENCOrder`.
 2. Use the **Steps** panel to run the pipeline sequentially or click **Run All**.
 3. Use **Edit Skeleton** / **Edit Graph** for interactive editing:
