@@ -1,10 +1,10 @@
 # AutoFlow
-- extracted planes
+The following gif shows a demo case, including:
+- automated placed planes
 - streamline visualization
 - wall shear stress (WSS)
 - turbulent kinetic energy (TKE)
-
-<video src="./demo.mp4" controls width="100%"></video>
+![Demo](./demo.gif)
 
 ## Requirements
 
