@@ -6,7 +6,7 @@ The GIF below showcases a demo case processed by **AutoFlow** on the demo data, 
 - wall shear stress (WSS)
 - turbulent kinetic energy (TKE)
 
-![Demo](./demo.gif)
+![Demo](https://github.com/user-attachments/assets/e2c17a9e-6a47-4f85-ba0d-c35b622802b1)
 
 ## Requirements
 
