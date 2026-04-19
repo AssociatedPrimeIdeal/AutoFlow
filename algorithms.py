@@ -213,13 +213,12 @@ def load_h5_data(path):
 
         segmask_ds = g["segmask"]
         segmask_full = segmask_ds[:].astype(np.int16)
-        segmask_target = _reorient_spatial_only(segmask_full, spatial_order, target_spatial_order)
-        bbox_target = _compute_spatial_bbox(segmask_target, pad=2)
-        src_slices = _target_bbox_to_source_slices(segmask_full.shape[:3], spatial_order, target_spatial_order, bbox_target)
+        src_slices = _compute_spatial_bbox(segmask_full, pad=2)
         segmask = segmask_ds[src_slices + (slice(None),) * (segmask_ds.ndim - 3)].astype(np.int16)
+        del segmask_full
 
         img_ds = g["img_complex"]
-        img_complex = img_ds[src_slices + (slice(None),) * (img_ds.ndim - 3)]
+        img_complex = np.asarray(img_ds[src_slices + (slice(None),) * (img_ds.ndim - 3)])
 
         mag = np.abs(img_complex[..., 0]).astype(np.float32)
         flow_raw = np.angle(img_complex[..., 1:4] * np.conj(img_complex[..., 0][..., None])).astype(np.float32)
@@ -375,7 +374,7 @@ def generate_skeleton_from_mask3d(mask3d, resolution):
         if np.any(local_skel):
             skel[bbox] |= local_skel
     pts = np.argwhere(skel > 0).astype(float) * np.asarray(resolution, dtype=float).reshape(1, 3)
-    return pts, mask3d
+    return pts, skel
 
 
 def build_graph_from_points(points, spacing):
@@ -517,7 +516,8 @@ def _vector_orientation_text(vec):
 
 
 def _orient_node_paths_by_flow(node_paths, graph_points, flow_xyzt3=None, segmask_binary_4d=None,
-                               spacing=(1.0, 1.0, 1.0), origin=(0.0, 0.0, 0.0)):
+                               spacing=(1.0, 1.0, 1.0), origin=(0.0, 0.0, 0.0),
+                               confidence_eps=0.05):
     if flow_xyzt3 is None or segmask_binary_4d is None:
         return [list(map(int, p)) for p in node_paths]
     flow = np.asarray(flow_xyzt3, dtype=float)
@@ -533,21 +533,208 @@ def _orient_node_paths_by_flow(node_paths, graph_points, flow_xyzt3=None, segmas
             out.append(nodes)
             continue
         pts = np.asarray(graph_points[nodes], dtype=float)
-        geom_dir = pts[-1] - pts[0]
-        if np.linalg.norm(geom_dir) <= 1e-12:
-            out.append(nodes)
-            continue
         vox = np.rint((pts - origin.reshape(1, 3)) / (spacing.reshape(1, 3) + 1e-12)).astype(int)
         for k in range(3):
             vox[:, k] = np.clip(vox[:, k], 0, flow.shape[k] - 1)
         vec = flow[vox[:, 0], vox[:, 1], vox[:, 2], :, :]
         m = mask[vox[:, 0], vox[:, 1], vox[:, 2], :]
-        vec = vec * m[..., None]
-        mean_flow = np.sum(vec, axis=(0, 1))
-        if np.linalg.norm(mean_flow) > 1e-12 and np.dot(mean_flow, geom_dir) < 0:
+        flow_per_pt = np.sum(vec * m[..., None], axis=1)
+        seg_dl = pts[1:] - pts[:-1]
+        flow_mid = 0.5 * (flow_per_pt[1:] + flow_per_pt[:-1])
+        dots = np.sum(flow_mid * seg_dl, axis=1)
+        score = float(np.sum(dots))
+        norm_den = float(np.sum(
+            np.linalg.norm(flow_mid, axis=1) * np.linalg.norm(seg_dl, axis=1)))
+        confidence = score / (norm_den + 1e-12)
+
+        reverse = False
+        if abs(confidence) >= float(confidence_eps):
+            reverse = (confidence < 0.0)
+        else:
+            geom_dir = pts[-1] - pts[0]
+            mean_flow_global = flow_per_pt.sum(axis=0)
+            if (np.linalg.norm(geom_dir) > 1e-12
+                    and np.linalg.norm(mean_flow_global) > 1e-12
+                    and np.dot(mean_flow_global, geom_dir) < 0):
+                reverse = True
+        if reverse:
             nodes = nodes[::-1]
         out.append(nodes)
     return out
+
+
+def _path_cumulative_distance(path_points):
+    pts = np.asarray(path_points, dtype=float).reshape(-1, 3)
+    if len(pts) == 0:
+        return np.zeros(0, dtype=float)
+    if len(pts) == 1:
+        return np.zeros(1, dtype=float)
+    seglens = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    return np.concatenate([[0.0], np.cumsum(seglens)])
+
+
+
+def _path_point_at_distance(path_points, distance):
+    pts = np.asarray(path_points, dtype=float).reshape(-1, 3)
+    cum = _path_cumulative_distance(pts)
+    if len(pts) == 0:
+        return np.zeros(3, dtype=float), 0, 0.0, cum
+    if len(pts) == 1 or len(cum) <= 1 or float(cum[-1]) <= 1e-12:
+        return pts[0].copy(), 0, 0.0, cum
+    d = float(np.clip(float(distance), 0.0, float(cum[-1])))
+    j = int(np.searchsorted(cum, d, side="right") - 1)
+    j = min(max(0, j), len(pts) - 2)
+    seg = pts[j + 1] - pts[j]
+    seglen = float(np.linalg.norm(seg))
+    if seglen <= 1e-12:
+        alpha = 0.0
+        point = pts[j].copy()
+    else:
+        alpha = float(np.clip((d - float(cum[j])) / seglen, 0.0, 1.0))
+        point = pts[j] + alpha * seg
+    return point.astype(float), int(j), float(alpha), cum
+
+
+
+def _path_tangent_from_segment(path_points, seg_idx):
+    pts = np.asarray(path_points, dtype=float).reshape(-1, 3)
+    N = len(pts)
+    if N < 2:
+        return np.zeros(3, dtype=float), "degenerate", 0, 0
+    seg_idx = min(max(0, int(seg_idx)), N - 2)
+    i0 = max(0, seg_idx - 1)
+    i1 = min(N - 1, seg_idx + 2)
+    if i0 >= i1:
+        i0 = max(0, seg_idx)
+        i1 = min(N - 1, seg_idx + 1)
+        if i0 >= i1:
+            return np.zeros(3, dtype=float), "degenerate", i0, i1
+    t = pts[i1] - pts[i0]
+    n = float(np.linalg.norm(t))
+    if n < 1e-12:
+        return np.zeros(3, dtype=float), "degenerate", i0, i1
+    source = "local" if (seg_idx > 0 and seg_idx < N - 2) else "endpoint"
+    return (t / n).astype(float), source, int(i0), int(i1)
+
+
+
+def _project_point_to_path(path_points, query_point):
+    pts = np.asarray(path_points, dtype=float).reshape(-1, 3)
+    q = np.asarray(query_point, dtype=float).reshape(3)
+    cum = _path_cumulative_distance(pts)
+    if len(pts) == 0:
+        return np.zeros(3, dtype=float), 0, 0.0, 0.0, float("inf"), cum
+    if len(pts) == 1:
+        err = float(np.linalg.norm(pts[0] - q))
+        return pts[0].copy(), 0, 0.0, 0.0, err, cum
+
+    seg = pts[1:] - pts[:-1]
+    seglen = np.linalg.norm(seg, axis=1)
+    seglen2 = seglen * seglen
+    valid = seglen2 > 1e-12
+    if np.any(valid):
+        base = pts[:-1][valid]
+        direction = seg[valid]
+        alpha = np.sum((q.reshape(1, 3) - base) * direction, axis=1) / seglen2[valid]
+        alpha = np.clip(alpha, 0.0, 1.0)
+        proj = base + alpha[:, None] * direction
+        d2 = np.sum((proj - q.reshape(1, 3)) ** 2, axis=1)
+        best_local = int(np.argmin(d2))
+        seg_ids = np.nonzero(valid)[0]
+        seg_idx = int(seg_ids[best_local])
+        a = float(alpha[best_local])
+        point = proj[best_local]
+        distance = float(cum[seg_idx] + a * seglen[seg_idx])
+        err = float(np.linalg.norm(point - q))
+        return point.astype(float), int(seg_idx), float(a), distance, err, cum
+
+    idx = int(np.argmin(np.linalg.norm(pts - q.reshape(1, 3), axis=1)))
+    point = pts[idx].copy()
+    if idx >= len(pts) - 1:
+        seg_idx = max(0, len(pts) - 2)
+        a = 1.0
+    else:
+        seg_idx = idx
+        a = 0.0
+    distance = float(cum[idx]) if len(cum) > idx else 0.0
+    err = float(np.linalg.norm(point - q))
+    return point.astype(float), int(seg_idx), float(a), distance, err, cum
+
+
+
+def _determine_plane_forward(plane, path_points, path_info, eps=0.1):
+    center = np.asarray(getattr(plane, "center", [0.0, 0.0, 0.0]), dtype=float).reshape(3)
+    normal = np.asarray(getattr(plane, "normal", [1.0, 0.0, 0.0]), dtype=float).reshape(3)
+    n_mag = float(np.linalg.norm(normal))
+    if n_mag > 1e-12:
+        normal = normal / n_mag
+    else:
+        normal = np.zeros(3, dtype=float)
+
+    pp = np.asarray(path_points, dtype=float).reshape(-1, 3) if path_points is not None else np.empty((0, 3), dtype=float)
+    local_t = np.zeros(3, dtype=float)
+    local_src = "none"
+    cos_local = 0.0
+
+    if len(pp) >= 2:
+        seglens = np.linalg.norm(np.diff(pp, axis=0), axis=1)
+        pos = seglens[seglens > 1e-12]
+        seg_step = float(np.median(pos)) if len(pos) else 0.0
+        tol = max(1.0, 2.0 * seg_step)
+
+        try:
+            qd = float(getattr(plane, "distance", None))
+        except (TypeError, ValueError):
+            qd = None
+
+        tan_d = np.zeros(3, dtype=float)
+        cos_d = 0.0
+        err_d = float("inf")
+        src_d = "none"
+        if qd is not None and np.isfinite(qd):
+            pt_d, seg_d, _alpha_d, _cum_d = _path_point_at_distance(pp, qd)
+            err_d = float(np.linalg.norm(pt_d - center))
+            tan_d, src_d, _i0_d, _i1_d = _path_tangent_from_segment(pp, seg_d)
+            cos_d = float(np.dot(normal, tan_d)) if np.linalg.norm(tan_d) > 0 else 0.0
+        else:
+            qd = None
+
+        _pt_p, seg_p, _alpha_p, _dist_p, err_p, _cum_p = _project_point_to_path(pp, center)
+        tan_p, src_p, _i0_p, _i1_p = _path_tangent_from_segment(pp, seg_p)
+        cos_p = float(np.dot(normal, tan_p)) if np.linalg.norm(tan_p) > 0 else 0.0
+
+        if qd is not None and np.isfinite(err_d) and err_d <= max(tol, err_p + tol):
+            local_t = tan_d
+            local_src = str(src_d) if src_d != "degenerate" else "none"
+            cos_local = float(cos_d)
+        else:
+            local_t = tan_p
+            local_src = str(src_p) if src_p != "degenerate" else "none"
+            cos_local = float(cos_p)
+
+    fallback = np.zeros(3, dtype=float)
+    if path_info is not None and 0 <= int(getattr(plane, "path_index", -1)) < len(path_info):
+        info = path_info[int(getattr(plane, "path_index", -1))]
+        sp = np.asarray(info.get("start_point", [0.0, 0.0, 0.0]), dtype=float).reshape(3)
+        ep = np.asarray(info.get("end_point", [0.0, 0.0, 0.0]), dtype=float).reshape(3)
+        fallback = ep - sp
+    if np.linalg.norm(fallback) < 1e-12 and len(pp) >= 2:
+        fallback = pp[-1] - pp[0]
+    fb_mag = float(np.linalg.norm(fallback))
+    if fb_mag > 1e-12:
+        fb_unit = fallback / fb_mag
+        cos_fb = float(np.dot(normal, fb_unit))
+    else:
+        fb_unit = np.zeros(3, dtype=float)
+        cos_fb = 0.0
+
+    if local_src != "none" and abs(cos_local) >= float(eps):
+        return 1 if cos_local >= 0 else -1, "flow_tangent", local_t, float(cos_local)
+    if fb_mag > 1e-12:
+        if local_src != "none":
+            return 1 if cos_fb >= 0 else -1, "geometry_fallback", local_t, float(cos_local)
+        return 1 if cos_fb >= 0 else -1, "geometry_fallback", fb_unit, float(cos_fb)
+    return 1, "none", local_t, float(cos_local)
 
 
 def find_path_forks(node_paths, node_points):
@@ -907,21 +1094,35 @@ def _build_branch_grid(branch_labels_3d, spacing, origin):
     return branch_grid
 
 
-def _largest_region_by_area(poly):
+def _select_connected_region(poly, ref_point=None):
     if poly is None or poly.n_cells == 0:
         return None
     poly = poly.compute_cell_sizes(area=True)
     conn = poly.connectivity()
     if conn.n_cells == 0 or "RegionId" not in conn.cell_data:
         return poly
-    region_ids = np.asarray(conn.cell_data["RegionId"])
-    areas = np.asarray(conn.cell_data["Area"]) if "Area" in conn.cell_data else np.ones(conn.n_cells, dtype=float)
+    region_ids = np.asarray(conn.cell_data["RegionId"]).copy()
+    areas = np.asarray(conn.cell_data["Area"]).copy() if "Area" in conn.cell_data else np.ones(conn.n_cells, dtype=float)
+    centers = None
+    ref = None
+    if ref_point is not None:
+        ref = np.asarray(ref_point, dtype=float).reshape(1, 3)
+        cc = conn.cell_centers()
+        centers = np.asarray(cc.points, dtype=float).copy() if cc is not None and cc.n_points == conn.n_cells else None
+
     best_region = None
-    best_area = -1.0
+    best_key = None
     for rid in np.unique(region_ids):
-        s = float(np.sum(areas[region_ids == rid]))
-        if s > best_area:
-            best_area = s
+        mask = region_ids == rid
+        s = float(np.sum(areas[mask]))
+        if centers is not None and ref is not None and np.any(mask):
+            region_centers = centers[mask]
+            d = float(np.min(np.linalg.norm(region_centers - ref, axis=1)))
+            key = (d, -s, int(rid))
+        else:
+            key = (0.0, -s, int(rid))
+        if best_key is None or key < best_key:
+            best_key = key
             best_region = int(rid)
     if best_region is None:
         return None
@@ -955,7 +1156,7 @@ def extract_plane_cross_section(mask_xyz, plane, spacing, origin, branch_grid=No
         if pg is None or pg.n_cells == 0:
             return None
         pg = pg.compute_cell_sizes(area=True)
-    return _largest_region_by_area(pg)
+    return _select_connected_region(pg, ref_point=np.asarray(plane.center, dtype=float))
 
 
 def _flow_grid_for_t(flow_t, spacing, origin):
@@ -993,7 +1194,7 @@ def _extract_plane_flow_region(mask_xyz, flow_t, plane, spacing, origin, branch_
         if pg is None or pg.n_cells == 0:
             return None
         pg = pg.compute_cell_sizes(area=True)
-    return _largest_region_by_area(pg)
+    return _select_connected_region(pg, ref_point=np.asarray(plane.center, dtype=float))
 
 
 def generate_streamlines_from_plane_at_t(flow_xyzt3, t, plane, spacing, origin,
@@ -1201,7 +1402,8 @@ def apply_internal_consistency_to_metrics(plane_metrics, path_info=None, forks=N
 
 
 def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes, RR=1000.0,
-                          branch_labels_3d=None, path_info=None, forks=None, return_qc=False):
+                          branch_labels_3d=None, path_info=None, forks=None,
+                          paths=None, return_qc=False):
     flow = np.asarray(flow_xyzt3, dtype=float)
     mask = np.asarray(segmask_binary_4d, dtype=bool)
     spacing = np.asarray(spacing, dtype=float).reshape(-1)[:3]
@@ -1217,11 +1419,14 @@ def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes
     Nt = int(flow.shape[3])
     branch_grid = _build_branch_grid(branch_labels_3d, spacing, origin)
     mask_static = all(np.array_equal(mask[..., 0], mask[..., t]) for t in range(1, Nt))
-    results = []
+    mask_template = mask[..., 0] if mask_static else None
 
+    paths_lookup = None
+    if paths is not None:
+        paths_lookup = [np.asarray(p, dtype=float).reshape(-1, 3) for p in paths]
+
+    results = []
     for plane in planes:
-        normal = np.asarray(plane.normal, dtype=float).reshape(3)
-        normal = normal / (np.linalg.norm(normal) + 1e-12)
         target_label = None
         if branch_labels_3d is not None:
             target_label = int(getattr(plane, "label", 0) or 0)
@@ -1229,64 +1434,15 @@ def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes
                 ijk = np.rint((np.asarray(plane.center, dtype=float).reshape(3) - origin) / (spacing + 1e-12)).astype(int)
                 ijk = np.clip(ijk, 0, np.array(np.asarray(branch_labels_3d).shape) - 1)
                 target_label = int(np.asarray(branch_labels_3d)[ijk[0], ijk[1], ijk[2]])
-        mask_template = mask[..., 0] if mask_static else None
-        peakv = 0.0
-        flowrate = []
-        area = []
-        meanv_t = []
-        for t in range(Nt):
-            mask_t = mask_template if mask_template is not None else mask[..., t]
-            pg = _extract_plane_flow_region(
-                mask_t, flow[..., t, :], plane, spacing, origin,
-                branch_grid=branch_grid, target_label=target_label,
-            )
-            if pg is None or pg.n_cells == 0:
-                flowrate.append(0.0)
-                meanv_t.append(0.0)
-                area.append(0.0)
-                continue
-            if "flow" not in pg.cell_data and "flow" in pg.point_data:
-                pg = pg.point_data_to_cell_data(pass_point_data=True)
-            vec = np.asarray(pg.cell_data.get("flow", []), dtype=float)
-            if vec.ndim != 2 or vec.shape[1] != 3 or len(vec) != pg.n_cells:
-                ca0 = np.asarray(pg.cell_data.get("Area", []), dtype=float)
-                flowrate.append(0.0)
-                meanv_t.append(0.0)
-                area.append(float(np.sum(ca0)) if len(ca0) else 0.0)
-                continue
-            ca = np.asarray(pg.cell_data.get("Area", np.ones(pg.n_cells, dtype=float)), dtype=float).reshape(-1)
-            if len(ca) != len(vec):
-                ca = np.ones(len(vec), dtype=float)
-            proj = np.dot(vec, normal)
-            area_t = float(np.sum(ca)) if len(ca) else 0.0
-            fr = float(np.sum(proj * ca) / 100.0) if area_t > 0.0 else 0.0
-            mv = float(np.sum(proj * ca) / area_t) if area_t > 0.0 else 0.0
-            peakv = max(peakv, float(np.max(np.abs(proj))) if len(proj) else 0.0)
-            flowrate.append(fr)
-            meanv_t.append(mv)
-            area.append(area_t)
-        metric = {
-            "center": np.asarray(plane.center, dtype=float).tolist(),
-            "normal": normal.tolist(),
-            "label": int(plane.label),
-            "path_index": int(plane.path_index),
-            "distance": float(plane.distance),
-            "target_branch_label": int(target_label) if target_label is not None else 0,
-            "peakv_cm_s": float(peakv),
-            "flowrate_mL_s": [float(x) for x in flowrate],
-            "netflow_mL_beat": float(abs(np.mean(flowrate)) * RR / 1000.0) if len(flowrate) else 0.0,
-            "meanv_cm_s": float(np.mean(meanv_t)) if len(meanv_t) else 0.0,
-            "meanv_cm_s_t": [float(x) for x in meanv_t],
-            "area_mm2": [float(x) for x in area],
-        }
-        if path_info is not None and 0 <= int(plane.path_index) < len(path_info):
-            info = path_info[int(plane.path_index)]
-            metric["path_direction"] = info.get("direction_text", "")
-            metric["path_start_point"] = info.get("start_point", [0.0, 0.0, 0.0])
-            metric["path_end_point"] = info.get("end_point", [0.0, 0.0, 0.0])
-            metric["path_fork_ids"] = info.get("fork_ids", [])
-            metric["path_fork_roles"] = info.get("fork_roles", [])
-        results.append(metric)
+        pp = None
+        if paths_lookup is not None:
+            pi = int(getattr(plane, "path_index", -1))
+            if 0 <= pi < len(paths_lookup):
+                pp = paths_lookup[pi]
+        results.append(_compute_single_plane_metric(
+            (flow, mask, spacing, origin, plane, Nt, RR,
+             branch_grid, target_label, path_info, pp, mask_template)
+        ))
 
     results, qc = apply_internal_consistency_to_metrics(results, path_info=path_info, forks=forks)
     if return_qc:
@@ -1376,15 +1532,26 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
         result["pixelwise_export"] = {}
     return result
 def _compute_single_plane_metric(args):
-    flow, mask, spacing, origin, plane, Nt, RR, branch_grid, target_label, path_info = args
+    (flow, mask, spacing, origin, plane, Nt, RR, branch_grid, target_label,
+     path_info, path_points, mask_template) = args
     normal = np.asarray(plane.normal, dtype=float).reshape(3)
     normal = normal / (np.linalg.norm(normal) + 1e-12)
-    mask_static = all(np.array_equal(mask[..., 0], mask[..., t]) for t in range(1, Nt))
-    mask_template = mask[..., 0] if mask_static else None
-    peakv = 0.0
-    flowrate = []
+
+    forward_sign, forward_sign_source, local_tangent, ntc = _determine_plane_forward(
+        plane, path_points, path_info, eps=0.1,
+    )
+
+    peakv_abs = 0.0
+    peakv_fwd = 0.0
+    peakv_rev = 0.0
+    flowrate = []        
+    flowrate_fwd = []     
+    flowrate_rev = []     
     area = []
-    meanv_t = []
+    meanv_t = []         
+    meanv_fwd_t = []     
+    meanv_rev_t = []     
+
     for t in range(Nt):
         mask_t = mask_template if mask_template is not None else mask[..., t]
         pg = _extract_plane_flow_region(
@@ -1392,8 +1559,8 @@ def _compute_single_plane_metric(args):
             branch_grid=branch_grid, target_label=target_label,
         )
         if pg is None or pg.n_cells == 0:
-            flowrate.append(0.0)
-            meanv_t.append(0.0)
+            flowrate.append(0.0); flowrate_fwd.append(0.0); flowrate_rev.append(0.0)
+            meanv_t.append(0.0); meanv_fwd_t.append(0.0); meanv_rev_t.append(0.0)
             area.append(0.0)
             continue
         if "flow" not in pg.cell_data and "flow" in pg.point_data:
@@ -1401,21 +1568,61 @@ def _compute_single_plane_metric(args):
         vec = np.asarray(pg.cell_data.get("flow", []), dtype=float)
         if vec.ndim != 2 or vec.shape[1] != 3 or len(vec) != pg.n_cells:
             ca0 = np.asarray(pg.cell_data.get("Area", []), dtype=float)
-            flowrate.append(0.0)
-            meanv_t.append(0.0)
+            flowrate.append(0.0); flowrate_fwd.append(0.0); flowrate_rev.append(0.0)
+            meanv_t.append(0.0); meanv_fwd_t.append(0.0); meanv_rev_t.append(0.0)
             area.append(float(np.sum(ca0)) if len(ca0) else 0.0)
             continue
         ca = np.asarray(pg.cell_data.get("Area", np.ones(pg.n_cells, dtype=float)), dtype=float).reshape(-1)
         if len(ca) != len(vec):
             ca = np.ones(len(vec), dtype=float)
+
         proj = np.dot(vec, normal)
+        proj_fwd = proj * float(forward_sign)
+        pos_mask = proj_fwd > 0.0
+        neg_mask = proj_fwd < 0.0
+
         area_t = float(np.sum(ca)) if len(ca) else 0.0
+
         fr = float(np.sum(proj * ca) / 100.0) if area_t > 0.0 else 0.0
-        mv = float(np.sum(proj * ca) / area_t) if area_t > 0.0 else 0.0
-        peakv = max(peakv, float(np.max(np.abs(proj))) if len(proj) else 0.0)
+        if area_t > 0.0:
+            fr_fwd = float(np.sum(proj_fwd[pos_mask] * ca[pos_mask]) / 100.0)
+            fr_rev = float(-np.sum(proj_fwd[neg_mask] * ca[neg_mask]) / 100.0)
+            mv = float(np.sum(proj * ca) / area_t)
+            mv_fwd = float(np.sum(np.where(pos_mask, proj_fwd, 0.0) * ca) / area_t)
+            mv_rev = float(-np.sum(np.where(neg_mask, proj_fwd, 0.0) * ca) / area_t)
+        else:
+            fr_fwd = fr_rev = 0.0
+            mv = mv_fwd = mv_rev = 0.0
+
+        if len(proj):
+            peakv_abs = max(peakv_abs, float(np.max(np.abs(proj))))
+        if len(proj_fwd):
+            if np.any(pos_mask):
+                peakv_fwd = max(peakv_fwd, float(np.max(proj_fwd[pos_mask])))
+            if np.any(neg_mask):
+                peakv_rev = max(peakv_rev, float(-np.min(proj_fwd[neg_mask])))
+
         flowrate.append(fr)
+        flowrate_fwd.append(fr_fwd)
+        flowrate_rev.append(fr_rev)
         meanv_t.append(mv)
+        meanv_fwd_t.append(mv_fwd)
+        meanv_rev_t.append(mv_rev)
         area.append(area_t)
+
+    netflow_mag = float(abs(np.mean(flowrate)) * RR / 1000.0) if len(flowrate) else 0.0
+    netflow_fwd = float(np.mean(flowrate_fwd) * RR / 1000.0) if len(flowrate_fwd) else 0.0
+    netflow_rev = float(np.mean(flowrate_rev) * RR / 1000.0) if len(flowrate_rev) else 0.0
+    net_signed = float(netflow_fwd - netflow_rev)
+    reflux_frac = float(netflow_rev / netflow_fwd) if netflow_fwd > 1e-12 else 0.0
+    meanv_fwd = float(np.mean(meanv_fwd_t)) if meanv_fwd_t else 0.0
+    meanv_rev = float(np.mean(meanv_rev_t)) if meanv_rev_t else 0.0
+
+    sgn = float(forward_sign)
+    flowrate_signed = [float(x) * sgn for x in flowrate]
+    meanv_signed_t = [float(x) * sgn for x in meanv_t]
+    meanv_signed = float(np.mean(meanv_signed_t)) if meanv_signed_t else 0.0
+
     metric = {
         "center": np.asarray(plane.center, dtype=float).tolist(),
         "normal": normal.tolist(),
@@ -1423,12 +1630,32 @@ def _compute_single_plane_metric(args):
         "path_index": int(plane.path_index),
         "distance": float(plane.distance),
         "target_branch_label": int(target_label) if target_label is not None else 0,
-        "peakv_cm_s": float(peakv),
+        "peakv_cm_s": float(peakv_abs),
         "flowrate_mL_s": [float(x) for x in flowrate],
-        "netflow_mL_beat": float(abs(np.mean(flowrate)) * RR / 1000.0) if len(flowrate) else 0.0,
-        "meanv_cm_s": float(np.mean(meanv_t)) if len(meanv_t) else 0.0,
+        "netflow_mL_beat": netflow_mag,
+        "meanv_cm_s": float(np.mean(meanv_t)) if meanv_t else 0.0,
         "meanv_cm_s_t": [float(x) for x in meanv_t],
         "area_mm2": [float(x) for x in area],
+        "flowrate_forward_mL_s": [float(x) for x in flowrate_fwd],
+        "flowrate_reverse_mL_s": [float(x) for x in flowrate_rev],
+        "meanv_forward_cm_s_t": [float(x) for x in meanv_fwd_t],
+        "meanv_reverse_cm_s_t": [float(x) for x in meanv_rev_t],
+        "flowrate_signed_mL_s": flowrate_signed,
+        "meanv_signed_cm_s_t": meanv_signed_t,
+        "meanv_signed_cm_s": meanv_signed,
+        "netflow_forward_mL_beat": netflow_fwd,
+        "netflow_reverse_mL_beat": netflow_rev,
+        "net_netflow_signed_mL_beat": net_signed,
+        "reflux_fraction": reflux_frac,
+        "peakv_forward_cm_s": float(peakv_fwd),
+        "peakv_reverse_cm_s": float(peakv_rev),
+        "meanv_forward_cm_s": meanv_fwd,
+        "meanv_reverse_cm_s": meanv_rev,
+        "forward_sign": int(forward_sign),
+        "forward_sign_source": str(forward_sign_source),
+        "local_path_tangent": [float(x) for x in np.asarray(local_tangent, dtype=float).tolist()],
+        "local_path_direction": _vector_orientation_text(local_tangent),
+        "normal_tangent_cos": float(ntc),
     }
     if path_info is not None and 0 <= int(plane.path_index) < len(path_info):
         info = path_info[int(plane.path_index)]
@@ -1441,8 +1668,8 @@ def _compute_single_plane_metric(args):
 
 
 def compute_plane_metrics_multithread(flow_xyzt3, segmask_binary_4d, spacing, origin, planes, RR=1000.0,
-                                       branch_labels_3d=None, path_info=None, forks=None, return_qc=False,
-                                       max_workers=None):
+                                       branch_labels_3d=None, path_info=None, forks=None,
+                                       paths=None, return_qc=False, max_workers=None):
     from concurrent.futures import ThreadPoolExecutor
     flow = np.asarray(flow_xyzt3, dtype=float)
     mask = np.asarray(segmask_binary_4d, dtype=bool)
@@ -1455,7 +1682,14 @@ def compute_plane_metrics_multithread(flow_xyzt3, segmask_binary_4d, spacing, or
     elif mask.ndim == 4 and mask.shape[3] == 1 and flow.shape[3] > 1:
         mask = np.repeat(mask, flow.shape[3], axis=3)
     Nt = int(flow.shape[3])
+    mask_static = all(np.array_equal(mask[..., 0], mask[..., t]) for t in range(1, Nt))
+    mask_template = mask[..., 0] if mask_static else None
+
     branch_grid = _build_branch_grid(branch_labels_3d, spacing, origin)
+    paths_lookup = None
+    if paths is not None:
+        paths_lookup = [np.asarray(p, dtype=float).reshape(-1, 3) for p in paths]
+
     args_list = []
     for plane in planes:
         target_label = None
@@ -1465,7 +1699,13 @@ def compute_plane_metrics_multithread(flow_xyzt3, segmask_binary_4d, spacing, or
                 ijk = np.rint((np.asarray(plane.center, dtype=float).reshape(3) - origin) / (spacing + 1e-12)).astype(int)
                 ijk = np.clip(ijk, 0, np.array(np.asarray(branch_labels_3d).shape) - 1)
                 target_label = int(np.asarray(branch_labels_3d)[ijk[0], ijk[1], ijk[2]])
-        args_list.append((flow, mask, spacing, origin, plane, Nt, RR, branch_grid, target_label, path_info))
+        pp = None
+        if paths_lookup is not None:
+            pi = int(getattr(plane, "path_index", -1))
+            if 0 <= pi < len(paths_lookup):
+                pp = paths_lookup[pi]
+        args_list.append((flow, mask, spacing, origin, plane, Nt, RR,
+                          branch_grid, target_label, path_info, pp, mask_template))
     if max_workers is None:
         import os as _os
         max_workers = min(len(planes), max(1, _os.cpu_count() or 4))
@@ -1485,6 +1725,13 @@ def load_metrics_as_table(metrics_json_path, qc_json_path=None):
         "label", "path_index", "distance", "target_branch_label",
         "peakv_cm_s", "netflow_mL_beat", "meanv_cm_s", "path_ic",
         "path_direction",
+        "peakv_forward_cm_s", "peakv_reverse_cm_s",
+        "meanv_forward_cm_s", "meanv_reverse_cm_s",
+        "netflow_forward_mL_beat", "netflow_reverse_mL_beat",
+        "net_netflow_signed_mL_beat", "reflux_fraction",
+        "meanv_signed_cm_s",
+        "forward_sign", "forward_sign_source",
+        "local_path_direction", "normal_tangent_cos",
     ]
     table_rows = []
     for i, m in enumerate(metrics):
@@ -1502,6 +1749,18 @@ def load_metrics_as_table(metrics_json_path, qc_json_path=None):
             row[f"area_t{t}"] = m["area_mm2"][t]
         for t in range(len(m.get("meanv_cm_s_t", []))):
             row[f"meanv_t{t}"] = m["meanv_cm_s_t"][t]
+        for t in range(len(m.get("flowrate_forward_mL_s", []))):
+            row[f"flowrate_fwd_t{t}"] = m["flowrate_forward_mL_s"][t]
+        for t in range(len(m.get("flowrate_reverse_mL_s", []))):
+            row[f"flowrate_rev_t{t}"] = m["flowrate_reverse_mL_s"][t]
+        for t in range(len(m.get("meanv_forward_cm_s_t", []))):
+            row[f"meanv_fwd_t{t}"] = m["meanv_forward_cm_s_t"][t]
+        for t in range(len(m.get("meanv_reverse_cm_s_t", []))):
+            row[f"meanv_rev_t{t}"] = m["meanv_reverse_cm_s_t"][t]
+        for t in range(len(m.get("flowrate_signed_mL_s", []))):
+            row[f"flowrate_signed_t{t}"] = m["flowrate_signed_mL_s"][t]
+        for t in range(len(m.get("meanv_signed_cm_s_t", []))):
+            row[f"meanv_signed_t{t}"] = m["meanv_signed_cm_s_t"][t]
         fork_ic = m.get("fork_ic", [])
         for fi, fic in enumerate(fork_ic):
             row[f"fork{fi}_id"] = fic.get("fork_id", -1)

@@ -64,9 +64,67 @@ During loading, the software reconstructs `mag`, `flow`, `IVSD`, and `TKE` from 
 Results are saved next to the input file:
 
 - `planes.json` — plane geometry and per-plane metrics
-- `plane_metrics.json` — detailed time-resolved metrics
+- `plane_metrics.json` — detailed time-resolved metrics (see below)
 - `plane_qc.json` — internal consistency quality control
 
+## Plane Metrics
+
+Each measurement plane exports a set of time-resolved or cycle aggregated quantities to `plane_metrics.json`.
+### Output fields
+ 
+Time-series fields have length `T` (cardiac phases); cycle aggregates are scalars.
+ 
+**Geometry / identity**
+ 
+| Field | Description |
+|---|---|
+| `center`, `normal` | plane center (mm) and unit normal |
+| `label` | branch label (0 = whole vessel) |
+| `path_index` | which branch this plane belongs to |
+| `distance` | arc-length position along the branch (mm) |
+ 
+**Per-timestep signals**
+ 
+| Field | Unit | Description |
+|---|---|---|
+| `area_mm2` | mm² | lumen area at this plane |
+| `flowrate_mL_s` | mL/s | signed flow along the raw plane normal (backward-compatible) |
+| `meanv_cm_s_t` | cm/s | area-weighted mean velocity along the raw plane normal |
+| `flowrate_signed_mL_s` | mL/s | `flowrate_mL_s × forward_sign`; sign is now "+ = along the branch's forward direction", stable across planes on curved branches |
+| `meanv_signed_cm_s_t` | cm/s | `meanv_cm_s_t × forward_sign`; same sign convention as above |
+| `flowrate_forward_mL_s` | mL/s | forward-only flowrate, ≥ 0 |
+| `flowrate_reverse_mL_s` | mL/s | reverse-only flowrate, reported as a positive magnitude |
+| `meanv_forward_cm_s_t` | cm/s | forward-only mean velocity |
+| `meanv_reverse_cm_s_t` | cm/s | reverse-only mean velocity magnitude |
+ 
+**Cycle aggregates**
+ 
+| Field | Unit | Description |
+|---|---|---|
+| `peakv_cm_s` | cm/s | peak \|velocity\| over the cycle (backward-compatible) |
+| `netflow_mL_beat` | mL/beat | \|mean flowrate\| × RR / 1000 (magnitude, backward-compatible) |
+| `meanv_cm_s` | cm/s | cycle-averaged mean velocity along the raw normal |
+| `meanv_signed_cm_s` | cm/s | `meanv_cm_s × forward_sign`; recommended for display — stable sign on curved branches |
+| `netflow_forward_mL_beat` | mL/beat | forward volume per cardiac cycle |
+| `netflow_reverse_mL_beat` | mL/beat | reverse volume per cardiac cycle |
+| `net_netflow_signed_mL_beat` | mL/beat | forward − reverse. Positive: net flow agrees with the branch direction. Negative: the plane's net flow runs counter to the branch direction |
+| `reflux_fraction` | ratio | `reverse / forward`; flags regurgitant or retrograde flow |
+| `peakv_forward_cm_s` | cm/s | forward peak velocity |
+| `peakv_reverse_cm_s` | cm/s | reverse peak velocity magnitude |
+| `meanv_forward_cm_s` | cm/s | cycle-averaged forward mean velocity |
+| `meanv_reverse_cm_s` | cm/s | cycle-averaged reverse mean velocity |
+| `path_ic` | 0..1 | internal consistency of net-flow magnitudes across planes on the same branch |
+ 
+**Diagnostics for the forward direction**
+ 
+| Field | Description |
+|---|---|
+| `forward_sign` | ±1; sign applied to `normal` to point along the branch's forward direction at this plane |
+| `forward_sign_source` | `"flow_tangent"` when driven by the local tangent, `"geometry_fallback"` when the tangent was too weak and the branch chord was used, `"none"` if no directional information was available (defaults to +1) |
+| `local_path_tangent` | 3-vector, unit tangent of the reoriented branch at the plane center |
+| `local_path_direction` | short text label (`HF+`, `LR-`, …) summarizing the local tangent direction |
+| `normal_tangent_cos` | `dot(normal, local_path_tangent)`; magnitudes near 1 indicate the plane is well aligned with the centerline |
+ 
 ## References
 
 - WSS calculation references:

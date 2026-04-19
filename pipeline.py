@@ -36,6 +36,20 @@ class PipelineEngine:
         os.makedirs(out_dir, exist_ok=True)
         return out_dir
 
+    def _json_safe(self, obj):
+        if isinstance(obj, np.floating):
+            val = float(obj)
+            return val if np.isfinite(val) else None
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, float):
+            return obj if np.isfinite(obj) else None
+        if isinstance(obj, dict):
+            return {k: self._json_safe(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [self._json_safe(v) for v in obj]
+        return obj
+
     def load_data(self, ws, log):
         path = ws.paths.segmask_path or ws.paths.flow_path
         if not path:
@@ -187,16 +201,21 @@ class PipelineEngine:
             return [], {}, "Plane metrics skipped: no flow"
         if ws.segmask_binary is None:
             self.preprocess(ws)
+        # Prefer the smoothed centerlines (better local tangents) but fall back
+        # to the raw ordered ones if the smoothing step hasn't been run yet.
+        paths_for_tangent = ws.centerline_paths_smooth if len(ws.centerline_paths_smooth) > 0 else ws.centerline_paths
         if use_multithread:
             metrics, qc = compute_plane_metrics_multithread(
                 ws.flow_raw, ws.segmask_binary, ws.resolution, ws.origin, ws.planes,
                 RR=ws.rr, branch_labels_3d=ws.branch_labels,
-                path_info=ws.path_info, forks=ws.forks, return_qc=True)
+                path_info=ws.path_info, forks=ws.forks, paths=paths_for_tangent,
+                return_qc=True)
         else:
             metrics, qc = compute_plane_metrics(
                 ws.flow_raw, ws.segmask_binary, ws.resolution, ws.origin, ws.planes,
                 RR=ws.rr, branch_labels_3d=ws.branch_labels,
-                path_info=ws.path_info, forks=ws.forks, return_qc=True)
+                path_info=ws.path_info, forks=ws.forks, paths=paths_for_tangent,
+                return_qc=True)
         ws.derived.plane_metrics = metrics
         ws.derived.plane_qc = qc
         for i, metric in enumerate(metrics):
@@ -301,15 +320,8 @@ class PipelineEngine:
                           color="yellow", line_width=2)
 
         planes_path = self._save_planes_json(ws)
-
-        metric_msg = ""
-        if ws.has_flow() and len(ws.planes) > 0:
-            _, _, metric_msg = self._compute_plane_metrics_internal(ws, save=False)
-            ws.pipeline.mark_done(StepId.COMPUTE_PLANE_METRICS)
         ws.pipeline.mark_done(StepId.GENERATE_PLANES)
         msg = f"Planes: {len(ws.planes)} paths={len(ws.centerline_paths_smooth)} forks={len(ws.forks)} saved={planes_path}"
-        if metric_msg:
-            msg += f" | {metric_msg}"
         return StepResult(StepId.GENERATE_PLANES, True, False, msg)
 
     def _step_edit_planes(self, ws):

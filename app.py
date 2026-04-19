@@ -9,6 +9,7 @@ import numpy as np
 import pyvista as pv
 from PyQt5 import QtCore, QtWidgets
 from pyvistaqt import QtInteractor
+from pyvista import _vtk
 
 from models import Workspace, StepId, ObjectKind
 from pipeline import PipelineEngine
@@ -76,10 +77,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._plane_drag_active = False
         self._plane_drag_index = None
         self._plane_widget_initializing = False
+        self._plane_drag_metrics_dirty = False
         self._selected_plane_index = -1
         self._plane_drag_timer = QtCore.QTimer(self)
         self._plane_drag_timer.setSingleShot(True)
-        self._plane_drag_timer.timeout.connect(self._recompute_dragged_plane_metrics)
+        self._plane_drag_timer.timeout.connect(lambda: self._recompute_dragged_plane_metrics(persist=False))
         self._build_ui()
         self._bind_scene()
         self._esc_shortcut = QtWidgets.QShortcut(QtCore.Qt.Key_Escape, self)
@@ -439,6 +441,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._plane_drag_active = False
         self._plane_drag_index = None
         self._plane_widget_initializing = False
+        self._plane_drag_metrics_dirty = False
         if self._edit_mode is not None:
             return
         try:
@@ -483,11 +486,41 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ortho_viewer._selected_plane_idx = int(plane_idx)
         self.ortho_viewer.refresh()
         self._plane_drag_index = int(plane_idx)
+        self._plane_drag_metrics_dirty = True
         self._plane_drag_timer.start(250)
         try:
             self.plotter.render()
         except Exception:
             pass
+
+    def _persist_plane_outputs(self):
+        out_dir = self.pipeline._output_dir(self.workspace)
+        metrics = self.workspace.derived.plane_metrics
+        qc = self.workspace.derived.plane_qc
+        if metrics and len(metrics) == len(self.workspace.planes):
+            with open(os.path.join(out_dir, "plane_metrics.json"), "w", encoding="utf-8") as f:
+                json.dump(metrics, f, ensure_ascii=False, indent=2)
+        if qc:
+            with open(os.path.join(out_dir, "plane_qc.json"), "w", encoding="utf-8") as f:
+                json.dump(qc, f, ensure_ascii=False, indent=2)
+        try:
+            self.pipeline._save_planes_json(self.workspace)
+        except Exception:
+            pass
+
+    def _finalize_plane_drag(self, plane_idx):
+        if not (0 <= int(plane_idx) < len(self.workspace.planes)):
+            return
+        self._plane_drag_timer.stop()
+        self._plane_drag_index = int(plane_idx)
+        if self.workspace.flow_raw is None or self.workspace.segmask_binary is None:
+            self._persist_plane_outputs()
+            self._plane_drag_metrics_dirty = False
+            return
+        if self._plane_drag_metrics_dirty or len(self.workspace.derived.plane_metrics) != len(self.workspace.planes):
+            self._recompute_dragged_plane_metrics(persist=True)
+        else:
+            self._persist_plane_outputs()
 
     def _activate_plane_drag_widgets(self, plane_idx):
         if self._edit_mode is not None or not (0 <= int(plane_idx) < len(self.workspace.planes)):
@@ -512,10 +545,27 @@ class MainWindow(QtWidgets.QMainWindow):
             tip_now = np.asarray(new_tip, dtype=float).reshape(3)
             self._update_plane_from_drag(plane_idx, normal=(tip_now - c))
 
+        def _end_cb(_widget, _event):
+            self._finalize_plane_drag(plane_idx)
+
         try:
             self._plane_widget_initializing = True
-            self.plotter.add_sphere_widget(callback=_center_cb, center=tuple(center.tolist()), radius=radius, color="cyan")
-            self.plotter.add_sphere_widget(callback=_normal_cb, center=tuple(tip.tolist()), radius=radius, color="orange")
+            center_widget = self.plotter.add_sphere_widget(
+                callback=_center_cb,
+                center=tuple(center.tolist()),
+                radius=radius,
+                color="cyan",
+                interaction_event="always",
+            )
+            normal_widget = self.plotter.add_sphere_widget(
+                callback=_normal_cb,
+                center=tuple(tip.tolist()),
+                radius=radius,
+                color="orange",
+                interaction_event="always",
+            )
+            center_widget.AddObserver(_vtk.vtkCommand.EndInteractionEvent, _end_cb)
+            normal_widget.AddObserver(_vtk.vtkCommand.EndInteractionEvent, _end_cb)
             self._plane_drag_active = True
             self._plane_drag_index = int(plane_idx)
         except Exception as e:
@@ -525,16 +575,19 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             self._plane_widget_initializing = False
 
-    def _recompute_dragged_plane_metrics(self):
+    def _recompute_dragged_plane_metrics(self, persist=False):
         if self._plane_drag_index is None or not (0 <= int(self._plane_drag_index) < len(self.workspace.planes)):
             return
         if self.workspace.flow_raw is None or self.workspace.segmask_binary is None:
             self.ortho_viewer.refresh()
+            if persist:
+                self._persist_plane_outputs()
+            self._plane_drag_metrics_dirty = False
             return
         plane_idx = int(self._plane_drag_index)
         try:
             if len(self.workspace.derived.plane_metrics) != len(self.workspace.planes):
-                self.pipeline._compute_plane_metrics_internal(self.workspace, save=True)
+                self.pipeline._compute_plane_metrics_internal(self.workspace, save=persist)
                 self.scene.invalidate_cache("plane_")
                 self.scene.sync_from_workspace()
             else:
@@ -559,19 +612,15 @@ class MainWindow(QtWidgets.QMainWindow):
                     for i, metric in enumerate(metrics):
                         if i < len(self.workspace.planes):
                             self.workspace.planes[i].metrics = dict(metric)
-                    out_dir = self.pipeline._output_dir(self.workspace)
-                    with open(os.path.join(out_dir, "plane_metrics.json"), "w", encoding="utf-8") as f:
-                        json.dump(metrics, f, ensure_ascii=False, indent=2)
-                    with open(os.path.join(out_dir, "plane_qc.json"), "w", encoding="utf-8") as f:
-                        json.dump(qc, f, ensure_ascii=False, indent=2)
-                    try:
-                        self.pipeline._save_planes_json(self.workspace)
-                    except Exception:
-                        pass
+                    if persist:
+                        self._persist_plane_outputs()
+            if persist:
+                self._persist_plane_outputs()
             self._selected_plane_index = plane_idx
             self.ortho_viewer._selected_plane_idx = plane_idx
             self.ortho_viewer.refresh()
             self._log_selected_plane_metric(plane_idx)
+            self._plane_drag_metrics_dirty = False
         except Exception as e:
             self.log(f"Plane metric update error: {type(e).__name__}: {e}")
             self.log(traceback.format_exc())

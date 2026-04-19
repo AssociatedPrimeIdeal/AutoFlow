@@ -37,16 +37,24 @@ def print_metrics_summary(table_rows):
     if not table_rows:
         print("  No metrics to summarize.")
         return
-    print(f"  {'Plane':>6} {'Path':>5} {'Net Flow(mL/beat)':>18} {'Peak Velocity(cm/s)':>20} {'Mean Velocity(cm/s)':>20} {'IC':>6}")
-    print(f"  {'-'*6} {'-'*5}  {'-'*18} {'-'*20} {'-'*20} {'-'*6}")
+    print(f"  {'Plane':>6} {'Path':>5} {'Net Flow(mL/beat)':>18} "
+          f"{'Peak Velocity(cm/s)':>20} {'Mean Velocity(cm/s)':>20} "
+          f"{'Reflux':>7} {'IC':>6}")
+    print(f"  {'-'*6} {'-'*5}  {'-'*18} {'-'*20} {'-'*20} "
+          f"{'-'*7} {'-'*6}")
     for row in table_rows:
         pidx = row.get("plane_index", "?")
         path = row.get("path_index", "?")
         nf = row.get("netflow_mL_beat", 0.0)
         pv_ = row.get("peakv_cm_s", 0.0)
-        mv = row.get("meanv_cm_s", 0.0)
+        if "meanv_signed_cm_s" in row:
+            mv = row["meanv_signed_cm_s"]
+        else:
+            mv = row.get("meanv_cm_s", 0.0)
+        refl = row.get("reflux_fraction", 0.0)
         ic = row.get("path_ic", 1.0)
-        print(f"  {pidx:>6} {path:>5} {nf:>18.4f} {pv_:>20.3f} {mv:>20.3f} {ic:>6.3f}")
+        print(f"  {pidx:>6} {path:>5} {nf:>18.4f} "
+              f"{pv_:>20.3f} {mv:>20.3f} {refl:>7.3f} {ic:>6.3f}")
 
 
 def _normalize(v):
@@ -977,35 +985,25 @@ def process_single(
     ws.paths.output_dir = out_dir
     ws.derived_params.use_multithread = use_multithread
     engine = PipelineEngine()
-    logger = lambda msg: print(f"  [LOG] {msg}")
-
+    logger = lambda msg: None
     import time as _time
     _t_total_start = _time.time()
 
-    _t0 = _time.time()
     print("[1/7] Loading data...")
     engine.load_data(ws, logger)
-    print(f"  -> Step 1 took {_time.time() - _t0:.2f}s")
 
-    _t0 = _time.time()
     print("[2/7] Generate Skeleton...")
     r = engine.run_step(ws, StepId.GENERATE_SKELETON, logger)
     print(f"  -> {r.message}")
-    print(f"  -> Step 2 took {_time.time() - _t0:.2f}s")
 
-    _t0 = _time.time()
     print("[3/7] Generate Graph (+ branches/forks)...")
     r = engine.run_step(ws, StepId.GENERATE_GRAPH, logger)
     print(f"  -> {r.message}")
-    print(f"  -> Step 3 took {_time.time() - _t0:.2f}s")
 
-    _t0 = _time.time()
     print("[4/7] Generate Planes...")
     r = engine.run_step(ws, StepId.GENERATE_PLANES, logger)
     print(f"  -> {r.message}")
-    print(f"  -> Step 4 took {_time.time() - _t0:.2f}s")
 
-    _t0 = _time.time()
     if reuse_planes_path:
         print(f"[5/7] Reuse Plane Positions: {reuse_planes_path}")
         plane_items = load_plane_positions(reuse_planes_path)
@@ -1014,9 +1012,7 @@ def process_single(
         print(f"  -> Reused {len(ws.planes)} planes saved={planes_json}")
     else:
         print("[5/7] Use generated planes")
-    print(f"  -> Step 5 took {_time.time() - _t0:.2f}s")
 
-    _t0 = _time.time()
     if skip_plane_metrics:
         print("[6/7] Skipped plane metrics")
     else:
@@ -1031,9 +1027,7 @@ def process_single(
             engine._save_planes_json(ws)
         except Exception:
             pass
-    print(f"  -> Step 6 took {_time.time() - _t0:.2f}s")
 
-    _t0 = _time.time()
     pixelwise_result = {}
     if not skip_derived:
         print("[7/7] Compute Derived Metrics (WSS/TKE)...")
@@ -1071,7 +1065,6 @@ def process_single(
         print(f"  -> Derived: Nt={len(ws.derived.wss_surfaces)}")
     else:
         print("[7/7] Skipped derived metrics (WSS/TKE)")
-    print(f"  -> Step 7 took {_time.time() - _t0:.2f}s")
     total_time_sec = _time.time() - _t_total_start
     print(f"  => Total pipeline took {total_time_sec:.2f}s")
 
@@ -1228,7 +1221,7 @@ def build_base_workspace():
     ws.skeleton_params.min_cc_volume_mm3 = globals().get("MIN_CC_VOLUME", 50.0)
     ws.streamline_params.max_steps = 2000
     ws.streamline_params.min_seeds = 50
-    ws.streamline_params.seed_ratio = globals().get("SEED_RATIO", 50.0)
+    ws.streamline_params.seed_ratio = globals().get("SEED_RATIO", 0.02)
     ws.streamline_params.tube_radius = globals().get("TUBE_RADIUS", 0.05)
     return ws
 

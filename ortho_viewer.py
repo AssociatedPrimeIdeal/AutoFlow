@@ -11,7 +11,18 @@ class OrthoViewer(QtWidgets.QWidget):
         self.workspace = workspace
         self._selected_plane_idx = None
         self._scalar_cbar = None
+        self._cache = {}
         self._build_ui()
+
+    def _cached(self, group, key, builder, max_items=24):
+        bucket = self._cache.setdefault(group, {})
+        if key in bucket:
+            return bucket[key]
+        value = builder()
+        if len(bucket) >= max_items:
+            bucket.clear()
+        bucket[key] = value
+        return value
 
     def _build_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
@@ -217,15 +228,23 @@ class OrthoViewer(QtWidgets.QWidget):
         if shape is None:
             return None, "WSS (no data)", {"cmap": "jet", "clim": None}
         res = self._get_resolution()
-        vol = np.zeros(shape, dtype=float)
-        pts = np.asarray(surf.points, dtype=float)
-        vals = np.asarray(surf.point_data["wss"], dtype=float)
-        vox = np.rint(pts / (res.reshape(1, 3) + 1e-12)).astype(int)
-        for k in range(3):
-            vox[:, k] = np.clip(vox[:, k], 0, shape[k] - 1)
-        flat = np.ravel_multi_index((vox[:, 0], vox[:, 1], vox[:, 2]), shape)
-        tgt = vol.reshape(-1)
-        np.maximum.at(tgt, flat, vals)
+        key = (
+            id(surf),
+            tuple(int(x) for x in shape),
+            tuple(np.round(res, 6).tolist()),
+        )
+        def _build():
+            vol = np.zeros(shape, dtype=float)
+            pts = np.asarray(surf.points, dtype=float)
+            vals = np.asarray(surf.point_data["wss"], dtype=float)
+            vox = np.rint(pts / (res.reshape(1, 3) + 1e-12)).astype(int)
+            for k in range(3):
+                vox[:, k] = np.clip(vox[:, k], 0, shape[k] - 1)
+            flat = np.ravel_multi_index((vox[:, 0], vox[:, 1], vox[:, 2]), shape)
+            tgt = vol.reshape(-1)
+            np.maximum.at(tgt, flat, vals)
+            return vol
+        vol = self._cached("wss_volume", key, _build)
         cmap, clim = self._scene_style("wss_surface_live", "jet", None)
         return vol, "WSS (Pa)", {"cmap": cmap, "clim": clim}
 
@@ -233,16 +252,22 @@ class OrthoViewer(QtWidgets.QWidget):
         ws = self.workspace
         if ws.derived.tke_array is not None:
             arr = np.asarray(ws.derived.tke_array, dtype=float)
-            if arr.ndim == 4:
-                vol = arr[..., min(max(0, int(t)), arr.shape[3] - 1)]
-            else:
-                vol = arr
-            if ws.segmask_binary is not None:
-                if ws.segmask_binary.ndim == 4:
-                    mask_t = ws.segmask_binary[..., min(max(0, int(t)), ws.segmask_binary.shape[3] - 1)]
+            tidx = min(max(0, int(t)), arr.shape[3] - 1) if arr.ndim == 4 else 0
+            mask_id = id(ws.segmask_binary) if ws.segmask_binary is not None else -1
+            key = (id(ws.derived.tke_array), mask_id, int(tidx))
+            def _build():
+                if arr.ndim == 4:
+                    vol = arr[..., tidx]
                 else:
-                    mask_t = ws.segmask_binary
-                vol = vol * np.asarray(mask_t, dtype=float)
+                    vol = arr
+                if ws.segmask_binary is not None:
+                    if ws.segmask_binary.ndim == 4:
+                        mask_t = ws.segmask_binary[..., min(max(0, int(t)), ws.segmask_binary.shape[3] - 1)]
+                    else:
+                        mask_t = ws.segmask_binary
+                    vol = np.asarray(vol, dtype=float) * np.asarray(mask_t, dtype=float)
+                return np.asarray(vol, dtype=float)
+            vol = self._cached("tke_volume", key, _build)
             cmap, clim = self._scene_style("tke_volume", "hot", None)
             return vol, "TKE (J/m³)", {"cmap": cmap, "clim": clim}
         if ws.derived.tke_volume is None:
@@ -254,19 +279,27 @@ class OrthoViewer(QtWidgets.QWidget):
         if "TKE" not in tke_mesh.point_data and "TKE" not in tke_mesh.cell_data:
             return None, "TKE (no data)", {"cmap": "hot", "clim": None}
         res = self._get_resolution()
-        vol = np.zeros(shape, dtype=float)
-        if "TKE" in tke_mesh.cell_data:
-            pts = tke_mesh.cell_centers().points
-            vals = np.asarray(tke_mesh.cell_data["TKE"], dtype=float)
-        else:
-            pts = tke_mesh.points
-            vals = np.asarray(tke_mesh.point_data["TKE"], dtype=float)
-        vox = np.rint(pts / (res.reshape(1, 3) + 1e-12)).astype(int)
-        for k in range(3):
-            vox[:, k] = np.clip(vox[:, k], 0, shape[k] - 1)
-        flat = np.ravel_multi_index((vox[:, 0], vox[:, 1], vox[:, 2]), shape)
-        tgt = vol.reshape(-1)
-        np.maximum.at(tgt, flat, vals)
+        key = (
+            id(tke_mesh),
+            tuple(int(x) for x in shape),
+            tuple(np.round(res, 6).tolist()),
+        )
+        def _build():
+            vol = np.zeros(shape, dtype=float)
+            if "TKE" in tke_mesh.cell_data:
+                pts = tke_mesh.cell_centers().points
+                vals = np.asarray(tke_mesh.cell_data["TKE"], dtype=float)
+            else:
+                pts = tke_mesh.points
+                vals = np.asarray(tke_mesh.point_data["TKE"], dtype=float)
+            vox = np.rint(pts / (res.reshape(1, 3) + 1e-12)).astype(int)
+            for k in range(3):
+                vox[:, k] = np.clip(vox[:, k], 0, shape[k] - 1)
+            flat = np.ravel_multi_index((vox[:, 0], vox[:, 1], vox[:, 2]), shape)
+            tgt = vol.reshape(-1)
+            np.maximum.at(tgt, flat, vals)
+            return vol
+        vol = self._cached("tke_mesh_volume", key, _build)
         cmap, clim = self._scene_style("tke_volume", "hot", None)
         return vol, "TKE (J/m³)", {"cmap": cmap, "clim": clim}
     def _get_scalar_slice(self, t):
@@ -288,11 +321,19 @@ class OrthoViewer(QtWidgets.QWidget):
             vol = np.asarray(ws.mag_raw[..., t], dtype=float)
             return vol, "Magnitude", {"cmap": "gray", "clim": (float(np.nanmin(vol)), float(np.nanmax(vol)))}
         if content_idx == 4 and ws.mag_raw is not None and ws.flow_raw is not None:
-            speed = np.sqrt(np.sum(ws.flow_raw[..., t, :] ** 2, axis=-1))
-            vol = np.asarray(ws.mag_raw[..., t], dtype=float) * np.asarray(speed, dtype=float)
+            key = (id(ws.mag_raw), id(ws.flow_raw), int(t))
+            def _build():
+                speed = np.sqrt(np.sum(ws.flow_raw[..., t, :] ** 2, axis=-1))
+                return np.asarray(ws.mag_raw[..., t], dtype=float) * np.asarray(speed, dtype=float)
+            vol = self._cached("scalar_volume", ("pcmra",) + key, _build)
             return vol, "PC-MRA", {"cmap": "gray", "clim": (float(np.nanmin(vol)), float(np.nanmax(vol)))}
         if content_idx == 5 and ws.flow_raw is not None:
-            vol = np.sqrt(np.sum(ws.flow_raw[..., t, :] ** 2, axis=-1))
+            key = (id(ws.flow_raw), int(t))
+            vol = self._cached(
+                "scalar_volume",
+                ("speed",) + key,
+                lambda: np.sqrt(np.sum(ws.flow_raw[..., t, :] ** 2, axis=-1)),
+            )
             return np.asarray(vol, dtype=float), "Speed (cm/s)", {"cmap": "turbo", "clim": (0.0, float(np.nanmax(vol)) if np.nanmax(vol) > 0 else 1.0)}
         if content_idx == 6:
             return self._get_wss_volume(t)
@@ -305,7 +346,8 @@ class OrthoViewer(QtWidgets.QWidget):
         if ws.segmask_3d is not None:
             return ws.segmask_3d
         if ws.segmask_binary is not None and ws.segmask_binary.ndim == 4:
-            return np.any(ws.segmask_binary, axis=3)
+            key = (id(ws.segmask_binary), tuple(int(x) for x in ws.segmask_binary.shape))
+            return self._cached("mask_3d", key, lambda: np.any(ws.segmask_binary, axis=3))
         return None
 
     def _update_value_label(self, vol, title):
@@ -454,16 +496,37 @@ class OrthoViewer(QtWidgets.QWidget):
         normal = np.asarray(plane.normal, dtype=float)
         normal = normal / (np.linalg.norm(normal) + 1e-12)
         flow_t = ws.flow_raw[..., t, :]
-        proj = flow_t[..., 0] * normal[0] + flow_t[..., 1] * normal[1] + flow_t[..., 2] * normal[2]
         shape = self._get_volume_shape()
         half_size = max(10, min(shape) // 2)
-        sl = self._resample_oblique(proj, center_vox, normal, half_size=half_size)
+        plane_key = (
+            int(self._selected_plane_idx),
+            int(t),
+            tuple(np.round(center_vox, 4).tolist()),
+            tuple(np.round(normal, 6).tolist()),
+            int(half_size),
+            id(ws.flow_raw),
+        )
+        def _build_plane_flow():
+            proj = flow_t[..., 0] * normal[0] + flow_t[..., 1] * normal[1] + flow_t[..., 2] * normal[2]
+            return self._resample_oblique(proj, center_vox, normal, half_size=half_size)
+        sl = self._cached("plane_flow", plane_key, _build_plane_flow)
         vmax = max(abs(np.nanmin(sl)), abs(np.nanmax(sl)), 1e-6)
         self.ax_plane.imshow(sl.T, origin="lower", cmap="RdBu_r", vmin=-vmax, vmax=vmax, aspect=1.0)
         self.ax_plane.plot(half_size, half_size, "r+", markersize=10, markeredgewidth=2)
         mask_3d = self._get_mask_3d()
         if mask_3d is not None:
-            m_sl = self._resample_oblique(mask_3d.astype(float), center_vox, normal, half_size=half_size)
+            mask_key = (
+                int(self._selected_plane_idx),
+                tuple(np.round(center_vox, 4).tolist()),
+                tuple(np.round(normal, 6).tolist()),
+                int(half_size),
+                id(mask_3d),
+            )
+            m_sl = self._cached(
+                "plane_mask",
+                mask_key,
+                lambda: self._resample_oblique(mask_3d.astype(float), center_vox, normal, half_size=half_size),
+            )
             try:
                 self.ax_plane.contour(m_sl.T, levels=[0.5], colors="cyan", linewidths=0.5, origin="lower")
             except Exception:
@@ -481,6 +544,7 @@ class OrthoViewer(QtWidgets.QWidget):
     def reset_state(self):
         self._selected_plane_idx = None
         self._remove_colorbar()
+        self._cache.clear()
         self.label_value.setText("Voxel: -   Value: -")
         self.label_plane_metric.setText("Plane metrics: -")
         for ax in [self.ax_ax, self.ax_cor, self.ax_sag, self.ax_plane]:
