@@ -8,14 +8,9 @@ The GIF below showcases a demo case processed by **AutoFlow** on the demo data, 
 
 ![Demo](https://github.com/user-attachments/assets/e2c17a9e-6a47-4f85-ba0d-c35b622802b1)
 
-## Requirements
+## Installation
 
-- Python 3.9+
-- System packages for Qt5 when using the GUI (for example `libxcb-xinerama0` on Ubuntu)
-
-## Local Installation
-
-Clone the repo and install inside your current Conda environment:
+Clone the repo and install inside your environment:
 
 ```bash
 git clone https://github.com/AssociatedPrimeIdeal/AutoFlow.git
@@ -31,6 +26,26 @@ If you also want the desktop GUI:
 git clone https://github.com/AssociatedPrimeIdeal/AutoFlow.git
 cd AutoFlow
 pip install ".[gui]"
+```
+
+## Running The CLI
+
+You can also run the non-GUI pipeline from the command line:
+
+Video outputs are disabled by default. Pass the specific `--*-video` flags you want to generate.
+
+```bash
+autoflow-run ./data/demo_data.h5 \
+  --output-dir ./results/demo \
+```
+
+Example with evenly spaced planes and rotating dynamic videos:
+
+```bash
+autoflow-run ./data/phantom_S.h5 ./data/phantom_U.h5 ./data/phantom_Y.h5 \
+  --output-dir ./results/demo \
+  --plane-by-distance \
+  --cross-section-dist 15 \
 ```
 
 ## Running The Library
@@ -65,42 +80,6 @@ config = AutoFlowConfig(
 )
 
 results, case_out = run_batch(config)
-```
-
-## Running The CLI
-
-You can also run the non-GUI pipeline from the command line:
-
-```bash
-autoflow-run ./data/demo_data.h5 \
-  --output-dir ./results \
-  --wss-video \
-  --streamlines-video \
-  --tke-video \
-  --rotate-dynamic-video \
-  --dynamic-rotation-frames 180 \
-  --dynamic-rotation-elevation-deg 10 \
-  --dynamic-time-repeat 3 \
-  --camera-view right \
-  --no-path-idx
-```
-
-Example with evenly spaced planes and rotating dynamic videos:
-
-```bash
-autoflow-run ./data/phantom_S.h5 ./data/phantom_U.h5 ./data/phantom_Y.h5 \
-  --output-dir ./results \
-  --plane-by-distance \
-  --cross-section-dist 15 \
-  --wss-video \
-  --streamlines-video \
-  --tke-video \
-  --rotate-dynamic-video \
-  --dynamic-rotation-frames 180 \
-  --dynamic-rotation-elevation-deg 10 \
-  --dynamic-time-repeat 3 \
-  --camera-view right \
-  --no-path-idx
 ```
 
 ## Running The GUI
