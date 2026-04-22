@@ -28,19 +28,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--fps", type=int, default=12, help="Output video FPS.")
     parser.add_argument("--plane-rotation-frames", type=int, default=180, help="Frame count for plane rotation video.")
-    parser.add_argument("--plane-video", dest="make_plane_video", action="store_true", help="Enable plane rotation video.")
-    parser.add_argument("--no-plane-video", dest="make_plane_video", action="store_false", help="Disable plane rotation video.")
-    parser.add_argument("--wss-video", dest="make_wss_video", action="store_true", help="Enable WSS video.")
-    parser.add_argument("--no-wss-video", dest="make_wss_video", action="store_false", help="Disable WSS video.")
-    parser.add_argument("--streamlines-video", dest="make_streamlines_video", action="store_true", help="Enable streamline video.")
-    parser.add_argument("--no-streamlines-video", dest="make_streamlines_video", action="store_false", help="Disable streamline video.")
-    parser.add_argument("--tke-video", dest="make_tke_video", action="store_true", help="Enable TKE video.")
-    parser.add_argument("--no-tke-video", dest="make_tke_video", action="store_false", help="Disable TKE video.")
+    parser.add_argument("--plane-video", dest="make_plane_video", action="store_true", help="Generate plane rotation video.")
+    parser.add_argument("--wss-video", dest="make_wss_video", action="store_true", help="Generate WSS video.")
+    parser.add_argument("--streamlines-video", dest="make_streamlines_video", action="store_true", help="Generate streamline video.")
+    parser.add_argument("--tke-video", dest="make_tke_video", action="store_true", help="Generate TKE video.")
     parser.set_defaults(
         make_plane_video=False,
-        make_wss_video=True,
-        make_streamlines_video=True,
-        make_tke_video=True,
+        make_wss_video=False,
+        make_streamlines_video=False,
+        make_tke_video=False,
     )
 
     parser.add_argument("--camera-view", default="right", help="Camera preset used for rendered videos.")

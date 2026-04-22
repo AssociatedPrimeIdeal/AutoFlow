@@ -61,9 +61,9 @@ class AutoFlowConfig:
     fps: int = 12
     plane_rotation_frames: int = 180
     make_plane_video: bool = False
-    make_wss_video: bool = True
-    make_streamlines_video: bool = True
-    make_tke_video: bool = True
+    make_wss_video: bool = False
+    make_streamlines_video: bool = False
+    make_tke_video: bool = False
 
     camera_view: str = "right"
     camera_distance_scale: float = 1.5
