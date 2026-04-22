@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autoflow-mri"
+version = "0.1.0"
+description = "AutoFlow PC-MRI pipeline with optional Qt GUI."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+dependencies = [
+  "numpy",
+  "scipy",
+  "scikit-image",
+  "networkx",
+  "pyvista",
+  "h5py",
+  "imageio",
+  "Pillow",
+]
+
+[project.optional-dependencies]
+gui = [
+  "PyQt5",
+  "pyvistaqt",
+  "matplotlib",
+]
+
+[project.scripts]
+autoflow-run = "autoflow.cli:main"
+autoflow-gui = "autoflow.gui:main"
+
+[tool.setuptools]
+include-package-data = false
+py-modules = [
+  "algorithms",
+  "app",
+  "editors",
+  "io_utils",
+  "models",
+  "ortho_viewer",
+  "pipeline",
+  "utils_demo",
+  "viewer",
+]
+
+[tool.setuptools.packages.find]
+include = ["autoflow"]

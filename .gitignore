@@ -1,4 +1,16 @@
 __pycache__/
 *.pyc
 *.pyo
+.ipynb_checkpoints/
 
+# Local data and generated outputs
+/111/
+/results/
+/@eaDir/
+Thumbs.db
+.DS_Store
+
+# Generated plane/QC exports
+/data/planes.json
+/data/plane_metrics.json
+/data/plane_qc.json

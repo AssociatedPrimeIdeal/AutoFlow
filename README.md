@@ -11,26 +11,106 @@ The GIF below showcases a demo case processed by **AutoFlow** on the demo data, 
 ## Requirements
 
 - Python 3.9+
-- System packages for Qt5 (e.g. `libxcb-xinerama0` on Ubuntu)
+- System packages for Qt5 when using the GUI (for example `libxcb-xinerama0` on Ubuntu)
 
-## Installation
+## Local Installation
 
-```bash
-pip install numpy scipy scikit-image networkx pyvista pyvistaqt PyQt5 matplotlib h5py imageio Pillow
-```
-
-## Running Script
-
-See `./demo.ipynb` for example workflows, including:
-
-- a demo showing how to run the pipeline on an aortic dataset
-- demo examples for three phantom datasets
-
-## Running Software
+Clone the repo and install inside your current Conda environment:
 
 ```bash
-python app.py
+git clone https://github.com/AssociatedPrimeIdeal/AutoFlow.git
+cd AutoFlow
+pip install .
 ```
+
+The base install is intended for library usage and non-GUI batch processing.
+
+If you also want the desktop GUI:
+
+```bash
+git clone https://github.com/AssociatedPrimeIdeal/AutoFlow.git
+cd AutoFlow
+pip install ".[gui]"
+```
+
+## Running The Library
+
+See `./library_demo.ipynb` for a packaged-library workflow.
+
+Example with rotating dynamic videos:
+
+```python
+from autoflow import AutoFlowConfig, run_batch
+
+config = AutoFlowConfig(
+    inputs=["./data/demo_data.h5"],
+    output_dir="./results/demo",
+    use_center_plane=True,
+    cross_section_dist=15.0,
+    start_dist=5.0,
+    end_dist=0.0,
+    skip_derived=False,
+    use_multithread=True,
+    make_plane_video=False,
+    make_wss_video=True,
+    make_streamlines_video=True,
+    make_tke_video=True,
+    rotate_dynamic_video=True,
+    dynamic_rotation_frames=180,
+    dynamic_rotation_elevation_deg=10.0,
+    dynamic_time_repeat=3,
+    camera_view="right",
+    camera_distance_scale=1.5,
+    add_path_idx=False,
+)
+
+results, case_out = run_batch(config)
+```
+
+## Running The CLI
+
+You can also run the non-GUI pipeline from the command line:
+
+```bash
+autoflow-run ./data/demo_data.h5 \
+  --output-dir ./results \
+  --wss-video \
+  --streamlines-video \
+  --tke-video \
+  --rotate-dynamic-video \
+  --dynamic-rotation-frames 180 \
+  --dynamic-rotation-elevation-deg 10 \
+  --dynamic-time-repeat 3 \
+  --camera-view right \
+  --no-path-idx
+```
+
+Example with evenly spaced planes and rotating dynamic videos:
+
+```bash
+autoflow-run ./data/phantom_S.h5 ./data/phantom_U.h5 ./data/phantom_Y.h5 \
+  --output-dir ./results \
+  --plane-by-distance \
+  --cross-section-dist 15 \
+  --wss-video \
+  --streamlines-video \
+  --tke-video \
+  --rotate-dynamic-video \
+  --dynamic-rotation-frames 180 \
+  --dynamic-rotation-elevation-deg 10 \
+  --dynamic-time-repeat 3 \
+  --camera-view right \
+  --no-path-idx
+```
+
+## Running The GUI
+
+After `pip install ".[gui]"`:
+
+```bash
+autoflow-gui
+```
+
 ![app](https://github.com/user-attachments/assets/2a668f0c-f98d-4168-9e84-79fa3949adb2)
 1. **File → Open Data** to load an HDF5 file containing `img_complex`, `segmask`, `Resolution`, `VENC`, `RR`, `SpatialOrder`, and `VENCOrder`.
 2. Use the **Steps** panel to run the pipeline sequentially or click **Run All**.

@@ -591,6 +591,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.scene.invalidate_cache("plane_")
                 self.scene.sync_from_workspace()
             else:
+                paths_for_tangent = (
+                    self.workspace.centerline_paths_smooth
+                    if len(self.workspace.centerline_paths_smooth) > 0
+                    else self.workspace.centerline_paths
+                )
                 partial_metrics = compute_plane_metrics(
                     self.workspace.flow_raw,
                     self.workspace.segmask_binary,
@@ -601,6 +606,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     branch_labels_3d=self.workspace.branch_labels,
                     path_info=self.workspace.path_info,
                     forks=self.workspace.forks,
+                    paths=paths_for_tangent,
                     return_qc=False,
                 )
                 if partial_metrics:
