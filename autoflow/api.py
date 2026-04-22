@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from models import Workspace
-from utils_demo import collect_h5_files, process_single, resolve_reuse_plane_file
+from utils import collect_h5_files, process_single, resolve_reuse_plane_file
 
 DEFAULT_WSS_BAR_CFG = {
     "position_x": 0.75,

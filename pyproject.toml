@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "autoflow-mri"
 version = "1.0.0"
-description = "AutoFlow PC-MRI pipeline with optional Qt GUI."
+description = "Automated processing pipeline for 4D flow MRI with optional Qt GUI."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
@@ -41,7 +41,7 @@ py-modules = [
   "models",
   "ortho_viewer",
   "pipeline",
-  "utils_demo",
+  "utils",
   "viewer",
 ]
 
