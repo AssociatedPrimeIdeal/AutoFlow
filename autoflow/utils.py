@@ -10,9 +10,9 @@ import pyvista as pv
 import imageio.v2 as imageio
 from PIL import Image
 
-from models import Workspace, StepId, PlaneData
-from pipeline import PipelineEngine
-from algorithms import (
+from .models import Workspace, StepId, PlaneData
+from .pipeline import PipelineEngine
+from .algorithms import (
     load_metrics_as_table,
     compute_derived_metrics,
     create_uniform_grid,

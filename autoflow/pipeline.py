@@ -2,8 +2,8 @@ import json
 import os
 import numpy as np
 
-from models import StepId, ObjectKind
-from algorithms import (
+from .models import StepId, ObjectKind
+from .algorithms import (
     load_h5_data,
     filter_segmask_labels, merge_segmask_to_3d,
     preprocess_mask_for_skeleton,
@@ -124,7 +124,7 @@ class PipelineEngine:
     def _step_generate_skeleton(self, ws):
         self.preprocess(ws)
         if ws.skeleton_params.remove_small_cc:
-            from algorithms import remove_small_cc_from_binary_mask
+            from .algorithms import remove_small_cc_from_binary_mask
             ws.segmask_binary = remove_small_cc_from_binary_mask(
                 ws.segmask_binary, ws.resolution, ws.skeleton_params.min_cc_volume_mm3)
             ws.segmask_3d = merge_segmask_to_3d(ws.segmask_binary)

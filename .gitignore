@@ -1,7 +1,10 @@
 __pycache__/
 *.pyc
 *.pyo
+/*.py
 .ipynb_checkpoints/
+*.ipynb
+!library_demo.ipynb
 
 # Local data and generated outputs
 /111/
@@ -19,6 +22,4 @@ TODO.md
 app.png
 autoflow_mri.egg-info/
 build/
-test.ipynb
-utils_bgc.py
 /scripts/
