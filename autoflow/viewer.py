@@ -1,8 +1,8 @@
 import numpy as np
 import pyvista as pv
 
-from models import ObjectKind
-from algorithms import (
+from .models import ObjectKind
+from .algorithms import (
     build_multilabel_surface_t,
     build_surface_from_mask3d,
     graph_to_polydata,

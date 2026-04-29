@@ -9,7 +9,7 @@ from scipy.spatial import cKDTree
 from scipy.signal import savgol_filter
 from skimage.morphology import skeletonize
 
-from models import PlaneData, GraphData, SkeletonParams
+from .models import PlaneData, GraphData, SkeletonParams
 
 
 def _axis_pair(a):

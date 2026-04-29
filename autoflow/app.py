@@ -11,12 +11,12 @@ from PyQt5 import QtCore, QtWidgets
 from pyvistaqt import QtInteractor
 from pyvista import _vtk
 
-from models import Workspace, StepId, ObjectKind
-from pipeline import PipelineEngine
-from viewer import SceneController
-from editors import SkeletonEditor, PlaneEditor
-from ortho_viewer import OrthoViewer
-from algorithms import compute_plane_metrics, apply_internal_consistency_to_metrics, compute_plane_metrics_multithread
+from .models import Workspace, StepId, ObjectKind
+from .pipeline import PipelineEngine
+from .viewer import SceneController
+from .editors import SkeletonEditor, PlaneEditor
+from .ortho_viewer import OrthoViewer
+from .algorithms import compute_plane_metrics, apply_internal_consistency_to_metrics, compute_plane_metrics_multithread
 
 
 def _parse_plane_index(data_key):

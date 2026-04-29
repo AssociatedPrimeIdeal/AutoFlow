@@ -34,20 +34,6 @@ test = [
 autoflow-run = "autoflow.cli:main"
 autoflow-gui = "autoflow.gui:main"
 
-[tool.setuptools]
-include-package-data = false
-py-modules = [
-  "algorithms",
-  "app",
-  "editors",
-  "io_utils",
-  "models",
-  "ortho_viewer",
-  "pipeline",
-  "utils",
-  "viewer",
-]
-
 [tool.setuptools.packages.find]
 include = ["autoflow"]
 

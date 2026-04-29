@@ -1,5 +1,5 @@
 import numpy as np
-from models import PlaneData, GraphData
+from .models import PlaneData, GraphData
 
 
 class SkeletonEditor:
