@@ -14,3 +14,11 @@ Thumbs.db
 /data/planes.json
 /data/plane_metrics.json
 /data/plane_qc.json
+
+TODO.md
+app.png
+autoflow_mri.egg-info/
+build/
+test.ipynb
+utils_bgc.py
+/scripts/

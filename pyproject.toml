@@ -26,6 +26,9 @@ gui = [
   "pyvistaqt",
   "matplotlib",
 ]
+test = [
+  "pytest",
+]
 
 [project.scripts]
 autoflow-run = "autoflow.cli:main"
@@ -47,3 +50,6 @@ py-modules = [
 
 [tool.setuptools.packages.find]
 include = ["autoflow"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
