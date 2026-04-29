@@ -5,7 +5,7 @@ import numpy as np
 from .models import StepId, ObjectKind
 from .algorithms import (
     load_h5_data,
-    filter_segmask_labels, merge_segmask_to_3d,
+    filter_segmask_labels, binarize_segmask, merge_segmask_to_3d,
     preprocess_mask_for_skeleton,
     generate_skeleton_from_mask3d, build_graph_from_points,
     segment_vessels_from_graph_and_mask,
@@ -97,7 +97,7 @@ class PipelineEngine:
         if ws.segmask_raw is None:
             raise ValueError("segmask_raw is None")
         ws.segmask_labels = filter_segmask_labels(ws.segmask_raw)
-        ws.segmask_binary = (ws.segmask_labels > 0).astype(bool)
+        ws.segmask_binary = binarize_segmask(ws.segmask_labels)
         ws.segmask_3d = merge_segmask_to_3d(ws.segmask_binary)
         ws.set_object_visible_by_data_key("segmask_raw_surface", False)
         ws.remove_object_by_data_key("segmask_pre_surface")

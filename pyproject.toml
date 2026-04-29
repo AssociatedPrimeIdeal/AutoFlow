@@ -35,7 +35,7 @@ autoflow-run = "autoflow.cli:main"
 autoflow-gui = "autoflow.gui:main"
 
 [tool.setuptools.packages.find]
-include = ["autoflow"]
+include = ["autoflow", "autoflow.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
