@@ -18,6 +18,7 @@ def test_run_batch_smoke_on_phantom_data(tmp_path):
         skip_derived=True,
         skip_plane_metrics=True,
         use_multithread=False,
+        use_center_plane=True,
         make_plane_video=False,
         make_wss_video=False,
         make_streamlines_video=False,
@@ -53,8 +54,8 @@ def test_run_batch_smoke_on_phantom_data(tmp_path):
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         assert summary["input"].endswith(f"{case_name}.h5")
         assert summary["output_dir"] == str(case_dir)
-        assert summary["n_planes"] >= 1
         assert summary["n_paths"] >= 1
+        assert summary["n_planes"] == summary["n_paths"]
         assert summary["plane_metrics"] == []
         assert summary["plane_qc"] == {}
         assert summary["videos"] == {}

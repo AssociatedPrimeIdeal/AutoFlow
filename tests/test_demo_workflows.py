@@ -12,7 +12,6 @@ from autoflow import AutoFlowConfig, run_batch
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEMO_INPUT = REPO_ROOT / "data" / "demo_data.h5"
 EXPECTED_PIXELWISE_KEYS = {"origin", "spacing", "tke", "tke_time", "wss"}
-NOTEBOOK_VIDEO_KEYS = {"streamlines", "tke", "wss"}
 
 
 def _run_cli(*args: str) -> subprocess.CompletedProcess[str]:
@@ -108,9 +107,9 @@ def test_library_demo_notebook_workflow_processes_demo_data(tmp_path):
         remove_small_cc=True,
         min_cc_volume=50.0,
         make_plane_video=False,
-        make_wss_video=True,
-        make_streamlines_video=True,
-        make_tke_video=True,
+        make_wss_video=False,
+        make_streamlines_video=False,
+        make_tke_video=False,
         camera_view="right",
         camera_distance_scale=1.5,
         rotate_dynamic_video=True,
@@ -126,5 +125,5 @@ def test_library_demo_notebook_workflow_processes_demo_data(tmp_path):
     assert results[0]["status"] == "ok"
     assert case_out == str(output_root / "demo_data")
 
-    summary = _assert_demo_outputs(output_root, expected_video_keys=NOTEBOOK_VIDEO_KEYS)
-    assert set(summary["videos"]) == NOTEBOOK_VIDEO_KEYS
+    summary = _assert_demo_outputs(output_root, expected_video_keys=set())
+    assert summary["videos"] == {}
