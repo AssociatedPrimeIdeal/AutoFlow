@@ -116,8 +116,6 @@ Input HDF5 file must contain:
 | `SpatialOrder` | `(3,)`                       | Spatial axis labels                              |
 | `VENCOrder`  | `(3,)`                         | Encoding direction labels                        |
 
-During loading, the software reconstructs `mag`, `flow`, `IVSD`, and `TKE` from `img_complex`.
-
 ## Output
 
 Results are saved next to the input file:
