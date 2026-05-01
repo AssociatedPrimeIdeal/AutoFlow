@@ -1,5 +1,5 @@
 import json
-from .models import Workspace
+from .core.models import Workspace
 
 
 def save_workspace_file(path, workspace):

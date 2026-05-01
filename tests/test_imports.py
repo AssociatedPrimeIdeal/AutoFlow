@@ -105,6 +105,42 @@ def test_base_imports_do_not_require_optional_gui_dependencies():
     assert result.returncode == 0, result.stderr or result.stdout
 
 
+def test_refactor_modules_and_utils_compatibility_import():
+    import autoflow.plane_io as plane_io
+    import autoflow.processing as processing
+    import autoflow.rendering as rendering
+    import autoflow.reporting as reporting
+    import autoflow.utils as utils
+
+    assert utils.process_single is processing.process_single
+    assert utils.resolve_reuse_plane_file is plane_io.resolve_reuse_plane_file
+    assert utils.print_qc_summary is reporting.print_qc_summary
+    assert utils.render_tke_video is rendering.render_tke_video
+
+
+def test_core_and_ui_packages_reexport_legacy_entry_points():
+    import autoflow.app as app
+    import autoflow.core as core
+    import autoflow.core.models as core_models
+    import autoflow.core.pipeline as core_pipeline
+    import autoflow.editors as editors
+    import autoflow.gui as gui
+    import autoflow.models as models
+    import autoflow.ortho_viewer as ortho_viewer
+    import autoflow.pipeline as pipeline
+    import autoflow.ui as ui
+    import autoflow.viewer as viewer
+
+    assert models.Workspace is core_models.Workspace
+    assert pipeline.PipelineEngine is core_pipeline.PipelineEngine
+    assert viewer.SceneController is ui.SceneController
+    assert ortho_viewer.OrthoViewer is ui.OrthoViewer
+    assert editors.PlaneEditor is ui.PlaneEditor
+    assert app.main is ui.main
+    assert gui.launch_gui is ui.launch_gui
+    assert core.PipelineEngine is core_pipeline.PipelineEngine
+
+
 def test_launch_gui_reports_missing_optional_dependencies():
     code = _block_optional_gui_imports(
         """
