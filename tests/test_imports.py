@@ -118,33 +118,30 @@ def test_refactor_modules_and_utils_compatibility_import():
     assert utils.render_tke_video is rendering.render_tke_video
 
 
-def test_core_and_ui_packages_reexport_legacy_entry_points():
+def test_core_and_ui_packages_are_the_new_internal_layout():
     import autoflow.core as core
     import autoflow.core.models as core_models
     import autoflow.core.pipeline as core_pipeline
-    import autoflow.editors as editors
-    import autoflow.gui as gui
-    import autoflow.models as models
-    import autoflow.pipeline as pipeline
     import autoflow.ui as ui
+    import autoflow.ui.editors as ui_editors
+    import autoflow.ui.launcher as ui_launcher
 
-    assert models.Workspace is core_models.Workspace
-    assert pipeline.PipelineEngine is core_pipeline.PipelineEngine
-    assert editors.PlaneEditor is ui.PlaneEditor
-    assert gui.launch_gui is ui.launch_gui
     assert core.PipelineEngine is core_pipeline.PipelineEngine
+    assert core.Workspace is core_models.Workspace
+    assert ui.PlaneEditor is ui_editors.PlaneEditor
+    assert ui.launch_gui is ui_launcher.launch_gui
 
 
-def test_gui_shims_remain_lazy_without_optional_dependencies():
+def test_ui_modules_can_be_imported_lazily_without_optional_dependencies():
     code = _block_optional_gui_imports(
         """
-        import autoflow.app as app
-        import autoflow.ortho_viewer as ortho_viewer
-        import autoflow.viewer as viewer
+        import autoflow
+        import autoflow.ui
+        import autoflow.ui.launcher as launcher
 
-        print(app.__all__)
-        print(ortho_viewer.__all__)
-        print(viewer.__all__)
+        print(autoflow.__all__)
+        print(autoflow.ui.__all__)
+        print(launcher.launch_gui.__name__)
         """
     )
     result = _run_python(code)
@@ -154,7 +151,7 @@ def test_gui_shims_remain_lazy_without_optional_dependencies():
 def test_launch_gui_reports_missing_optional_dependencies():
     code = _block_optional_gui_imports(
         """
-        from autoflow.gui import launch_gui
+        from autoflow import launch_gui
 
         try:
             launch_gui()

@@ -20,7 +20,7 @@ def __getattr__(name):
             "run_case": run_case,
         }[name]
     if name == "launch_gui":
-        from .gui import launch_gui
+        from .ui.launcher import launch_gui
 
         return launch_gui
     raise AttributeError(f"module 'autoflow' has no attribute {name!r}")

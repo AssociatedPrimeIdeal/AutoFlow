@@ -3,7 +3,7 @@ import numpy as np
 import pyvista as pv
 from scipy.spatial import cKDTree
 
-from ..models import GraphData
+from ..core.models import GraphData
 
 
 def build_graph_from_points(points, spacing):

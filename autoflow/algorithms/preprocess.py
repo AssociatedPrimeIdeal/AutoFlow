@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.ndimage import binary_closing, binary_opening, gaussian_filter, label
 
-from ..models import SkeletonParams
+from ..core.models import SkeletonParams
 
 
 def _normalize_label_selection(labels):

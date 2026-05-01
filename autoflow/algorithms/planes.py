@@ -1,6 +1,6 @@
 import numpy as np
 
-from ..models import PlaneData
+from ..core.models import PlaneData
 from .paths import inter_points, smooth_path_savgol
 
 

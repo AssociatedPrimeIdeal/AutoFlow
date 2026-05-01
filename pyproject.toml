@@ -32,7 +32,7 @@ test = [
 
 [project.scripts]
 autoflow-run = "autoflow.cli:main"
-autoflow-gui = "autoflow.gui:main"
+autoflow-gui = "autoflow.ui.launcher:main"
 
 [tool.setuptools.packages.find]
 include = ["autoflow", "autoflow.*"]
