@@ -2,13 +2,14 @@ from dataclasses import dataclass, field
 import json
 import os
 import traceback
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
+from .case_types import InputCase
 from .core.models import Workspace
 from .plane_io import resolve_reuse_plane_file
-from .processing import collect_h5_files, process_single
+from .processing import collect_input_items, process_single
 
 DEFAULT_WSS_BAR_CFG = {
     "position_x": 0.75,
@@ -101,19 +102,25 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
 
 
 def run_case(
-    input_path: str,
+    input_path: Union[str, InputCase],
     output_dir: Optional[str] = None,
     config: Optional[AutoFlowConfig] = None,
     workspace: Optional[Workspace] = None,
 ) -> Dict[str, Any]:
     cfg = config or AutoFlowConfig()
     base_ws = workspace if workspace is not None else build_workspace(cfg)
+    source = input_path
+    if isinstance(input_path, InputCase):
+        source = input_path
     case_dir = output_dir
     if not case_dir:
-        case_name = os.path.splitext(os.path.basename(input_path))[0]
+        if isinstance(source, InputCase):
+            case_name = source.output_name or os.path.splitext(os.path.basename(source.input_path))[0]
+        else:
+            case_name = os.path.splitext(os.path.basename(str(source)))[0]
         case_dir = os.path.join(cfg.output_dir, case_name)
     return process_single(
-        input_path,
+        source,
         case_dir,
         workspace=base_ws,
         skip_derived=cfg.skip_derived,
@@ -147,30 +154,30 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
     if not config.inputs:
         raise ValueError("AutoFlowConfig.inputs is empty.")
 
-    h5_files = collect_h5_files(list(config.inputs))
-    if not h5_files:
-        print("No H5 files found.")
+    input_cases = collect_input_items(list(config.inputs))
+    if not input_cases:
+        print("No supported H5 or DICOM inputs found.")
         return [], ""
 
-    print(f"Found {len(h5_files)} file(s) to process.")
+    print(f"Found {len(input_cases)} input case(s) to process.")
     base_ws = build_workspace(config)
     results: List[Dict[str, Any]] = []
     last_case_out = ""
 
-    for path in h5_files:
-        case_name = os.path.splitext(os.path.basename(path))[0]
+    for case in input_cases:
+        case_name = case.output_name or os.path.splitext(os.path.basename(case.input_path))[0]
         case_out = os.path.join(config.output_dir, case_name)
         reuse_file = resolve_reuse_plane_file(config.reuse_planes, case_name)
 
         if config.reuse_planes and not os.path.isfile(reuse_file):
             error = f"reuse plane file not found: {config.reuse_planes}"
-            results.append({"file": path, "status": "error", "error": error})
+            results.append({"file": case.input_path, "case": case.display_name, "status": "error", "error": error})
             print(f"\n[ERROR] {error}")
             continue
 
         try:
             case_cfg = AutoFlowConfig(
-                inputs=[path],
+                inputs=[case.input_path],
                 output_dir=config.output_dir,
                 skip_derived=config.skip_derived,
                 skip_plane_metrics=config.skip_plane_metrics,
@@ -205,13 +212,13 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 streamline_clim=config.streamline_clim,
                 streamline_bar_cfg=dict(config.streamline_bar_cfg),
             )
-            summary = run_case(path, output_dir=case_out, config=case_cfg, workspace=base_ws)
-            results.append({"file": path, "status": "ok", "summary": summary})
+            summary = run_case(case, output_dir=case_out, config=case_cfg, workspace=base_ws)
+            results.append({"file": case.input_path, "case": case.display_name, "status": "ok", "summary": summary})
             last_case_out = case_out
         except Exception:
-            print(f"\n[ERROR] Failed: {path}")
+            print(f"\n[ERROR] Failed: {case.display_name or case.input_path}")
             print(traceback.format_exc())
-            results.append({"file": path, "status": "error", "error": traceback.format_exc()})
+            results.append({"file": case.input_path, "case": case.display_name, "status": "error", "error": traceback.format_exc()})
 
     os.makedirs(config.output_dir, exist_ok=True)
     batch_report = os.path.join(config.output_dir, "batch_report.json")

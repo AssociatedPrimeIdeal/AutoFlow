@@ -32,11 +32,26 @@ pip install ".[gui]"
 
 You can also run the non-GUI pipeline from the command line:
 
+`autoflow-run` accepts:
+
+- legacy / normalized H5 inputs
+- a DICOM file
+- a DICOM directory
+
+When you pass a directory, AutoFlow now scans it recursively. If multiple DICOM 4D-flow cases are found, batch mode processes each case separately.
+
 Video outputs are disabled by default. Pass the specific `--*-video` flags you want to generate.
 
 ```bash
 autoflow-run ./data/demo_data.h5 \
   --output-dir ./results/demo \
+```
+
+Direct DICOM example:
+
+```bash
+autoflow-run ./dicom \
+  --output-dir ./results/dicom_batch \
 ```
 
 Example with evenly spaced planes and rotating dynamic videos:
@@ -91,18 +106,35 @@ autoflow-gui
 ```
 
 ![app](https://github.com/user-attachments/assets/2a668f0c-f98d-4168-9e84-79fa3949adb2)
-1. **File → Open Data** to load an HDF5 file containing `img_complex`, `segmask`, `Resolution`, `VENC`, `RR`, `SpatialOrder`, and `VENCOrder`.
-2. Use the **Steps** panel to run the pipeline sequentially or click **Run All**.
-3. Use **Edit Skeleton** / **Edit Graph** for interactive editing:
+1. Use **File → Open H5** for legacy / normalized HDF5 input.
+2. Use **File → Import DICOM Directory** for direct DICOM input. AutoFlow scans the selected directory recursively, lists the detected 4D-flow cases, and then imports the one you choose.
+3. Legacy HDF5 input can still contain `img_complex`, `segmask`, `Resolution`, `VENC`, `RR`, `SpatialOrder`, and `VENCOrder`.
+4. Use the **Steps** panel to run the pipeline sequentially or click **Run All**.
+5. Use **Edit Skeleton** / **Edit Graph** for interactive editing:
    - Click a node to select it; drag the sphere widget to move it.
    - Press `Delete` or `Backspace` to remove the selected node or edge.
    - In graph edit mode, press `E` to toggle edge mode. With edge mode on, click two nodes sequentially to add/remove an edge between them. Click an edge directly to select it for deletion.
    - Press `Escape` to cancel edits; click the step button again to apply.
-4. Adjust parameters in the bottom panels before running each step.
-5. Use the **Timeline** slider to scrub through time frames.
-6. The **Ortho Viewer** on the right shows reformatted cross-sectional images for the selected plane.
+6. Adjust parameters in the bottom panels before running each step.
+7. Use the **Timeline** slider to scrub through time frames.
+8. The **Ortho Viewer** on the right shows reformatted cross-sectional images for the selected plane.
 
-## Data Format
+## Input Formats
+
+### Direct DICOM
+
+AutoFlow can now read 4D-flow DICOM directly without converting to H5 first.
+
+- Directory scan reads DICOM headers first and only loads pixel data for the selected / active case.
+- Spatial orientation is inferred from `ImageOrientationPatient` plus slice ordering from `ImagePositionPatient` when available.
+- Velocity component direction is inferred in this order:
+  - standard `MRVelocityEncodingSequence / VelocityEncodingDirection`
+  - explicit anatomical labels in DICOM text fields such as `RL`, `LR`, `AP`, `PA`, `FH`, `HF`
+  - `RO / PE / SS` style labels combined with `InPlanePhaseEncodingDirection`
+- Direct DICOM import normalizes into AutoFlow's internal `mag + flow + resolution + venc + rr` representation.
+- DICOM does not synthesize TKE. If no segmentation is embedded or provided separately, segmentation-dependent steps are skipped cleanly.
+
+### Legacy HDF5
 
 Input HDF5 file must contain:
 
@@ -118,7 +150,10 @@ Input HDF5 file must contain:
 
 ## Output
 
-Results are saved next to the input file:
+Results are saved under the chosen output directory.
+
+- CLI batch mode creates one subdirectory per case, using the H5 stem or detected DICOM case name.
+- GUI DICOM import defaults to `<selected_dicom_root>/autoflow_<case_name>`.
 
 - `planes.json` — plane geometry and per-plane metrics
 - `plane_metrics.json` — detailed time-resolved metrics (see below)

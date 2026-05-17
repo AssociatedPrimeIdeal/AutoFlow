@@ -4,7 +4,7 @@ import numpy as np
 
 from .models import StepId, ObjectKind
 from ..algorithms import (
-    load_h5_data,
+    load_input_data,
     filter_segmask_labels, binarize_segmask, merge_segmask_to_3d,
     preprocess_mask_for_skeleton,
     generate_skeleton_from_mask3d, build_graph_from_points,
@@ -55,11 +55,11 @@ class PipelineEngine:
             return [self._json_safe(v) for v in obj]
         return obj
 
-    def load_data(self, ws, log):
+    def load_data(self, ws, log, input_source=None):
         path = ws.paths.segmask_path or ws.paths.flow_path
-        if not path:
+        if input_source is None and not path:
             raise ValueError("data path is empty")
-        data = load_h5_data(path)
+        data = load_input_data(path if input_source is None else input_source)
         flow = np.asarray(data.flow, dtype=np.float32)
         mag = np.asarray(data.mag, dtype=np.float32)
         seg = None if data.segmentation is None else np.asarray(data.segmentation, dtype=np.int16)

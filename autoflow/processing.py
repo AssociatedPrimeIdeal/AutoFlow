@@ -8,7 +8,7 @@ import numpy as np
 
 from .core.models import StepId, Workspace
 from .core.pipeline import PipelineEngine
-from .algorithms import compute_derived_metrics
+from .algorithms import collect_input_cases, compute_derived_metrics, resolve_input_case
 from .plane_io import (
     load_plane_positions,
     project_planes_to_workspace,
@@ -25,7 +25,7 @@ from .reporting import load_metrics_from_output, print_metrics_summary, print_qc
 
 
 def process_single(
-    h5_path,
+    input_source,
     out_dir,
     workspace=None,
     skip_derived=False,
@@ -53,15 +53,18 @@ def process_single(
     streamline_bar_cfg=None,
     dynamic_time_repeat=1,
 ):
+    case = resolve_input_case(input_source)
+    input_label = case.display_name or case.input_path
+
     print(f"\n{'=' * 60}")
-    print(f"Processing: {h5_path}")
+    print(f"Processing: {input_label}")
     print(f"Output dir: {out_dir}")
     print(f"{'=' * 60}")
 
     os.makedirs(out_dir, exist_ok=True)
     ws = copy.deepcopy(workspace) if workspace is not None else Workspace()
-    ws.paths.segmask_path = h5_path
-    ws.paths.flow_path = h5_path
+    ws.paths.segmask_path = case.input_path
+    ws.paths.flow_path = case.input_path
     ws.paths.output_dir = out_dir
     ws.derived_params.use_multithread = use_multithread
     engine = PipelineEngine()
@@ -71,7 +74,7 @@ def process_single(
     t_total_start = _time.time()
 
     print("[1/7] Loading data...")
-    engine.load_data(ws, logger)
+    engine.load_data(ws, logger, input_source=case)
 
     print("[2/7] Generate Skeleton...")
     result = engine.run_step(ws, StepId.GENERATE_SKELETON, logger)
@@ -156,7 +159,7 @@ def process_single(
     total_time_sec = _time.time() - t_total_start
     print(f"  => Total pipeline took {total_time_sec:.2f}s")
 
-    plane_positions_path = save_plane_positions(ws, os.path.join(out_dir, "plane_positions.json"), source_path=h5_path)
+    plane_positions_path = save_plane_positions(ws, os.path.join(out_dir, "plane_positions.json"), source_path=case.input_path)
     print(f"Plane positions saved: {plane_positions_path}")
 
     video_paths = {}
@@ -261,7 +264,9 @@ def process_single(
         print_qc_summary(qc_data, ws.forks)
 
     summary = {
-        "input": h5_path,
+        "input": case.input_path,
+        "input_kind": case.input_kind,
+        "input_display_name": case.display_name,
         "output_dir": out_dir,
         "resolution": ws.resolution.tolist(),
         "origin": np.asarray(ws.origin, dtype=float).reshape(3).tolist(),
@@ -301,6 +306,10 @@ def collect_h5_files(inputs):
             files.extend(sorted(glob.glob(os.path.join(inp, "**", "*.h5"), recursive=True)))
             files.extend(sorted(glob.glob(os.path.join(inp, "**", "*.hdf5"), recursive=True)))
     return sorted(dict.fromkeys(files))
+
+
+def collect_input_items(inputs):
+    return collect_input_cases(inputs)
 
 
 def build_base_workspace():
@@ -358,29 +367,36 @@ def run_batch():
         {"position_x": 0.75, "position_y": 0.2, "height": 0.22, "width": 0.05, "title_font_size": 40, "label_font_size": 32},
     )
 
-    h5_files = collect_h5_files(inputs)
-    if not h5_files:
-        print("No H5 files found.")
+    input_cases = collect_input_items(inputs)
+    if not input_cases:
+        print("No supported H5 or DICOM inputs found.")
         return [], ""
 
-    print(f"Found {len(h5_files)} file(s) to process.")
+    print(f"Found {len(input_cases)} input case(s) to process.")
     base_ws = build_base_workspace()
     results = []
     case_out = ""
 
-    for path in h5_files:
-        name = os.path.splitext(os.path.basename(path))[0]
+    for case in input_cases:
+        name = case.output_name or os.path.splitext(os.path.basename(case.input_path))[0]
         case_out = os.path.join(output_dir, name)
         reuse_file = resolve_reuse_plane_file(reuse_planes, name)
 
         if reuse_planes and not os.path.isfile(reuse_file):
-            results.append({"file": path, "status": "error", "error": f"reuse plane file not found: {reuse_planes}"})
+            results.append(
+                {
+                    "file": case.input_path,
+                    "case": case.display_name,
+                    "status": "error",
+                    "error": f"reuse plane file not found: {reuse_planes}",
+                }
+            )
             print(f"\n[ERROR] Reuse plane file not found: {reuse_planes}")
             continue
 
         try:
             summary = process_single(
-                path,
+                case,
                 case_out,
                 workspace=base_ws,
                 skip_derived=skip_derived,
@@ -408,11 +424,11 @@ def run_batch():
                 dynamic_rotation_elevation_deg=dynamic_rotation_elevation_deg,
                 dynamic_time_repeat=dynamic_time_repeat,
             )
-            results.append({"file": path, "status": "ok", "summary": summary})
+            results.append({"file": case.input_path, "case": case.display_name, "status": "ok", "summary": summary})
         except Exception:
-            print(f"\n[ERROR] Failed: {path}")
+            print(f"\n[ERROR] Failed: {case.display_name or case.input_path}")
             print(traceback.format_exc())
-            results.append({"file": path, "status": "error", "error": traceback.format_exc()})
+            results.append({"file": case.input_path, "case": case.display_name, "status": "error", "error": traceback.format_exc()})
 
     os.makedirs(output_dir, exist_ok=True)
     batch_report = os.path.join(output_dir, "batch_report.json")

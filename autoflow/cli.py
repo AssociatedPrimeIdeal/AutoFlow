@@ -5,7 +5,7 @@ from .api import AutoFlowConfig, run_batch
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the AutoFlow batch pipeline without the Qt GUI.")
-    parser.add_argument("inputs", nargs="+", help="H5/HDF5 files or directories to process.")
+    parser.add_argument("inputs", nargs="+", help="H5/HDF5 files, DICOM files, or directories to process.")
     parser.add_argument("--output-dir", default="./results", help="Root output directory.")
     parser.add_argument("--reuse-planes", default="", help="Plane positions file or directory to reuse.")
 

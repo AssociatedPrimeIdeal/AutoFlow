@@ -11,6 +11,7 @@ from PyQt5 import QtCore, QtWidgets
 from pyvistaqt import QtInteractor
 from pyvista import _vtk
 
+from ..algorithms import resolve_input_case, scan_dicom_cases
 from ..core.models import ObjectKind, StepId, Workspace
 from ..core.pipeline import PipelineEngine
 from ..algorithms import compute_plane_metrics, apply_internal_consistency_to_metrics, compute_plane_metrics_multithread
@@ -357,7 +358,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_menu(self):
         mb = self.menuBar()
         mf = mb.addMenu("File")
-        for label, slot in [("Open Data", self._on_open_data), ("Clear Workspace", self._on_close_workspace), ("Exit", self.close)]:
+        for label, slot in [
+            ("Open H5", self._on_open_h5),
+            ("Import DICOM Directory", self._on_import_dicom_directory),
+            ("Clear Workspace", self._on_close_workspace),
+            ("Exit", self.close),
+        ]:
             a = QtWidgets.QAction(label, self)
             a.triggered.connect(slot)
             mf.addAction(a)
@@ -1087,25 +1093,61 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self.log(f"VIEW ERROR: {type(e).__name__}: {e}")
 
-    def _on_open_data(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open Data", "", "H5 (*.h5 *.hdf5);;All (*)")
-        if not path:
-            return
+    def _load_selected_input_case(self, case):
         try:
             if self._edit_mode is not None:
                 self._exit_interactive_edit(False)
             self._clear_plane_drag_widgets()
             self.workspace.reset_all()
-            self.workspace.paths.segmask_path = path
-            self.workspace.paths.flow_path = path
-            self.pipeline.load_data(self.workspace, self.log)
+            resolved = resolve_input_case(case)
+            self.workspace.paths.segmask_path = resolved.input_path
+            self.workspace.paths.flow_path = resolved.input_path
+            if resolved.input_kind == "dicom":
+                out_name = resolved.output_name or "dicom_case"
+                self.workspace.paths.output_dir = os.path.join(resolved.input_path, f"autoflow_{out_name}")
+            self.pipeline.load_data(self.workspace, self.log, input_source=resolved)
             self.scene.workspace = self.workspace
             self.scene.reset_scene()
             self._refresh_all()
             self.ortho_viewer.update_slider_ranges()
+            label = resolved.display_name or resolved.input_path
+            self.log(f"Loaded input: {label}")
         except Exception as e:
             self.log(f"LOAD ERROR: {type(e).__name__}: {e}")
             self.log(traceback.format_exc())
+
+    def _on_open_h5(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open H5", "", "H5 (*.h5 *.hdf5);;All (*)")
+        if not path:
+            return
+        self._load_selected_input_case(path)
+
+    def _on_import_dicom_directory(self):
+        root = QtWidgets.QFileDialog.getExistingDirectory(self, "Import DICOM Directory", "")
+        if not root:
+            return
+        try:
+            cases = scan_dicom_cases(root)
+        except Exception as e:
+            self.log(f"DICOM SCAN ERROR: {type(e).__name__}: {e}")
+            self.log(traceback.format_exc())
+            return
+        if not cases:
+            self.log(f"No supported DICOM 4D flow cases found in: {root}")
+            return
+        labels = [case.display_name or case.output_name or case.input_path for case in cases]
+        choice, ok = QtWidgets.QInputDialog.getItem(
+            self,
+            "Select DICOM Case",
+            "Scanned cases:",
+            labels,
+            0,
+            False,
+        )
+        if not ok or not choice:
+            return
+        selected = cases[labels.index(choice)]
+        self._load_selected_input_case(selected)
 
     def _on_close_workspace(self):
         if self._edit_mode is not None:
@@ -1120,7 +1162,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _run_single_step(self, step):
         if not self.workspace.data_loaded:
-            self.log("No data loaded. Use File > Open Data.")
+            self.log("No data loaded. Use File > Open H5 or Import DICOM Directory.")
             return
         if self._edit_mode is not None:
             if step == StepId.EDIT_SKELETON and self._edit_mode == "skeleton":
@@ -1169,7 +1211,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _run_all_pipeline(self):
         if not self.workspace.data_loaded:
-            self.log("No data loaded. Use File > Open Data.")
+            self.log("No data loaded. Use File > Open H5 or Import DICOM Directory.")
             return
         if self._edit_mode is not None:
             self.log("Finish current interactive edit first.")

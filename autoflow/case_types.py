@@ -55,6 +55,16 @@ class LoadedCase:
 
 
 @dataclass
+class InputCase:
+    input_path: str
+    input_kind: str
+    display_name: str = ""
+    output_name: str = ""
+    source_group: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class InputState:
     source_format: str = ""
     source_group: Optional[str] = None

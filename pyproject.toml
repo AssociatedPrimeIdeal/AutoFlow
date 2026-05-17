@@ -16,6 +16,7 @@ dependencies = [
   "networkx",
   "pyvista",
   "h5py",
+  "pydicom",
   "imageio",
   "Pillow",
 ]

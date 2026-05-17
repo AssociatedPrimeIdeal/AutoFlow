@@ -1,7 +1,7 @@
 """Compatibility re-exports for legacy utility imports."""
 
 from .plane_io import load_plane_positions, project_planes_to_workspace, resolve_reuse_plane_file, save_plane_positions
-from .processing import build_base_workspace, collect_h5_files, process_single, run_batch
+from .processing import build_base_workspace, collect_h5_files, collect_input_items, process_single, run_batch
 from .rendering import (
     CAMERA_PRESETS,
     WINDOW_SIZE,
@@ -18,6 +18,7 @@ __all__ = [
     "WINDOW_SIZE",
     "build_base_workspace",
     "collect_h5_files",
+    "collect_input_items",
     "extract_frame",
     "load_metrics_from_output",
     "load_plane_positions",

@@ -102,7 +102,7 @@ def test_pipeline_load_data_keeps_tke_sources_out_of_derived_state(monkeypatch):
             supports_plane_metrics=True,
         ),
     )
-    monkeypatch.setattr(pipeline_module, "load_h5_data", lambda path: case)
+    monkeypatch.setattr(pipeline_module, "load_input_data", lambda path: case)
 
     ws = Workspace()
     ws.paths.flow_path = "dummy.h5"
@@ -134,7 +134,7 @@ def test_pipeline_skips_segmentation_steps_when_input_has_no_segmentation(monkey
             supports_plane_metrics=True,
         ),
     )
-    monkeypatch.setattr(pipeline_module, "load_h5_data", lambda path: case)
+    monkeypatch.setattr(pipeline_module, "load_input_data", lambda path: case)
 
     ws = Workspace()
     ws.paths.flow_path = "dummy.h5"

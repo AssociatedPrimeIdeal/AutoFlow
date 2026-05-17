@@ -22,6 +22,14 @@ from .data import (
     load_h5_data,
 )
 
+from .dicom import (
+    collect_input_cases,
+    load_dicom_case,
+    load_input_data,
+    resolve_input_case,
+    scan_dicom_cases,
+)
+
 from .preprocess import (
     filter_segmask_labels,
     binarize_segmask,
@@ -110,6 +118,11 @@ __all__ = [
     "LoaderCapabilities",
     "reorient",
     "load_h5_data",
+    "load_input_data",
+    "load_dicom_case",
+    "resolve_input_case",
+    "scan_dicom_cases",
+    "collect_input_cases",
     "normalize_loaded_case",
     "filter_segmask_labels",
     "binarize_segmask",
