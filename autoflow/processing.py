@@ -111,39 +111,45 @@ def process_single(
 
     pixelwise_result = {}
     if not skip_derived:
-        print("[7/7] Compute Derived Metrics (WSS/TKE)...")
-        dp = ws.derived_params
-        engine.preprocess(ws)
-        loaded_tke = ws.derived.tke_array
+        if ws.segmask_raw is None:
+            print("[7/7] Skipped derived metrics (no segmentation)")
+        else:
+            print("[7/7] Compute Derived Metrics (WSS/TKE)...")
+            dp = ws.derived_params
+            engine.preprocess(ws)
+            source_tke = ws.source_tke_array
+            source_sigma = ws.source_sigma if ws.input_state.capabilities.has_complex_source else None
 
-        derived = compute_derived_metrics(
-            flow=ws.flow_raw * ws.segmask_binary[..., None],
-            mask4d=ws.segmask_binary,
-            spacing=ws.resolution,
-            origin=ws.origin,
-            smoothing_iteration=dp.smoothing_iteration,
-            viscosity=dp.viscosity,
-            inward_distance=dp.inward_distance,
-            parabolic_fitting=dp.parabolic_fitting,
-            no_slip_condition=dp.no_slip_condition,
-            step_size=dp.step_size,
-            tube_radius=dp.tube_radius,
-            rho=dp.rho,
-            save_pixelwise=True,
-            tke_array=loaded_tke,
-        )
-        ws.derived.wss_surfaces = derived["wss_surfaces"]
-        ws.derived.wss_volume = derived.get("wss_volume")
-        ws.derived.tke_volume = derived["tke_volume"]
-        ws.derived.tke_array = derived.get("tke_array")
-        ws.derived.pixelwise_export = derived.get("pixelwise_export", {})
-        pixelwise_result = ws.derived.pixelwise_export
-        pixel_path = os.path.join(out_dir, "derived_metrics_pixelwise.npz")
-        if pixelwise_result:
-            np.savez_compressed(pixel_path, **pixelwise_result)
-            print(f"  -> Saved pixelwise: {pixel_path}")
-        ws.pipeline.mark_done(StepId.COMPUTE_DERIVED_METRICS)
-        print(f"  -> Derived: Nt={len(ws.derived.wss_surfaces)}")
+            derived = compute_derived_metrics(
+                flow=ws.flow_raw * ws.segmask_binary[..., None],
+                mask4d=ws.segmask_binary,
+                spacing=ws.resolution,
+                origin=ws.origin,
+                smoothing_iteration=dp.smoothing_iteration,
+                viscosity=dp.viscosity,
+                inward_distance=dp.inward_distance,
+                parabolic_fitting=dp.parabolic_fitting,
+                no_slip_condition=dp.no_slip_condition,
+                step_size=dp.step_size,
+                tube_radius=dp.tube_radius,
+                rho=dp.rho,
+                save_pixelwise=True,
+                tke_array=source_tke,
+                sigma=source_sigma,
+            )
+            ws.derived.wss_surfaces = derived["wss_surfaces"]
+            ws.derived.wss_volume = derived.get("wss_volume")
+            ws.derived.tke_volume = derived["tke_volume"]
+            ws.derived.tke_array = derived.get("tke_array")
+            ws.derived.pixelwise_export = derived.get("pixelwise_export", {})
+            pixelwise_result = ws.derived.pixelwise_export
+            pixel_path = os.path.join(out_dir, "derived_metrics_pixelwise.npz")
+            if pixelwise_result:
+                np.savez_compressed(pixel_path, **pixelwise_result)
+                print(f"  -> Saved pixelwise: {pixel_path}")
+            ws.pipeline.mark_done(StepId.COMPUTE_DERIVED_METRICS)
+            tke_suffix = "" if ws.derived.tke_array is not None or ws.derived.tke_volume is not None else " tke=unavailable"
+            print(f"  -> Derived: Nt={len(ws.derived.wss_surfaces)}{tke_suffix}")
     else:
         print("[7/7] Skipped derived metrics (WSS/TKE)")
 
@@ -260,6 +266,9 @@ def process_single(
         "resolution": ws.resolution.tolist(),
         "origin": np.asarray(ws.origin, dtype=float).reshape(3).tolist(),
         "rr": ws.rr,
+        "source_format": ws.input_state.source_format,
+        "source_group": ws.input_state.source_group,
+        "capabilities": ws.input_state.capabilities.to_dict(),
         "total_time_sec": float(total_time_sec),
         "n_planes": len(ws.planes),
         "n_skeleton_pts": len(ws.skeleton_points) if ws.skeleton_points is not None else 0,

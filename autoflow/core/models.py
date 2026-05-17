@@ -4,6 +4,8 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
+from ..case_types import InputState, LoadedCase, LoaderCapabilities
+
 
 class ObjectKind(Enum):
     SEGMENTATION = "Segmentation"
@@ -296,6 +298,7 @@ class Workspace:
     plane_gen_params: PlaneGenerationParams = field(default_factory=PlaneGenerationParams)
     streamline_params: StreamlineParams = field(default_factory=StreamlineParams)
     derived_params: DerivedMetricsParams = field(default_factory=DerivedMetricsParams)
+    input_state: InputState = field(default_factory=InputState)
 
     resolution: np.ndarray = field(default_factory=lambda: np.array([1., 1., 1.]))
     origin: np.ndarray = field(default_factory=lambda: np.array([0., 0., 0.]))
@@ -310,6 +313,8 @@ class Workspace:
     segmask_3d: Optional[np.ndarray] = None
 
     mag_raw: Optional[np.ndarray] = None
+    source_sigma: Optional[np.ndarray] = None
+    source_tke_array: Optional[np.ndarray] = None
 
     skeleton_points: Optional[np.ndarray] = None
     skeleton_mask: Optional[np.ndarray] = None
@@ -348,6 +353,9 @@ class Workspace:
 
     def has_flow(self):
         return self.flow_raw is not None
+
+    def has_segmentation(self):
+        return self.segmask_raw is not None
 
     def unique_labels(self):
         if self.segmask_raw is None:
@@ -396,6 +404,7 @@ class Workspace:
             ("plane_gen_params", PlaneGenerationParams()),
             ("streamline_params", StreamlineParams()),
             ("derived_params", DerivedMetricsParams()),
+            ("input_state", InputState()),
         ]:
             setattr(self, attr, default)
         self.resolution = np.array([1., 1., 1.])
@@ -404,7 +413,7 @@ class Workspace:
         self.rr = 1000.0
         for attr in ["segmask_raw", "segmask_labels", "segmask_binary", "segmask_3d",
                       "skeleton_points", "skeleton_mask", "branch_labels", "flow_raw",
-                      "streamline_seeds", "mag_raw"]:
+                      "streamline_seeds", "mag_raw", "source_sigma", "source_tke_array"]:
             setattr(self, attr, None)
         self.graph = GraphData()
         self.centerline_paths = []
@@ -437,6 +446,7 @@ class Workspace:
             "plane_gen_params": self.plane_gen_params.to_dict(),
             "streamline_params": self.streamline_params.to_dict(),
             "derived_params": self.derived_params.to_dict(),
+            "input_state": self.input_state.to_dict(),
             "resolution": arr(self.resolution),
             "origin": arr(self.origin),
             "venc": arr(self.venc),
@@ -446,6 +456,8 @@ class Workspace:
             "segmask_binary": arr(self.segmask_binary),
             "segmask_3d": arr(self.segmask_3d),
             "mag_raw": arr(self.mag_raw),
+            "source_sigma": arr(self.source_sigma),
+            "source_tke_array": arr(self.source_tke_array),
             "skeleton_points": arr(self.skeleton_points),
             "skeleton_mask": arr(self.skeleton_mask),
             "graph": {"points": arr(self.graph.points), "edges": arr(self.graph.edges)},
@@ -483,6 +495,7 @@ class Workspace:
         self.plane_gen_params = PlaneGenerationParams.from_dict(d.get("plane_gen_params", {}))
         self.streamline_params = StreamlineParams.from_dict(d.get("streamline_params", {}))
         self.derived_params = DerivedMetricsParams.from_dict(d.get("derived_params", {}))
+        self.input_state = InputState.from_dict(d.get("input_state", {}))
         self.resolution = np.asarray(d.get("resolution", [1, 1, 1]), dtype=float)
         self.origin = np.array([0.0, 0.0, 0.0], dtype=float)
         self.venc = np.asarray(d.get("venc", [1, 1, 1]), dtype=float)
@@ -497,6 +510,8 @@ class Workspace:
         self.segmask_binary = None if d.get("segmask_binary") is None else np.asarray(d["segmask_binary"], dtype=bool)
         self.segmask_3d = None if d.get("segmask_3d") is None else np.asarray(d["segmask_3d"], dtype=bool)
         self.mag_raw = nparr("mag_raw")
+        self.source_sigma = nparr("source_sigma")
+        self.source_tke_array = nparr("source_tke_array")
         self.skeleton_points = nparr("skeleton_points")
         self.skeleton_mask = nparr("skeleton_mask")
         gd = d.get("graph", {})

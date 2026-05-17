@@ -26,6 +26,11 @@ class StepResult:
 
 
 class PipelineEngine:
+    def _missing_segmentation_message(self, ws, action):
+        if not ws.input_state.capabilities.has_segmentation:
+            return f"{action} skipped: input has no segmentation"
+        return f"{action} skipped: no segmentation available"
+
     def _output_dir(self, ws):
         out_dir = getattr(ws.paths, "output_dir", "") or ""
         if out_dir:
@@ -55,41 +60,46 @@ class PipelineEngine:
         if not path:
             raise ValueError("data path is empty")
         data = load_h5_data(path)
-        flow = np.asarray(data["flow"], dtype=np.float32)
-        mag = np.asarray(data["mag"], dtype=np.float32)
-        seg = np.asarray(data["segmask"], dtype=np.int16)
-        if flow.ndim == 4 and flow.shape[-1] == 3:
-            flow = flow[..., np.newaxis, :]
-        if mag.ndim == 3:
-            mag = mag[..., np.newaxis]
-        if seg.ndim == 3:
-            seg = np.repeat(seg[..., np.newaxis], flow.shape[3], axis=3)
-        elif seg.ndim == 4 and seg.shape[3] == 1 and flow.shape[3] > 1:
-            seg = np.repeat(seg, flow.shape[3], axis=3)
-        if seg.shape[3] != flow.shape[3]:
-            raise ValueError(f"segmask time dimension {seg.shape[3]} != flow {flow.shape[3]}")
+        flow = np.asarray(data.flow, dtype=np.float32)
+        mag = np.asarray(data.mag, dtype=np.float32)
+        seg = None if data.segmentation is None else np.asarray(data.segmentation, dtype=np.int16)
 
         ws.segmask_raw = seg
-        ws.resolution = np.asarray(data["resolution"], dtype=float).reshape(3)
-        ws.origin = np.asarray(data.get("origin", [0.0, 0.0, 0.0]), dtype=float).reshape(3)
-        ws.venc = np.asarray(data["venc"], dtype=float).reshape(-1)
-        ws.rr = float(data.get("rr", 1000.0))
+        ws.resolution = np.asarray(data.resolution, dtype=float).reshape(3)
+        ws.origin = np.asarray(data.origin, dtype=float).reshape(3)
+        ws.venc = np.asarray(data.venc, dtype=float).reshape(-1)
+        ws.rr = float(data.rr)
         ws.current_t = 0
         ws.flow_raw = flow
         ws.mag_raw = mag
-        ws.derived.tke_array = np.asarray(data["tke_array"], dtype=np.float32) if "tke_array" in data else None
+        ws.input_state.source_format = str(data.source_format or "")
+        ws.input_state.source_group = data.source_group
+        ws.input_state.metadata = dict(data.metadata or {})
+        ws.input_state.capabilities = data.capabilities
+        ws.source_sigma = None if data.sigma is None else np.asarray(data.sigma, dtype=np.float32)
+        ws.source_tke_array = None if data.tke_array is None else np.asarray(data.tke_array, dtype=np.float32)
+        ws.derived.tke_array = None
+        ws.derived.tke_volume = None
+        ws.derived.wss_surfaces = []
+        ws.derived.wss_volume = None
+        ws.derived.pixelwise_export = {}
         ws.data_loaded = True
 
-        ws.remove_object_by_data_key("segmask_raw_surface")
-        ws.add_object(name="segmask_raw", kind=ObjectKind.SEGMENTATION,
-                      data_key="segmask_raw_surface", visible=True, opacity=0.3,
-                      scalars="label", cmap="tab10", dynamic=True,
-                      show_scalar_bar=True, scalar_bar_title="Label")
+        for data_key in ["segmask_raw_surface", "segmask_pre_surface", "wss_surface_live", "tke_volume"]:
+            ws.remove_object_by_data_key(data_key)
+        if ws.segmask_raw is not None:
+            ws.add_object(name="segmask_raw", kind=ObjectKind.SEGMENTATION,
+                          data_key="segmask_raw_surface", visible=True, opacity=0.3,
+                          scalars="label", cmap="tab10", dynamic=True,
+                          show_scalar_bar=True, scalar_bar_title="Label")
 
-        ulabels = ws.unique_labels()
-        msg = f"Loaded: segmask={ws.segmask_raw.shape} labels={ulabels} rr={ws.rr}"
+        seg_desc = "none"
+        if ws.segmask_raw is not None:
+            seg_desc = f"{ws.segmask_raw.shape} labels={ws.unique_labels()}"
+        msg = f"Loaded: segmask={seg_desc} rr={ws.rr}"
         msg += f" flow={ws.flow_raw.shape} mag={ws.mag_raw.shape}"
         msg += f" origin={ws.origin.tolist()}"
+        msg += f" caps={ws.input_state.capabilities.to_dict()}"
         log(msg)
         return msg
 
@@ -122,6 +132,11 @@ class PipelineEngine:
         return dispatch[step](ws)
 
     def _step_generate_skeleton(self, ws):
+        if ws.segmask_raw is None:
+            return StepResult(
+                StepId.GENERATE_SKELETON, True, True,
+                self._missing_segmentation_message(ws, "Skeleton"),
+            )
         self.preprocess(ws)
         if ws.skeleton_params.remove_small_cc:
             from ..algorithms import remove_small_cc_from_binary_mask
@@ -151,8 +166,15 @@ class PipelineEngine:
         return StepResult(StepId.EDIT_SKELETON, True, True, "Skeleton edit")
 
     def _step_generate_graph(self, ws):
+        if ws.segmask_raw is None:
+            return StepResult(
+                StepId.GENERATE_GRAPH, True, True,
+                self._missing_segmentation_message(ws, "Graph"),
+            )
         if ws.skeleton_points is None or len(ws.skeleton_points) == 0:
-            self._step_generate_skeleton(ws)
+            skel_result = self._step_generate_skeleton(ws)
+            if skel_result.skipped or not skel_result.success:
+                return StepResult(StepId.GENERATE_GRAPH, skel_result.success, True, skel_result.message)
         graph = build_graph_from_points(ws.skeleton_points, ws.resolution)
         ws.graph = graph
 
@@ -199,6 +221,8 @@ class PipelineEngine:
     def _compute_plane_metrics_internal(self, ws, save=True, use_multithread=False):
         if not ws.has_flow():
             return [], {}, "Plane metrics skipped: no flow"
+        if ws.segmask_raw is None:
+            return [], {}, self._missing_segmentation_message(ws, "Plane metrics")
         if ws.segmask_binary is None:
             self.preprocess(ws)
         # Prefer the smoothed centerlines (better local tangents) but fall back
@@ -259,8 +283,15 @@ class PipelineEngine:
         return out_path
 
     def _step_generate_planes(self, ws):
+        if ws.segmask_raw is None:
+            return StepResult(
+                StepId.GENERATE_PLANES, True, True,
+                self._missing_segmentation_message(ws, "Planes"),
+            )
         if ws.graph is None or len(ws.graph.points) == 0:
-            self._step_generate_graph(ws)
+            graph_result = self._step_generate_graph(ws)
+            if graph_result.skipped or not graph_result.success:
+                return StepResult(StepId.GENERATE_PLANES, graph_result.success, True, graph_result.message)
 
         if len(ws.centerline_paths) == 0:
             flow_for_orientation = None
@@ -329,6 +360,11 @@ class PipelineEngine:
         return StepResult(StepId.EDIT_PLANES, True, True, "Plane edit")
 
     def _step_generate_streamlines(self, ws):
+        if ws.segmask_raw is None:
+            return StepResult(
+                StepId.GENERATE_STREAMLINES, True, True,
+                self._missing_segmentation_message(ws, "Streamlines"),
+            )
         if ws.flow_raw is None or ws.segmask_3d is None:
             return StepResult(StepId.GENERATE_STREAMLINES, True, True, "Streamlines skipped: no flow or mask")
         self.preprocess(ws)
@@ -355,6 +391,11 @@ class PipelineEngine:
         return StepResult(StepId.GENERATE_STREAMLINES, True, False, param_msg)
 
     def _step_plane_streamlines(self, ws):
+        if ws.segmask_raw is None:
+            return StepResult(
+                StepId.PLANE_STREAMLINES, True, True,
+                self._missing_segmentation_message(ws, "Plane streamlines"),
+            )
         if ws.flow_raw is None or ws.segmask_3d is None:
             return StepResult(StepId.PLANE_STREAMLINES, True, True, "Plane streamlines skipped: no flow or mask")
         if len(ws.planes) == 0:
@@ -376,8 +417,15 @@ class PipelineEngine:
     def _step_compute_plane_metrics(self, ws):
         if not ws.has_flow():
             return StepResult(StepId.COMPUTE_PLANE_METRICS, True, True, "Plane metrics skipped: no flow")
+        if ws.segmask_raw is None:
+            return StepResult(
+                StepId.COMPUTE_PLANE_METRICS, True, True,
+                self._missing_segmentation_message(ws, "Plane metrics"),
+            )
         if len(ws.planes) == 0:
-            self._step_generate_planes(ws)
+            plane_result = self._step_generate_planes(ws)
+            if plane_result.skipped or not plane_result.success:
+                return StepResult(StepId.COMPUTE_PLANE_METRICS, plane_result.success, True, plane_result.message)
         use_mt = getattr(ws.derived_params, "use_multithread", False)
         _, _, msg = self._compute_plane_metrics_internal(ws, save=True, use_multithread=use_mt)
         self._save_planes_json(ws)
@@ -387,9 +435,15 @@ class PipelineEngine:
     def _step_compute_derived_metrics(self, ws):
         if not ws.has_flow():
             return StepResult(StepId.COMPUTE_DERIVED_METRICS, True, True, "Derived metrics skipped: no flow")
+        if ws.segmask_raw is None:
+            return StepResult(
+                StepId.COMPUTE_DERIVED_METRICS, True, True,
+                self._missing_segmentation_message(ws, "Derived metrics"),
+            )
         self.preprocess(ws)
         dp = ws.derived_params
-        loaded_tke = ws.derived.tke_array
+        source_tke = ws.source_tke_array
+        source_sigma = ws.source_sigma if ws.input_state.capabilities.has_complex_source else None
         result = compute_derived_metrics(
             flow=ws.flow_raw * ws.segmask_binary[..., None],
             mask4d=ws.segmask_binary,
@@ -404,7 +458,8 @@ class PipelineEngine:
             tube_radius=dp.tube_radius,
             rho=dp.rho,
             save_pixelwise=False,
-            tke_array=loaded_tke,
+            tke_array=source_tke,
+            sigma=source_sigma,
         )
         ws.derived.wss_surfaces = result["wss_surfaces"]
         ws.derived.wss_volume = result.get("wss_volume")
@@ -420,10 +475,14 @@ class PipelineEngine:
                       data_key="wss_surface_live", visible=False, opacity=1.0,
                       scalars="wss", cmap="jet", clim=(0.0, wss_max if wss_max > 0 else 1.0), dynamic=True,
                       show_scalar_bar=True, scalar_bar_title="WSS (Pa)")
-        ws.add_object(name="tke_volume", kind=ObjectKind.METRIC,
-                      data_key="tke_volume", visible=False, opacity=0.5,
-                      scalars="TKE", cmap="hot", clim=(0.0, tke_max if tke_max > 0 else 1.0), dynamic=True,
-                      show_scalar_bar=True, scalar_bar_title="TKE (J/m³)")
+        has_tke = ws.derived.tke_array is not None or ws.derived.tke_volume is not None
+        if has_tke:
+            ws.add_object(name="tke_volume", kind=ObjectKind.METRIC,
+                          data_key="tke_volume", visible=False, opacity=0.5,
+                          scalars="TKE", cmap="hot", clim=(0.0, tke_max if tke_max > 0 else 1.0), dynamic=True,
+                          show_scalar_bar=True, scalar_bar_title="TKE (J/m³)")
         msg = f"Derived: Nt={len(ws.derived.wss_surfaces)}"
+        if not has_tke:
+            msg += " tke=unavailable"
         ws.pipeline.mark_done(StepId.COMPUTE_DERIVED_METRICS)
         return StepResult(StepId.COMPUTE_DERIVED_METRICS, True, False, msg)
