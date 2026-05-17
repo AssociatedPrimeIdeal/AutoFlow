@@ -276,9 +276,6 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
                             tube_radius=0.1, rho=1060.0,
                             save_pixelwise=False, tke_array=None, sigma=None):
     mask4d = _ensure_mask4d(mask4d)
-    tke = compute_tke_metrics(
-        mask4d, spacing, origin=origin, tke_array=tke_array, sigma=sigma, rho=rho,
-    )
     wss = compute_wss_metrics(
         mask4d, flow, spacing, origin=origin,
         smoothing_iteration=smoothing_iteration,
@@ -287,26 +284,33 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
         parabolic_fitting=parabolic_fitting,
         no_slip_condition=no_slip_condition,
     )
+    tke = None
+    if tke_array is not None or sigma is not None:
+        tke = compute_tke_metrics(
+            mask4d, spacing, origin=origin, tke_array=tke_array, sigma=sigma, rho=rho,
+        )
 
     spacing = np.asarray(spacing, dtype=float).reshape(3)
     origin = np.asarray(origin, dtype=float).reshape(3)
     result = {
         "wss_surfaces": wss["wss_surfaces"],
         "wss_volume": wss["wss_volume"],
-        "tke_volume": tke["tke_volume"],
-        "tke_array": tke["tke_array"],
-        "tke_peak": tke["tke_peak"],
+        "tke_volume": None if tke is None else tke["tke_volume"],
+        "tke_array": None if tke is None else tke["tke_array"],
+        "tke_peak": None if tke is None else tke["tke_peak"],
         "streamlines": [],
         "tube_radius": float(tube_radius),
     }
     if save_pixelwise:
-        result["pixelwise_export"] = {
+        pixelwise_export = {
             "wss": np.asarray(wss["wss_volume"], dtype=np.float32),
-            "tke": np.asarray(tke["tke_peak"], dtype=np.float32),
-            "tke_time": np.asarray(tke["tke_array"], dtype=np.float32),
             "spacing": np.asarray(spacing, dtype=np.float32),
             "origin": np.asarray(origin, dtype=np.float32),
         }
+        if tke is not None:
+            pixelwise_export["tke"] = np.asarray(tke["tke_peak"], dtype=np.float32)
+            pixelwise_export["tke_time"] = np.asarray(tke["tke_array"], dtype=np.float32)
+        result["pixelwise_export"] = pixelwise_export
     else:
         result["pixelwise_export"] = {}
     return result

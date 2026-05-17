@@ -5,12 +5,15 @@ while keeping each implementation module focused on one processing stage.
 """
 
 from .data import (
+    LoadedCase,
+    LoaderCapabilities,
     _axis_pair,
     _need_flip,
     _permute_spatial,
     _flip_axes,
     reorient,
     _ensure_flow_mag_time_and_segmask,
+    normalize_loaded_case,
     _reorient_spatial_only,
     _compute_spatial_bbox,
     _target_bbox_to_source_slices,
@@ -103,8 +106,11 @@ from .metrics import (
     load_metrics_as_table,
 )
 __all__ = [
+    "LoadedCase",
+    "LoaderCapabilities",
     "reorient",
     "load_h5_data",
+    "normalize_loaded_case",
     "filter_segmask_labels",
     "binarize_segmask",
     "merge_segmask_to_3d",

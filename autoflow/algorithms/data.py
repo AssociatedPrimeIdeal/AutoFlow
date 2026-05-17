@@ -1,7 +1,7 @@
 import h5py
 import numpy as np
 
-from .metrics import compute_tke_array_from_sigma
+from ..case_types import LoadedCase, LoaderCapabilities
 
 
 def _axis_pair(a):
@@ -128,6 +128,126 @@ def _ensure_flow_mag_time_and_segmask(flow, mag, segmask):
     )
 
 
+def _ensure_flow_mag_time(flow, mag):
+    flow = np.asarray(flow)
+    mag = np.asarray(mag)
+    if flow.ndim == 4 and flow.shape[-1] == 3:
+        flow = flow[..., np.newaxis, :]
+    if flow.ndim != 5 or flow.shape[-1] != 3:
+        raise ValueError(f"flow must be XYZTV or XYZV with 3 components, got {flow.shape}")
+    nt = int(flow.shape[3])
+    if mag.ndim == 3:
+        mag = np.repeat(mag[..., np.newaxis], nt, axis=3)
+    elif mag.ndim == 4 and mag.shape[3] == 1 and nt > 1:
+        mag = np.repeat(mag, nt, axis=3)
+    elif mag.ndim != 4:
+        raise ValueError(f"mag must be XYZT or XYZ, got {mag.shape}")
+    if mag.shape[3] != nt:
+        if mag.shape[3] == 1:
+            mag = np.repeat(mag, nt, axis=3)
+        else:
+            raise ValueError(f"mag time dimension {mag.shape[3]} does not match flow {nt}")
+    return (
+        np.ascontiguousarray(flow, dtype=np.float32),
+        np.ascontiguousarray(mag, dtype=np.float32),
+    )
+
+
+def _ensure_optional_time_volume(arr, nt, name, dtype):
+    if arr is None:
+        return None
+    arr = np.asarray(arr)
+    if arr.ndim == 3:
+        arr = np.repeat(arr[..., np.newaxis], nt, axis=3)
+    elif arr.ndim == 4 and arr.shape[3] == 1 and nt > 1:
+        arr = np.repeat(arr, nt, axis=3)
+    elif arr.ndim != 4:
+        raise ValueError(f"{name} must be XYZT or XYZ, got {arr.shape}")
+    if arr.shape[3] != nt:
+        if arr.shape[3] == 1:
+            arr = np.repeat(arr, nt, axis=3)
+        else:
+            raise ValueError(f"{name} time dimension {arr.shape[3]} does not match flow {nt}")
+    return np.ascontiguousarray(arr, dtype=dtype)
+
+
+def _ensure_optional_sigma_time(sigma, nt):
+    if sigma is None:
+        return None
+    sigma = np.asarray(sigma)
+    if sigma.ndim == 4 and sigma.shape[-1] == 3:
+        sigma = sigma[..., np.newaxis, :]
+    elif sigma.ndim != 5 or sigma.shape[-1] != 3:
+        raise ValueError(f"sigma must be XYZTV or XYZV with 3 components, got {sigma.shape}")
+    if sigma.shape[3] != nt:
+        if sigma.shape[3] == 1:
+            sigma = np.repeat(sigma, nt, axis=3)
+        else:
+            raise ValueError(f"sigma time dimension {sigma.shape[3]} does not match flow {nt}")
+    return np.ascontiguousarray(sigma, dtype=np.float32)
+
+
+def normalize_loaded_case(
+    *,
+    flow,
+    mag,
+    resolution,
+    origin,
+    venc,
+    rr,
+    segmentation=None,
+    tke_array=None,
+    sigma=None,
+    metadata=None,
+    source_format="",
+    source_group=None,
+    capabilities=None,
+):
+    flow_out, mag_out = _ensure_flow_mag_time(flow, mag)
+    nt = int(flow_out.shape[3])
+    seg_out = _ensure_optional_time_volume(segmentation, nt, "segmentation", np.int16)
+    tke_out = _ensure_optional_time_volume(tke_array, nt, "tke_array", np.float32)
+    sigma_out = _ensure_optional_sigma_time(sigma, nt)
+    if capabilities is None:
+        capabilities = LoaderCapabilities()
+    else:
+        capabilities = LoaderCapabilities(
+            has_segmentation=bool(capabilities.has_segmentation),
+            has_tke=bool(capabilities.has_tke),
+            has_complex_source=bool(capabilities.has_complex_source),
+            supports_wss=bool(capabilities.supports_wss),
+            supports_plane_metrics=bool(capabilities.supports_plane_metrics),
+        )
+    capabilities.has_segmentation = seg_out is not None
+    capabilities.has_tke = bool(capabilities.has_tke or tke_out is not None)
+
+    resolution = np.asarray(resolution, dtype=float).reshape(-1)
+    if resolution.size == 1:
+        resolution = np.repeat(resolution, 3)
+    origin = np.asarray(origin, dtype=float).reshape(-1)
+    if origin.size == 1:
+        origin = np.repeat(origin, 3)
+    venc = np.asarray(venc, dtype=float).reshape(-1)
+    if venc.size == 1:
+        venc = np.repeat(venc, 3)
+
+    return LoadedCase(
+        flow=flow_out,
+        mag=mag_out,
+        segmentation=seg_out,
+        resolution=np.asarray(resolution[:3], dtype=float).reshape(3),
+        origin=np.asarray(origin[:3], dtype=float).reshape(3),
+        venc=np.asarray(venc[:3], dtype=float).reshape(3),
+        rr=float(rr),
+        sigma=sigma_out,
+        tke_array=tke_out,
+        metadata=dict(metadata or {}),
+        source_format=str(source_format or ""),
+        source_group=source_group,
+        capabilities=capabilities,
+    )
+
+
 def _reorient_spatial_only(arr, spatial_order, target_spatial_order):
     arr_r, src_pos = _permute_spatial(arr, spatial_order, target_spatial_order, spatial_axes=(0, 1, 2))
     flip_axes = [i for i in range(3) if _need_flip(spatial_order[src_pos[i]], target_spatial_order[i])]
@@ -198,54 +318,88 @@ def load_h5_data(path):
     target_spatial_order = ("LR", "AP", "FH")
     target_venc_order = ("LR", "AP", "FH")
     with h5py.File(path, "r") as g:
-        if "img_complex" not in g or "segmask" not in g:
-            raise ValueError(f"h5 must contain img_complex and segmask: {path}")
         VENC = g["VENC"][:] if "VENC" in g else np.array([150, 150, 150], dtype=float)
         resolution = g["Resolution"][:] if "Resolution" in g else np.array([1, 1, 1], dtype=float)
-        origin = np.array([0.0, 0.0, 0.0], dtype=float)
+        origin = g["Origin"][:] if "Origin" in g else np.array([0.0, 0.0, 0.0], dtype=float)
         rr = float(g["RR"][()]) if "RR" in g else 1000.0
         spatial_order = g["SpatialOrder"][:].astype(str) if "SpatialOrder" in g else np.array(["FH", "AP", "LR"])
         venc_order = g["VENCOrder"][:].astype(str) if "VENCOrder" in g else np.array(["FH", "AP", "LR"])
+        seg_name = "segmask" if "segmask" in g else "segmentation" if "segmentation" in g else None
 
-        segmask_ds = g["segmask"]
-        segmask_full = segmask_ds[:].astype(np.int16)
-        src_slices = _compute_spatial_bbox(segmask_full, pad=2)
-        segmask = segmask_ds[src_slices + (slice(None),) * (segmask_ds.ndim - 3)].astype(np.int16)
-        del segmask_full
+        if "img_complex" in g:
+            img_ds = g["img_complex"]
+            if seg_name is not None:
+                segmask_ds = g[seg_name]
+                segmask_full = segmask_ds[:].astype(np.int16)
+                src_slices = _compute_spatial_bbox(segmask_full, pad=2)
+                segmask = segmask_ds[src_slices + (slice(None),) * (segmask_ds.ndim - 3)].astype(np.int16)
+                del segmask_full
+            else:
+                src_slices = tuple(slice(0, int(img_ds.shape[i])) for i in range(3))
+                segmask = None
 
-        img_ds = g["img_complex"]
-        img_complex = np.asarray(img_ds[src_slices + (slice(None),) * (img_ds.ndim - 3)])
+            img_complex = np.asarray(img_ds[src_slices + (slice(None),) * (img_ds.ndim - 3)])
+            mag = np.abs(img_complex[..., 0]).astype(np.float32)
+            flow_raw = np.angle(img_complex[..., 1:4] * np.conj(img_complex[..., 0][..., None])).astype(np.float32)
+            sigma_raw = _sigma_from_complex(img_complex, VENC)
+            segmask_for_reorient = segmask if segmask is not None else np.zeros(mag.shape, dtype=np.int16)
 
-        mag = np.abs(img_complex[..., 0]).astype(np.float32)
-        flow_raw = np.angle(img_complex[..., 1:4] * np.conj(img_complex[..., 0][..., None])).astype(np.float32)
-        sigma_raw = _sigma_from_complex(img_complex, VENC)
+            flow, mag_out, seg_r, venc_new, res_new = reorient(
+                mag, flow_raw, segmask_for_reorient, venc=VENC, resolution=resolution,
+                spatial_order=spatial_order, venc_order=venc_order,
+                target_spatial_order=target_spatial_order,
+                target_venc_order=target_venc_order,
+                return_velocity=True,
+            )
+            sigma = _reorient_component_abs(
+                sigma_raw,
+                spatial_order=spatial_order,
+                target_spatial_order=target_spatial_order,
+                venc_order=venc_order,
+                target_venc_order=target_venc_order,
+            ).astype(np.float32)
+            return normalize_loaded_case(
+                flow=flow,
+                mag=mag_out,
+                segmentation=seg_r if segmask is not None else None,
+                resolution=np.asarray(res_new, dtype=float),
+                origin=origin,
+                venc=np.asarray(venc_new, dtype=float),
+                rr=float(rr),
+                sigma=sigma,
+                tke_array=None,
+                source_format="legacy_h5",
+                capabilities=LoaderCapabilities(
+                    has_segmentation=segmask is not None,
+                    has_tke=True,
+                    has_complex_source=True,
+                    supports_wss=True,
+                    supports_plane_metrics=True,
+                ),
+            )
 
-        flow, mag_out, seg_r, venc_new, res_new = reorient(
-            mag, flow_raw, segmask, venc=VENC, resolution=resolution,
-            spatial_order=spatial_order, venc_order=venc_order,
-            target_spatial_order=target_spatial_order,
-            target_venc_order=target_venc_order,
-            return_velocity=True,
-        )
-        sigma = _reorient_component_abs(
-            sigma_raw,
-            spatial_order=spatial_order,
-            target_spatial_order=target_spatial_order,
-            venc_order=venc_order,
-            target_venc_order=target_venc_order,
-        ).astype(np.float32)
+        if "flow" in g and "mag" in g:
+            sigma = np.asarray(g["sigma"][:], dtype=np.float32) if "sigma" in g else None
+            tke_array = np.asarray(g["tke_array"][:], dtype=np.float32) if "tke_array" in g else None
+            segmentation = None if seg_name is None else np.asarray(g[seg_name][:], dtype=np.int16)
+            return normalize_loaded_case(
+                flow=np.asarray(g["flow"][:], dtype=np.float32),
+                mag=np.asarray(g["mag"][:], dtype=np.float32),
+                segmentation=segmentation,
+                resolution=resolution,
+                origin=origin,
+                venc=VENC,
+                rr=float(rr),
+                sigma=sigma,
+                tke_array=tke_array,
+                source_format="normalized_h5",
+                capabilities=LoaderCapabilities(
+                    has_segmentation=segmentation is not None,
+                    has_tke=tke_array is not None,
+                    has_complex_source=False,
+                    supports_wss=True,
+                    supports_plane_metrics=True,
+                ),
+            )
 
-        flow, mag_out, seg_r = _ensure_flow_mag_time_and_segmask(flow, mag_out, seg_r)
-        tke_array = compute_tke_array_from_sigma(sigma, rho=1060.0)
-
-        return {
-            "flow": flow,
-            "mag": mag_out,
-            "segmask": seg_r,
-            "resolution": np.asarray(res_new, dtype=float),
-            "origin": origin,
-            "venc": np.asarray(venc_new, dtype=float),
-            "rr": float(rr),
-            "sigma": sigma,
-            "tke_array": tke_array,
-        }
+        raise ValueError(f"unsupported h5 layout: {path}")
