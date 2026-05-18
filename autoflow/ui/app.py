@@ -244,7 +244,7 @@ class MainWindow(QtWidgets.QMainWindow):
         grp = QtWidgets.QGroupBox("Input / Background Correction")
         fl = QtWidgets.QFormLayout(grp)
         self.chk_bpc_enabled = QtWidgets.QCheckBox()
-        self.chk_bpc_enabled.setChecked(True)
+        self.chk_bpc_enabled.setChecked(False)
         self.spin_bpc_fit_order = QtWidgets.QSpinBox()
         self.spin_bpc_fit_order.setRange(0, 3)
         self.spin_bpc_fit_order.setValue(3)
@@ -422,10 +422,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.segmentation_panel.edit_active_name.editingFinished.connect(self._on_active_label_name_changed)
         self.segmentation_panel.btn_active_color.clicked.connect(self._on_active_label_color_clicked)
         self.segmentation_panel.chk_edit_all_timepoints.toggled.connect(self._on_segmentation_edit_scope_changed)
+        self.segmentation_panel.chk_editing_enabled.toggled.connect(self._on_segmentation_edit_enabled_changed)
         for tool_name, button in [
             ("brush", self.segmentation_panel.btn_tool_brush),
             ("erase", self.segmentation_panel.btn_tool_erase),
-            ("fill", self.segmentation_panel.btn_tool_fill),
             ("relabel", self.segmentation_panel.btn_tool_relabel),
         ]:
             button.clicked.connect(partial(self._set_segmentation_tool, tool_name))
@@ -637,10 +637,12 @@ class MainWindow(QtWidgets.QMainWindow):
         panel.chk_edit_all_timepoints.blockSignals(True)
         panel.chk_edit_all_timepoints.setChecked(bool(seg.edit_all_timepoints))
         panel.chk_edit_all_timepoints.blockSignals(False)
+        panel.chk_editing_enabled.blockSignals(True)
+        panel.chk_editing_enabled.setChecked(bool(seg.editing_enabled))
+        panel.chk_editing_enabled.blockSignals(False)
         for tool_name, button in [
             ("brush", panel.btn_tool_brush),
             ("erase", panel.btn_tool_erase),
-            ("fill", panel.btn_tool_fill),
             ("relabel", panel.btn_tool_relabel),
         ]:
             button.blockSignals(True)
@@ -654,9 +656,10 @@ class MainWindow(QtWidgets.QMainWindow):
         dirty = "dirty" if seg.dirty else "clean"
         active_src = seg.active_source or "none"
         working = seg.working_source or "-"
+        edit_state = "enabled" if seg.editing_enabled else "locked"
         edit_mode = "3D-all-frames" if seg.edit_all_timepoints else f"4D-current-frame t={int(ws.current_t)}"
         panel.label_status.setText(
-            f"Source: {active_src}   Labels: {n_labels}   State: {dirty}   Working: {working}   Edit: {edit_mode}"
+            f"Source: {active_src}   Labels: {n_labels}   State: {dirty}   Working: {working}   Edit: {edit_state}   Scope: {edit_mode}"
         )
 
     def _refresh_segmentation_preview(self):
@@ -764,7 +767,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log("Apply or cancel segmentation edits before running threshold segmentation.")
             return False
         try:
-            seg, provenance, _scalar, threshold_value = generate_threshold_segmentation(
+            seg, provenance, _scalar, threshold_info = generate_threshold_segmentation(
                 mag=ws.mag_raw,
                 flow=ws.flow_raw,
                 resolution=ws.resolution,
@@ -783,7 +786,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ensure_segmentation_label_metadata(np.max(seg, axis=3))
         self._commit_segmentation_source_change(
             "threshold",
-            f"Threshold segmentation ready: scalar={seg_state.threshold_scalar} threshold={threshold_value:.6g}",
+            f"Threshold segmentation ready: scalar={seg_state.threshold_scalar} {self._format_threshold_summary(threshold_info)}",
         )
         try:
             sidecar = self._default_segmentation_sidecar_path("threshold")
@@ -798,6 +801,18 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self.log(f"Threshold sidecar save failed: {type(e).__name__}: {e}")
         return True
+
+    def _format_threshold_summary(self, threshold_info):
+        mode = str(threshold_info.get("mode", "manual_absolute"))
+        if mode == "auto":
+            return f"threshold=auto resolved={float(threshold_info['min_value']):.6g}"
+        if mode == "manual_percent":
+            return (
+                "threshold="
+                f"{float(threshold_info['min_percent']):.6g}%..{float(threshold_info['max_percent']):.6g}% "
+                f"values={float(threshold_info['min_value']):.6g}..{float(threshold_info['max_value']):.6g}"
+            )
+        return f"threshold={float(threshold_info['min_value']):.6g}"
 
     def _on_configure_segmentation(self):
         if not self.workspace.data_loaded:
@@ -989,16 +1004,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_segmentation_ui()
         self.ortho_viewer.refresh()
 
-    def _slice_component_mask(self, arr2d, seed_xy):
-        sx, sy = int(seed_xy[0]), int(seed_xy[1])
-        if not (0 <= sx < arr2d.shape[0] and 0 <= sy < arr2d.shape[1]):
-            return None
-        target = int(arr2d[sx, sy])
-        component_map, _ = ndi_label(arr2d == target)
-        comp_id = int(component_map[sx, sy])
-        if comp_id <= 0:
-            return None
-        return component_map == comp_id
+    def _on_segmentation_edit_enabled_changed(self, checked):
+        self.workspace.segmentation.editing_enabled = bool(checked)
+        self._refresh_segmentation_ui()
 
     def _paint_segmentation_brush(self, view_name, x, y, z, value):
         labels = self._current_working_labels_3d()
@@ -1029,37 +1037,6 @@ class MainWindow(QtWidgets.QMainWindow):
             changed = not np.array_equal(before, plane)
         return changed
 
-    def _fill_segmentation_slice(self, view_name, x, y, z, value):
-        labels = self._current_working_labels_3d()
-        if labels is None:
-            return False
-        value = int(value)
-        if view_name == "axial":
-            plane = labels[:, :, int(z)]
-            mask = self._slice_component_mask(plane, (x, y))
-            if mask is None:
-                return False
-            before = plane.copy()
-            plane[mask] = value
-            return not np.array_equal(before, plane)
-        if view_name == "coronal":
-            plane = labels[:, int(y), :]
-            mask = self._slice_component_mask(plane, (x, z))
-            if mask is None:
-                return False
-            before = plane.copy()
-            plane[mask] = value
-            return not np.array_equal(before, plane)
-        if view_name == "sagittal":
-            plane = labels[int(x), :, :]
-            mask = self._slice_component_mask(plane, (y, z))
-            if mask is None:
-                return False
-            before = plane.copy()
-            plane[mask] = value
-            return not np.array_equal(before, plane)
-        return False
-
     def _relabel_segmentation_component(self, x, y, z, value):
         labels = self._current_working_labels_3d()
         if labels is None:
@@ -1078,6 +1055,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _handle_segmentation_edit(self, view_name, x, y, z, dragging):
         if self._edit_mode is not None:
             return False
+        if not self.workspace.segmentation.editing_enabled:
+            return False
         if not self._begin_segmentation_edit_session():
             return False
         tool = self.workspace.segmentation.tool
@@ -1089,8 +1068,6 @@ class MainWindow(QtWidgets.QMainWindow):
             changed = self._paint_segmentation_brush(view_name, x, y, z, label_value)
         elif tool == "erase":
             changed = self._paint_segmentation_brush(view_name, x, y, z, 0)
-        elif tool == "fill" and not dragging:
-            changed = self._fill_segmentation_slice(view_name, x, y, z, label_value)
         elif tool == "relabel" and not dragging:
             changed = self._relabel_segmentation_component(x, y, z, label_value)
         if changed:
@@ -2008,7 +1985,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_all()
             self.ortho_viewer.update_slider_ranges()
             label = resolved.display_name or resolved.input_path
-            self.log(f"Loaded input: {label}")
+            mode = "enabled" if self.workspace.loader_params.background_phase_correction.enabled else "disabled"
+            self.log(f"Loaded input: {label} (BGC {mode})")
         except Exception as e:
             self.log(f"LOAD ERROR: {type(e).__name__}: {e}")
             self.log(traceback.format_exc())
@@ -2016,11 +1994,37 @@ class MainWindow(QtWidgets.QMainWindow):
             if progress_dialog is not None:
                 progress_dialog.close()
 
+    def _prompt_background_phase_choice(self, case):
+        resolved = resolve_input_case(case)
+        label = resolved.display_name or resolved.input_path
+        kind_label = "DICOM case" if resolved.input_kind == "dicom" else "H5 input"
+        buttons = (
+            QtWidgets.QMessageBox.Yes
+            | QtWidgets.QMessageBox.No
+            | QtWidgets.QMessageBox.Cancel
+        )
+        choice = QtWidgets.QMessageBox.question(
+            self,
+            "Background Phase Correction",
+            f"{kind_label}: {label}\n\nEnable background phase correction for this load?",
+            buttons,
+            QtWidgets.QMessageBox.No,
+        )
+        if choice == QtWidgets.QMessageBox.Cancel:
+            self.log(f"Load cancelled: {label}")
+            return None
+        enabled = choice == QtWidgets.QMessageBox.Yes
+        self.chk_bpc_enabled.setChecked(enabled)
+        return resolved
+
     def _on_open_h5(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open H5", "", "H5 (*.h5 *.hdf5);;All (*)")
         if not path:
             return
-        self._load_selected_input_case(path)
+        resolved = self._prompt_background_phase_choice(path)
+        if resolved is None:
+            return
+        self._load_selected_input_case(resolved)
 
     def _on_import_dicom_directory(self):
         root = QtWidgets.QFileDialog.getExistingDirectory(self, "Import DICOM Directory", "")
@@ -2044,7 +2048,10 @@ class MainWindow(QtWidgets.QMainWindow):
         selected = dialog.selected_case()
         if selected is None:
             return
-        self._load_selected_input_case(selected, dicom_parameter_overrides=dialog.parameter_overrides())
+        resolved = self._prompt_background_phase_choice(selected)
+        if resolved is None:
+            return
+        self._load_selected_input_case(resolved, dicom_parameter_overrides=dialog.parameter_overrides())
 
     def _inspect_dicom_case_preview(self, case):
         progress_dialog = self._create_progress_dialog("Inspect DICOM", "Reading DICOM load parameters...")

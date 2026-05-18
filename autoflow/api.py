@@ -48,7 +48,7 @@ class AutoFlowConfig:
     skip_plane_metrics: bool = False
     use_multithread: bool = True
     reuse_planes: str = ""
-    background_phase_correction: bool = True
+    background_phase_correction: bool = False
     background_phase_corr_fit_order: int = 3
     background_phase_threshold: float = 0.1
     dicom_read_workers: int = 1

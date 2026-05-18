@@ -342,10 +342,16 @@ def _progress_prefix(progress_callback, prefix):
     return _wrapped
 
 
+def _loader_correction_config(correction_config):
+    if correction_config is None:
+        return coerce_background_phase_correction_config({"enabled": False})
+    return coerce_background_phase_correction_config(correction_config)
+
+
 def load_h5_data(path, correction_config=None, progress_callback=None):
     target_spatial_order = ("LR", "AP", "FH")
     target_venc_order = ("LR", "AP", "FH")
-    cfg = coerce_background_phase_correction_config(correction_config)
+    cfg = _loader_correction_config(correction_config)
     with h5py.File(path, "r") as g:
         VENC = g["VENC"][:] if "VENC" in g else np.array([150, 150, 150], dtype=float)
         resolution = g["Resolution"][:] if "Resolution" in g else np.array([1, 1, 1], dtype=float)
@@ -357,18 +363,11 @@ def load_h5_data(path, correction_config=None, progress_callback=None):
 
         if "img_complex" in g:
             img_ds = g["img_complex"]
+            src_slices = tuple(slice(0, int(img_ds.shape[i])) for i in range(3))
             if seg_name is not None:
                 segmask_ds = g[seg_name]
-                segmask_full = segmask_ds[:].astype(np.int16)
-                if cfg.enabled:
-                    src_slices = tuple(slice(0, int(img_ds.shape[i])) for i in range(3))
-                    segmask = segmask_full
-                else:
-                    src_slices = _compute_spatial_bbox(segmask_full, pad=2)
-                    segmask = segmask_ds[src_slices + (slice(None),) * (segmask_ds.ndim - 3)].astype(np.int16)
-                del segmask_full
+                segmask = segmask_ds[:].astype(np.int16)
             else:
-                src_slices = tuple(slice(0, int(img_ds.shape[i])) for i in range(3))
                 segmask = None
 
             img_complex = np.asarray(img_ds[src_slices + (slice(None),) * (img_ds.ndim - 3)])

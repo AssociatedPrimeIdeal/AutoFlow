@@ -59,6 +59,8 @@ def test_load_h5_data_legacy_complex_is_normalized_but_tke_is_lazy(tmp_path):
     assert case.segmentation.shape == (2, 2, 2, 1)
     assert case.sigma.shape == (2, 2, 2, 1, 3)
     assert case.tke_array is None
+    assert case.metadata["background_phase_correction"]["enabled"] is False
+    assert case.metadata["background_phase_correction"]["applied"] is False
     assert "stationary_voxels" not in case.metadata["background_phase_correction"]
     assert case.capabilities.to_dict() == {
         "has_segmentation": True,
@@ -81,6 +83,8 @@ def test_load_h5_data_normalized_flow_mag_only_keeps_optional_fields_empty(tmp_p
     assert case.segmentation is None
     assert case.sigma is None
     assert case.tke_array is None
+    assert case.metadata["background_phase_correction"]["enabled"] is False
+    assert case.metadata["background_phase_correction"]["applied"] is False
     assert "stationary_voxels" not in case.metadata["background_phase_correction"]
     assert case.capabilities.to_dict() == {
         "has_segmentation": False,
@@ -89,6 +93,31 @@ def test_load_h5_data_normalized_flow_mag_only_keeps_optional_fields_empty(tmp_p
         "supports_wss": True,
         "supports_plane_metrics": True,
     }
+
+
+def test_load_h5_data_legacy_complex_does_not_crop_to_segmentation_bbox(tmp_path):
+    path = tmp_path / "legacy_complex_uncropped.h5"
+    img_complex = np.ones((6, 7, 8, 1, 4), dtype=np.complex64)
+    img_complex[..., 0] = 1.0 + 0.0j
+    for idx, phase in enumerate((0.1, 0.2, 0.3), start=1):
+        img_complex[..., idx] = 0.5 * np.exp(1j * phase)
+    segmask = np.zeros((6, 7, 8), dtype=np.int16)
+    segmask[2:4, 3:5, 1:3] = 1
+
+    with h5py.File(path, "w") as f:
+        f["img_complex"] = img_complex
+        f["segmask"] = segmask
+        f["VENC"] = np.array([150.0, 150.0, 150.0], dtype=np.float32)
+        f["Resolution"] = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+        f["SpatialOrder"] = np.array(["LR", "AP", "FH"], dtype="S2")
+        f["VENCOrder"] = np.array(["LR", "AP", "FH"], dtype="S2")
+        f["RR"] = 1000.0
+
+    case = load_h5_data(str(path))
+
+    assert case.flow.shape == (6, 7, 8, 1, 3)
+    assert case.mag.shape == (6, 7, 8, 1)
+    assert case.segmentation.shape == (6, 7, 8, 1)
 
 
 def test_background_phase_correction_on_mag_flow_recovers_static_background():
@@ -361,7 +390,10 @@ def test_compute_plane_metrics_multithread_handles_empty_planes():
 
 
 def test_finalize_loaded_dicom_case_applies_parameter_overrides(monkeypatch):
+    captured = {}
+
     def fake_apply_background_phase_correction_to_mag_flow(mag, flow, venc, config=None, progress_callback=None):
+        captured["enabled"] = bool(getattr(config, "enabled", None))
         return np.asarray(flow, dtype=np.float32), np.zeros(flow.shape[:3], dtype=bool), {
             "enabled": True,
             "applied": False,
@@ -414,6 +446,7 @@ def test_finalize_loaded_dicom_case_applies_parameter_overrides(monkeypatch):
     assert np.allclose(loaded.resolution, [1.1, 1.2, 1.3])
     assert np.allclose(loaded.venc, [210.0, 220.0, 230.0])
     assert loaded.rr == pytest.approx(875.0)
+    assert captured["enabled"] is False
     assert loaded.metadata["spatial_order_raw"] == ["LR", "AP", "FH"]
     assert loaded.metadata["venc_order_raw"] == ["LR", "AP", "FH"]
     assert loaded.metadata["dicom_parameter_overrides"] == {
@@ -424,6 +457,82 @@ def test_finalize_loaded_dicom_case_applies_parameter_overrides(monkeypatch):
         "rr": 875.0,
     }
     assert "stationary_voxels" not in loaded.metadata["background_phase_correction"]
+
+
+def test_inspect_dicom_case_reports_matrix_size(monkeypatch):
+    class FakeDataset:
+        def __init__(self, **attrs):
+            for key, value in attrs.items():
+                setattr(self, key, value)
+
+    datasets = {}
+    entries = []
+    labels = [None, "RL", "AP", "FH"]
+    venc_lookup = {"RL": 150.0, "AP": 160.0, "FH": 170.0}
+
+    for slice_idx in range(2):
+        for time_idx in range(2):
+            for label in labels:
+                is_magnitude = label is None
+                tag = "mag" if is_magnitude else label.lower()
+                path = f"/tmp/{tag}_z{slice_idx}_t{time_idx}.dcm"
+                sequence_name = "Magnitude"
+                if label is not None:
+                    sequence_name = f"4D FLOW {int(venc_lookup[label])} {label}"
+                datasets[path] = FakeDataset(
+                    Manufacturer="Siemens",
+                    ProtocolName="4D Flow",
+                    SeriesDescription=sequence_name,
+                    SequenceName=sequence_name,
+                    ImageOrientationPatient=[1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                    ImagePositionPatient=[0.0, 0.0, float(slice_idx)],
+                    PixelSpacing=[1.0, 2.0],
+                    SliceThickness=3.0,
+                    TriggerTime=float(100 * time_idx),
+                    CardiacRRIntervalSpecified=900.0,
+                    Rows=2,
+                    Columns=3,
+                )
+                entries.append(
+                    {
+                        "path": path,
+                        "case_id": "case-1",
+                        "manufacturer": "Siemens",
+                        "group_kind": 0,
+                        "component_label": label,
+                        "is_magnitude": is_magnitude,
+                        "series_description": "4D Flow",
+                        "protocol_name": "4D Flow",
+                    }
+                )
+
+    class FakePydicom:
+        def dcmread(self, path, force=True, stop_before_pixels=False):
+            return datasets[path]
+
+    monkeypatch.setattr(dicom_module, "_import_pydicom", lambda: FakePydicom())
+
+    case = InputCase(
+        input_path="/tmp/dicom_case",
+        input_kind="dicom",
+        display_name="dicom_case",
+        output_name="dicom_case",
+        source_group="case-1",
+        metadata={
+            "manufacturer": "Siemens",
+            "group_kind": 0,
+            "series_description": "4D Flow",
+            "protocol_name": "4D Flow",
+            "dicom_entries": entries,
+        },
+    )
+
+    preview = dicom_module.inspect_dicom_case(case)
+
+    assert preview["matrix_size"] == [3, 2, 2, 2]
+    assert preview["resolution"] == pytest.approx([2.0, 1.0, 1.0])
+    assert preview["venc"] == pytest.approx([150.0, 160.0, 170.0])
+    assert preview["rr"] == pytest.approx(900.0)
 
 
 def test_load_dicom_case_multithread_matches_single_thread(monkeypatch):

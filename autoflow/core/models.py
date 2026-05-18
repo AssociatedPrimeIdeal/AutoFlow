@@ -284,7 +284,7 @@ class DicomParameterOverrides:
 @dataclass
 class LoaderParams:
     background_phase_correction: BackgroundPhaseCorrectionConfig = field(
-        default_factory=BackgroundPhaseCorrectionConfig
+        default_factory=lambda: BackgroundPhaseCorrectionConfig(enabled=False)
     )
     dicom_parameter_overrides: "DicomParameterOverrides" = field(
         default_factory=lambda: DicomParameterOverrides()
@@ -303,7 +303,7 @@ class LoaderParams:
         payload = d or {}
         return LoaderParams(
             background_phase_correction=BackgroundPhaseCorrectionConfig.from_dict(
-                payload.get("background_phase_correction", {})
+                payload.get("background_phase_correction", {"enabled": False})
             ),
             dicom_parameter_overrides=DicomParameterOverrides.from_dict(
                 payload.get("dicom_parameter_overrides", {})
@@ -420,6 +420,7 @@ class SegmentationState:
     active_label: int = 1
     label_names: Dict[str, str] = field(default_factory=dict)
     label_colors: Dict[str, str] = field(default_factory=dict)
+    editing_enabled: bool = False
     tool: str = "brush"
     brush_radius: int = 3
     edit_all_timepoints: bool = True
@@ -431,7 +432,7 @@ class SegmentationState:
     input_source: str = "original"
     import_path: str = ""
     threshold_scalar: str = "pcmra"
-    threshold_value: str = "auto"
+    threshold_value: Any = field(default_factory=lambda: {"mode": "manual", "min_percent": 10.0, "max_percent": 100.0})
     threshold_keep_largest_cc: bool = True
     threshold_min_component_volume_mm3: float = 0.0
     threshold_closing: bool = True
@@ -441,6 +442,26 @@ class SegmentationState:
     auto_checkpoint: str = ""
     auto_device: str = "cpu"
     auto_label_map: str = ""
+
+    @staticmethod
+    def _coerce_threshold_value(value):
+        if isinstance(value, dict):
+            mode = str(value.get("mode", "manual") or "manual").strip().lower()
+            if mode == "auto":
+                return "auto"
+            return {
+                "mode": "manual",
+                "min_percent": float(value.get("min_percent", 10.0)),
+                "max_percent": float(value.get("max_percent", 100.0)),
+            }
+        if isinstance(value, str) and value.strip().lower() == "auto":
+            return "auto"
+        if value in (None, ""):
+            return {"mode": "manual", "min_percent": 10.0, "max_percent": 100.0}
+        try:
+            return float(value)
+        except Exception:
+            return {"mode": "manual", "min_percent": 10.0, "max_percent": 100.0}
 
     def to_dict(self):
         return {
@@ -454,6 +475,7 @@ class SegmentationState:
             "active_label": int(self.active_label),
             "label_names": copy.deepcopy(self.label_names),
             "label_colors": copy.deepcopy(self.label_colors),
+            "editing_enabled": bool(self.editing_enabled),
             "tool": self.tool,
             "brush_radius": int(self.brush_radius),
             "edit_all_timepoints": bool(self.edit_all_timepoints),
@@ -465,7 +487,7 @@ class SegmentationState:
             "input_source": self.input_source,
             "import_path": self.import_path,
             "threshold_scalar": self.threshold_scalar,
-            "threshold_value": self.threshold_value,
+            "threshold_value": copy.deepcopy(self.threshold_value),
             "threshold_keep_largest_cc": bool(self.threshold_keep_largest_cc),
             "threshold_min_component_volume_mm3": float(self.threshold_min_component_volume_mm3),
             "threshold_closing": bool(self.threshold_closing),
@@ -480,6 +502,9 @@ class SegmentationState:
     @staticmethod
     def from_dict(d):
         payload = d or {}
+        tool = str(payload.get("tool", "brush"))
+        if tool not in ("brush", "erase", "relabel"):
+            tool = "brush"
         return SegmentationState(
             original=SegmentationVersion.from_dict(payload.get("original", {})),
             imported=SegmentationVersion.from_dict(payload.get("imported", {})),
@@ -491,7 +516,8 @@ class SegmentationState:
             active_label=int(payload.get("active_label", 1)),
             label_names={str(k): str(v) for k, v in dict(payload.get("label_names", {})).items()},
             label_colors={str(k): str(v) for k, v in dict(payload.get("label_colors", {})).items()},
-            tool=str(payload.get("tool", "brush")),
+            editing_enabled=bool(payload.get("editing_enabled", False)),
+            tool=tool,
             brush_radius=int(payload.get("brush_radius", 3)),
             edit_all_timepoints=bool(payload.get("edit_all_timepoints", True)),
             working_labels_3d=None if payload.get("working_labels_3d") is None else np.asarray(payload.get("working_labels_3d"), dtype=np.int16),
@@ -502,7 +528,7 @@ class SegmentationState:
             input_source=str(payload.get("input_source", "original")),
             import_path=str(payload.get("import_path", "")),
             threshold_scalar=str(payload.get("threshold_scalar", "pcmra")),
-            threshold_value=str(payload.get("threshold_value", "auto")),
+            threshold_value=SegmentationState._coerce_threshold_value(payload.get("threshold_value")),
             threshold_keep_largest_cc=bool(payload.get("threshold_keep_largest_cc", True)),
             threshold_min_component_volume_mm3=float(payload.get("threshold_min_component_volume_mm3", 0.0)),
             threshold_closing=bool(payload.get("threshold_closing", True)),

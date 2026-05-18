@@ -39,6 +39,13 @@ You can also run the non-GUI pipeline from the command line:
 
 Video outputs are disabled by default. Pass the specific `--*-video` flags you want to generate.
 
+Background phase correction is opt-in for both H5 and DICOM inputs:
+
+- CLI / library batch mode keeps BGC disabled by default.
+- Pass `--bgc` on the CLI to enable it for a run.
+- Optional CLI tuning flags are `--bgc-fit-order` and `--bgc-threshold`.
+- In the GUI, AutoFlow asks whether to enable BGC each time you load an H5 file or DICOM case.
+
 General usage:
 
 ```bash
@@ -61,6 +68,16 @@ DICOM directory example:
 ```bash
 autoflow-run /path/to/dicom_root \
   --output-dir ./results/dicom_batch \
+```
+
+with background phase correction enabled:
+
+```bash
+autoflow-run /path/to/dicom_root \
+  --output-dir ./results/dicom_batch \
+  --bgc \
+  --bgc-fit-order 3 \
+  --bgc-threshold 0.1 \
 ```
 
 Example with evenly spaced planes and rotating dynamic videos:
@@ -117,17 +134,18 @@ autoflow-gui
 ![app](https://github.com/user-attachments/assets/2a668f0c-f98d-4168-9e84-79fa3949adb2)
 1. Use **File → Open H5** for legacy / normalized HDF5 input.
 2. Use **File → Import DICOM Directory** for direct DICOM input. AutoFlow scans the selected directory recursively, lists the detected 4D-flow cases, and then imports the one you choose.
-3. The **Input / Background Correction** panel shows the current resolution, venc, and detected direction labels; you can edit these values before running downstream steps if the DICOM readout needs manual adjustment.
-4. Legacy HDF5 input can still contain `img_complex`, `segmask`, `Resolution`, `VENC`, `RR`, `SpatialOrder`, and `VENCOrder`.
-5. Use the **Steps** panel to run the pipeline sequentially or click **Run All**.
-6. Use **Edit Skeleton** / **Edit Graph** for interactive editing:
+3. After you choose an H5 file or DICOM case, AutoFlow asks whether to enable background phase correction for that load.
+4. The **Input / Background Correction** panel shows the current resolution, venc, and detected direction labels; you can edit these values before running downstream steps if the DICOM readout needs manual adjustment.
+5. Legacy HDF5 input can still contain `img_complex`, `segmask`, `Resolution`, `VENC`, `RR`, `SpatialOrder`, and `VENCOrder`.
+6. Use the **Steps** panel to run the pipeline sequentially or click **Run All**.
+7. Use **Edit Skeleton** / **Edit Graph** for interactive editing:
    - Click a node to select it; drag the sphere widget to move it.
    - Press `Delete` or `Backspace` to remove the selected node or edge.
    - In graph edit mode, press `E` to toggle edge mode. With edge mode on, click two nodes sequentially to add/remove an edge between them. Click an edge directly to select it for deletion.
    - Press `Escape` to cancel edits; click the step button again to apply.
-7. Adjust parameters in the bottom panels before running each step.
-8. Use the **Timeline** slider to scrub through time frames.
-9. The **Ortho Viewer** on the right shows reformatted cross-sectional images for the selected plane.
+8. Adjust parameters in the bottom panels before running each step.
+9. Use the **Timeline** slider to scrub through time frames.
+10. The **Ortho Viewer** on the right shows reformatted cross-sectional images for the selected plane.
 
 ## Input Formats
 
@@ -141,11 +159,9 @@ AutoFlow can now read 4D-flow DICOM directly without converting to H5 first.
   - standard `MRVelocityEncodingSequence / VelocityEncodingDirection`
   - explicit anatomical labels in DICOM text fields such as `RL`, `LR`, `AP`, `PA`, `FH`, `HF`
   - `RO / PE / SS` style labels combined with `InPlanePhaseEncodingDirection`
-- Direct DICOM import normalizes into AutoFlow's internal `mag + flow + resolution + venc + rr` representation.
 - The currently supported direct-DICOM layouts are still limited. Different vendors, scanner models, and software versions often write substantially different 4D-flow DICOM variants, so AutoFlow cannot currently adapt to every machine's DICOM output automatically.
 - Manual verification and occasional parameter adjustment are still expected for direct DICOM input.
-- Direct DICOM loading does not have the complex encodes or sigma information required for TKE reconstruction, so TKE cannot be computed from DICOM input.
-- DICOM does not synthesize TKE. If no segmentation is embedded or provided separately, segmentation-dependent steps are skipped cleanly.
+
 
 ### Legacy HDF5
 

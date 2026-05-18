@@ -7,7 +7,7 @@ from autoflow.algorithms import (
     generate_threshold_segmentation,
     normalize_loaded_case,
 )
-from autoflow.core.models import LoaderCapabilities, Workspace
+from autoflow.core.models import LoaderCapabilities, SegmentationState, Workspace
 from autoflow.core.pipeline import PipelineEngine
 
 
@@ -97,7 +97,7 @@ def test_generate_threshold_segmentation_reports_shape_and_provenance(scalar_nam
     mag = np.ones((2, 2, 2, 4), dtype=np.float32)
     flow = np.ones((2, 2, 2, 4, 3), dtype=np.float32)
 
-    seg, provenance, scalar, _resolved_threshold = generate_threshold_segmentation(
+    seg, provenance, scalar, threshold_info = generate_threshold_segmentation(
         mag=mag,
         flow=flow,
         resolution=(1.0, 1.0, 1.0),
@@ -114,3 +114,68 @@ def test_generate_threshold_segmentation_reports_shape_and_provenance(scalar_nam
     assert seg.shape == (2, 2, 2, 4)
     assert provenance["source"] == "threshold"
     assert provenance["scalar"] == scalar_name
+    assert provenance["threshold_mode"] == "manual_absolute"
+    assert provenance["threshold_value_min"] == pytest.approx(float(threshold_value))
+    assert threshold_info["mode"] == "manual_absolute"
+    assert threshold_info["min_value"] == pytest.approx(float(threshold_value))
+
+
+def test_generate_threshold_segmentation_supports_manual_percent_range():
+    mag = np.array(
+        [
+            [[[0.0], [0.25]], [[0.5], [0.75]]],
+            [[[1.0], [0.0]], [[0.0], [0.0]]],
+        ],
+        dtype=np.float32,
+    )
+    flow = np.zeros((2, 2, 2, 1, 3), dtype=np.float32)
+
+    seg, provenance, scalar, threshold_info = generate_threshold_segmentation(
+        mag=mag,
+        flow=flow,
+        resolution=(1.0, 1.0, 1.0),
+        time_count=1,
+        scalar_name="mag",
+        threshold={"mode": "manual", "min_percent": 25.0, "max_percent": 75.0},
+        keep_largest_cc=False,
+        min_component_volume_mm3=0.0,
+        closing=False,
+        opening=False,
+    )
+
+    expected = np.array(
+        [
+            [[0, 1], [1, 1]],
+            [[0, 0], [0, 0]],
+        ],
+        dtype=np.int16,
+    )
+
+    assert scalar.shape == (2, 2, 2)
+    assert seg.shape == (2, 2, 2, 1)
+    assert np.array_equal(seg[..., 0], expected)
+    assert provenance["threshold_mode"] == "manual_percent"
+    assert provenance["threshold_percent_min"] == pytest.approx(25.0)
+    assert provenance["threshold_percent_max"] == pytest.approx(75.0)
+    assert provenance["threshold_value_min"] == pytest.approx(0.25)
+    assert provenance["threshold_value_max"] == pytest.approx(0.75)
+    assert threshold_info["mode"] == "manual_percent"
+    assert threshold_info["min_value"] == pytest.approx(0.25)
+    assert threshold_info["max_value"] == pytest.approx(0.75)
+
+
+def test_segmentation_state_defaults_to_manual_threshold_percent_range_and_discards_fill_tool():
+    seg = SegmentationState.from_dict({"tool": "fill"})
+
+    assert seg.tool == "brush"
+    assert seg.editing_enabled is False
+    assert seg.threshold_value == {"mode": "manual", "min_percent": 10.0, "max_percent": 100.0}
+
+
+def test_segmentation_state_round_trips_editing_enabled():
+    seg = SegmentationState.from_dict({"editing_enabled": True})
+
+    payload = seg.to_dict()
+
+    assert payload["editing_enabled"] is True
+    assert SegmentationState.from_dict(payload).editing_enabled is True

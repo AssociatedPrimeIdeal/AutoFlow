@@ -65,12 +65,20 @@ class SegmentationConfigDialog(QtWidgets.QDialog):
         self.combo_threshold_scalar = QtWidgets.QComboBox()
         self.combo_threshold_scalar.addItems(["mag", "pcmra", "pcmra_std"])
         self.combo_threshold_mode = QtWidgets.QComboBox()
-        self.combo_threshold_mode.addItems(["auto", "manual"])
+        self.combo_threshold_mode.addItems(["manual", "auto"])
         self.combo_threshold_mode.currentTextChanged.connect(self._sync_threshold_mode)
-        self.spin_threshold_value = QtWidgets.QDoubleSpinBox()
-        self.spin_threshold_value.setDecimals(6)
-        self.spin_threshold_value.setRange(-1e9, 1e9)
-        self.spin_threshold_value.setSingleStep(0.05)
+        self.spin_threshold_min_percent = QtWidgets.QDoubleSpinBox()
+        self.spin_threshold_min_percent.setDecimals(2)
+        self.spin_threshold_min_percent.setRange(0.0, 100.0)
+        self.spin_threshold_min_percent.setSingleStep(1.0)
+        self.spin_threshold_min_percent.setValue(10.0)
+        self.spin_threshold_min_percent.setSuffix(" %")
+        self.spin_threshold_max_percent = QtWidgets.QDoubleSpinBox()
+        self.spin_threshold_max_percent.setDecimals(2)
+        self.spin_threshold_max_percent.setRange(0.0, 100.0)
+        self.spin_threshold_max_percent.setSingleStep(1.0)
+        self.spin_threshold_max_percent.setValue(100.0)
+        self.spin_threshold_max_percent.setSuffix(" %")
         self.chk_keep_largest_cc = QtWidgets.QCheckBox()
         self.chk_threshold_closing = QtWidgets.QCheckBox()
         self.chk_threshold_opening = QtWidgets.QCheckBox()
@@ -80,7 +88,8 @@ class SegmentationConfigDialog(QtWidgets.QDialog):
         self.spin_min_cc_volume.setSuffix(" mm^3")
         form.addRow("Scalar", self.combo_threshold_scalar)
         form.addRow("Threshold", self.combo_threshold_mode)
-        form.addRow("Manual Value", self.spin_threshold_value)
+        form.addRow("Manual Min (% Max)", self.spin_threshold_min_percent)
+        form.addRow("Manual Max (% Max)", self.spin_threshold_max_percent)
         form.addRow("Keep Largest CC", self.chk_keep_largest_cc)
         form.addRow("Closing", self.chk_threshold_closing)
         form.addRow("Opening", self.chk_threshold_opening)
@@ -135,7 +144,9 @@ class SegmentationConfigDialog(QtWidgets.QDialog):
         self.stack.setCurrentIndex(index)
 
     def _sync_threshold_mode(self, mode):
-        self.spin_threshold_value.setEnabled(str(mode) == "manual")
+        manual = str(mode) == "manual"
+        self.spin_threshold_min_percent.setEnabled(manual)
+        self.spin_threshold_max_percent.setEnabled(manual)
 
     def _load_from_workspace(self):
         seg = self.workspace.segmentation
@@ -144,12 +155,23 @@ class SegmentationConfigDialog(QtWidgets.QDialog):
         self.radio_input_import.setChecked(seg.input_source == "imported")
         self.edit_import_path.setText(seg.import_path)
         self.combo_threshold_scalar.setCurrentText(seg.threshold_scalar if seg.threshold_scalar in ("mag", "pcmra", "pcmra_std") else "pcmra")
-        self.combo_threshold_mode.setCurrentText("auto" if seg.threshold_value == "auto" else "manual")
-        if seg.threshold_value != "auto":
+        threshold_value = seg.threshold_value
+        if isinstance(threshold_value, dict):
+            self.combo_threshold_mode.setCurrentText("manual")
+            self.spin_threshold_min_percent.setValue(float(threshold_value.get("min_percent", 10.0)))
+            self.spin_threshold_max_percent.setValue(float(threshold_value.get("max_percent", 100.0)))
+        elif threshold_value == "auto":
+            self.combo_threshold_mode.setCurrentText("auto")
+            self.spin_threshold_min_percent.setValue(10.0)
+            self.spin_threshold_max_percent.setValue(100.0)
+        else:
+            self.combo_threshold_mode.setCurrentText("manual")
             try:
-                self.spin_threshold_value.setValue(float(seg.threshold_value))
+                value = float(threshold_value)
             except Exception:
-                self.spin_threshold_value.setValue(0.0)
+                value = 0.0
+            self.spin_threshold_min_percent.setValue(value)
+            self.spin_threshold_max_percent.setValue(100.0)
         self.chk_keep_largest_cc.setChecked(bool(seg.threshold_keep_largest_cc))
         self.chk_threshold_closing.setChecked(bool(seg.threshold_closing))
         self.chk_threshold_opening.setChecked(bool(seg.threshold_opening))
@@ -168,7 +190,15 @@ class SegmentationConfigDialog(QtWidgets.QDialog):
             "input_source": "imported" if self.radio_input_import.isChecked() else "original",
             "import_path": self.edit_import_path.text().strip(),
             "threshold_scalar": self.combo_threshold_scalar.currentText(),
-            "threshold_value": "auto" if self.combo_threshold_mode.currentText() == "auto" else float(self.spin_threshold_value.value()),
+            "threshold_value": (
+                "auto"
+                if self.combo_threshold_mode.currentText() == "auto"
+                else {
+                    "mode": "manual",
+                    "min_percent": float(self.spin_threshold_min_percent.value()),
+                    "max_percent": float(self.spin_threshold_max_percent.value()),
+                }
+            ),
             "threshold_keep_largest_cc": self.chk_keep_largest_cc.isChecked(),
             "threshold_closing": self.chk_threshold_closing.isChecked(),
             "threshold_opening": self.chk_threshold_opening.isChecked(),
@@ -179,6 +209,19 @@ class SegmentationConfigDialog(QtWidgets.QDialog):
             "auto_device": self.edit_auto_device.text().strip(),
             "auto_label_map": self.edit_auto_label_map.toPlainText().strip(),
         }
+
+    def accept(self):
+        values = self.values()
+        threshold_value = values["threshold_value"]
+        if values["mode"] == "threshold" and isinstance(threshold_value, dict):
+            if float(threshold_value["max_percent"]) < float(threshold_value["min_percent"]):
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Invalid Threshold Range",
+                    "Manual threshold max percentage must be greater than or equal to min percentage.",
+                )
+                return
+        super().accept()
 
 
 class SegmentationDock(QtWidgets.QWidget):
@@ -238,9 +281,8 @@ class SegmentationDock(QtWidgets.QWidget):
         tools_layout = QtWidgets.QGridLayout(tools_group)
         self.btn_tool_brush = QtWidgets.QPushButton("Brush")
         self.btn_tool_erase = QtWidgets.QPushButton("Erase")
-        self.btn_tool_fill = QtWidgets.QPushButton("Fill")
         self.btn_tool_relabel = QtWidgets.QPushButton("Relabel")
-        self.tool_buttons = [self.btn_tool_brush, self.btn_tool_erase, self.btn_tool_fill, self.btn_tool_relabel]
+        self.tool_buttons = [self.btn_tool_brush, self.btn_tool_erase, self.btn_tool_relabel]
         for btn in self.tool_buttons:
             btn.setCheckable(True)
         self.btn_tool_brush.setChecked(True)
@@ -251,8 +293,7 @@ class SegmentationDock(QtWidgets.QWidget):
         self.chk_edit_all_timepoints.setChecked(True)
         tools_layout.addWidget(self.btn_tool_brush, 0, 0)
         tools_layout.addWidget(self.btn_tool_erase, 0, 1)
-        tools_layout.addWidget(self.btn_tool_fill, 1, 0)
-        tools_layout.addWidget(self.btn_tool_relabel, 1, 1)
+        tools_layout.addWidget(self.btn_tool_relabel, 1, 0, 1, 2)
         tools_layout.addWidget(QtWidgets.QLabel("Brush Radius"), 2, 0)
         tools_layout.addWidget(self.spin_brush_radius, 2, 1)
         tools_layout.addWidget(self.chk_edit_all_timepoints, 3, 0, 1, 2)
@@ -260,14 +301,16 @@ class SegmentationDock(QtWidgets.QWidget):
 
         actions_group = QtWidgets.QGroupBox("Edit")
         actions_layout = QtWidgets.QGridLayout(actions_group)
+        self.chk_editing_enabled = QtWidgets.QCheckBox("Enable Ortho Editing")
         self.btn_undo = QtWidgets.QPushButton("Undo")
         self.btn_redo = QtWidgets.QPushButton("Redo")
         self.btn_apply = QtWidgets.QPushButton("Apply")
         self.btn_cancel = QtWidgets.QPushButton("Cancel")
-        actions_layout.addWidget(self.btn_undo, 0, 0)
-        actions_layout.addWidget(self.btn_redo, 0, 1)
-        actions_layout.addWidget(self.btn_apply, 1, 0)
-        actions_layout.addWidget(self.btn_cancel, 1, 1)
+        actions_layout.addWidget(self.chk_editing_enabled, 0, 0, 1, 2)
+        actions_layout.addWidget(self.btn_undo, 1, 0)
+        actions_layout.addWidget(self.btn_redo, 1, 1)
+        actions_layout.addWidget(self.btn_apply, 2, 0)
+        actions_layout.addWidget(self.btn_cancel, 2, 1)
         layout.addWidget(actions_group)
 
         self.label_status = QtWidgets.QLabel("No active segmentation")

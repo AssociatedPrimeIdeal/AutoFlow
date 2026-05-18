@@ -836,6 +836,20 @@ def _estimate_entry_venc(ds, entry, group_kind):
     return _extract_multiframe_venc(ds)
 
 
+def _preview_matrix_size_xyz(axis_dirs, row_count, col_count, slice_count, time_count):
+    raw_shape = (
+        max(1, int(row_count or 1)),
+        max(1, int(col_count or 1)),
+        max(1, int(slice_count or 1)),
+    )
+    spatial_shape_xyz = _reorder_row_col_slice_to_xyz(
+        np.zeros(raw_shape, dtype=np.uint8),
+        axis_dirs,
+        (1.0, 1.0, 1.0),
+    )[0].shape[:3]
+    return [int(x) for x in spatial_shape_xyz] + [max(1, int(time_count or 1))]
+
+
 def inspect_dicom_case(case, progress_callback=None):
     case, entries = _resolve_dicom_entries(case)
     pydicom = _import_pydicom()
@@ -843,8 +857,12 @@ def inspect_dicom_case(case, progress_callback=None):
     rr_values = []
     venc_map = {}
     slice_keys = []
+    time_keys = []
     axis0 = axis1 = axis2 = None
     row_spacing = col_spacing = thickness = None
+    row_count = col_count = None
+    frame_time_count = None
+    multiframe_slice_count = None
     total = len(entries)
 
     for index, entry in enumerate(entries, start=1):
@@ -875,11 +893,17 @@ def inspect_dicom_case(case, progress_callback=None):
         row_spacing = sp0 if sp0 is not None else row_spacing
         col_spacing = sp1 if sp1 is not None else col_spacing
         thickness = thick if thick is not None else thickness
+        rows = int(_safe_float(getattr(ds, "Rows", None), default=0) or 0)
+        cols = int(_safe_float(getattr(ds, "Columns", None), default=0) or 0)
+        row_count = rows if rows > 0 else row_count
+        col_count = cols if cols > 0 else col_count
         if axis2 is not None:
             if group_kind == 0:
                 slice_keys.append(_extract_slice_key(ds, axis2))
+                time_keys.append(_extract_time_key(ds))
             elif group_kind == 1:
-                frame_content = getattr(getattr(ds, "PerFrameFunctionalGroupsSequence", None), "__getitem__", lambda _x: None)
+                frame_count = int(_safe_float(getattr(ds, "NumberOfFrames", 1), default=1) or 1)
+                frame_time_count = frame_count if frame_time_count is None else max(int(frame_time_count), frame_count)
                 try:
                     last_fg = ds.PerFrameFunctionalGroupsSequence[-1]
                     fc = getattr(last_fg, "FrameContentSequence", None)
@@ -887,6 +911,30 @@ def inspect_dicom_case(case, progress_callback=None):
                         slice_keys.append(float(_safe_float(fc[0].InStackPositionNumber, default=0.0) or 0.0))
                 except Exception:
                     slice_keys.append(_extract_slice_key(ds, axis2))
+            elif group_kind == 2:
+                frame_count = int(_safe_float(getattr(ds, "NumberOfFrames", 0), default=0) or 0)
+                slice_count = None
+                try:
+                    last_fg = ds.PerFrameFunctionalGroupsSequence[-1]
+                    fc = getattr(last_fg, "FrameContentSequence", None)
+                    if fc and hasattr(fc[0], "InStackPositionNumber"):
+                        slice_count = int(_safe_float(fc[0].InStackPositionNumber, default=0) or 0)
+                except Exception:
+                    slice_count = None
+                if slice_count and slice_count > 0:
+                    multiframe_slice_count = (
+                        slice_count
+                        if multiframe_slice_count is None
+                        else max(int(multiframe_slice_count), int(slice_count))
+                    )
+                    factor = 2 if bool(entry.get("is_magnitude", False)) else 3
+                    if frame_count >= factor * slice_count:
+                        time_candidate = max(1, frame_count // (factor * slice_count))
+                        frame_time_count = (
+                            time_candidate
+                            if frame_time_count is None
+                            else max(int(frame_time_count), int(time_candidate))
+                        )
 
     if axis2 is None:
         raise ValueError("ImageOrientationPatient is required for direct DICOM loading")
@@ -902,12 +950,28 @@ def inspect_dicom_case(case, progress_callback=None):
             float(slice_spacing) if group_kind in (0, 1) else (1.0 if thickness is None else float(thickness)),
         ),
     )
+    if group_kind == 0:
+        matrix_time_count = len(set(time_keys))
+        matrix_slice_count = len(set(slice_keys))
+    elif group_kind == 1:
+        matrix_time_count = frame_time_count
+        matrix_slice_count = len(set(slice_keys))
+    else:
+        matrix_time_count = frame_time_count
+        matrix_slice_count = multiframe_slice_count
     raw_venc = np.asarray([_default_venc(venc_map.get(label)) for label in component_labels], dtype=float)
     preview = {
         "resolution": np.asarray(resolution, dtype=float).reshape(3).tolist(),
         "venc": raw_venc.reshape(3).tolist(),
         "spatial_order": list(spatial_order),
         "venc_order": list(component_labels),
+        "matrix_size": _preview_matrix_size_xyz(
+            (axis0, axis1, axis2),
+            row_count,
+            col_count,
+            matrix_slice_count,
+            matrix_time_count,
+        ),
         "rr": float(rr_values[0]) if rr_values else 1000.0,
         "display_name": case.display_name,
         "file_count": int(len(entries)),
@@ -955,7 +1019,10 @@ def _finalize_loaded_dicom_case(
         target_venc_order=("LR", "AP", "FH"),
         return_velocity=False,
     )
-    cfg = coerce_background_phase_correction_config(correction_config)
+    if correction_config is None:
+        cfg = coerce_background_phase_correction_config({"enabled": False})
+    else:
+        cfg = coerce_background_phase_correction_config(correction_config)
     flow_corr, _stationary_mask, corr_report = apply_background_phase_correction_to_mag_flow(
         mag_out,
         flow_out,

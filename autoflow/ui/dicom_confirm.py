@@ -36,6 +36,8 @@ class DicomImportDialog(QtWidgets.QDialog):
         form = QtWidgets.QFormLayout(form_group)
         self.label_case_info = QtWidgets.QLabel("-")
         self.label_case_info.setWordWrap(True)
+        self.edit_matrix_size = QtWidgets.QLineEdit()
+        self.edit_matrix_size.setReadOnly(True)
         self.edit_resolution = QtWidgets.QLineEdit()
         self.edit_venc = QtWidgets.QLineEdit()
         self.edit_spatial_order = QtWidgets.QLineEdit()
@@ -44,6 +46,7 @@ class DicomImportDialog(QtWidgets.QDialog):
         self.label_preview_status = QtWidgets.QLabel("")
         self.label_preview_status.setWordWrap(True)
         form.addRow("Case", self.label_case_info)
+        form.addRow("Matrix Size XYZT", self.edit_matrix_size)
         form.addRow("Resolution XYZ", self.edit_resolution)
         form.addRow("VENC XYZ", self.edit_venc)
         form.addRow("Spatial Order", self.edit_spatial_order)
@@ -71,6 +74,10 @@ class DicomImportDialog(QtWidgets.QDialog):
     def _format_labels(self, values):
         return ", ".join(str(x).upper() for x in list(values)[:3])
 
+    def _format_matrix_size(self, values):
+        vals = [int(float(x)) for x in list(values)[:4]]
+        return " x ".join(str(v) for v in vals)
+
     def _preview_key(self, case):
         return (str(case.input_path), str(case.source_group or ""))
 
@@ -81,6 +88,7 @@ class DicomImportDialog(QtWidgets.QDialog):
         return self._preview_cache[key]
 
     def _set_preview_fields(self, preview):
+        self.edit_matrix_size.setText(self._format_matrix_size(preview.get("matrix_size", [1, 1, 1, 1])))
         self.edit_resolution.setText(self._format_triplet(preview.get("resolution", [1.0, 1.0, 1.0])))
         self.edit_venc.setText(self._format_triplet(preview.get("venc", [150.0, 150.0, 150.0])))
         self.edit_spatial_order.setText(self._format_labels(preview.get("spatial_order", ["LR", "AP", "FH"])))
@@ -99,6 +107,7 @@ class DicomImportDialog(QtWidgets.QDialog):
             preview = self._preview_for_case(case)
         except Exception as exc:
             self.label_case_info.setText(case.display_name or case.input_path)
+            self.edit_matrix_size.clear()
             self.edit_resolution.clear()
             self.edit_venc.clear()
             self.edit_spatial_order.clear()

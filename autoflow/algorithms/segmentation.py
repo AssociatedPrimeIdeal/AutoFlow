@@ -136,6 +136,57 @@ def _otsu_threshold(values):
     return float(centers[int(np.argmax(between))])
 
 
+def _finite_scalar_max(values):
+    data = np.asarray(values, dtype=float)
+    data = data[np.isfinite(data)]
+    if data.size == 0:
+        return 0.0
+    return float(np.max(data))
+
+
+def _resolve_threshold_config(values, threshold):
+    if isinstance(threshold, dict):
+        mode = str(threshold.get("mode", "manual") or "manual").strip().lower()
+        if mode == "auto":
+            threshold = "auto"
+        else:
+            min_percent = float(threshold.get("min_percent", 10.0))
+            max_percent = float(threshold.get("max_percent", 100.0))
+            if not np.isfinite(min_percent) or not np.isfinite(max_percent):
+                raise ValueError("manual threshold percentages must be finite")
+            if max_percent < min_percent:
+                raise ValueError("manual threshold max percent must be greater than or equal to min percent")
+            scalar_max = _finite_scalar_max(values)
+            return {
+                "mode": "manual_percent",
+                "min_percent": float(min_percent),
+                "max_percent": float(max_percent),
+                "scalar_max": float(scalar_max),
+                "min_value": float(scalar_max * (min_percent / 100.0)),
+                "max_value": float(scalar_max * (max_percent / 100.0)),
+                "spec": {
+                    "mode": "manual",
+                    "min_percent": float(min_percent),
+                    "max_percent": float(max_percent),
+                },
+            }
+    if isinstance(threshold, str) and threshold.strip().lower() == "auto":
+        threshold_value = _otsu_threshold(values)
+        return {
+            "mode": "auto",
+            "min_value": float(threshold_value),
+            "max_value": None,
+            "spec": "auto",
+        }
+    threshold_value = float(threshold)
+    return {
+        "mode": "manual_absolute",
+        "min_value": float(threshold_value),
+        "max_value": None,
+        "spec": float(threshold_value),
+    }
+
+
 def compute_reference_scalar(mag, flow, scalar_name):
     scalar_name = str(scalar_name or "pcmra").lower()
     mag_arr = np.asarray(mag, dtype=np.float32)
@@ -170,8 +221,10 @@ def generate_threshold_segmentation(
     opening=False,
 ):
     scalar = compute_reference_scalar(mag, flow, scalar_name)
-    threshold_value = _otsu_threshold(scalar) if threshold == "auto" else float(threshold)
-    mask = np.asarray(scalar >= threshold_value, dtype=bool)
+    threshold_info = _resolve_threshold_config(scalar, threshold)
+    mask = np.asarray(scalar >= float(threshold_info["min_value"]), dtype=bool)
+    if threshold_info.get("max_value") is not None:
+        mask &= np.asarray(scalar <= float(threshold_info["max_value"]), dtype=bool)
     if closing:
         mask = binary_closing(mask).astype(bool)
     if opening:
@@ -185,15 +238,23 @@ def generate_threshold_segmentation(
     provenance = {
         "source": "threshold",
         "scalar": str(scalar_name),
-        "threshold": threshold if threshold == "auto" else float(threshold_value),
-        "threshold_value": float(threshold_value),
+        "threshold": threshold_info["spec"],
+        "threshold_mode": str(threshold_info["mode"]),
+        "threshold_value": float(threshold_info["min_value"]),
+        "threshold_value_min": float(threshold_info["min_value"]),
         "keep_largest_cc": bool(keep_largest_cc),
         "min_component_volume_mm3": float(min_component_volume_mm3),
         "closing": bool(closing),
         "opening": bool(opening),
         "created_at": segmentation_timestamp(),
     }
-    return seg, provenance, scalar, float(threshold_value)
+    if threshold_info.get("max_value") is not None:
+        provenance["threshold_value_max"] = float(threshold_info["max_value"])
+    if threshold_info["mode"] == "manual_percent":
+        provenance["threshold_percent_min"] = float(threshold_info["min_percent"])
+        provenance["threshold_percent_max"] = float(threshold_info["max_percent"])
+        provenance["scalar_max"] = float(threshold_info["scalar_max"])
+    return seg, provenance, scalar, threshold_info
 
 
 def save_segmentation_file(path, segmentation, resolution=None, origin=None, provenance=None):

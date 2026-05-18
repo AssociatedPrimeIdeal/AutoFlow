@@ -12,6 +12,7 @@ def test_autoflow_config_defaults_cover_workspace_and_rendering_contract():
     assert cfg.skip_plane_metrics is False
     assert cfg.use_multithread is True
     assert cfg.reuse_planes == ""
+    assert cfg.background_phase_correction is False
     assert cfg.dicom_read_workers == 1
 
     assert cfg.use_center_plane is True
@@ -83,6 +84,7 @@ def test_build_workspace_maps_default_config_values():
         "rng_seed": 0,
     }
     assert getattr(ws.streamline_params, "tube_radius") == 0.05
+    assert ws.loader_params.background_phase_correction.enabled is False
     assert ws.loader_params.dicom_read_workers == 1
 
 
@@ -109,6 +111,9 @@ def test_build_workspace_maps_custom_plane_generation_parameters():
 
 def test_build_workspace_maps_skeleton_and_streamline_parameters():
     config = AutoFlowConfig(
+        background_phase_correction=True,
+        background_phase_corr_fit_order=2,
+        background_phase_threshold=0.25,
         remove_small_cc=False,
         min_cc_volume=42.0,
         seed_ratio=0.03,
@@ -134,6 +139,9 @@ def test_build_workspace_maps_skeleton_and_streamline_parameters():
         "rng_seed": 0,
     }
     assert getattr(ws.streamline_params, "tube_radius") == 0.12
+    assert ws.loader_params.background_phase_correction.enabled is True
+    assert ws.loader_params.background_phase_correction.corr_fit_order == 2
+    assert ws.loader_params.background_phase_correction.threshold == 0.25
     assert ws.loader_params.dicom_read_workers == 5
 
 

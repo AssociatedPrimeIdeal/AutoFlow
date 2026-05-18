@@ -50,7 +50,7 @@ class BackgroundPhaseCorrectionConfig:
     def from_dict(d):
         payload = d or {}
         return BackgroundPhaseCorrectionConfig(
-            enabled=bool(payload.get("enabled", True)),
+            enabled=bool(payload.get("enabled", False)),
             corr_fit_order=int(payload.get("corr_fit_order", 3)),
             threshold=float(payload.get("threshold", 0.1)),
         )
