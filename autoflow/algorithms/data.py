@@ -5,7 +5,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import h5py
 import numpy as np
 
-from ..case_types import LoadedCase, LoaderCapabilities
+from ..case_types import BackgroundPhaseCorrectionConfig, LoadedCase, LoaderCapabilities
+from .phase_correction import (
+    apply_background_phase_correction_to_complex,
+    apply_background_phase_correction_to_mag_flow,
+    background_phase_report_for_metadata,
+    coerce_background_phase_correction_config,
+)
 
 
 def _axis_pair(a):
@@ -213,7 +219,13 @@ def normalize_loaded_case(
     tke_out = _ensure_optional_time_volume(tke_array, nt, "tke_array", np.float32)
     sigma_out = _ensure_optional_sigma_time(sigma, nt)
     if capabilities is None:
-        capabilities = LoaderCapabilities()
+        capabilities = LoaderCapabilities(
+            has_segmentation=seg_out is not None,
+            has_tke=tke_out is not None,
+            has_complex_source=False,
+            supports_wss=False,
+            supports_plane_metrics=False,
+        )
     else:
         capabilities = LoaderCapabilities(
             has_segmentation=bool(capabilities.has_segmentation),
@@ -222,7 +234,6 @@ def normalize_loaded_case(
             supports_wss=bool(capabilities.supports_wss),
             supports_plane_metrics=bool(capabilities.supports_plane_metrics),
         )
-    capabilities.has_segmentation = seg_out is not None
     capabilities.has_tke = bool(capabilities.has_tke or tke_out is not None)
 
     resolution = np.asarray(resolution, dtype=float).reshape(-1)
@@ -318,9 +329,23 @@ def _reorient_component_abs(arr, spatial_order, target_spatial_order, venc_order
     return arr_r[..., comp_perm]
 
 
-def load_h5_data(path):
+def _progress_prefix(progress_callback, prefix):
+    if progress_callback is None:
+        return None
+
+    def _wrapped(payload):
+        data = dict(payload or {})
+        stage = str(data.get("stage", ""))
+        data["stage"] = f"{prefix}{stage}" if prefix else stage
+        progress_callback(data)
+
+    return _wrapped
+
+
+def load_h5_data(path, correction_config=None, progress_callback=None):
     target_spatial_order = ("LR", "AP", "FH")
     target_venc_order = ("LR", "AP", "FH")
+    cfg = coerce_background_phase_correction_config(correction_config)
     with h5py.File(path, "r") as g:
         VENC = g["VENC"][:] if "VENC" in g else np.array([150, 150, 150], dtype=float)
         resolution = g["Resolution"][:] if "Resolution" in g else np.array([1, 1, 1], dtype=float)
@@ -335,19 +360,29 @@ def load_h5_data(path):
             if seg_name is not None:
                 segmask_ds = g[seg_name]
                 segmask_full = segmask_ds[:].astype(np.int16)
-                src_slices = _compute_spatial_bbox(segmask_full, pad=2)
-                segmask = segmask_ds[src_slices + (slice(None),) * (segmask_ds.ndim - 3)].astype(np.int16)
+                if cfg.enabled:
+                    src_slices = tuple(slice(0, int(img_ds.shape[i])) for i in range(3))
+                    segmask = segmask_full
+                else:
+                    src_slices = _compute_spatial_bbox(segmask_full, pad=2)
+                    segmask = segmask_ds[src_slices + (slice(None),) * (segmask_ds.ndim - 3)].astype(np.int16)
                 del segmask_full
             else:
                 src_slices = tuple(slice(0, int(img_ds.shape[i])) for i in range(3))
                 segmask = None
 
             img_complex = np.asarray(img_ds[src_slices + (slice(None),) * (img_ds.ndim - 3)])
+            img_complex_corr, _stationary_mask_raw, corr_report = apply_background_phase_correction_to_complex(
+                img_complex,
+                config=cfg,
+                progress_callback=_progress_prefix(progress_callback, "h5_"),
+                source_mode="legacy_complex_h5",
+            )
+            img_complex_use = img_complex_corr if bool(corr_report.get("applied", False)) else img_complex
             mag = np.abs(img_complex[..., 0]).astype(np.float32)
-            flow_raw = np.angle(img_complex[..., 1:4] * np.conj(img_complex[..., 0][..., None])).astype(np.float32)
-            sigma_raw = _sigma_from_complex(img_complex, VENC)
+            flow_raw = np.angle(img_complex_use[..., 1:4] * np.conj(img_complex_use[..., 0][..., None])).astype(np.float32)
+            sigma_raw = _sigma_from_complex(img_complex_use, VENC)
             segmask_for_reorient = segmask if segmask is not None else np.zeros(mag.shape, dtype=np.int16)
-
             flow, mag_out, seg_r, venc_new, res_new = reorient(
                 mag, flow_raw, segmask_for_reorient, venc=VENC, resolution=resolution,
                 spatial_order=spatial_order, venc_order=venc_order,
@@ -362,6 +397,9 @@ def load_h5_data(path):
                 venc_order=venc_order,
                 target_venc_order=target_venc_order,
             ).astype(np.float32)
+            meta = {
+                "background_phase_correction": background_phase_report_for_metadata(corr_report),
+            }
             return normalize_loaded_case(
                 flow=flow,
                 mag=mag_out,
@@ -372,6 +410,7 @@ def load_h5_data(path):
                 rr=float(rr),
                 sigma=sigma,
                 tke_array=None,
+                metadata=meta,
                 source_format="legacy_h5",
                 capabilities=LoaderCapabilities(
                     has_segmentation=segmask is not None,
@@ -386,9 +425,18 @@ def load_h5_data(path):
             sigma = np.asarray(g["sigma"][:], dtype=np.float32) if "sigma" in g else None
             tke_array = np.asarray(g["tke_array"][:], dtype=np.float32) if "tke_array" in g else None
             segmentation = None if seg_name is None else np.asarray(g[seg_name][:], dtype=np.int16)
+            flow_raw = np.asarray(g["flow"][:], dtype=np.float32)
+            mag_raw = np.asarray(g["mag"][:], dtype=np.float32)
+            flow_corr, _stationary_mask, corr_report = apply_background_phase_correction_to_mag_flow(
+                mag_raw,
+                flow_raw,
+                VENC,
+                config=cfg,
+                progress_callback=_progress_prefix(progress_callback, "h5_"),
+            )
             return normalize_loaded_case(
-                flow=np.asarray(g["flow"][:], dtype=np.float32),
-                mag=np.asarray(g["mag"][:], dtype=np.float32),
+                flow=flow_corr,
+                mag=mag_raw,
                 segmentation=segmentation,
                 resolution=resolution,
                 origin=origin,
@@ -396,6 +444,7 @@ def load_h5_data(path):
                 rr=float(rr),
                 sigma=sigma,
                 tke_array=tke_array,
+                metadata={"background_phase_correction": background_phase_report_for_metadata(corr_report)},
                 source_format="normalized_h5",
                 capabilities=LoaderCapabilities(
                     has_segmentation=segmentation is not None,

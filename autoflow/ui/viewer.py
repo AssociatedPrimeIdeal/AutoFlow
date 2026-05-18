@@ -522,9 +522,10 @@ class SceneController:
         org = ws.origin
 
         if data_key == "segmask_raw_surface":
-            if ws.segmask_raw is None:
+            seg_display = ws.segmentation_display_4d()
+            if seg_display is None:
                 return None
-            return self._cached(data_key, t, lambda: build_multilabel_surface_t(ws.segmask_raw, t, sp, org))
+            return self._cached(data_key, t, lambda: build_multilabel_surface_t(seg_display, t, sp, org))
 
         if data_key == "segmask_pre_surface":
             if ws.segmask_labels is None:

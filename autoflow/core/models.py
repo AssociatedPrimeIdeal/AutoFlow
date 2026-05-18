@@ -4,7 +4,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
-from ..case_types import InputState, LoadedCase, LoaderCapabilities
+from ..case_types import BackgroundPhaseCorrectionConfig, InputState, LoadedCase, LoaderCapabilities
 
 
 class ObjectKind(Enum):
@@ -215,6 +215,104 @@ class DerivedMetricsParams:
 
 
 @dataclass
+class DicomParameterOverrides:
+    resolution: Optional[List[float]] = None
+    venc: Optional[List[float]] = None
+    spatial_order: Optional[List[str]] = None
+    venc_order: Optional[List[str]] = None
+    rr: Optional[float] = None
+
+    @staticmethod
+    def _coerce_float_triplet(value):
+        if value is None:
+            return None
+        arr = np.asarray(value, dtype=float).reshape(-1)
+        if arr.size == 1:
+            arr = np.repeat(arr, 3)
+        if arr.size < 3:
+            return None
+        return [float(x) for x in arr[:3]]
+
+    @staticmethod
+    def _coerce_label_triplet(value):
+        if value is None:
+            return None
+        labels = [str(x).strip().upper() for x in list(value) if str(x).strip()]
+        if len(labels) < 3:
+            return None
+        return labels[:3]
+
+    def to_dict(self):
+        return {
+            "resolution": None if self.resolution is None else [float(x) for x in self.resolution[:3]],
+            "venc": None if self.venc is None else [float(x) for x in self.venc[:3]],
+            "spatial_order": None if self.spatial_order is None else [str(x).upper() for x in self.spatial_order[:3]],
+            "venc_order": None if self.venc_order is None else [str(x).upper() for x in self.venc_order[:3]],
+            "rr": None if self.rr is None else float(self.rr),
+        }
+
+    def to_loader_kwargs(self):
+        payload = {}
+        if self.resolution is not None:
+            payload["resolution"] = [float(x) for x in self.resolution[:3]]
+        if self.venc is not None:
+            payload["venc"] = [float(x) for x in self.venc[:3]]
+        if self.spatial_order is not None:
+            payload["spatial_order"] = [str(x).upper() for x in self.spatial_order[:3]]
+        if self.venc_order is not None:
+            payload["venc_order"] = [str(x).upper() for x in self.venc_order[:3]]
+        if self.rr is not None:
+            payload["rr"] = float(self.rr)
+        return payload
+
+    def has_values(self):
+        return bool(self.to_loader_kwargs())
+
+    @staticmethod
+    def from_dict(d):
+        payload = d or {}
+        rr = payload.get("rr")
+        return DicomParameterOverrides(
+            resolution=DicomParameterOverrides._coerce_float_triplet(payload.get("resolution")),
+            venc=DicomParameterOverrides._coerce_float_triplet(payload.get("venc")),
+            spatial_order=DicomParameterOverrides._coerce_label_triplet(payload.get("spatial_order")),
+            venc_order=DicomParameterOverrides._coerce_label_triplet(payload.get("venc_order")),
+            rr=None if rr in (None, "") else float(rr),
+        )
+
+
+@dataclass
+class LoaderParams:
+    background_phase_correction: BackgroundPhaseCorrectionConfig = field(
+        default_factory=BackgroundPhaseCorrectionConfig
+    )
+    dicom_parameter_overrides: "DicomParameterOverrides" = field(
+        default_factory=lambda: DicomParameterOverrides()
+    )
+    dicom_read_workers: int = 1
+
+    def to_dict(self):
+        return {
+            "background_phase_correction": self.background_phase_correction.to_dict(),
+            "dicom_parameter_overrides": self.dicom_parameter_overrides.to_dict(),
+            "dicom_read_workers": int(self.dicom_read_workers),
+        }
+
+    @staticmethod
+    def from_dict(d):
+        payload = d or {}
+        return LoaderParams(
+            background_phase_correction=BackgroundPhaseCorrectionConfig.from_dict(
+                payload.get("background_phase_correction", {})
+            ),
+            dicom_parameter_overrides=DicomParameterOverrides.from_dict(
+                payload.get("dicom_parameter_overrides", {})
+            ),
+            dicom_read_workers=int(payload.get("dicom_read_workers", 1) or 1),
+        )
+
+
+@dataclass
 class PathsState:
     segmask_path: str = ""
     flow_path: str = ""
@@ -290,15 +388,145 @@ class DerivedResults:
 
 
 @dataclass
+class SegmentationVersion:
+    data: Optional[np.ndarray] = None
+    provenance: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self):
+        return {
+            "data": None if self.data is None else np.asarray(self.data, dtype=np.int16).tolist(),
+            "provenance": copy.deepcopy(self.provenance),
+        }
+
+    @staticmethod
+    def from_dict(d):
+        payload = d or {}
+        data = payload.get("data")
+        return SegmentationVersion(
+            data=None if data is None else np.asarray(data, dtype=np.int16),
+            provenance=copy.deepcopy(payload.get("provenance", {})),
+        )
+
+
+@dataclass
+class SegmentationState:
+    original: SegmentationVersion = field(default_factory=SegmentationVersion)
+    imported: SegmentationVersion = field(default_factory=SegmentationVersion)
+    threshold: SegmentationVersion = field(default_factory=SegmentationVersion)
+    auto: SegmentationVersion = field(default_factory=SegmentationVersion)
+    active_source: str = ""
+    visible: bool = True
+    opacity: float = 0.35
+    active_label: int = 1
+    label_names: Dict[str, str] = field(default_factory=dict)
+    label_colors: Dict[str, str] = field(default_factory=dict)
+    tool: str = "brush"
+    brush_radius: int = 3
+    edit_all_timepoints: bool = True
+    working_labels_3d: Optional[np.ndarray] = None
+    working_labels_4d: Optional[np.ndarray] = None
+    working_source: str = ""
+    dirty: bool = False
+    mode: str = "input"
+    input_source: str = "original"
+    import_path: str = ""
+    threshold_scalar: str = "pcmra"
+    threshold_value: str = "auto"
+    threshold_keep_largest_cc: bool = True
+    threshold_min_component_volume_mm3: float = 0.0
+    threshold_closing: bool = True
+    threshold_opening: bool = False
+    auto_backend: str = "nnUNet"
+    auto_model: str = ""
+    auto_checkpoint: str = ""
+    auto_device: str = "cpu"
+    auto_label_map: str = ""
+
+    def to_dict(self):
+        return {
+            "original": self.original.to_dict(),
+            "imported": self.imported.to_dict(),
+            "threshold": self.threshold.to_dict(),
+            "auto": self.auto.to_dict(),
+            "active_source": self.active_source,
+            "visible": bool(self.visible),
+            "opacity": float(self.opacity),
+            "active_label": int(self.active_label),
+            "label_names": copy.deepcopy(self.label_names),
+            "label_colors": copy.deepcopy(self.label_colors),
+            "tool": self.tool,
+            "brush_radius": int(self.brush_radius),
+            "edit_all_timepoints": bool(self.edit_all_timepoints),
+            "working_labels_3d": None if self.working_labels_3d is None else np.asarray(self.working_labels_3d, dtype=np.int16).tolist(),
+            "working_labels_4d": None if self.working_labels_4d is None else np.asarray(self.working_labels_4d, dtype=np.int16).tolist(),
+            "working_source": self.working_source,
+            "dirty": bool(self.dirty),
+            "mode": self.mode,
+            "input_source": self.input_source,
+            "import_path": self.import_path,
+            "threshold_scalar": self.threshold_scalar,
+            "threshold_value": self.threshold_value,
+            "threshold_keep_largest_cc": bool(self.threshold_keep_largest_cc),
+            "threshold_min_component_volume_mm3": float(self.threshold_min_component_volume_mm3),
+            "threshold_closing": bool(self.threshold_closing),
+            "threshold_opening": bool(self.threshold_opening),
+            "auto_backend": self.auto_backend,
+            "auto_model": self.auto_model,
+            "auto_checkpoint": self.auto_checkpoint,
+            "auto_device": self.auto_device,
+            "auto_label_map": self.auto_label_map,
+        }
+
+    @staticmethod
+    def from_dict(d):
+        payload = d or {}
+        return SegmentationState(
+            original=SegmentationVersion.from_dict(payload.get("original", {})),
+            imported=SegmentationVersion.from_dict(payload.get("imported", {})),
+            threshold=SegmentationVersion.from_dict(payload.get("threshold", {})),
+            auto=SegmentationVersion.from_dict(payload.get("auto", {})),
+            active_source=str(payload.get("active_source", "")),
+            visible=bool(payload.get("visible", True)),
+            opacity=float(payload.get("opacity", 0.35)),
+            active_label=int(payload.get("active_label", 1)),
+            label_names={str(k): str(v) for k, v in dict(payload.get("label_names", {})).items()},
+            label_colors={str(k): str(v) for k, v in dict(payload.get("label_colors", {})).items()},
+            tool=str(payload.get("tool", "brush")),
+            brush_radius=int(payload.get("brush_radius", 3)),
+            edit_all_timepoints=bool(payload.get("edit_all_timepoints", True)),
+            working_labels_3d=None if payload.get("working_labels_3d") is None else np.asarray(payload.get("working_labels_3d"), dtype=np.int16),
+            working_labels_4d=None if payload.get("working_labels_4d") is None else np.asarray(payload.get("working_labels_4d"), dtype=np.int16),
+            working_source=str(payload.get("working_source", "")),
+            dirty=bool(payload.get("dirty", False)),
+            mode=str(payload.get("mode", "input")),
+            input_source=str(payload.get("input_source", "original")),
+            import_path=str(payload.get("import_path", "")),
+            threshold_scalar=str(payload.get("threshold_scalar", "pcmra")),
+            threshold_value=str(payload.get("threshold_value", "auto")),
+            threshold_keep_largest_cc=bool(payload.get("threshold_keep_largest_cc", True)),
+            threshold_min_component_volume_mm3=float(payload.get("threshold_min_component_volume_mm3", 0.0)),
+            threshold_closing=bool(payload.get("threshold_closing", True)),
+            threshold_opening=bool(payload.get("threshold_opening", False)),
+            auto_backend=str(payload.get("auto_backend", "nnUNet")),
+            auto_model=str(payload.get("auto_model", "")),
+            auto_checkpoint=str(payload.get("auto_checkpoint", "")),
+            auto_device=str(payload.get("auto_device", "cpu")),
+            auto_label_map=str(payload.get("auto_label_map", "")),
+        )
+
+
+@dataclass
 class Workspace:
     paths: PathsState = field(default_factory=PathsState)
     pipeline: PipelineFlags = field(default_factory=PipelineFlags)
+    loader_params: LoaderParams = field(default_factory=LoaderParams)
     preprocess_params: PreprocessParams = field(default_factory=PreprocessParams)
     skeleton_params: SkeletonParams = field(default_factory=SkeletonParams)
     plane_gen_params: PlaneGenerationParams = field(default_factory=PlaneGenerationParams)
     streamline_params: StreamlineParams = field(default_factory=StreamlineParams)
     derived_params: DerivedMetricsParams = field(default_factory=DerivedMetricsParams)
     input_state: InputState = field(default_factory=InputState)
+    segmentation: SegmentationState = field(default_factory=SegmentationState)
 
     resolution: np.ndarray = field(default_factory=lambda: np.array([1., 1., 1.]))
     origin: np.ndarray = field(default_factory=lambda: np.array([0., 0., 0.]))
@@ -344,12 +572,100 @@ class Workspace:
     ortho_cursor: np.ndarray = field(default_factory=lambda: np.array([0, 0, 0], dtype=int))
     selected_path_index: int = -1
 
+    def _segmentation_version(self, source):
+        if source not in ("original", "imported", "threshold", "auto"):
+            return None
+        return getattr(self.segmentation, source)
+
     def time_count(self):
         if self.flow_raw is not None and self.flow_raw.ndim == 5:
             return int(self.flow_raw.shape[3])
         if self.segmask_raw is not None and self.segmask_raw.ndim == 4:
             return int(self.segmask_raw.shape[3])
         return 1
+
+    def segmentation_source_names(self):
+        names = []
+        for source in ["original", "imported", "threshold", "auto"]:
+            version = self._segmentation_version(source)
+            if version is not None and version.data is not None:
+                names.append(source)
+        return names
+
+    def get_segmentation_source(self, source):
+        version = self._segmentation_version(source)
+        if version is None or version.data is None:
+            return None
+        return np.asarray(version.data, dtype=np.int16)
+
+    def set_segmentation_source(self, source, data, provenance=None):
+        version = self._segmentation_version(source)
+        if version is None:
+            raise ValueError(f"unknown segmentation source: {source}")
+        version.data = None if data is None else np.asarray(data, dtype=np.int16).copy()
+        version.provenance = copy.deepcopy(provenance or {})
+        if version.data is None and self.segmentation.active_source == source:
+            self.segmentation.active_source = ""
+            self.segmask_raw = None
+
+    def get_active_segmentation(self):
+        if self.segmentation.active_source:
+            data = self.get_segmentation_source(self.segmentation.active_source)
+            if data is not None:
+                return data
+        return None if self.segmask_raw is None else np.asarray(self.segmask_raw, dtype=np.int16)
+
+    def get_active_segmentation_provenance(self):
+        version = self._segmentation_version(self.segmentation.active_source)
+        if version is None:
+            return {}
+        return copy.deepcopy(version.provenance)
+
+    def activate_segmentation_source(self, source):
+        if not source:
+            self.segmentation.active_source = ""
+            self.segmask_raw = None
+            self.clear_working_segmentation()
+            return False
+        data = self.get_segmentation_source(source)
+        if data is None:
+            return False
+        self.segmentation.active_source = str(source)
+        self.segmask_raw = np.asarray(data, dtype=np.int16).copy()
+        self.clear_working_segmentation()
+        return True
+
+    def clear_working_segmentation(self):
+        self.segmentation.working_labels_3d = None
+        self.segmentation.working_labels_4d = None
+        self.segmentation.working_source = ""
+        self.segmentation.dirty = False
+
+    def segmentation_display_4d(self):
+        if self.segmentation.working_labels_4d is not None:
+            return np.asarray(self.segmentation.working_labels_4d, dtype=np.int16)
+        if self.segmentation.working_labels_3d is not None:
+            labels = np.asarray(self.segmentation.working_labels_3d, dtype=np.int16)
+            active = self.get_active_segmentation()
+            nt = int(active.shape[3]) if active is not None and active.ndim == 4 else self.time_count()
+            nt = max(1, nt)
+            return np.repeat(labels[..., None], nt, axis=3).astype(np.int16)
+        active = self.get_active_segmentation()
+        return None if active is None else np.asarray(active, dtype=np.int16)
+
+    def segmentation_display_3d(self):
+        display = self.segmentation_display_4d()
+        if display is None:
+            return None
+        if display.ndim == 3:
+            return np.asarray(display, dtype=np.int16)
+        return np.max(display, axis=3).astype(np.int16)
+
+    def display_unique_labels(self):
+        display = self.segmentation_display_4d()
+        if display is None:
+            return []
+        return sorted(int(x) for x in np.unique(display) if int(x) != 0)
 
     def has_flow(self):
         return self.flow_raw is not None
@@ -395,16 +711,54 @@ class Workspace:
         self.plane_streamline_plane_idx = -1
         self.remove_object_by_data_key("plane_streamlines_live")
 
+    def reset_segmentation_results(self):
+        for attr in [
+            "segmask_labels",
+            "segmask_binary",
+            "segmask_3d",
+            "skeleton_points",
+            "skeleton_mask",
+            "branch_labels",
+        ]:
+            setattr(self, attr, None)
+        self.graph = GraphData()
+        self.centerline_paths = []
+        self.centerline_node_paths = []
+        self.centerline_paths_smooth = []
+        self.path_info = []
+        self.forks = []
+        self.planes = []
+        self.selected_path_index = -1
+        self.pipeline.reset()
+        self.clear_streamlines()
+        self.clear_plane_streamlines()
+        self.derived = DerivedResults()
+        self.remove_object_by_data_key("segmask_pre_surface")
+        self.remove_object_by_data_key("skeleton_points")
+        self.remove_object_by_data_key("skeleton_mask_surface")
+        self.remove_object_by_data_key("segmask_3d_surface")
+        self.remove_object_by_data_key("graph_lines")
+        self.remove_object_by_data_key("fork_markers")
+        self.remove_object_by_data_key("wss_surface_live")
+        self.remove_object_by_data_key("tke_volume")
+        self.remove_object_by_data_key("derived_streamlines_live")
+        self.remove_objects_by_prefix("plane_")
+        self.remove_objects_by_prefix("path_")
+        self.remove_objects_by_prefix("smooth_path_")
+        self.remove_objects_by_prefix("path_arrow_")
+
     def reset_all(self):
         for attr, default in [
             ("paths", PathsState()),
             ("pipeline", PipelineFlags()),
+            ("loader_params", LoaderParams()),
             ("preprocess_params", PreprocessParams()),
             ("skeleton_params", SkeletonParams()),
             ("plane_gen_params", PlaneGenerationParams()),
             ("streamline_params", StreamlineParams()),
             ("derived_params", DerivedMetricsParams()),
             ("input_state", InputState()),
+            ("segmentation", SegmentationState()),
         ]:
             setattr(self, attr, default)
         self.resolution = np.array([1., 1., 1.])
@@ -441,14 +795,18 @@ class Workspace:
             "paths": {"segmask_path": self.paths.segmask_path, "flow_path": self.paths.flow_path,
                       "workspace_path": self.paths.workspace_path, "output_dir": self.paths.output_dir},
             "pipeline": {"completed": dict(self.pipeline.completed), "skipped": dict(self.pipeline.skipped)},
+            "loader_params": self.loader_params.to_dict(),
             "preprocess_params": self.preprocess_params.to_dict(),
             "skeleton_params": self.skeleton_params.to_dict(),
             "plane_gen_params": self.plane_gen_params.to_dict(),
             "streamline_params": self.streamline_params.to_dict(),
             "derived_params": self.derived_params.to_dict(),
             "input_state": self.input_state.to_dict(),
+            "segmentation": self.segmentation.to_dict(),
             "resolution": arr(self.resolution),
             "origin": arr(self.origin),
+            "spatial_order": list(self.spatial_order),
+            "venc_order": list(self.venc_order),
             "venc": arr(self.venc),
             "rr": float(self.rr),
             "segmask_raw": arr(self.segmask_raw),
@@ -490,14 +848,18 @@ class Workspace:
         self.paths = PathsState(**{k: d.get("paths", {}).get(k, "") for k in ["segmask_path", "flow_path", "workspace_path", "output_dir"]})
         self.pipeline = PipelineFlags(completed=dict(d.get("pipeline", {}).get("completed", {})),
                                       skipped=dict(d.get("pipeline", {}).get("skipped", {})))
+        self.loader_params = LoaderParams.from_dict(d.get("loader_params", {}))
         self.preprocess_params = PreprocessParams.from_dict(d.get("preprocess_params", {}))
         self.skeleton_params = SkeletonParams.from_dict(d.get("skeleton_params", {}))
         self.plane_gen_params = PlaneGenerationParams.from_dict(d.get("plane_gen_params", {}))
         self.streamline_params = StreamlineParams.from_dict(d.get("streamline_params", {}))
         self.derived_params = DerivedMetricsParams.from_dict(d.get("derived_params", {}))
         self.input_state = InputState.from_dict(d.get("input_state", {}))
+        self.segmentation = SegmentationState.from_dict(d.get("segmentation", {}))
         self.resolution = np.asarray(d.get("resolution", [1, 1, 1]), dtype=float)
         self.origin = np.array([0.0, 0.0, 0.0], dtype=float)
+        self.spatial_order = [str(x) for x in d.get("spatial_order", ["FH", "AP", "LR"])]
+        self.venc_order = [str(x) for x in d.get("venc_order", ["FH", "AP", "LR"])]
         self.venc = np.asarray(d.get("venc", [1, 1, 1]), dtype=float)
         self.rr = float(d.get("rr", 1000.0))
 
@@ -509,6 +871,10 @@ class Workspace:
         self.segmask_labels = nparr("segmask_labels", np.int16)
         self.segmask_binary = None if d.get("segmask_binary") is None else np.asarray(d["segmask_binary"], dtype=bool)
         self.segmask_3d = None if d.get("segmask_3d") is None else np.asarray(d["segmask_3d"], dtype=bool)
+        if self.segmentation.original.data is None and self.segmask_raw is not None:
+            self.set_segmentation_source("original", self.segmask_raw, provenance={"source": "original"})
+            if not self.segmentation.active_source:
+                self.segmentation.active_source = "original"
         self.mag_raw = nparr("mag_raw")
         self.source_sigma = nparr("source_sigma")
         self.source_tke_array = nparr("source_tke_array")

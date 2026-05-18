@@ -372,7 +372,7 @@ def run_batch():
         print("No supported H5 or DICOM inputs found.")
         return [], ""
 
-    print(f"Found {len(input_cases)} input case(s) to process.")
+    print(f"Found {len(input_cases)} file(s) to process.")
     base_ws = build_base_workspace()
     results = []
     case_out = ""

@@ -1,6 +1,7 @@
 import numpy as np
 from PyQt5 import QtWidgets, QtCore
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib import colors as mcolors
 from matplotlib.figure import Figure
 from scipy.ndimage import map_coordinates
 
@@ -12,6 +13,8 @@ class OrthoViewer(QtWidgets.QWidget):
         self._selected_plane_idx = None
         self._scalar_cbar = None
         self._cache = {}
+        self._segmentation_edit_handler = None
+        self._dragging_segmentation_view = None
         self._build_ui()
 
     def _cached(self, group, key, builder, max_items=24):
@@ -81,6 +84,11 @@ class OrthoViewer(QtWidgets.QWidget):
 
         self.canvas.mpl_connect("scroll_event", self._on_scroll)
         self.canvas.mpl_connect("button_press_event", self._on_click)
+        self.canvas.mpl_connect("motion_notify_event", self._on_motion)
+        self.canvas.mpl_connect("button_release_event", self._on_release)
+
+    def set_segmentation_edit_handler(self, handler):
+        self._segmentation_edit_handler = handler
 
     def _remove_colorbar(self):
         if self._scalar_cbar is not None:
@@ -108,18 +116,53 @@ class OrthoViewer(QtWidgets.QWidget):
     def _on_click(self, event):
         if event.inaxes is None or event.xdata is None or event.ydata is None:
             return
+        mapped = self._event_to_voxel(event)
+        if mapped is None:
+            return
+        view_name, x, y, z = mapped
+        if event.button == 1 and self._segmentation_edit_handler is not None:
+            if self._segmentation_edit_handler(view_name, int(x), int(y), int(z), False):
+                self._dragging_segmentation_view = view_name
+                self._set_cursor(int(x), int(y), int(z))
+                return
+        self._set_cursor(int(x), int(y), int(z))
+
+    def _on_motion(self, event):
+        if self._dragging_segmentation_view is None:
+            return
+        if event.inaxes is None or event.xdata is None or event.ydata is None:
+            return
+        mapped = self._event_to_voxel(event)
+        if mapped is None:
+            return
+        view_name, x, y, z = mapped
+        if view_name != self._dragging_segmentation_view:
+            return
+        if self._segmentation_edit_handler is not None:
+            if self._segmentation_edit_handler(view_name, int(x), int(y), int(z), True):
+                self._set_cursor(int(x), int(y), int(z))
+
+    def _on_release(self, _event):
+        self._dragging_segmentation_view = None
+
+    def _event_to_voxel(self, event):
         shape = self._get_volume_shape()
         if shape is None:
-            return
-        x = int(np.clip(np.round(event.xdata), 0, shape[0] - 1))
-        y = int(np.clip(np.round(event.ydata), 0, max(shape[1], shape[2]) - 1))
+            return None
         cx, cy, cz = self.slider_x.value(), self.slider_y.value(), self.slider_z.value()
         if event.inaxes == self.ax_ax:
-            self._set_cursor(x, int(np.clip(np.round(event.ydata), 0, shape[1] - 1)), cz)
-        elif event.inaxes == self.ax_cor:
-            self._set_cursor(x, cy, int(np.clip(np.round(event.ydata), 0, shape[2] - 1)))
-        elif event.inaxes == self.ax_sag:
-            self._set_cursor(cx, int(np.clip(np.round(event.xdata), 0, shape[1] - 1)), int(np.clip(np.round(event.ydata), 0, shape[2] - 1)))
+            x = int(np.clip(np.round(event.xdata), 0, shape[0] - 1))
+            y = int(np.clip(np.round(event.ydata), 0, shape[1] - 1))
+            return "axial", x, y, cz
+        if event.inaxes == self.ax_cor:
+            x = int(np.clip(np.round(event.xdata), 0, shape[0] - 1))
+            z = int(np.clip(np.round(event.ydata), 0, shape[2] - 1))
+            return "coronal", x, cy, z
+        if event.inaxes == self.ax_sag:
+            y = int(np.clip(np.round(event.xdata), 0, shape[1] - 1))
+            z = int(np.clip(np.round(event.ydata), 0, shape[2] - 1))
+            return "sagittal", cx, y, z
+        return None
 
     def _set_cursor(self, x, y, z):
         self.slider_x.blockSignals(True)
@@ -161,6 +204,9 @@ class OrthoViewer(QtWidgets.QWidget):
             return ws.flow_raw.shape[:3]
         if ws.mag_raw is not None and ws.mag_raw.ndim == 4:
             return ws.mag_raw.shape[:3]
+        display_labels = ws.segmentation_display_4d()
+        if display_labels is not None:
+            return display_labels.shape[:3]
         if ws.segmask_3d is not None:
             return ws.segmask_3d.shape[:3]
         return None
@@ -343,12 +389,57 @@ class OrthoViewer(QtWidgets.QWidget):
 
     def _get_mask_3d(self):
         ws = self.workspace
+        display = ws.segmentation_display_4d()
+        if display is not None:
+            display = np.asarray(display, dtype=np.int16)
+            if display.ndim == 4:
+                t = min(max(0, int(ws.current_t)), max(0, display.shape[3] - 1))
+                return display[..., t]
+            return display
         if ws.segmask_3d is not None:
             return ws.segmask_3d
         if ws.segmask_binary is not None and ws.segmask_binary.ndim == 4:
             key = (id(ws.segmask_binary), tuple(int(x) for x in ws.segmask_binary.shape))
             return self._cached("mask_3d", key, lambda: np.any(ws.segmask_binary, axis=3))
         return None
+
+    def _label_color(self, label_id):
+        palette = [
+            "#ff6b6b", "#4dabf7", "#51cf66", "#ffd43b", "#f783ac",
+            "#74c0fc", "#63e6be", "#ffa94d", "#b197fc", "#a9e34b",
+        ]
+        color = self.workspace.segmentation.label_colors.get(str(int(label_id)), "")
+        if color:
+            return color
+        return palette[(max(1, int(label_id)) - 1) % len(palette)]
+
+    def _draw_segmentation_overlay(self, ax, labels_2d, aspect):
+        seg_state = self.workspace.segmentation
+        if not seg_state.visible:
+            return
+        if labels_2d is None:
+            return
+        labels_2d = np.asarray(labels_2d, dtype=np.int16)
+        if not np.any(labels_2d > 0):
+            return
+        rgba = np.zeros(labels_2d.shape + (4,), dtype=float)
+        alpha = float(np.clip(seg_state.opacity, 0.0, 1.0))
+        for label_id in [int(x) for x in np.unique(labels_2d) if int(x) != 0]:
+            color = mcolors.to_rgba(self._label_color(label_id), alpha=alpha)
+            rgba[labels_2d == label_id, :] = color
+        ax.imshow(rgba, origin="lower", aspect=aspect, interpolation="none")
+        active = int(seg_state.active_label)
+        if active > 0 and np.any(labels_2d == active):
+            try:
+                ax.contour(
+                    (labels_2d == active).astype(float),
+                    levels=[0.5],
+                    colors=[self._label_color(active)],
+                    linewidths=1.0,
+                    origin="lower",
+                )
+            except Exception:
+                pass
 
     def _update_value_label(self, vol, title):
         if vol is None:
@@ -396,7 +487,8 @@ class OrthoViewer(QtWidgets.QWidget):
 
         cx, cy, cz = self.slider_x.value(), self.slider_y.value(), self.slider_z.value()
         vol, title, style = self._get_scalar_slice(t)
-        mask_3d = self._get_mask_3d()
+        labels_3d = self._get_mask_3d()
+        mask_3d = None if labels_3d is None else np.asarray(labels_3d) > 0
         res = self._get_resolution()
 
         for ax in [self.ax_ax, self.ax_cor, self.ax_sag]:
@@ -418,11 +510,8 @@ class OrthoViewer(QtWidgets.QWidget):
             self.ax_ax.axvline(cx, color="lime", linewidth=0.5, alpha=0.5)
             self.ax_ax.plot(cx, cy, "r+", markersize=8, markeredgewidth=1.5)
             self.ax_ax.set_title(f"Axial Z={cz}", color="white", fontsize=8)
-            if mask_3d is not None and cz < mask_3d.shape[2]:
-                try:
-                    self.ax_ax.contour(mask_3d[:, :, cz].astype(float).T, levels=[0.5], colors="cyan", linewidths=0.5, origin="lower")
-                except Exception:
-                    pass
+            if labels_3d is not None and cz < labels_3d.shape[2]:
+                self._draw_segmentation_overlay(self.ax_ax, labels_3d[:, :, cz].T, float(res[1] / res[0]))
 
             coronal = vol[:, cy, :]
             self.ax_cor.imshow(coronal.T, origin="lower", cmap=cmap, vmin=clim[0], vmax=clim[1], aspect=float(res[2] / res[0]))
@@ -430,11 +519,8 @@ class OrthoViewer(QtWidgets.QWidget):
             self.ax_cor.axvline(cx, color="lime", linewidth=0.5, alpha=0.5)
             self.ax_cor.plot(cx, cz, "r+", markersize=8, markeredgewidth=1.5)
             self.ax_cor.set_title(f"Coronal Y={cy}", color="white", fontsize=8)
-            if mask_3d is not None and cy < mask_3d.shape[1]:
-                try:
-                    self.ax_cor.contour(mask_3d[:, cy, :].astype(float).T, levels=[0.5], colors="cyan", linewidths=0.5, origin="lower")
-                except Exception:
-                    pass
+            if labels_3d is not None and cy < labels_3d.shape[1]:
+                self._draw_segmentation_overlay(self.ax_cor, labels_3d[:, cy, :].T, float(res[2] / res[0]))
 
             sagittal = vol[cx, :, :]
             self.ax_sag.imshow(sagittal.T, origin="lower", cmap=cmap, vmin=clim[0], vmax=clim[1], aspect=float(res[2] / res[1]))
@@ -442,11 +528,8 @@ class OrthoViewer(QtWidgets.QWidget):
             self.ax_sag.axvline(cy, color="lime", linewidth=0.5, alpha=0.5)
             self.ax_sag.plot(cy, cz, "r+", markersize=8, markeredgewidth=1.5)
             self.ax_sag.set_title(f"Sagittal X={cx}", color="white", fontsize=8)
-            if mask_3d is not None and cx < mask_3d.shape[0]:
-                try:
-                    self.ax_sag.contour(mask_3d[cx, :, :].astype(float).T, levels=[0.5], colors="cyan", linewidths=0.5, origin="lower")
-                except Exception:
-                    pass
+            if labels_3d is not None and cx < labels_3d.shape[0]:
+                self._draw_segmentation_overlay(self.ax_sag, labels_3d[cx, :, :].T, float(res[2] / res[1]))
 
             if self.combo_content.currentIndex() in (6, 7):
                 self._scalar_cbar = self.fig.colorbar(im, ax=[self.ax_ax, self.ax_cor, self.ax_sag], fraction=0.025, pad=0.01)
@@ -528,7 +611,13 @@ class OrthoViewer(QtWidgets.QWidget):
                 lambda: self._resample_oblique(mask_3d.astype(float), center_vox, normal, half_size=half_size),
             )
             try:
-                self.ax_plane.contour(m_sl.T, levels=[0.5], colors="cyan", linewidths=0.5, origin="lower")
+                self.ax_plane.contour(
+                    m_sl.T,
+                    levels=[0.5],
+                    colors=[self._label_color(self.workspace.segmentation.active_label)],
+                    linewidths=0.7,
+                    origin="lower",
+                )
             except Exception:
                 pass
         metrics = plane.metrics or {}

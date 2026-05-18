@@ -34,6 +34,29 @@ class LoaderCapabilities:
 
 
 @dataclass
+class BackgroundPhaseCorrectionConfig:
+    enabled: bool = True
+    corr_fit_order: int = 3
+    threshold: float = 0.1
+
+    def to_dict(self):
+        return {
+            "enabled": bool(self.enabled),
+            "corr_fit_order": int(self.corr_fit_order),
+            "threshold": float(self.threshold),
+        }
+
+    @staticmethod
+    def from_dict(d):
+        payload = d or {}
+        return BackgroundPhaseCorrectionConfig(
+            enabled=bool(payload.get("enabled", True)),
+            corr_fit_order=int(payload.get("corr_fit_order", 3)),
+            threshold=float(payload.get("threshold", 0.1)),
+        )
+
+
+@dataclass
 class LoadedCase:
     mag: np.ndarray
     flow: np.ndarray

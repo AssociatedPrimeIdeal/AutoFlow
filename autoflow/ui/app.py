@@ -7,16 +7,27 @@ from functools import partial
 
 import numpy as np
 import pyvista as pv
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 from pyvistaqt import QtInteractor
 from pyvista import _vtk
+from scipy.ndimage import label as ndi_label
 
-from ..algorithms import resolve_input_case, scan_dicom_cases
-from ..core.models import ObjectKind, StepId, Workspace
+from ..algorithms import (
+    inspect_dicom_case,
+    resolve_input_case,
+    scan_dicom_cases,
+    load_segmentation_file,
+    generate_threshold_segmentation,
+    save_segmentation_file,
+    segmentation_timestamp,
+)
+from ..core.models import DicomParameterOverrides, ObjectKind, StepId, Workspace
 from ..core.pipeline import PipelineEngine
 from ..algorithms import compute_plane_metrics, apply_internal_consistency_to_metrics, compute_plane_metrics_multithread
 from .editors import PlaneEditor, SkeletonEditor
+from .dicom_confirm import DicomImportDialog
 from .ortho_viewer import OrthoViewer
+from .segmentation import SegmentationConfigDialog, SegmentationDock, SOURCE_LABELS
 from .viewer import SceneController
 
 
@@ -37,6 +48,15 @@ def _parse_path_index(data_key):
         return int(suffix)
     except ValueError:
         return None
+
+
+def _default_segmentation_color(label_id):
+    palette = [
+        "#ff6b6b", "#4dabf7", "#51cf66", "#ffd43b", "#f783ac",
+        "#74c0fc", "#63e6be", "#ffa94d", "#b197fc", "#a9e34b",
+    ]
+    idx = (max(1, int(label_id)) - 1) % len(palette)
+    return palette[idx]
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -80,15 +100,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._plane_widget_initializing = False
         self._plane_drag_metrics_dirty = False
         self._selected_plane_index = -1
+        self._seg_edit_active = False
+        self._seg_edit_history = []
+        self._seg_edit_future = []
+        self._seg_surface_rebuild_timer = QtCore.QTimer(self)
+        self._seg_surface_rebuild_timer.setSingleShot(True)
+        self._seg_surface_rebuild_timer.timeout.connect(self._rebuild_segmentation_surface)
         self._plane_drag_timer = QtCore.QTimer(self)
         self._plane_drag_timer.setSingleShot(True)
         self._plane_drag_timer.timeout.connect(lambda: self._recompute_dragged_plane_metrics(persist=False))
+        self._loader_progress_dialog = None
         self._build_ui()
         self._bind_scene()
         self._esc_shortcut = QtWidgets.QShortcut(QtCore.Qt.Key_Escape, self)
         self._esc_shortcut.setContext(QtCore.Qt.ApplicationShortcut)
         self._esc_shortcut.activated.connect(self._force_exit_edit)
         QtCore.QTimer.singleShot(0, self._setup_focus_behavior)
+        self.ortho_viewer.set_segmentation_edit_handler(self._handle_segmentation_edit)
         self._refresh_all()
 
     def _setup_focus_behavior(self):
@@ -175,6 +203,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_log(log_lay)
         bot_splitter.addWidget(log_w)
         bot_splitter.setSizes([40, 80, 60])
+        self._build_segmentation_dock()
 
     def _build_browser(self, parent):
         grp = QtWidgets.QGroupBox("Browser")
@@ -212,7 +241,30 @@ class MainWindow(QtWidgets.QMainWindow):
         parent.addWidget(grp, 0)
 
     def _build_preprocess_params(self):
-        return
+        grp = QtWidgets.QGroupBox("Input / Background Correction")
+        fl = QtWidgets.QFormLayout(grp)
+        self.chk_bpc_enabled = QtWidgets.QCheckBox()
+        self.chk_bpc_enabled.setChecked(True)
+        self.spin_bpc_fit_order = QtWidgets.QSpinBox()
+        self.spin_bpc_fit_order.setRange(0, 3)
+        self.spin_bpc_fit_order.setValue(3)
+        self.spin_bpc_threshold = QtWidgets.QDoubleSpinBox()
+        self.spin_bpc_threshold.setDecimals(3)
+        self.spin_bpc_threshold.setRange(0.001, 10.0)
+        self.spin_bpc_threshold.setSingleStep(0.01)
+        self.spin_bpc_threshold.setValue(0.1)
+        self.edit_input_resolution = QtWidgets.QLineEdit("1.0, 1.0, 1.0")
+        self.edit_input_venc = QtWidgets.QLineEdit("150.0, 150.0, 150.0")
+        self.edit_input_spatial_order = QtWidgets.QLineEdit("LR, AP, FH")
+        self.edit_input_venc_order = QtWidgets.QLineEdit("LR, AP, FH")
+        fl.addRow("Enable Correction", self.chk_bpc_enabled)
+        fl.addRow("MSAC Corr Fit Order", self.spin_bpc_fit_order)
+        fl.addRow("MSAC Threshold", self.spin_bpc_threshold)
+        fl.addRow("Current Resolution XYZ", self.edit_input_resolution)
+        fl.addRow("Current VENC XYZ", self.edit_input_venc)
+        fl.addRow("Current Spatial Order", self.edit_input_spatial_order)
+        fl.addRow("Current VENC Order", self.edit_input_venc_order)
+        self.params_layout.addWidget(grp)
 
     def _build_skeleton_params(self):
         grp = QtWidgets.QGroupBox("Generate Skeleton Parameters")
@@ -355,6 +407,34 @@ class MainWindow(QtWidgets.QMainWindow):
         ll.addWidget(self.console)
         parent.addWidget(grp)
 
+    def _build_segmentation_dock(self):
+        self.segmentation_dock = QtWidgets.QDockWidget("Segmentation", self)
+        self.segmentation_dock.setObjectName("SegmentationDock")
+        self.segmentation_panel = SegmentationDock(self)
+        self.segmentation_dock.setWidget(self.segmentation_panel)
+        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self.segmentation_dock)
+        self.segmentation_panel.combo_source.currentIndexChanged.connect(self._on_segmentation_source_changed)
+        self.segmentation_panel.check_visible.toggled.connect(self._on_segmentation_visibility_changed)
+        self.segmentation_panel.slider_opacity.valueChanged.connect(self._on_segmentation_opacity_changed)
+        self.segmentation_panel.table_labels.itemSelectionChanged.connect(self._on_segmentation_label_selected)
+        self.segmentation_panel.table_labels.itemChanged.connect(self._on_segmentation_label_item_changed)
+        self.segmentation_panel.spin_active_label.valueChanged.connect(self._on_active_label_changed)
+        self.segmentation_panel.edit_active_name.editingFinished.connect(self._on_active_label_name_changed)
+        self.segmentation_panel.btn_active_color.clicked.connect(self._on_active_label_color_clicked)
+        self.segmentation_panel.chk_edit_all_timepoints.toggled.connect(self._on_segmentation_edit_scope_changed)
+        for tool_name, button in [
+            ("brush", self.segmentation_panel.btn_tool_brush),
+            ("erase", self.segmentation_panel.btn_tool_erase),
+            ("fill", self.segmentation_panel.btn_tool_fill),
+            ("relabel", self.segmentation_panel.btn_tool_relabel),
+        ]:
+            button.clicked.connect(partial(self._set_segmentation_tool, tool_name))
+        self.segmentation_panel.spin_brush_radius.valueChanged.connect(self._on_segmentation_brush_radius_changed)
+        self.segmentation_panel.btn_undo.clicked.connect(self._undo_segmentation_edit)
+        self.segmentation_panel.btn_redo.clicked.connect(self._redo_segmentation_edit)
+        self.segmentation_panel.btn_apply.clicked.connect(self._apply_segmentation_edits)
+        self.segmentation_panel.btn_cancel.clicked.connect(self._cancel_segmentation_edits)
+
     def _build_menu(self):
         mb = self.menuBar()
         mf = mb.addMenu("File")
@@ -373,12 +453,709 @@ class MainWindow(QtWidgets.QMainWindow):
             a = QtWidgets.QAction(label, self)
             a.triggered.connect(slot)
             mv.addAction(a)
+        ms = mb.addMenu("Segmentation")
+        for label, slot in [
+            ("Configure Segmentation...", self._on_configure_segmentation),
+            ("Use Original Segmentation", self._on_use_original_segmentation),
+            ("Import Segmentation...", self._on_import_segmentation),
+            ("Save Active Segmentation...", self._on_save_active_segmentation),
+            ("Reset Active To Original", self._on_reset_active_to_original),
+        ]:
+            a = QtWidgets.QAction(label, self)
+            a.triggered.connect(slot)
+            ms.addAction(a)
 
     def _bind_scene(self):
         self.scene = SceneController(self.plotter, self.workspace, self.log)
         self.scene.initialize()
         self.scene.enable_plane_picking(self._on_3d_plane_picked)
         self.scene.enable_path_picking(self._on_3d_path_picked)
+
+    def _segmentation_object_name(self):
+        source = self.workspace.segmentation.active_source or "active"
+        return f"segmentation ({SOURCE_LABELS.get(source, source.title())})"
+
+    def _ensure_segmentation_label_metadata(self, labels=None):
+        seg = self.workspace.segmentation
+        if labels is None:
+            labels = self.workspace.segmentation_display_3d()
+        if labels is None:
+            return
+        label_values = [int(x) for x in np.unique(labels) if int(x) != 0]
+        for label_id in label_values:
+            key = str(int(label_id))
+            seg.label_names.setdefault(key, f"Label {int(label_id)}")
+            seg.label_colors.setdefault(key, _default_segmentation_color(label_id))
+        if seg.active_label <= 0:
+            seg.active_label = label_values[0] if label_values else 1
+
+    def _has_working_segmentation(self):
+        seg = self.workspace.segmentation
+        return seg.working_labels_3d is not None or seg.working_labels_4d is not None
+
+    def _working_segmentation_array(self):
+        seg = self.workspace.segmentation
+        if seg.working_labels_4d is not None:
+            return seg.working_labels_4d
+        return seg.working_labels_3d
+
+    def _set_working_segmentation_array(self, arr):
+        seg = self.workspace.segmentation
+        if arr is None:
+            seg.working_labels_3d = None
+            seg.working_labels_4d = None
+            return
+        arr = np.asarray(arr, dtype=np.int16)
+        if arr.ndim == 4:
+            seg.working_labels_4d = arr
+            seg.working_labels_3d = None
+        elif arr.ndim == 3:
+            seg.working_labels_3d = arr
+            seg.working_labels_4d = None
+        else:
+            raise ValueError(f"working segmentation must be 3D or 4D, got shape={arr.shape}")
+
+    def _current_working_labels_3d(self):
+        seg = self.workspace.segmentation
+        if seg.working_labels_4d is not None:
+            arr = np.asarray(seg.working_labels_4d, dtype=np.int16)
+            t = min(max(0, int(self.workspace.current_t)), max(0, arr.shape[3] - 1))
+            return arr[..., t]
+        if seg.working_labels_3d is not None:
+            return seg.working_labels_3d
+        return None
+
+    def _segmentation_labels_for_ui(self):
+        seg = self.workspace.segmentation
+        if seg.working_labels_4d is not None:
+            return self._current_working_labels_3d()
+        if not seg.edit_all_timepoints:
+            display = self.workspace.segmentation_display_4d()
+            if display is not None and display.ndim == 4:
+                t = min(max(0, int(self.workspace.current_t)), max(0, display.shape[3] - 1))
+                return np.asarray(display[..., t], dtype=np.int16)
+        return self.workspace.segmentation_display_3d()
+
+    def _sync_segmentation_scene_object(self):
+        ws = self.workspace
+        uid = self._find_uid_by_data_key("segmask_raw_surface")
+        seg = ws.get_active_segmentation()
+        if seg is None:
+            if uid is not None:
+                self.scene.remove_object(uid)
+            return
+        if uid is None:
+            uid = ws.add_object(
+                name=self._segmentation_object_name(),
+                kind=ObjectKind.SEGMENTATION,
+                data_key="segmask_raw_surface",
+                visible=bool(ws.segmentation.visible),
+                opacity=float(ws.segmentation.opacity),
+                scalars="label",
+                cmap="tab10",
+                dynamic=True,
+                show_scalar_bar=True,
+                scalar_bar_title="Label",
+            )
+        obj = ws.scene_objects.get(uid)
+        if obj is None:
+            return
+        obj.name = self._segmentation_object_name()
+        obj.visible = bool(ws.segmentation.visible)
+        obj.opacity = float(ws.segmentation.opacity)
+        obj.scalars = "label"
+        obj.cmap = "tab10"
+        obj.dynamic = True
+        obj.show_scalar_bar = True
+        obj.scalar_bar_title = "Label"
+
+    def _refresh_segmentation_ui(self):
+        panel = self.segmentation_panel
+        ws = self.workspace
+        seg = ws.segmentation
+        self._ensure_segmentation_label_metadata()
+
+        panel.combo_source.blockSignals(True)
+        panel.combo_source.clear()
+        for source in ws.segmentation_source_names():
+            panel.combo_source.addItem(SOURCE_LABELS.get(source, source.title()), source)
+        if seg.active_source:
+            idx = panel.combo_source.findData(seg.active_source)
+            if idx >= 0:
+                panel.combo_source.setCurrentIndex(idx)
+        panel.combo_source.blockSignals(False)
+
+        panel.check_visible.blockSignals(True)
+        panel.check_visible.setChecked(bool(seg.visible))
+        panel.check_visible.blockSignals(False)
+        panel.slider_opacity.blockSignals(True)
+        panel.slider_opacity.setValue(int(round(float(seg.opacity) * 100.0)))
+        panel.slider_opacity.blockSignals(False)
+
+        provenance = ws.get_active_segmentation_provenance()
+        panel.text_provenance.setPlainText(json.dumps(provenance, ensure_ascii=False, indent=2) if provenance else "")
+
+        labels = self._segmentation_labels_for_ui()
+        panel.table_labels.blockSignals(True)
+        panel.table_labels.clearContents()
+        if labels is None:
+            panel.table_labels.setRowCount(0)
+        else:
+            label_values = [int(x) for x in np.unique(labels) if int(x) != 0]
+            panel.table_labels.setRowCount(len(label_values))
+            for row, label_id in enumerate(label_values):
+                key = str(int(label_id))
+                count = int(np.sum(labels == label_id))
+                items = [
+                    QtWidgets.QTableWidgetItem(str(int(label_id))),
+                    QtWidgets.QTableWidgetItem(seg.label_names.get(key, f"Label {label_id}")),
+                    QtWidgets.QTableWidgetItem(str(count)),
+                    QtWidgets.QTableWidgetItem(seg.label_colors.get(key, _default_segmentation_color(label_id))),
+                ]
+                items[0].setFlags(items[0].flags() & ~QtCore.Qt.ItemIsEditable)
+                items[2].setFlags(items[2].flags() & ~QtCore.Qt.ItemIsEditable)
+                items[0].setData(QtCore.Qt.UserRole, int(label_id))
+                for col, item in enumerate(items):
+                    panel.table_labels.setItem(row, col, item)
+                if int(label_id) == int(seg.active_label):
+                    panel.table_labels.selectRow(row)
+        panel.table_labels.blockSignals(False)
+
+        panel.spin_active_label.blockSignals(True)
+        panel.spin_active_label.setValue(max(1, int(seg.active_label)))
+        panel.spin_active_label.blockSignals(False)
+        active_key = str(int(seg.active_label))
+        panel.edit_active_name.blockSignals(True)
+        panel.edit_active_name.setText(seg.label_names.get(active_key, f"Label {seg.active_label}"))
+        panel.edit_active_name.blockSignals(False)
+        color = seg.label_colors.get(active_key, _default_segmentation_color(seg.active_label))
+        panel.btn_active_color.setText(color)
+        panel.btn_active_color.setStyleSheet(f"QPushButton {{ background-color: {color}; color: black; }}")
+        panel.spin_brush_radius.blockSignals(True)
+        panel.spin_brush_radius.setValue(int(seg.brush_radius))
+        panel.spin_brush_radius.blockSignals(False)
+        panel.chk_edit_all_timepoints.blockSignals(True)
+        panel.chk_edit_all_timepoints.setChecked(bool(seg.edit_all_timepoints))
+        panel.chk_edit_all_timepoints.blockSignals(False)
+        for tool_name, button in [
+            ("brush", panel.btn_tool_brush),
+            ("erase", panel.btn_tool_erase),
+            ("fill", panel.btn_tool_fill),
+            ("relabel", panel.btn_tool_relabel),
+        ]:
+            button.blockSignals(True)
+            button.setChecked(seg.tool == tool_name)
+            button.blockSignals(False)
+        panel.btn_undo.setEnabled(bool(self._seg_edit_history))
+        panel.btn_redo.setEnabled(bool(self._seg_edit_future))
+        panel.btn_apply.setEnabled(self._has_working_segmentation())
+        panel.btn_cancel.setEnabled(self._has_working_segmentation())
+        n_labels = 0 if labels is None else len([int(x) for x in np.unique(labels) if int(x) != 0])
+        dirty = "dirty" if seg.dirty else "clean"
+        active_src = seg.active_source or "none"
+        working = seg.working_source or "-"
+        edit_mode = "3D-all-frames" if seg.edit_all_timepoints else f"4D-current-frame t={int(ws.current_t)}"
+        panel.label_status.setText(
+            f"Source: {active_src}   Labels: {n_labels}   State: {dirty}   Working: {working}   Edit: {edit_mode}"
+        )
+
+    def _refresh_segmentation_preview(self):
+        self._ensure_segmentation_label_metadata()
+        self._sync_segmentation_scene_object()
+        self._refresh_segmentation_ui()
+        self.ortho_viewer.refresh()
+        self._seg_surface_rebuild_timer.start(180)
+
+    def _rebuild_segmentation_surface(self):
+        self.scene.invalidate_cache("segmask_raw_surface")
+        self.scene.rebuild_dynamic()
+        self._refresh_scene()
+
+    def _reset_segmentation_edit_history(self):
+        self._seg_edit_history = []
+        self._seg_edit_future = []
+
+    def _push_segmentation_history(self):
+        working = self._working_segmentation_array()
+        if working is None:
+            return
+        self._seg_edit_history.append(np.asarray(working, dtype=np.int16).copy())
+        if len(self._seg_edit_history) > 32:
+            self._seg_edit_history = self._seg_edit_history[-32:]
+        self._seg_edit_future = []
+
+    def _begin_segmentation_edit_session(self):
+        ws = self.workspace
+        if ws.get_active_segmentation() is None:
+            return False
+        if not self._has_working_segmentation():
+            if ws.segmentation.edit_all_timepoints:
+                display = ws.segmentation_display_3d()
+                if display is None:
+                    return False
+                self._set_working_segmentation_array(np.asarray(display, dtype=np.int16).copy())
+            else:
+                display = ws.segmentation_display_4d()
+                if display is None:
+                    return False
+                self._set_working_segmentation_array(np.asarray(display, dtype=np.int16).copy())
+            ws.segmentation.working_source = ws.segmentation.active_source or "imported"
+            ws.segmentation.dirty = False
+            self._seg_edit_active = True
+            self._reset_segmentation_edit_history()
+        return True
+
+    def _commit_segmentation_source_change(self, source, log_message=None):
+        ws = self.workspace
+        if not ws.activate_segmentation_source(source):
+            self.log(f"Segmentation source unavailable: {source}")
+            return False
+        ws.reset_segmentation_results()
+        self._selected_plane_index = -1
+        self.scene.highlight_plane(None)
+        self.scene.highlight_path(None)
+        self.scene.show_forks_for_path(-1)
+        self.ortho_viewer.set_selected_plane(None)
+        self._clear_plane_drag_widgets()
+        self._seg_edit_active = False
+        self._reset_segmentation_edit_history()
+        self._ensure_segmentation_label_metadata(ws.segmentation_display_3d())
+        self._sync_segmentation_scene_object()
+        self.scene.invalidate_cache()
+        self.scene.sync_from_workspace()
+        self._refresh_all()
+        self.ortho_viewer.refresh()
+        if log_message:
+            self.log(log_message)
+        return True
+
+    def _import_segmentation_path(self, path):
+        if self.workspace.segmentation.dirty:
+            self.log("Apply or cancel segmentation edits before importing a new source.")
+            return False
+        if not self.workspace.data_loaded:
+            self.log("Load a case before importing segmentation.")
+            return False
+        try:
+            seg, provenance = load_segmentation_file(
+                path,
+                spatial_shape=self.workspace.flow_raw.shape[:3] if self.workspace.flow_raw is not None else None,
+                time_count=self.workspace.time_count(),
+            )
+        except Exception as e:
+            self.log(f"Import segmentation failed: {type(e).__name__}: {e}")
+            return False
+        self.workspace.segmentation.import_path = str(path)
+        self.workspace.segmentation.input_source = "imported"
+        self.workspace.set_segmentation_source("imported", seg, provenance=provenance)
+        self._ensure_segmentation_label_metadata(np.max(seg, axis=3))
+        return self._commit_segmentation_source_change("imported", f"Imported segmentation: {path}")
+
+    def _default_segmentation_sidecar_path(self, source):
+        base = os.path.splitext(os.path.basename(self.workspace.paths.flow_path or self.workspace.paths.segmask_path or "segmentation"))[0]
+        out_dir = self.workspace.paths.output_dir or os.path.dirname(self.workspace.paths.flow_path or ".") or "."
+        os.makedirs(out_dir, exist_ok=True)
+        return os.path.join(out_dir, f"{base}_{source}_segmentation.h5")
+
+    def _run_threshold_segmentation(self):
+        ws = self.workspace
+        seg_state = ws.segmentation
+        if ws.segmentation.dirty:
+            self.log("Apply or cancel segmentation edits before running threshold segmentation.")
+            return False
+        try:
+            seg, provenance, _scalar, threshold_value = generate_threshold_segmentation(
+                mag=ws.mag_raw,
+                flow=ws.flow_raw,
+                resolution=ws.resolution,
+                time_count=ws.time_count(),
+                scalar_name=seg_state.threshold_scalar,
+                threshold=seg_state.threshold_value,
+                keep_largest_cc=seg_state.threshold_keep_largest_cc,
+                min_component_volume_mm3=seg_state.threshold_min_component_volume_mm3,
+                closing=seg_state.threshold_closing,
+                opening=seg_state.threshold_opening,
+            )
+        except Exception as e:
+            self.log(f"Threshold segmentation failed: {type(e).__name__}: {e}")
+            return False
+        ws.set_segmentation_source("threshold", seg, provenance=provenance)
+        self._ensure_segmentation_label_metadata(np.max(seg, axis=3))
+        self._commit_segmentation_source_change(
+            "threshold",
+            f"Threshold segmentation ready: scalar={seg_state.threshold_scalar} threshold={threshold_value:.6g}",
+        )
+        try:
+            sidecar = self._default_segmentation_sidecar_path("threshold")
+            save_segmentation_file(
+                sidecar,
+                ws.get_active_segmentation(),
+                resolution=ws.resolution,
+                origin=ws.origin,
+                provenance=ws.get_active_segmentation_provenance(),
+            )
+            self.log(f"Threshold segmentation saved: {sidecar}")
+        except Exception as e:
+            self.log(f"Threshold sidecar save failed: {type(e).__name__}: {e}")
+        return True
+
+    def _on_configure_segmentation(self):
+        if not self.workspace.data_loaded:
+            self.log("Load a case before configuring segmentation.")
+            return
+        dlg = SegmentationConfigDialog(self.workspace, self)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        values = dlg.values()
+        seg = self.workspace.segmentation
+        seg.mode = values["mode"]
+        seg.input_source = values["input_source"]
+        seg.import_path = values["import_path"]
+        seg.threshold_scalar = values["threshold_scalar"]
+        seg.threshold_value = values["threshold_value"]
+        seg.threshold_keep_largest_cc = bool(values["threshold_keep_largest_cc"])
+        seg.threshold_closing = bool(values["threshold_closing"])
+        seg.threshold_opening = bool(values["threshold_opening"])
+        seg.threshold_min_component_volume_mm3 = float(values["threshold_min_component_volume_mm3"])
+        seg.auto_backend = values["auto_backend"]
+        seg.auto_model = values["auto_model"]
+        seg.auto_checkpoint = values["auto_checkpoint"]
+        seg.auto_device = values["auto_device"]
+        seg.auto_label_map = values["auto_label_map"]
+        if seg.mode == "input":
+            if seg.input_source == "original":
+                self._on_use_original_segmentation()
+            elif seg.import_path:
+                self._import_segmentation_path(seg.import_path)
+            else:
+                self.log("Input mode requires either original segmentation or an external file.")
+        elif seg.mode == "threshold":
+            self._run_threshold_segmentation()
+        else:
+            self.log("Auto segmentation backend is not implemented in this GUI branch yet.")
+        self._refresh_segmentation_ui()
+
+    def _on_use_original_segmentation(self):
+        if self.workspace.segmentation.dirty:
+            self.log("Apply or cancel segmentation edits before switching back to original segmentation.")
+            return
+        if self.workspace.get_segmentation_source("original") is None:
+            self.log("Original segmentation is not available for this case.")
+            return
+        self.workspace.segmentation.mode = "input"
+        self.workspace.segmentation.input_source = "original"
+        self._commit_segmentation_source_change("original", "Using original segmentation")
+
+    def _on_import_segmentation(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Import Segmentation",
+            self.workspace.segmentation.import_path or "",
+            "Segmentation (*.h5 *.hdf5 *.npy *.npz);;All (*)",
+        )
+        if not path:
+            return
+        self._import_segmentation_path(path)
+
+    def _on_save_active_segmentation(self):
+        seg = self.workspace.segmentation_display_4d()
+        if seg is None:
+            self.log("No active segmentation to save.")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save Active Segmentation",
+            self._default_segmentation_sidecar_path(self.workspace.segmentation.active_source or "active"),
+            "H5 (*.h5 *.hdf5);;NumPy (*.npy);;NPZ (*.npz)",
+        )
+        if not path:
+            return
+        provenance = self.workspace.get_active_segmentation_provenance()
+        if self._has_working_segmentation():
+            provenance = dict(provenance)
+            provenance["saved_from_working_copy"] = True
+            provenance["saved_at"] = segmentation_timestamp()
+        try:
+            save_segmentation_file(path, seg, resolution=self.workspace.resolution, origin=self.workspace.origin, provenance=provenance)
+            self.log(f"Saved segmentation: {path}")
+        except Exception as e:
+            self.log(f"Save segmentation failed: {type(e).__name__}: {e}")
+
+    def _on_reset_active_to_original(self):
+        self._cancel_segmentation_edits()
+        self._on_use_original_segmentation()
+
+    def _on_segmentation_source_changed(self, _index):
+        source = self.segmentation_panel.combo_source.currentData()
+        if not source:
+            return
+        if self.workspace.segmentation.dirty:
+            self.log("Apply or cancel segmentation edits before switching source.")
+            self._refresh_segmentation_ui()
+            return
+        if source == self.workspace.segmentation.active_source:
+            return
+        self._commit_segmentation_source_change(source, f"Switched segmentation source: {source}")
+
+    def _on_segmentation_visibility_changed(self, checked):
+        self.workspace.segmentation.visible = bool(checked)
+        self._sync_segmentation_scene_object()
+        uid = self._find_uid_by_data_key("segmask_raw_surface")
+        if uid is not None:
+            obj = self.workspace.scene_objects.get(uid)
+            if obj is not None:
+                self.scene.apply_object_properties(obj)
+        self.ortho_viewer.refresh()
+
+    def _on_segmentation_opacity_changed(self, value):
+        self.workspace.segmentation.opacity = float(np.clip(value / 100.0, 0.0, 1.0))
+        self._sync_segmentation_scene_object()
+        uid = self._find_uid_by_data_key("segmask_raw_surface")
+        if uid is not None:
+            obj = self.workspace.scene_objects.get(uid)
+            if obj is not None:
+                self.scene.apply_object_properties(obj)
+        self.ortho_viewer.refresh()
+
+    def _on_segmentation_label_selected(self):
+        row = self.segmentation_panel.table_labels.currentRow()
+        if row < 0:
+            return
+        label_item = self.segmentation_panel.table_labels.item(row, 0)
+        if label_item is None:
+            return
+        label_id = label_item.data(QtCore.Qt.UserRole)
+        if label_id is None:
+            return
+        self.workspace.segmentation.active_label = int(label_id)
+        self._refresh_segmentation_ui()
+        self.ortho_viewer.refresh()
+
+    def _on_segmentation_label_item_changed(self, item):
+        if item is None:
+            return
+        row = item.row()
+        label_item = self.segmentation_panel.table_labels.item(row, 0)
+        if label_item is None:
+            return
+        label_id = int(label_item.data(QtCore.Qt.UserRole))
+        key = str(label_id)
+        if item.column() == 1:
+            self.workspace.segmentation.label_names[key] = item.text().strip() or f"Label {label_id}"
+        elif item.column() == 3:
+            self.workspace.segmentation.label_colors[key] = item.text().strip() or _default_segmentation_color(label_id)
+            self.ortho_viewer.refresh()
+        self._refresh_segmentation_ui()
+
+    def _on_active_label_changed(self, value):
+        value = max(1, int(value))
+        self.workspace.segmentation.active_label = value
+        key = str(value)
+        self.workspace.segmentation.label_names.setdefault(key, f"Label {value}")
+        self.workspace.segmentation.label_colors.setdefault(key, _default_segmentation_color(value))
+        self._refresh_segmentation_ui()
+        self.ortho_viewer.refresh()
+
+    def _on_active_label_name_changed(self):
+        value = max(1, int(self.workspace.segmentation.active_label))
+        self.workspace.segmentation.label_names[str(value)] = (
+            self.segmentation_panel.edit_active_name.text().strip() or f"Label {value}"
+        )
+        self._refresh_segmentation_ui()
+
+    def _on_active_label_color_clicked(self):
+        value = max(1, int(self.workspace.segmentation.active_label))
+        current = self.workspace.segmentation.label_colors.get(str(value), _default_segmentation_color(value))
+        color = QtWidgets.QColorDialog.getColor(QtGui.QColor(current), self, "Select Label Color")
+        if not color.isValid():
+            return
+        self.workspace.segmentation.label_colors[str(value)] = color.name()
+        self._refresh_segmentation_ui()
+        self.ortho_viewer.refresh()
+
+    def _set_segmentation_tool(self, tool_name):
+        self.workspace.segmentation.tool = str(tool_name)
+        self._refresh_segmentation_ui()
+
+    def _on_segmentation_brush_radius_changed(self, value):
+        self.workspace.segmentation.brush_radius = max(1, int(value))
+
+    def _on_segmentation_edit_scope_changed(self, checked):
+        if self._has_working_segmentation():
+            self.log("Apply or cancel current segmentation edits before switching 3D/4D edit mode.")
+            self._refresh_segmentation_ui()
+            return
+        self.workspace.segmentation.edit_all_timepoints = bool(checked)
+        self._refresh_segmentation_ui()
+        self.ortho_viewer.refresh()
+
+    def _slice_component_mask(self, arr2d, seed_xy):
+        sx, sy = int(seed_xy[0]), int(seed_xy[1])
+        if not (0 <= sx < arr2d.shape[0] and 0 <= sy < arr2d.shape[1]):
+            return None
+        target = int(arr2d[sx, sy])
+        component_map, _ = ndi_label(arr2d == target)
+        comp_id = int(component_map[sx, sy])
+        if comp_id <= 0:
+            return None
+        return component_map == comp_id
+
+    def _paint_segmentation_brush(self, view_name, x, y, z, value):
+        labels = self._current_working_labels_3d()
+        if labels is None:
+            return False
+        radius = max(1, int(self.workspace.segmentation.brush_radius))
+        changed = False
+        if view_name == "axial":
+            yy, xx = np.ogrid[:labels.shape[1], :labels.shape[0]]
+            mask = (xx - int(x)) ** 2 + (yy - int(y)) ** 2 <= radius ** 2
+            plane = labels[:, :, int(z)]
+            before = plane.copy()
+            plane[mask.T] = int(value)
+            changed = not np.array_equal(before, plane)
+        elif view_name == "coronal":
+            zz, xx = np.ogrid[:labels.shape[2], :labels.shape[0]]
+            mask = (xx - int(x)) ** 2 + (zz - int(z)) ** 2 <= radius ** 2
+            plane = labels[:, int(y), :]
+            before = plane.copy()
+            plane[mask.T] = int(value)
+            changed = not np.array_equal(before, plane)
+        elif view_name == "sagittal":
+            zz, yy = np.ogrid[:labels.shape[2], :labels.shape[1]]
+            mask = (yy - int(y)) ** 2 + (zz - int(z)) ** 2 <= radius ** 2
+            plane = labels[int(x), :, :]
+            before = plane.copy()
+            plane[mask.T] = int(value)
+            changed = not np.array_equal(before, plane)
+        return changed
+
+    def _fill_segmentation_slice(self, view_name, x, y, z, value):
+        labels = self._current_working_labels_3d()
+        if labels is None:
+            return False
+        value = int(value)
+        if view_name == "axial":
+            plane = labels[:, :, int(z)]
+            mask = self._slice_component_mask(plane, (x, y))
+            if mask is None:
+                return False
+            before = plane.copy()
+            plane[mask] = value
+            return not np.array_equal(before, plane)
+        if view_name == "coronal":
+            plane = labels[:, int(y), :]
+            mask = self._slice_component_mask(plane, (x, z))
+            if mask is None:
+                return False
+            before = plane.copy()
+            plane[mask] = value
+            return not np.array_equal(before, plane)
+        if view_name == "sagittal":
+            plane = labels[int(x), :, :]
+            mask = self._slice_component_mask(plane, (y, z))
+            if mask is None:
+                return False
+            before = plane.copy()
+            plane[mask] = value
+            return not np.array_equal(before, plane)
+        return False
+
+    def _relabel_segmentation_component(self, x, y, z, value):
+        labels = self._current_working_labels_3d()
+        if labels is None:
+            return False
+        target = int(labels[int(x), int(y), int(z)])
+        if target <= 0 or target == int(value):
+            return False
+        comp_map, _ = ndi_label(labels == target)
+        comp_id = int(comp_map[int(x), int(y), int(z)])
+        if comp_id <= 0:
+            return False
+        before = labels.copy()
+        labels[comp_map == comp_id] = int(value)
+        return not np.array_equal(before, labels)
+
+    def _handle_segmentation_edit(self, view_name, x, y, z, dragging):
+        if self._edit_mode is not None:
+            return False
+        if not self._begin_segmentation_edit_session():
+            return False
+        tool = self.workspace.segmentation.tool
+        label_value = int(self.workspace.segmentation.active_label)
+        if not dragging:
+            self._push_segmentation_history()
+        changed = False
+        if tool == "brush":
+            changed = self._paint_segmentation_brush(view_name, x, y, z, label_value)
+        elif tool == "erase":
+            changed = self._paint_segmentation_brush(view_name, x, y, z, 0)
+        elif tool == "fill" and not dragging:
+            changed = self._fill_segmentation_slice(view_name, x, y, z, label_value)
+        elif tool == "relabel" and not dragging:
+            changed = self._relabel_segmentation_component(x, y, z, label_value)
+        if changed:
+            self.workspace.segmentation.dirty = True
+            self._ensure_segmentation_label_metadata(self._current_working_labels_3d())
+            self._refresh_segmentation_preview()
+        elif not dragging and self._seg_edit_history:
+            self._seg_edit_history.pop()
+        return changed
+
+    def _undo_segmentation_edit(self):
+        current = self._working_segmentation_array()
+        if not self._seg_edit_history or current is None:
+            return
+        self._seg_edit_future.append(np.asarray(current, dtype=np.int16).copy())
+        self._set_working_segmentation_array(self._seg_edit_history.pop())
+        self.workspace.segmentation.dirty = True
+        self._refresh_segmentation_preview()
+
+    def _redo_segmentation_edit(self):
+        current = self._working_segmentation_array()
+        if not self._seg_edit_future or current is None:
+            return
+        self._seg_edit_history.append(np.asarray(current, dtype=np.int16).copy())
+        self._set_working_segmentation_array(self._seg_edit_future.pop())
+        self.workspace.segmentation.dirty = True
+        self._refresh_segmentation_preview()
+
+    def _apply_segmentation_edits(self):
+        ws = self.workspace
+        working = self._working_segmentation_array()
+        if working is None:
+            return
+        target_source = ws.segmentation.active_source or "imported"
+        if target_source == "original":
+            target_source = "imported"
+        working = np.asarray(working, dtype=np.int16)
+        if working.ndim == 4:
+            seg4d = working.copy()
+            edit_mode = "4d"
+        else:
+            seg4d = np.repeat(working[..., None], max(1, ws.time_count()), axis=3)
+            edit_mode = "3d"
+        provenance = ws.get_active_segmentation_provenance()
+        provenance = dict(provenance)
+        provenance.update(
+            {
+                "source": "manual_edit",
+                "edited_from": ws.segmentation.active_source,
+                "created_at": segmentation_timestamp(),
+                "edit_mode": edit_mode,
+            }
+        )
+        ws.set_segmentation_source(target_source, seg4d, provenance=provenance)
+        ws.clear_working_segmentation()
+        self._seg_edit_active = False
+        self._reset_segmentation_edit_history()
+        self._ensure_segmentation_label_metadata(np.max(seg4d, axis=3))
+        self._commit_segmentation_source_change(target_source, f"Applied segmentation edits to {target_source}")
+
+    def _cancel_segmentation_edits(self):
+        self.workspace.clear_working_segmentation()
+        self._seg_edit_active = False
+        self._reset_segmentation_edit_history()
+        self._refresh_segmentation_preview()
 
     def _on_3d_plane_picked(self, uid, plane_idx):
         if self._edit_mode is not None:
@@ -722,6 +1499,54 @@ class MainWindow(QtWidgets.QMainWindow):
     def log(self, text):
         self.console.append(str(text))
 
+    def _create_progress_dialog(self, title, label_text):
+        dlg = QtWidgets.QProgressDialog(label_text, "", 0, 0, self)
+        dlg.setWindowTitle(str(title))
+        dlg.setWindowModality(QtCore.Qt.WindowModal)
+        dlg.setCancelButton(None)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setValue(0)
+        dlg.show()
+        QtWidgets.QApplication.processEvents()
+        return dlg
+
+    def _make_progress_handler(self, dialog, log_prefix):
+        state = {"last_key": None}
+
+        def _handler(payload):
+            if not isinstance(payload, dict):
+                message = str(payload or "").strip()
+                if message:
+                    dialog.setLabelText(message)
+                    self.log(f"[{log_prefix}] {message}")
+                QtWidgets.QApplication.processEvents()
+                return
+            stage = str(payload.get("stage", "") or "")
+            current = payload.get("current")
+            total = payload.get("total")
+            message = str(payload.get("message", "") or stage or log_prefix)
+            if total is not None and int(total) > 0:
+                dialog.setRange(0, int(total))
+                dialog.setValue(min(int(current or 0), int(total)))
+            else:
+                dialog.setRange(0, 0)
+            dialog.setLabelText(message)
+            should_log = False
+            if stage in {"dicom_scan_done", "background_phase_done", "background_phase_start"}:
+                should_log = True
+            elif stage in {"dicom_scan_file", "dicom_load_file"} and total:
+                step = max(1, int(total) // 10)
+                should_log = int(current or 0) in {1, int(total)} or int(current or 0) % step == 0
+            key = (stage, int(current or 0), int(total or 0), message)
+            if should_log and key != state["last_key"]:
+                self.log(f"[{log_prefix}] {message}")
+                state["last_key"] = key
+            QtWidgets.QApplication.processEvents()
+
+        return _handler
+
     def _float_from_text(self, text, default=0.0):
         try:
             return float(text)
@@ -745,8 +1570,39 @@ class MainWindow(QtWidgets.QMainWindow):
                     pass
         return r
 
+    def _parse_float_list(self, text, default):
+        values = []
+        for tok in str(text or "").replace(";", ",").split(","):
+            tok = tok.strip()
+            if tok:
+                try:
+                    values.append(float(tok))
+                except ValueError:
+                    pass
+        if len(values) == 1:
+            values = values * 3
+        if len(values) >= 3:
+            return np.asarray(values[:3], dtype=float)
+        return np.asarray(default, dtype=float).reshape(3)
+
+    def _parse_label_order(self, text, default):
+        values = [tok.strip().upper() for tok in str(text or "").replace(";", ",").split(",") if tok.strip()]
+        if len(values) >= 3:
+            return values[:3]
+        return [str(x).upper() for x in default]
+
     def _sync_params_to_ws(self):
         ws = self.workspace
+        ws.loader_params.background_phase_correction.enabled = self.chk_bpc_enabled.isChecked()
+        ws.loader_params.background_phase_correction.corr_fit_order = int(self.spin_bpc_fit_order.value())
+        ws.loader_params.background_phase_correction.threshold = float(self.spin_bpc_threshold.value())
+        ws.resolution = self._parse_float_list(self.edit_input_resolution.text(), ws.resolution)
+        ws.venc = self._parse_float_list(self.edit_input_venc.text(), ws.venc if np.asarray(ws.venc).size >= 3 else [150.0, 150.0, 150.0])
+        ws.spatial_order = self._parse_label_order(self.edit_input_spatial_order.text(), ws.spatial_order)
+        ws.venc_order = self._parse_label_order(self.edit_input_venc_order.text(), ws.venc_order)
+        if isinstance(ws.input_state.metadata, dict):
+            ws.input_state.metadata["spatial_order_raw"] = list(ws.spatial_order)
+            ws.input_state.metadata["venc_order_raw"] = list(ws.venc_order)
         ws.skeleton_params.remove_small_cc = self.chk_remove_small_cc.isChecked()
         ws.skeleton_params.min_cc_volume_mm3 = self._float_from_text(self.edit_min_cc_volume.text(), 50.0)
         ws.skeleton_params.do_closing = self.chk_closing.isChecked()
@@ -776,6 +1632,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _sync_params_to_ui(self):
         ws = self.workspace
+        self.chk_bpc_enabled.setChecked(ws.loader_params.background_phase_correction.enabled)
+        self.spin_bpc_fit_order.setValue(int(ws.loader_params.background_phase_correction.corr_fit_order))
+        self.spin_bpc_threshold.setValue(float(ws.loader_params.background_phase_correction.threshold))
+        self.edit_input_resolution.setText(", ".join(f"{float(x):.6g}" for x in np.asarray(ws.resolution, dtype=float).reshape(-1)[:3]))
+        self.edit_input_venc.setText(", ".join(f"{float(x):.6g}" for x in np.asarray(ws.venc, dtype=float).reshape(-1)[:3]))
+        self.edit_input_spatial_order.setText(", ".join(str(x) for x in ws.spatial_order[:3]))
+        self.edit_input_venc_order.setText(", ".join(str(x) for x in ws.venc_order[:3]))
         self.chk_remove_small_cc.setChecked(ws.skeleton_params.remove_small_cc)
         self.edit_min_cc_volume.setText(str(ws.skeleton_params.min_cc_volume_mm3))
         self.chk_closing.setChecked(ws.skeleton_params.do_closing)
@@ -815,10 +1678,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scene.sync_from_workspace()
 
     def _refresh_all(self):
+        self._sync_segmentation_scene_object()
         self._refresh_browser()
         self._refresh_timeline()
         self._sync_params_to_ui()
         self._refresh_selection_info()
+        self._refresh_segmentation_ui()
         self._refresh_scene()
 
     def _refresh_browser(self):
@@ -915,6 +1780,9 @@ class MainWindow(QtWidgets.QMainWindow):
             obj = self.workspace.scene_objects.get(uid)
             if obj:
                 obj.visible = item.checkState(0) == QtCore.Qt.Checked
+                if obj.data_key == "segmask_raw_surface":
+                    self.workspace.segmentation.visible = bool(obj.visible)
+                    self._refresh_segmentation_ui()
                 self.scene.apply_object_properties(obj)
         else:
             checked = item.checkState(0) != QtCore.Qt.Unchecked
@@ -927,8 +1795,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     obj = self.workspace.scene_objects.get(cuid)
                     if obj:
                         obj.visible = checked
+                        if obj.data_key == "segmask_raw_surface":
+                            self.workspace.segmentation.visible = bool(checked)
                         self.scene.apply_object_properties(obj)
             self.tree_objects.blockSignals(False)
+            self._refresh_segmentation_ui()
         self._refresh_scene()
 
     def _on_browser_ctx_menu(self, pos):
@@ -987,7 +1858,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 obj = self.workspace.scene_objects.get(uid)
                 if obj:
                     obj.visible = visible
+                    if obj.data_key == "segmask_raw_surface":
+                        self.workspace.segmentation.visible = bool(visible)
                     self.scene.apply_object_properties(obj)
+        self._refresh_segmentation_ui()
         self._refresh_browser()
         self._refresh_scene()
 
@@ -1052,6 +1926,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lab_t.setText(str(v))
         self.scene.update_time(int(v))
         self.ortho_viewer.refresh()
+        self._refresh_segmentation_ui()
         self._refresh_selection_info()
 
     def _on_prev_frame(self):
@@ -1059,6 +1934,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_timeline()
         self.scene.update_time(self.workspace.current_t)
         self.ortho_viewer.refresh()
+        self._refresh_segmentation_ui()
         self._refresh_selection_info()
 
     def _on_next_frame(self):
@@ -1067,6 +1943,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_timeline()
         self.scene.update_time(self.workspace.current_t)
         self.ortho_viewer.refresh()
+        self._refresh_segmentation_ui()
         self._refresh_selection_info()
 
     def _on_play(self):
@@ -1085,6 +1962,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_timeline()
         self.scene.update_time(self.workspace.current_t)
         self.ortho_viewer.refresh()
+        self._refresh_segmentation_ui()
         self._refresh_selection_info()
 
     def _refresh_scene(self):
@@ -1093,19 +1971,38 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self.log(f"VIEW ERROR: {type(e).__name__}: {e}")
 
-    def _load_selected_input_case(self, case):
+    def _load_selected_input_case(self, case, dicom_parameter_overrides=None):
+        progress_dialog = None
         try:
             if self._edit_mode is not None:
                 self._exit_interactive_edit(False)
             self._clear_plane_drag_widgets()
+            self._seg_surface_rebuild_timer.stop()
+            self._seg_edit_active = False
+            self._reset_segmentation_edit_history()
+            self._sync_params_to_ws()
             self.workspace.reset_all()
+            self._sync_params_to_ws()
             resolved = resolve_input_case(case)
             self.workspace.paths.segmask_path = resolved.input_path
             self.workspace.paths.flow_path = resolved.input_path
             if resolved.input_kind == "dicom":
                 out_name = resolved.output_name or "dicom_case"
                 self.workspace.paths.output_dir = os.path.join(resolved.input_path, f"autoflow_{out_name}")
-            self.pipeline.load_data(self.workspace, self.log, input_source=resolved)
+                self.workspace.loader_params.dicom_parameter_overrides = DicomParameterOverrides.from_dict(
+                    dicom_parameter_overrides or {}
+                )
+                progress_dialog = self._create_progress_dialog("Load DICOM", "Loading DICOM case...")
+                progress_handler = self._make_progress_handler(progress_dialog, "DICOM Load")
+            else:
+                self.workspace.loader_params.dicom_parameter_overrides = DicomParameterOverrides()
+                progress_handler = None
+            self.pipeline.load_data(
+                self.workspace,
+                self.log,
+                input_source=resolved,
+                progress_callback=progress_handler,
+            )
             self.scene.workspace = self.workspace
             self.scene.reset_scene()
             self._refresh_all()
@@ -1115,6 +2012,9 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self.log(f"LOAD ERROR: {type(e).__name__}: {e}")
             self.log(traceback.format_exc())
+        finally:
+            if progress_dialog is not None:
+                progress_dialog.close()
 
     def _on_open_h5(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open H5", "", "H5 (*.h5 *.hdf5);;All (*)")
@@ -1126,33 +2026,43 @@ class MainWindow(QtWidgets.QMainWindow):
         root = QtWidgets.QFileDialog.getExistingDirectory(self, "Import DICOM Directory", "")
         if not root:
             return
+        progress_dialog = self._create_progress_dialog("Scan DICOM", "Scanning DICOM directory...")
         try:
-            cases = scan_dicom_cases(root)
+            cases = scan_dicom_cases(root, progress_callback=self._make_progress_handler(progress_dialog, "DICOM Scan"))
         except Exception as e:
+            progress_dialog.close()
             self.log(f"DICOM SCAN ERROR: {type(e).__name__}: {e}")
             self.log(traceback.format_exc())
             return
+        progress_dialog.close()
         if not cases:
             self.log(f"No supported DICOM 4D flow cases found in: {root}")
             return
-        labels = [case.display_name or case.output_name or case.input_path for case in cases]
-        choice, ok = QtWidgets.QInputDialog.getItem(
-            self,
-            "Select DICOM Case",
-            "Scanned cases:",
-            labels,
-            0,
-            False,
-        )
-        if not ok or not choice:
+        dialog = DicomImportDialog(cases, self._inspect_dicom_case_preview, self)
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
             return
-        selected = cases[labels.index(choice)]
-        self._load_selected_input_case(selected)
+        selected = dialog.selected_case()
+        if selected is None:
+            return
+        self._load_selected_input_case(selected, dicom_parameter_overrides=dialog.parameter_overrides())
+
+    def _inspect_dicom_case_preview(self, case):
+        progress_dialog = self._create_progress_dialog("Inspect DICOM", "Reading DICOM load parameters...")
+        try:
+            return inspect_dicom_case(
+                case,
+                progress_callback=self._make_progress_handler(progress_dialog, "DICOM Preview"),
+            )
+        finally:
+            progress_dialog.close()
 
     def _on_close_workspace(self):
         if self._edit_mode is not None:
             self._exit_interactive_edit(False)
         self._clear_plane_drag_widgets()
+        self._seg_surface_rebuild_timer.stop()
+        self._seg_edit_active = False
+        self._reset_segmentation_edit_history()
         self.workspace.reset_all()
         self._selected_plane_index = -1
         self.scene.reset_scene()

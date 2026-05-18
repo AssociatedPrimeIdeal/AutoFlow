@@ -13,6 +13,7 @@ from ..algorithms import (
     compute_plane_metrics, compute_derived_metrics,
     compute_plane_metrics_multithread,
     generate_seed_points,
+    segmentation_timestamp,
 )
 
 
@@ -55,18 +56,49 @@ class PipelineEngine:
             return [self._json_safe(v) for v in obj]
         return obj
 
-    def load_data(self, ws, log, input_source=None):
+    def load_data(self, ws, log, input_source=None, progress_callback=None):
         path = ws.paths.segmask_path or ws.paths.flow_path
         if input_source is None and not path:
             raise ValueError("data path is empty")
-        data = load_input_data(path if input_source is None else input_source)
+        load_target = path if input_source is None else input_source
+        load_kwargs = {
+            "correction_config": ws.loader_params.background_phase_correction,
+        }
+        dicom_overrides = ws.loader_params.dicom_parameter_overrides.to_loader_kwargs()
+        if dicom_overrides:
+            load_kwargs["parameter_overrides"] = dicom_overrides
+        load_kwargs["dicom_read_workers"] = int(getattr(ws.loader_params, "dicom_read_workers", 1) or 1)
+        if progress_callback is not None:
+            load_kwargs["progress_callback"] = progress_callback
+        try:
+            data = load_input_data(load_target, **load_kwargs)
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            data = load_input_data(load_target)
         flow = np.asarray(data.flow, dtype=np.float32)
         mag = np.asarray(data.mag, dtype=np.float32)
         seg = None if data.segmentation is None else np.asarray(data.segmentation, dtype=np.int16)
 
-        ws.segmask_raw = seg
+        ws.segmentation = ws.segmentation.__class__()
+        ws.segmask_raw = None
+        if seg is not None:
+            ws.set_segmentation_source(
+                "original",
+                seg,
+                provenance={
+                    "source": "original",
+                    "source_format": str(data.source_format or ""),
+                    "source_group": data.source_group,
+                    "created_at": segmentation_timestamp(),
+                    "metadata": dict(data.metadata or {}),
+                },
+            )
+            ws.activate_segmentation_source("original")
         ws.resolution = np.asarray(data.resolution, dtype=float).reshape(3)
         ws.origin = np.asarray(data.origin, dtype=float).reshape(3)
+        ws.spatial_order = [str(x) for x in dict(data.metadata or {}).get("spatial_order_raw", ["LR", "AP", "FH"])]
+        ws.venc_order = [str(x) for x in dict(data.metadata or {}).get("venc_order_raw", ["LR", "AP", "FH"])]
         ws.venc = np.asarray(data.venc, dtype=float).reshape(-1)
         ws.rr = float(data.rr)
         ws.current_t = 0
@@ -99,6 +131,17 @@ class PipelineEngine:
         msg = f"Loaded: segmask={seg_desc} rr={ws.rr}"
         msg += f" flow={ws.flow_raw.shape} mag={ws.mag_raw.shape}"
         msg += f" origin={ws.origin.tolist()}"
+        msg += f" resolution={np.asarray(ws.resolution, dtype=float).reshape(-1)[:3].tolist()}"
+        msg += f" venc={np.asarray(ws.venc, dtype=float).reshape(-1)[:3].tolist()}"
+        msg += f" spatial_order={list(ws.spatial_order[:3])}"
+        msg += f" venc_order={list(ws.venc_order[:3])}"
+        corr_meta = ws.input_state.metadata.get("background_phase_correction", {})
+        if isinstance(corr_meta, dict):
+            if corr_meta.get("applied"):
+                msg += " bpc=applied"
+            elif corr_meta.get("enabled"):
+                reason = str(corr_meta.get("skipped_reason", "") or "skipped")
+                msg += f" bpc={reason}"
         msg += f" caps={ws.input_state.capabilities.to_dict()}"
         log(msg)
         return msg

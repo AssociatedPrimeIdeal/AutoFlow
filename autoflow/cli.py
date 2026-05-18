@@ -12,7 +12,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-derived", action="store_true", help="Skip WSS/TKE derived metrics.")
     parser.add_argument("--skip-plane-metrics", action="store_true", help="Skip plane metric export.")
     parser.add_argument("--single-thread", dest="use_multithread", action="store_false", help="Disable multithreaded plane metric calculation.")
+    parser.add_argument("--no-background-phase-correction", dest="background_phase_correction", action="store_false", help="Disable background phase offset correction during loading.")
+    parser.add_argument("--background-phase-fit-order", type=int, default=3, help="Polynomial fit order used by MSAC background phase correction.")
+    parser.add_argument("--background-phase-threshold", type=float, default=0.1, help="MSAC threshold in venc units for background phase correction.")
+    parser.add_argument("--dicom-read-workers", type=int, default=1, help="Worker count for direct DICOM loading; use 0 to pick an automatic thread count.")
     parser.set_defaults(use_multithread=True)
+    parser.set_defaults(background_phase_correction=True)
 
     parser.add_argument("--plane-by-distance", dest="use_center_plane", action="store_false", help="Generate evenly spaced planes instead of a single center plane.")
     parser.add_argument("--cross-section-dist", type=float, default=5.0, help="Plane spacing in mm when using distance mode.")
@@ -63,6 +68,10 @@ def main() -> None:
         skip_plane_metrics=args.skip_plane_metrics,
         use_multithread=args.use_multithread,
         reuse_planes=args.reuse_planes,
+        background_phase_correction=args.background_phase_correction,
+        background_phase_corr_fit_order=args.background_phase_fit_order,
+        background_phase_threshold=args.background_phase_threshold,
+        dicom_read_workers=args.dicom_read_workers,
         use_center_plane=args.use_center_plane,
         cross_section_dist=args.cross_section_dist,
         start_dist=args.start_dist,

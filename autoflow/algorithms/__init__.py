@@ -21,9 +21,16 @@ from .data import (
     _reorient_component_abs,
     load_h5_data,
 )
+from .phase_correction import (
+    apply_background_phase_correction_to_complex,
+    apply_background_phase_correction_to_mag_flow,
+    background_phase_report_for_metadata,
+    coerce_background_phase_correction_config,
+)
 
 from .dicom import (
     collect_input_cases,
+    inspect_dicom_case,
     load_dicom_case,
     load_input_data,
     resolve_input_case,
@@ -90,6 +97,17 @@ from .surfaces import (
     create_uniform_vector,
 )
 
+from .segmentation import (
+    segmentation_timestamp,
+    collapse_segmentation_to_3d,
+    broadcast_segmentation_to_time,
+    normalize_segmentation_volume,
+    load_segmentation_file,
+    compute_reference_scalar,
+    generate_threshold_segmentation,
+    save_segmentation_file,
+)
+
 from .streamlines import (
     generate_seed_points,
     generate_streamlines_at_t,
@@ -118,11 +136,16 @@ __all__ = [
     "LoaderCapabilities",
     "reorient",
     "load_h5_data",
+    "apply_background_phase_correction_to_complex",
+    "apply_background_phase_correction_to_mag_flow",
+    "background_phase_report_for_metadata",
+    "coerce_background_phase_correction_config",
     "load_input_data",
     "load_dicom_case",
     "resolve_input_case",
     "scan_dicom_cases",
     "collect_input_cases",
+    "inspect_dicom_case",
     "normalize_loaded_case",
     "filter_segmask_labels",
     "binarize_segmask",
@@ -145,6 +168,14 @@ __all__ = [
     "build_multilabel_surface_t",
     "build_binary_surface_t",
     "build_surface_from_mask3d",
+    "segmentation_timestamp",
+    "collapse_segmentation_to_3d",
+    "broadcast_segmentation_to_time",
+    "normalize_segmentation_volume",
+    "load_segmentation_file",
+    "compute_reference_scalar",
+    "generate_threshold_segmentation",
+    "save_segmentation_file",
     "extract_plane_cross_section",
     "create_vector_volume_from_flow",
     "create_uniform_grid",

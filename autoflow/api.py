@@ -48,6 +48,10 @@ class AutoFlowConfig:
     skip_plane_metrics: bool = False
     use_multithread: bool = True
     reuse_planes: str = ""
+    background_phase_correction: bool = True
+    background_phase_corr_fit_order: int = 3
+    background_phase_threshold: float = 0.1
+    dicom_read_workers: int = 1
 
     use_center_plane: bool = True
     cross_section_dist: float = 5.0
@@ -88,6 +92,10 @@ class AutoFlowConfig:
 def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
     cfg = config or AutoFlowConfig()
     ws = Workspace()
+    ws.loader_params.background_phase_correction.enabled = bool(cfg.background_phase_correction)
+    ws.loader_params.background_phase_correction.corr_fit_order = int(cfg.background_phase_corr_fit_order)
+    ws.loader_params.background_phase_correction.threshold = float(cfg.background_phase_threshold)
+    ws.loader_params.dicom_read_workers = int(cfg.dicom_read_workers)
     ws.plane_gen_params.use_center_plane = bool(cfg.use_center_plane)
     ws.plane_gen_params.cross_section_distance = float(cfg.cross_section_dist)
     ws.plane_gen_params.start_distance = float(cfg.start_dist)
@@ -159,7 +167,7 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
         print("No supported H5 or DICOM inputs found.")
         return [], ""
 
-    print(f"Found {len(input_cases)} input case(s) to process.")
+    print(f"Found {len(input_cases)} file(s) to process.")
     base_ws = build_workspace(config)
     results: List[Dict[str, Any]] = []
     last_case_out = ""
@@ -183,6 +191,10 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 skip_plane_metrics=config.skip_plane_metrics,
                 use_multithread=config.use_multithread,
                 reuse_planes=reuse_file,
+                background_phase_correction=config.background_phase_correction,
+                background_phase_corr_fit_order=config.background_phase_corr_fit_order,
+                background_phase_threshold=config.background_phase_threshold,
+                dicom_read_workers=config.dicom_read_workers,
                 use_center_plane=config.use_center_plane,
                 cross_section_dist=config.cross_section_dist,
                 start_dist=config.start_dist,

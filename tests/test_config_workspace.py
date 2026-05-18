@@ -12,6 +12,7 @@ def test_autoflow_config_defaults_cover_workspace_and_rendering_contract():
     assert cfg.skip_plane_metrics is False
     assert cfg.use_multithread is True
     assert cfg.reuse_planes == ""
+    assert cfg.dicom_read_workers == 1
 
     assert cfg.use_center_plane is True
     assert cfg.cross_section_dist == 5.0
@@ -82,6 +83,7 @@ def test_build_workspace_maps_default_config_values():
         "rng_seed": 0,
     }
     assert getattr(ws.streamline_params, "tube_radius") == 0.05
+    assert ws.loader_params.dicom_read_workers == 1
 
 
 def test_build_workspace_maps_custom_plane_generation_parameters():
@@ -111,6 +113,7 @@ def test_build_workspace_maps_skeleton_and_streamline_parameters():
         min_cc_volume=42.0,
         seed_ratio=0.03,
         tube_radius=0.12,
+        dicom_read_workers=5,
     )
 
     ws = build_workspace(config)
@@ -131,6 +134,7 @@ def test_build_workspace_maps_skeleton_and_streamline_parameters():
         "rng_seed": 0,
     }
     assert getattr(ws.streamline_params, "tube_radius") == 0.12
+    assert ws.loader_params.dicom_read_workers == 5
 
 
 def test_run_case_forwards_rendering_defaults_to_process_single(monkeypatch, tmp_path):

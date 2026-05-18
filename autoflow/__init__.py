@@ -6,7 +6,7 @@ __all__ = [
     "launch_gui",
 ]
 
-__version__ = "0.1.0"
+__version__ = "2.0.0"
 
 
 def __getattr__(name):

@@ -9,6 +9,7 @@ __pycache__/
 # Local data and generated outputs
 /111/
 /results/
+/dicom/
 /@eaDir/
 Thumbs.db
 .DS_Store
@@ -20,6 +21,7 @@ Thumbs.db
 
 TODO.md
 GIT_COMMANDS.local.md
+AGENTS.md
 app.png
 autoflow_mri.egg-info/
 build/

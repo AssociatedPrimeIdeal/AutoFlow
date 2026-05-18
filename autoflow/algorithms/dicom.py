@@ -1,11 +1,22 @@
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from ..case_types import InputCase, LoadedCase, LoaderCapabilities
-from .data import _axis_pair, load_h5_data, normalize_loaded_case, reorient
+from .data import (
+    _axis_pair,
+    load_h5_data,
+    normalize_loaded_case,
+    reorient,
+)
+from .phase_correction import (
+    apply_background_phase_correction_to_mag_flow,
+    background_phase_report_for_metadata,
+    coerce_background_phase_correction_config,
+)
 
 _H5_SUFFIXES = (".h5", ".hdf5")
 _DIR_TOKEN_RE = re.compile(r"(?<![A-Z])(RL|LR|AP|PA|HF|FH|SI|IS|RO|PE|SS)(?![A-Z])")
@@ -238,6 +249,65 @@ def _extract_multiframe_venc(ds):
             if value is not None:
                 return abs(value)
     return None
+
+
+def _coerce_dicom_read_workers(dicom_read_workers, total):
+    total = int(total or 0)
+    if total <= 1:
+        return 1
+    try:
+        requested = 1 if dicom_read_workers is None else int(dicom_read_workers)
+    except Exception:
+        requested = 1
+    if requested < 0:
+        requested = 1
+    if requested == 0:
+        if total < 8:
+            return 1
+        cpu_count = max(1, int(os.cpu_count() or 1))
+        requested = min(total, cpu_count, 8)
+    return max(1, min(total, requested))
+
+
+def _emit_dicom_progress(progress_callback, stage, current, total, path, message_prefix):
+    if progress_callback is None:
+        return
+    try:
+        progress_callback(
+            {
+                "stage": stage,
+                "current": int(current),
+                "total": int(total),
+                "message": f"{message_prefix}: {os.path.basename(path)}",
+            }
+        )
+    except Exception:
+        pass
+
+
+def _map_dicom_entries(
+    entries,
+    worker,
+    progress_callback=None,
+    stage="dicom_load_file",
+    message_prefix="Loading DICOM pixels",
+    dicom_read_workers=1,
+):
+    total = len(entries)
+    actual_workers = _coerce_dicom_read_workers(dicom_read_workers, total)
+    results = []
+    if actual_workers <= 1:
+        for index, entry in enumerate(entries, start=1):
+            _emit_dicom_progress(progress_callback, stage, index, total, entry["path"], message_prefix)
+            results.append(worker(entry))
+        return results, actual_workers
+
+    with ThreadPoolExecutor(max_workers=actual_workers) as pool:
+        for index, result in enumerate(pool.map(worker, entries), start=1):
+            entry = entries[index - 1]
+            _emit_dicom_progress(progress_callback, stage, index, total, entry["path"], message_prefix)
+            results.append(result)
+    return results, actual_workers
 
 
 def _label_from_axis_role(ds, role):
@@ -484,14 +554,28 @@ def _collect_h5_files_from_dir(root):
     return sorted(matches)
 
 
-def scan_dicom_cases(root):
+def scan_dicom_cases(root, progress_callback=None):
     root = os.path.abspath(root)
     if not os.path.isdir(root):
         raise ValueError(f"not a directory: {root}")
     pydicom = _import_pydicom()
     grouped = {}
+    paths = list(_iter_candidate_dicom_files(root))
+    total = len(paths)
 
-    for path in _iter_candidate_dicom_files(root):
+    for index, path in enumerate(paths, start=1):
+        if progress_callback is not None:
+            try:
+                progress_callback(
+                    {
+                        "stage": "dicom_scan_file",
+                        "current": int(index),
+                        "total": int(total),
+                        "message": f"Scanning DICOM headers: {os.path.basename(path)}",
+                    }
+                )
+            except Exception:
+                pass
         try:
             ds = pydicom.dcmread(path, stop_before_pixels=True, force=True)
         except Exception:
@@ -536,6 +620,19 @@ def scan_dicom_cases(root):
                 },
             )
         )
+
+    if progress_callback is not None:
+        try:
+            progress_callback(
+                {
+                    "stage": "dicom_scan_done",
+                    "current": int(total),
+                    "total": int(total),
+                    "message": f"Found {len(cases)} DICOM case(s)",
+                }
+            )
+        except Exception:
+            pass
 
     return sorted(cases, key=lambda case: case.display_name.lower())
 
@@ -675,11 +772,177 @@ def _default_venc(value):
     return 150.0 if value is None else abs(value)
 
 
-def _finalize_loaded_dicom_case(case, entries, mag_rczt, flow_rczt3, component_labels, axis_dirs, axis_spacings, venc_map, rr):
+def _coerce_float_triplet(value, default):
+    arr = np.asarray(default, dtype=float).reshape(-1)
+    if value is None:
+        return np.asarray(arr[:3], dtype=float)
+    try:
+        raw = np.asarray(value, dtype=float).reshape(-1)
+    except Exception:
+        return np.asarray(arr[:3], dtype=float)
+    if raw.size == 1:
+        raw = np.repeat(raw, 3)
+    if raw.size < 3:
+        return np.asarray(arr[:3], dtype=float)
+    return np.asarray(raw[:3], dtype=float)
+
+
+def _coerce_label_triplet(value, default):
+    labels = [str(x).upper() for x in list(default)[:3]]
+    if value is None:
+        return labels
+    raw = [str(x).strip().upper() for x in value]
+    if len(raw) < 3:
+        return labels
+    return raw[:3]
+
+
+def _resolve_dicom_entries(case):
+    if not isinstance(case, InputCase):
+        case = resolve_input_case(case)
+    if case.input_kind != "dicom":
+        raise ValueError(f"not a DICOM case: {case.input_kind}")
+    entries = list(case.metadata.get("dicom_entries", []))
+    if not entries:
+        resolved = resolve_input_case(case.input_path)
+        entries = list(resolved.metadata.get("dicom_entries", []))
+        if case.source_group:
+            entries = [entry for entry in entries if entry.get("case_id") == case.source_group]
+    if not entries:
+        raise ValueError(f"empty DICOM case: {case.input_path}")
+    return case, entries
+
+
+def _estimate_entry_venc(ds, entry, group_kind):
+    label = entry.get("component_label")
+    if entry.get("is_magnitude", False) or not label:
+        return None
+    manufacturer = str(entry.get("manufacturer", "") or "").lower()
+    if group_kind == 0:
+        if "siemens" in manufacturer:
+            return _extract_venc_from_text(getattr(ds, "SequenceName", ""))
+        if "philips" in manufacturer:
+            intercept = _safe_float(getattr(ds, "RescaleIntercept", None), default=0.0)
+            return abs(intercept) if intercept is not None and abs(intercept) > 1e-12 else _extract_first_number(getattr(ds, "ProtocolName", ""))
+        if "ge" in manufacturer:
+            try:
+                venc = _safe_float(ds[0x0019, 0x10CC].value, default=None)
+                return None if venc is None else venc / 10.0
+            except Exception:
+                return None
+        if "uih" in manufacturer:
+            return _extract_venc_from_text(getattr(ds, "SeriesDescription", ""))
+        return _extract_first_number(_header_text(ds))
+    return _extract_multiframe_venc(ds)
+
+
+def inspect_dicom_case(case, progress_callback=None):
+    case, entries = _resolve_dicom_entries(case)
+    pydicom = _import_pydicom()
+    group_kind = int(case.metadata.get("group_kind", 0))
+    rr_values = []
+    venc_map = {}
+    slice_keys = []
+    axis0 = axis1 = axis2 = None
+    row_spacing = col_spacing = thickness = None
+    total = len(entries)
+
+    for index, entry in enumerate(entries, start=1):
+        if progress_callback is not None:
+            try:
+                progress_callback(
+                    {
+                        "stage": "dicom_inspect_file",
+                        "current": int(index),
+                        "total": int(total),
+                        "message": f"Inspecting DICOM parameters: {os.path.basename(entry['path'])}",
+                    }
+                )
+            except Exception:
+                pass
+        ds = pydicom.dcmread(entry["path"], stop_before_pixels=True, force=True)
+        rr = _extract_rr_ms(ds)
+        if rr is not None:
+            rr_values.append(rr)
+        venc = _estimate_entry_venc(ds, entry, group_kind)
+        label = entry.get("component_label")
+        if label and venc is not None:
+            venc_map[label] = venc
+        a0, a1, a2 = _extract_row_col_slice_dirs(ds)
+        if a2 is not None:
+            axis0, axis1, axis2 = a0, a1, a2
+        sp0, sp1, thick = _extract_pixel_measures(ds)
+        row_spacing = sp0 if sp0 is not None else row_spacing
+        col_spacing = sp1 if sp1 is not None else col_spacing
+        thickness = thick if thick is not None else thickness
+        if axis2 is not None:
+            if group_kind == 0:
+                slice_keys.append(_extract_slice_key(ds, axis2))
+            elif group_kind == 1:
+                frame_content = getattr(getattr(ds, "PerFrameFunctionalGroupsSequence", None), "__getitem__", lambda _x: None)
+                try:
+                    last_fg = ds.PerFrameFunctionalGroupsSequence[-1]
+                    fc = getattr(last_fg, "FrameContentSequence", None)
+                    if fc and hasattr(fc[0], "InStackPositionNumber"):
+                        slice_keys.append(float(_safe_float(fc[0].InStackPositionNumber, default=0.0) or 0.0))
+                except Exception:
+                    slice_keys.append(_extract_slice_key(ds, axis2))
+
+    if axis2 is None:
+        raise ValueError("ImageOrientationPatient is required for direct DICOM loading")
+
+    component_labels = _component_label_order([entry["component_label"] for entry in entries if entry.get("component_label")])
+    slice_spacing = _slice_spacing_from_keys(slice_keys, thickness)
+    _dummy, spatial_order, resolution = _reorder_row_col_slice_to_xyz(
+        np.zeros((1, 1, 1), dtype=np.float32),
+        (axis0, axis1, axis2),
+        (
+            1.0 if row_spacing is None else float(row_spacing),
+            1.0 if col_spacing is None else float(col_spacing),
+            float(slice_spacing) if group_kind in (0, 1) else (1.0 if thickness is None else float(thickness)),
+        ),
+    )
+    raw_venc = np.asarray([_default_venc(venc_map.get(label)) for label in component_labels], dtype=float)
+    preview = {
+        "resolution": np.asarray(resolution, dtype=float).reshape(3).tolist(),
+        "venc": raw_venc.reshape(3).tolist(),
+        "spatial_order": list(spatial_order),
+        "venc_order": list(component_labels),
+        "rr": float(rr_values[0]) if rr_values else 1000.0,
+        "display_name": case.display_name,
+        "file_count": int(len(entries)),
+        "group_kind": group_kind,
+    }
+    return preview
+
+
+def _finalize_loaded_dicom_case(
+    case,
+    entries,
+    mag_rczt,
+    flow_rczt3,
+    component_labels,
+    axis_dirs,
+    axis_spacings,
+    venc_map,
+    rr,
+    correction_config=None,
+    progress_callback=None,
+    parameter_overrides=None,
+    dicom_read_workers=1,
+):
     mag_xyz, spatial_order, resolution = _reorder_row_col_slice_to_xyz(mag_rczt, axis_dirs, axis_spacings)
     flow_xyz, _, _ = _reorder_row_col_slice_to_xyz(flow_rczt3, axis_dirs, axis_spacings)
+    overrides = dict(parameter_overrides or {})
+    spatial_order = _coerce_label_triplet(overrides.get("spatial_order"), spatial_order)
+    resolution = _coerce_float_triplet(overrides.get("resolution"), resolution)
+    component_labels = _coerce_label_triplet(overrides.get("venc_order"), component_labels)
     zero_seg = np.zeros(mag_xyz.shape, dtype=np.int16)
-    raw_venc = np.asarray([_default_venc(venc_map.get(label)) for label in component_labels], dtype=float)
+    raw_venc = _coerce_float_triplet(
+        overrides.get("venc"),
+        [_default_venc(venc_map.get(label)) for label in component_labels],
+    )
+    rr_value = _safe_float(overrides.get("rr"), default=rr)
     flow_out, mag_out, _, venc_out, resolution_out = reorient(
         mag_xyz,
         flow_xyz,
@@ -692,6 +955,14 @@ def _finalize_loaded_dicom_case(case, entries, mag_rczt, flow_rczt3, component_l
         target_venc_order=("LR", "AP", "FH"),
         return_velocity=False,
     )
+    cfg = coerce_background_phase_correction_config(correction_config)
+    flow_corr, _stationary_mask, corr_report = apply_background_phase_correction_to_mag_flow(
+        mag_out,
+        flow_out,
+        venc_out,
+        config=cfg,
+        progress_callback=progress_callback,
+    )
     meta = {
         "manufacturer": case.metadata.get("manufacturer", ""),
         "series_description": case.metadata.get("series_description", ""),
@@ -701,15 +972,18 @@ def _finalize_loaded_dicom_case(case, entries, mag_rczt, flow_rczt3, component_l
         "file_count": len(entries),
         "spatial_order_raw": list(spatial_order),
         "venc_order_raw": list(component_labels),
+        "dicom_read_workers": int(dicom_read_workers),
+        "background_phase_correction": background_phase_report_for_metadata(corr_report),
+        "dicom_parameter_overrides": dict(overrides),
     }
     return normalize_loaded_case(
-        flow=flow_out,
+        flow=flow_corr,
         mag=mag_out,
         segmentation=None,
         resolution=resolution_out,
         origin=np.zeros(3, dtype=float),
         venc=venc_out,
-        rr=1000.0 if rr is None else float(rr),
+        rr=1000.0 if rr_value is None else float(rr_value),
         metadata=meta,
         source_format="dicom",
         source_group=case.source_group,
@@ -735,8 +1009,8 @@ def _extract_group_rescale(ds):
     return slope, intercept
 
 
-def _convert_group0_frame(ds, entry):
-    pixel = np.asarray(ds.pixel_array, dtype=np.float32)
+def _convert_group0_frame(ds, entry, pixel=None):
+    pixel = np.asarray(ds.pixel_array if pixel is None else pixel, dtype=np.float32)
     slope = _safe_float(getattr(ds, "RescaleSlope", None), default=1.0)
     intercept = _safe_float(getattr(ds, "RescaleIntercept", None), default=0.0)
     manufacturer = str(entry.get("manufacturer", "") or "").lower()
@@ -778,7 +1052,14 @@ def _convert_group0_frame(ds, entry):
     return data.astype(np.float32), venc
 
 
-def _load_group0_case(case, entries):
+def _load_group0_case(
+    case,
+    entries,
+    correction_config=None,
+    progress_callback=None,
+    parameter_overrides=None,
+    dicom_read_workers=1,
+):
     pydicom = _import_pydicom()
     mag_records = []
     vel_records = []
@@ -786,29 +1067,46 @@ def _load_group0_case(case, entries):
     axis0 = axis1 = axis2 = None
     row_spacing = col_spacing = thickness = None
 
-    for entry in entries:
+    def _read_entry(entry):
         ds = pydicom.dcmread(entry["path"], force=True)
-        if np.asarray(ds.pixel_array).ndim != 2:
-            continue
-        data, venc = _convert_group0_frame(ds, entry)
+        pixel = np.asarray(ds.pixel_array, dtype=np.float32)
+        if pixel.ndim != 2:
+            return None
+        data, venc = _convert_group0_frame(ds, entry, pixel=pixel)
         rr = _extract_rr_ms(ds)
-        if rr is not None:
-            rr_values.append(rr)
         a0, a1, a2 = _extract_row_col_slice_dirs(ds)
-        if a2 is not None:
-            axis0, axis1, axis2 = a0, a1, a2
         sp0, sp1, thick = _extract_pixel_measures(ds)
-        row_spacing = sp0 if sp0 is not None else row_spacing
-        col_spacing = sp1 if sp1 is not None else col_spacing
-        thickness = thick if thick is not None else thickness
-        record = {
-            "slice_key": _extract_slice_key(ds, axis2),
+        return {
+            "rr": rr,
+            "axis_dirs": (a0, a1, a2),
+            "spacing": (sp0, sp1, thick),
+            "slice_key": _extract_slice_key(ds, a2),
             "time_key": _extract_time_key(ds),
             "data": np.asarray(data, dtype=np.float32),
             "label": entry.get("component_label"),
             "venc": venc,
+            "is_magnitude": bool(entry.get("is_magnitude", False)),
         }
-        if entry.get("is_magnitude", False):
+
+    loaded_entries, actual_workers = _map_dicom_entries(
+        entries,
+        _read_entry,
+        progress_callback=progress_callback,
+        dicom_read_workers=dicom_read_workers,
+    )
+    for record in loaded_entries:
+        if record is None:
+            continue
+        if record["rr"] is not None:
+            rr_values.append(record["rr"])
+        a0, a1, a2 = record["axis_dirs"]
+        if a2 is not None:
+            axis0, axis1, axis2 = a0, a1, a2
+        sp0, sp1, thick = record["spacing"]
+        row_spacing = sp0 if sp0 is not None else row_spacing
+        col_spacing = sp1 if sp1 is not None else col_spacing
+        thickness = thick if thick is not None else thickness
+        if record["is_magnitude"]:
             mag_records.append(record)
         else:
             vel_records.append(record)
@@ -854,6 +1152,10 @@ def _load_group0_case(case, entries):
         ),
         venc_map,
         rr_values[0] if rr_values else None,
+        correction_config=correction_config,
+        progress_callback=progress_callback,
+        parameter_overrides=parameter_overrides,
+        dicom_read_workers=actual_workers,
     )
 
 
@@ -878,7 +1180,14 @@ def _convert_group1_entry(ds, entry):
     return np.asarray(data, dtype=np.float32), venc, float(slice_key)
 
 
-def _load_group1_case(case, entries):
+def _load_group1_case(
+    case,
+    entries,
+    correction_config=None,
+    progress_callback=None,
+    parameter_overrides=None,
+    dicom_read_workers=1,
+):
     pydicom = _import_pydicom()
     mag_records = []
     vel_records = []
@@ -886,21 +1195,40 @@ def _load_group1_case(case, entries):
     axis0 = axis1 = axis2 = None
     row_spacing = col_spacing = thickness = None
 
-    for entry in entries:
+    def _read_entry(entry):
         ds = pydicom.dcmread(entry["path"], force=True)
         data_tyx, venc, slice_key = _convert_group1_entry(ds, entry)
         rr = _extract_rr_ms(ds)
-        if rr is not None:
-            rr_values.append(rr)
         a0, a1, a2 = _extract_row_col_slice_dirs(ds)
+        sp0, sp1, thick = _extract_pixel_measures(ds)
+        return {
+            "rr": rr,
+            "axis_dirs": (a0, a1, a2),
+            "spacing": (sp0, sp1, thick),
+            "slice_key": float(slice_key),
+            "data": data_tyx,
+            "label": entry.get("component_label"),
+            "venc": venc,
+            "is_magnitude": bool(entry.get("is_magnitude", False)),
+        }
+
+    loaded_entries, actual_workers = _map_dicom_entries(
+        entries,
+        _read_entry,
+        progress_callback=progress_callback,
+        dicom_read_workers=dicom_read_workers,
+    )
+    for record in loaded_entries:
+        if record["rr"] is not None:
+            rr_values.append(record["rr"])
+        a0, a1, a2 = record["axis_dirs"]
         if a2 is not None:
             axis0, axis1, axis2 = a0, a1, a2
-        sp0, sp1, thick = _extract_pixel_measures(ds)
+        sp0, sp1, thick = record["spacing"]
         row_spacing = sp0 if sp0 is not None else row_spacing
         col_spacing = sp1 if sp1 is not None else col_spacing
         thickness = thick if thick is not None else thickness
-        record = {"slice_key": float(slice_key), "data": data_tyx, "label": entry.get("component_label"), "venc": venc}
-        if entry.get("is_magnitude", False):
+        if record["is_magnitude"]:
             mag_records.append(record)
         else:
             vel_records.append(record)
@@ -945,6 +1273,10 @@ def _load_group1_case(case, entries):
         ),
         venc_map,
         rr_values[0] if rr_values else None,
+        correction_config=correction_config,
+        progress_callback=progress_callback,
+        parameter_overrides=parameter_overrides,
+        dicom_read_workers=actual_workers,
     )
 
 
@@ -989,7 +1321,14 @@ def _convert_group2_entry(ds, entry):
     return np.asarray(data, dtype=np.float32), venc
 
 
-def _load_group2_case(case, entries):
+def _load_group2_case(
+    case,
+    entries,
+    correction_config=None,
+    progress_callback=None,
+    parameter_overrides=None,
+    dicom_read_workers=1,
+):
     pydicom = _import_pydicom()
     mag_data = None
     flow_map = {}
@@ -998,27 +1337,46 @@ def _load_group2_case(case, entries):
     axis0 = axis1 = axis2 = None
     row_spacing = col_spacing = thickness = None
 
-    for entry in entries:
+    def _read_entry(entry):
         ds = pydicom.dcmread(entry["path"], force=True)
         data_sytx, venc = _convert_group2_entry(ds, entry)
         rr = _extract_rr_ms(ds)
-        if rr is not None:
-            rr_values.append(rr)
         a0, a1, a2 = _extract_row_col_slice_dirs(ds)
+        sp0, sp1, thick = _extract_pixel_measures(ds)
+        return {
+            "rr": rr,
+            "axis_dirs": (a0, a1, a2),
+            "spacing": (sp0, sp1, thick),
+            "is_magnitude": bool(entry.get("is_magnitude", False)),
+            "label": entry.get("component_label"),
+            "data": np.transpose(data_sytx, (2, 3, 0, 1)),
+            "venc": venc,
+        }
+
+    loaded_entries, actual_workers = _map_dicom_entries(
+        entries,
+        _read_entry,
+        progress_callback=progress_callback,
+        dicom_read_workers=dicom_read_workers,
+    )
+    for record in loaded_entries:
+        if record["rr"] is not None:
+            rr_values.append(record["rr"])
+        a0, a1, a2 = record["axis_dirs"]
         if a2 is not None:
             axis0, axis1, axis2 = a0, a1, a2
-        sp0, sp1, thick = _extract_pixel_measures(ds)
+        sp0, sp1, thick = record["spacing"]
         row_spacing = sp0 if sp0 is not None else row_spacing
         col_spacing = sp1 if sp1 is not None else col_spacing
         thickness = thick if thick is not None else thickness
-        if entry.get("is_magnitude", False):
-            mag_data = np.transpose(data_sytx, (2, 3, 0, 1))
-        else:
-            label = entry.get("component_label")
-            if label:
-                flow_map[label] = np.transpose(data_sytx, (2, 3, 0, 1))
-                if venc is not None:
-                    venc_map[label] = venc
+        if record["is_magnitude"]:
+            mag_data = record["data"]
+            continue
+        label = record["label"]
+        if label:
+            flow_map[label] = record["data"]
+            if record["venc"] is not None:
+                venc_map[label] = record["venc"]
 
     if mag_data is None or len(flow_map) < 3:
         raise ValueError("incomplete Philips enhanced DICOM case")
@@ -1041,10 +1399,20 @@ def _load_group2_case(case, entries):
         ),
         venc_map,
         rr_values[0] if rr_values else None,
+        correction_config=correction_config,
+        progress_callback=progress_callback,
+        parameter_overrides=parameter_overrides,
+        dicom_read_workers=actual_workers,
     )
 
 
-def load_dicom_case(case):
+def load_dicom_case(
+    case,
+    correction_config=None,
+    progress_callback=None,
+    parameter_overrides=None,
+    dicom_read_workers=1,
+):
     if not isinstance(case, InputCase):
         case = resolve_input_case(case)
     if case.input_kind != "dicom":
@@ -1061,16 +1429,49 @@ def load_dicom_case(case):
 
     group_kind = int(case.metadata.get("group_kind", 0))
     if group_kind == 0:
-        return _load_group0_case(case, entries)
+        return _load_group0_case(
+            case,
+            entries,
+            correction_config=correction_config,
+            progress_callback=progress_callback,
+            parameter_overrides=parameter_overrides,
+            dicom_read_workers=dicom_read_workers,
+        )
     if group_kind == 1:
-        return _load_group1_case(case, entries)
+        return _load_group1_case(
+            case,
+            entries,
+            correction_config=correction_config,
+            progress_callback=progress_callback,
+            parameter_overrides=parameter_overrides,
+            dicom_read_workers=dicom_read_workers,
+        )
     if group_kind == 2:
-        return _load_group2_case(case, entries)
+        return _load_group2_case(
+            case,
+            entries,
+            correction_config=correction_config,
+            progress_callback=progress_callback,
+            parameter_overrides=parameter_overrides,
+            dicom_read_workers=dicom_read_workers,
+        )
     raise ValueError(f"unsupported DICOM group kind: {group_kind}")
 
 
-def load_input_data(input_source):
+def load_input_data(
+    input_source,
+    correction_config=None,
+    progress_callback=None,
+    parameter_overrides=None,
+    dicom_read_workers=1,
+):
     case = resolve_input_case(input_source)
     if case.input_kind == "h5":
-        return load_h5_data(case.input_path)
-    return load_dicom_case(case)
+        return load_h5_data(case.input_path, correction_config=correction_config, progress_callback=progress_callback)
+    return load_dicom_case(
+        case,
+        correction_config=correction_config,
+        progress_callback=progress_callback,
+        parameter_overrides=parameter_overrides,
+        dicom_read_workers=dicom_read_workers,
+    )

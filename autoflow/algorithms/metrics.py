@@ -144,6 +144,12 @@ def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes
     if paths is not None:
         paths_lookup = [np.asarray(p, dtype=float).reshape(-1, 3) for p in paths]
 
+    if len(planes) == 0:
+        empty_qc = {"path_ic": {}, "fork_ic": {}, "forks": []}
+        if return_qc:
+            return [], empty_qc
+        return []
+
     results = []
     for plane in planes:
         target_label = None
@@ -474,6 +480,12 @@ def compute_plane_metrics_multithread(flow_xyzt3, segmask_binary_4d, spacing, or
     paths_lookup = None
     if paths is not None:
         paths_lookup = [np.asarray(p, dtype=float).reshape(-1, 3) for p in paths]
+
+    if len(planes) == 0:
+        empty_qc = {"path_ic": {}, "fork_ic": {}, "forks": []}
+        if return_qc:
+            return [], empty_qc
+        return []
 
     args_list = []
     for plane in planes:

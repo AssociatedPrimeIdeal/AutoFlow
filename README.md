@@ -35,22 +35,31 @@ You can also run the non-GUI pipeline from the command line:
 `autoflow-run` accepts:
 
 - legacy / normalized H5 inputs
-- a DICOM file
 - a DICOM directory
 
-When you pass a directory, AutoFlow now scans it recursively. If multiple DICOM 4D-flow cases are found, batch mode processes each case separately.
-
 Video outputs are disabled by default. Pass the specific `--*-video` flags you want to generate.
+
+General usage:
+
+```bash
+autoflow-run <input-path>  \
+  --output-dir <output-dir> \
+  [options]
+```
+
+When `<input-path>` is a DICOM directory, AutoFlow scans it recursively. If multiple 4D-flow cases are found, batch mode processes each case separately and writes each case to its own output subdirectory.
+
+Legacy H5 example:
 
 ```bash
 autoflow-run ./data/demo_data.h5 \
   --output-dir ./results/demo \
 ```
 
-Direct DICOM example:
+DICOM directory example:
 
 ```bash
-autoflow-run ./dicom \
+autoflow-run /path/to/dicom_root \
   --output-dir ./results/dicom_batch \
 ```
 
@@ -108,16 +117,17 @@ autoflow-gui
 ![app](https://github.com/user-attachments/assets/2a668f0c-f98d-4168-9e84-79fa3949adb2)
 1. Use **File → Open H5** for legacy / normalized HDF5 input.
 2. Use **File → Import DICOM Directory** for direct DICOM input. AutoFlow scans the selected directory recursively, lists the detected 4D-flow cases, and then imports the one you choose.
-3. Legacy HDF5 input can still contain `img_complex`, `segmask`, `Resolution`, `VENC`, `RR`, `SpatialOrder`, and `VENCOrder`.
-4. Use the **Steps** panel to run the pipeline sequentially or click **Run All**.
-5. Use **Edit Skeleton** / **Edit Graph** for interactive editing:
+3. The **Input / Background Correction** panel shows the current resolution, venc, and detected direction labels; you can edit these values before running downstream steps if the DICOM readout needs manual adjustment.
+4. Legacy HDF5 input can still contain `img_complex`, `segmask`, `Resolution`, `VENC`, `RR`, `SpatialOrder`, and `VENCOrder`.
+5. Use the **Steps** panel to run the pipeline sequentially or click **Run All**.
+6. Use **Edit Skeleton** / **Edit Graph** for interactive editing:
    - Click a node to select it; drag the sphere widget to move it.
    - Press `Delete` or `Backspace` to remove the selected node or edge.
    - In graph edit mode, press `E` to toggle edge mode. With edge mode on, click two nodes sequentially to add/remove an edge between them. Click an edge directly to select it for deletion.
    - Press `Escape` to cancel edits; click the step button again to apply.
-6. Adjust parameters in the bottom panels before running each step.
-7. Use the **Timeline** slider to scrub through time frames.
-8. The **Ortho Viewer** on the right shows reformatted cross-sectional images for the selected plane.
+7. Adjust parameters in the bottom panels before running each step.
+8. Use the **Timeline** slider to scrub through time frames.
+9. The **Ortho Viewer** on the right shows reformatted cross-sectional images for the selected plane.
 
 ## Input Formats
 
@@ -132,6 +142,9 @@ AutoFlow can now read 4D-flow DICOM directly without converting to H5 first.
   - explicit anatomical labels in DICOM text fields such as `RL`, `LR`, `AP`, `PA`, `FH`, `HF`
   - `RO / PE / SS` style labels combined with `InPlanePhaseEncodingDirection`
 - Direct DICOM import normalizes into AutoFlow's internal `mag + flow + resolution + venc + rr` representation.
+- The currently supported direct-DICOM layouts are still limited. Different vendors, scanner models, and software versions often write substantially different 4D-flow DICOM variants, so AutoFlow cannot currently adapt to every machine's DICOM output automatically.
+- Manual verification and occasional parameter adjustment are still expected for direct DICOM input.
+- Direct DICOM loading does not have the complex encodes or sigma information required for TKE reconstruction, so TKE cannot be computed from DICOM input.
 - DICOM does not synthesize TKE. If no segmentation is embedded or provided separately, segmentation-dependent steps are skipped cleanly.
 
 ### Legacy HDF5
