@@ -1,0 +1,52 @@
+{
+  "fps": 12,
+  "plane_rotation_frames": 180,
+  "make_plane_video": false,
+  "make_wss_video": false,
+  "make_streamlines_video": false,
+  "make_tke_video": false,
+  "camera_view": "right",
+  "camera_distance_scale": 1.5,
+  "rotate_dynamic_video": true,
+  "dynamic_rotation_frames": 180,
+  "dynamic_rotation_elevation_deg": 10.0,
+  "dynamic_time_repeat": 3,
+  "add_plane_idx": false,
+  "add_path_idx": false,
+  "wss_clim": [
+    0.0,
+    10.0
+  ],
+  "wss_bar_cfg": {
+    "position_x": 0.75,
+    "position_y": 0.2,
+    "height": 0.22,
+    "width": 0.05,
+    "title_font_size": 40,
+    "label_font_size": 32
+  },
+  "tke_clim": [
+    0.0,
+    100.0
+  ],
+  "tke_bar_cfg": {
+    "position_x": 0.75,
+    "position_y": 0.2,
+    "height": 0.22,
+    "width": 0.05,
+    "title_font_size": 40,
+    "label_font_size": 32
+  },
+  "streamline_clim": [
+    0.0,
+    1.0
+  ],
+  "streamline_bar_cfg": {
+    "position_x": 0.75,
+    "position_y": 0.2,
+    "height": 0.22,
+    "width": 0.05,
+    "title_font_size": 40,
+    "label_font_size": 32
+  }
+}

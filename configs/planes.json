@@ -1,0 +1,9 @@
+{
+  "use_center_plane": true,
+  "cross_section_distance": 5.0,
+  "start_distance": 5.0,
+  "end_distance": 0.0,
+  "smoothing_window": 15,
+  "smoothing_polyorder": 2,
+  "inter_time": 10
+}

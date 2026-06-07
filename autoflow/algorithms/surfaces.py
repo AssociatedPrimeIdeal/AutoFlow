@@ -129,6 +129,21 @@ def _flow_grid_for_t(flow_t, spacing, origin):
     return grid
 
 
+def create_uniform_field_grid(field, spacing, origin=(0, 0, 0), name="field"):
+    field = np.asarray(field)
+    if field.ndim < 3:
+        raise ValueError(f"{name} must have at least 3 spatial dimensions, got {field.shape}")
+    mesh = pv.ImageData()
+    mesh.dimensions = np.array(field.shape[:3]) + 1
+    mesh.spacing = tuple(np.asarray(spacing, dtype=float).reshape(-1)[:3])
+    mesh.origin = tuple(np.asarray(origin, dtype=float).reshape(-1)[:3])
+    if field.ndim == 3:
+        mesh.cell_data[name] = field.flatten(order="F")
+    else:
+        mesh.cell_data[name] = field.reshape(-1, field.shape[-1], order="F")
+    return mesh
+
+
 def _extract_plane_flow_region(mask_xyz, flow_t, plane, spacing, origin, branch_grid=None, target_label=None):
     mask_xyz = np.asarray(mask_xyz, dtype=bool)
     if not np.any(mask_xyz):

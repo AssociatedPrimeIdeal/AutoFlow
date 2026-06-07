@@ -113,7 +113,7 @@ class SegmentationConfigDialog(QtWidgets.QDialog):
         self.edit_auto_label_map = QtWidgets.QPlainTextEdit()
         self.edit_auto_label_map.setPlaceholderText('{"aorta": 1}')
         self.edit_auto_label_map.setMaximumHeight(90)
-        note = QtWidgets.QLabel("Auto backend config is wired in the GUI, but inference is not implemented in this branch.")
+        note = QtWidgets.QLabel("Auto backend uses nnUNet model-folder inference when backend is nnUNet.")
         note.setWordWrap(True)
         form.addRow("Backend", self.edit_auto_backend)
         form.addRow("Model", self.edit_auto_model)

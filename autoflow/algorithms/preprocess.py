@@ -1,5 +1,12 @@
 import numpy as np
-from scipy.ndimage import binary_closing, binary_opening, gaussian_filter, label
+from scipy.ndimage import (
+    binary_closing,
+    binary_dilation,
+    binary_erosion,
+    binary_opening,
+    gaussian_filter,
+    label,
+)
 
 from ..core.models import SkeletonParams
 
@@ -35,6 +42,21 @@ def merge_segmask_to_3d(segmask_binary_4d):
     return np.any(seg, axis=3)
 
 
+def majority_vote_labels_3d(segmask_labels):
+    seg = np.asarray(segmask_labels, dtype=np.int16)
+    if seg.ndim == 3:
+        return seg.copy()
+    if seg.ndim != 4:
+        raise ValueError(f"segmentation labels must be 3D or 4D, got {seg.shape}")
+    labels = [int(x) for x in np.unique(seg)]
+    counts = np.stack([(seg == int(label_value)).sum(axis=3) for label_value in labels], axis=-1)
+    winners = np.argmax(counts, axis=-1)
+    out = np.zeros(seg.shape[:3], dtype=np.int16)
+    for idx, label_value in enumerate(labels):
+        out[winners == idx] = int(label_value)
+    return out
+
+
 def _connected_components(mask, connectivity=1):
     m = np.asarray(mask, dtype=bool)
     if not np.any(m):
@@ -68,6 +90,19 @@ def remove_small_cc_from_binary_mask(segmask_binary, resolution, min_cc_volume_m
     return seg
 
 
+def remove_small_cc_from_labeled_mask(segmask_labels_3d, resolution, min_cc_volume_mm3):
+    labels = np.asarray(segmask_labels_3d, dtype=np.int16).copy()
+    if labels.ndim != 3:
+        raise ValueError(f"labeled mask must be 3D, got {labels.shape}")
+    if float(min_cc_volume_mm3) <= 0:
+        return labels
+    for label_value in sorted(int(x) for x in np.unique(labels) if int(x) != 0):
+        mask = labels == int(label_value)
+        cleaned = remove_small_cc_from_binary_mask(mask, resolution, float(min_cc_volume_mm3))
+        labels[mask & ~np.asarray(cleaned, dtype=bool)] = 0
+    return labels
+
+
 def _component_bbox(mask):
     idx = np.argwhere(np.asarray(mask, dtype=bool))
     if len(idx) == 0:
@@ -81,10 +116,18 @@ def _preprocess_single_component(mask_3d, params):
     m = np.asarray(mask_3d, dtype=bool).copy()
     if not np.any(m):
         return m
+    if getattr(params, "dilation_iters", 0) > 0:
+        m = binary_dilation(m, iterations=int(params.dilation_iters)).astype(bool)
+    if getattr(params, "erosion_iters", 0) > 0:
+        m = binary_erosion(m, iterations=int(params.erosion_iters)).astype(bool)
     if params.do_closing:
         m = binary_closing(m).astype(bool)
     if params.do_opening:
         m = binary_opening(m).astype(bool)
+    if getattr(params, "closing_iters", 0) > 0:
+        m = binary_closing(m, iterations=int(params.closing_iters)).astype(bool)
+    if getattr(params, "opening_iters", 0) > 0:
+        m = binary_opening(m, iterations=int(params.opening_iters)).astype(bool)
     if params.gaussian_enabled and params.gaussian_sigma > 0:
         m = gaussian_filter(m.astype(float), sigma=params.gaussian_sigma) > 0.5
     return m.astype(bool)

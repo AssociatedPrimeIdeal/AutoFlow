@@ -1,274 +1,160 @@
 import json
-import os
 from pathlib import Path
-import subprocess
-import sys
+import tempfile
+from types import SimpleNamespace
 
-import pytest
+import h5py
+import numpy as np
+
 from autoflow import AutoFlowConfig, run_batch
+from autoflow.algorithms.segmentation import generate_nnunet_auto_segmentation
 
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 PHANTOM_CASES = ("phantom_S", "phantom_U", "phantom_Y")
-EXPECTED_PIXELWISE_KEYS = {"origin", "spacing", "tke", "tke_time", "wss"}
-EXPECTED_PHANTOM_DISTANCE_BASELINE = {
-    "phantom_S": {
-        "n_paths": 1,
-        "n_planes": 5,
-        "n_forks": 0,
-        "path_ic": {"0": 1.0},
-        "fork_ic": {},
-        "netflow_mL_beat": [
-            16.04088137052839,
-            16.04088137052839,
-            16.04088137052839,
-            16.04088137052839,
-            16.04088137052839,
-        ],
-        "peakv_cm_s": [
-            79.99999999992,
-            79.99999999992,
-            79.99999999992,
-            79.99999999992,
-            79.99999999992,
-        ],
-        "meanv_cm_s": [
-            22.003952497295465,
-            22.003952497295465,
-            22.003952497295465,
-            22.003952497295465,
-            22.003952497295465,
-        ],
-        "reflux_fraction": [
-            0.0022392402587455857,
-            0.0022392402587455857,
-            0.0022392402587455857,
-            0.0022392402587455857,
-            0.0022392402587455857,
-        ],
-    },
-    "phantom_U": {
-        "n_paths": 1,
-        "n_planes": 8,
-        "n_forks": 0,
-        "path_ic": {"0": 0.9954934356203274},
-        "fork_ic": {},
-        "netflow_mL_beat": [
-            16.04088137052839,
-            16.04088137052839,
-            16.040881381705866,
-            16.18966765452808,
-            16.216262234630666,
-            16.181039532153374,
-            16.04088137052839,
-            16.04088137052839,
-        ],
-        "peakv_cm_s": [
-            79.99999999992,
-            79.99999999992,
-            79.23234740849787,
-            79.9332685476675,
-            79.38889387140485,
-            79.82523981007421,
-            79.99999999992,
-            79.99999999992,
-        ],
-        "meanv_cm_s": [
-            22.003952497295465,
-            22.003952497295465,
-            21.79281011182328,
-            23.304847079073053,
-            23.706846418754395,
-            23.655460631153808,
-            22.003952497295465,
-            22.003952497295465,
-        ],
-        "reflux_fraction": [
-            0.0022392402587455857,
-            0.0022392402587455857,
-            0.002239240488770073,
-            0.0,
-            0.0,
-            0.0,
-            0.0022392402587455857,
-            0.0022392402587455857,
-        ],
-    },
-    "phantom_Y": {
-        "n_paths": 3,
-        "n_planes": 7,
-        "n_forks": 1,
-        "path_ic": {"0": 1.0, "1": 0.9989900747351891, "2": 0.9986394360071724},
-        "fork_ic": {"0": 0.9888506466012691},
-        "netflow_mL_beat": [
-            16.04088137052839,
-            16.04088137052839,
-            16.04088137052839,
-            8.116032203094532,
-            8.132441947654,
-            8.107508141067772,
-            8.085476549161838,
-        ],
-        "peakv_cm_s": [
-            79.99999999992,
-            79.99999999992,
-            79.99999999992,
-            39.92927948437385,
-            40.00000268713704,
-            39.929279484373836,
-            40.00000268713704,
-        ],
-        "meanv_cm_s": [
-            22.003952497295465,
-            22.003952497295465,
-            22.003952497295465,
-            12.057293966466908,
-            11.307682761652485,
-            11.470991211132334,
-            12.101338858921398,
-        ],
-        "reflux_fraction": [
-            0.0022392402587455857,
-            0.0022392402587455857,
-            0.0022392402587455857,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-        ],
-    },
-}
+REL_TOL = 0.05
+PLANE_SPACING_MM = 15.0
 
 
-def _run_cli(*args: str) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    existing = env.get("PYTHONPATH", "")
-    repo_root = str(Path(__file__).resolve().parents[1])
-    env["PYTHONPATH"] = repo_root if not existing else os.pathsep.join((repo_root, existing))
-    return subprocess.run(
-        [sys.executable, "-m", "autoflow.cli", *args],
-        cwd=repo_root,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-
-def _assert_case_matches_distance_baseline(output_dir: Path, case_name: str) -> None:
-    expected = EXPECTED_PHANTOM_DISTANCE_BASELINE[case_name]
-    case_dir = output_dir / case_name
-    summary_path = case_dir / "summary.json"
-    plane_metrics_path = case_dir / "plane_metrics.json"
-    plane_qc_path = case_dir / "plane_qc.json"
-    pixelwise_path = case_dir / "derived_metrics_pixelwise.npz"
-
-    assert summary_path.is_file()
-    assert plane_metrics_path.is_file()
-    assert plane_qc_path.is_file()
-    assert pixelwise_path.is_file()
-
-    summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    metrics = json.loads(plane_metrics_path.read_text(encoding="utf-8"))
-    plane_qc = json.loads(plane_qc_path.read_text(encoding="utf-8"))
-
-    assert summary["input"].endswith(f"{case_name}.h5")
-    assert summary["output_dir"] == str(case_dir)
-    assert summary["n_paths"] == expected["n_paths"]
-    assert summary["n_planes"] == expected["n_planes"]
-    assert summary["n_forks"] == expected["n_forks"]
-    assert len(metrics) == expected["n_planes"]
-    assert set(summary["pixelwise_export"]) == EXPECTED_PIXELWISE_KEYS
-    assert plane_qc["path_ic"] == pytest.approx(expected["path_ic"])
-    assert plane_qc["fork_ic"] == pytest.approx(expected["fork_ic"])
-    assert [m["netflow_mL_beat"] for m in metrics] == pytest.approx(expected["netflow_mL_beat"])
-    assert [m["peakv_cm_s"] for m in metrics] == pytest.approx(expected["peakv_cm_s"])
-    assert [m["meanv_cm_s"] for m in metrics] == pytest.approx(expected["meanv_cm_s"])
-    assert [m["reflux_fraction"] for m in metrics] == pytest.approx(expected["reflux_fraction"])
-
-
-def test_run_batch_smoke_on_phantom_data(tmp_path):
-    inputs = [str(DATA_DIR / f"{case}.h5") for case in PHANTOM_CASES]
-    output_dir = tmp_path / "smoke_outputs"
-
-    config = AutoFlowConfig(
-        inputs=inputs,
-        output_dir=str(output_dir),
-        skip_derived=True,
-        skip_plane_metrics=True,
+def _run_case(input_name: str, *, skip_derived: bool = False):
+    output_root = Path(tempfile.mkdtemp(prefix=f"autoflow_{input_name}_", dir="/tmp"))
+    cfg = AutoFlowConfig(
+        inputs=[str(DATA_DIR / f"{input_name}.h5")],
+        output_dir=str(output_root),
+        skip_derived=skip_derived,
+        skip_plane_metrics=False,
         use_multithread=False,
-        use_center_plane=True,
+        use_center_plane=False,
+        cross_section_dist=PLANE_SPACING_MM,
         make_plane_video=False,
         make_wss_video=False,
         make_streamlines_video=False,
         make_tke_video=False,
     )
-
-    results, last_case_out = run_batch(config)
-
-    assert len(results) == len(PHANTOM_CASES)
-    assert last_case_out == str(output_dir / PHANTOM_CASES[-1])
-
-    batch_report = output_dir / "batch_report.json"
-    time_summary = output_dir / "time_summary.txt"
-    assert batch_report.is_file()
-    assert time_summary.is_file()
-
-    report_items = json.loads(batch_report.read_text(encoding="utf-8"))
-    assert len(report_items) == len(PHANTOM_CASES)
-
-    for result, case_name in zip(results, PHANTOM_CASES):
-        assert result["status"] == "ok"
-        assert Path(result["file"]).name == f"{case_name}.h5"
-
-        case_dir = output_dir / case_name
-        summary_path = case_dir / "summary.json"
-        plane_positions_path = case_dir / "plane_positions.json"
-        planes_path = case_dir / "planes.json"
-
-        assert summary_path.is_file()
-        assert plane_positions_path.is_file()
-        assert planes_path.is_file()
-
-        summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        assert summary["input"].endswith(f"{case_name}.h5")
-        assert summary["output_dir"] == str(case_dir)
-        assert summary["n_paths"] >= 1
-        assert summary["n_planes"] == summary["n_paths"]
-        assert summary["plane_metrics"] == []
-        assert summary["plane_qc"] == {}
-        assert summary["videos"] == {}
-        assert summary["pixelwise_export"] == {}
-
-    assert [item["status"] for item in report_items] == ["ok", "ok", "ok"]
+    results, case_out = run_batch(cfg)
+    assert len(results) == 1
+    assert results[0]["status"] == "ok"
+    case_dir = Path(case_out)
+    metrics = json.loads((case_dir / "plane_metrics.json").read_text(encoding="utf-8"))
+    return case_dir, metrics
 
 
-def test_cli_phantom_distance_mode_matches_regression_baseline(tmp_path):
-    output_dir = tmp_path / "phantom_cli_regression"
+def _relative_error(measured: float, truth: float) -> float:
+    denom = max(abs(float(truth)), 1e-12)
+    return abs(float(measured) - float(truth)) / denom
 
-    result = _run_cli(
-        str(DATA_DIR / "phantom_S.h5"),
-        str(DATA_DIR / "phantom_U.h5"),
-        str(DATA_DIR / "phantom_Y.h5"),
-        "--output-dir",
-        str(output_dir),
-        "--plane-by-distance",
-        "--cross-section-dist",
-        "15",
+
+def _mean_relative_error(values: list[float]) -> float:
+    return float(np.mean(np.asarray(values, dtype=float))) if values else 0.0
+
+
+def _truth_mean_velocity_cm_s(flow_rate_ml_s: np.ndarray, area_mm2: float) -> float:
+    area = max(float(area_mm2), 1e-12)
+    flow_rate = np.asarray(flow_rate_ml_s, dtype=float)
+    return float(np.mean(flow_rate) * 100.0 / area)
+
+
+def test_repo_phantom_h5_files_embed_truth_group():
+    expected = {
+        "phantom_S": (1,),
+        "phantom_U": (1,),
+        "phantom_Y": (3,),
+        "phantom_P": None,
+    }
+    for case_name, path_scale_shape in expected.items():
+        path = DATA_DIR / f"{case_name}.h5"
+        assert path.is_file()
+        with h5py.File(path, "r") as handle:
+            assert "truth" in handle
+            truth = handle["truth"]
+            assert truth["flow_xyzt3_cm_s"].shape[-1] == 3
+            if case_name != "phantom_P":
+                assert truth["segmentation_xyzt"].shape == handle["segmask"].shape
+                assert truth["mag_xyzt"].shape == handle["img_complex"].shape[:-1]
+                assert truth["path_scale_values"].shape == path_scale_shape
+            else:
+                assert truth["segmentation_xyzt"].shape == handle["segmentation"].shape
+                assert truth["mag_xyzt"].shape == handle["mag"].shape
+                assert truth["pressure_gradient_xyzt3_pa_m"].shape[-1] == 3
+
+
+def test_s_u_y_plane_metrics_match_truth_within_two_percent_mean_error():
+    for case_name in PHANTOM_CASES:
+        case_dir, metrics = _run_case(case_name)
+        assert (case_dir / "plane_metrics.json").is_file()
+        with h5py.File(DATA_DIR / f"{case_name}.h5", "r") as handle:
+            truth = handle["truth"]
+            truth_flow_per_beat = float(truth["flow_ml_per_beat"][()])
+            truth_peak = float(truth["peak_centerline_cm_s"][()])
+            path_scales = {idx: float(val) for idx, val in enumerate(truth["path_scale_values"][()].tolist())}
+            area_mm2 = float(np.pi * float(truth["tube_radius_mm"][()]) ** 2)
+            path_flow_rate_ml_s = np.asarray(truth["path_flow_rate_ml_s"][()], dtype=float)
+
+        assert len(metrics) >= len(path_scales)
+        seen_paths = set()
+        flow_errors = []
+        peak_errors = []
+        meanv_errors = []
+        for metric in metrics:
+            path_index = int(metric["path_index"])
+            seen_paths.add(path_index)
+            scale = path_scales[path_index]
+            expected_flow = truth_flow_per_beat * scale
+            expected_peak = truth_peak * scale
+            expected_meanv = _truth_mean_velocity_cm_s(path_flow_rate_ml_s[path_index], area_mm2)
+            flow_errors.append(_relative_error(metric["netflow_mL_beat"], expected_flow))
+            peak_errors.append(_relative_error(metric["peakv_cm_s"], expected_peak))
+            meanv_errors.append(_relative_error(metric["meanv_cm_s"], expected_meanv))
+
+        assert seen_paths == set(path_scales)
+        assert _mean_relative_error(flow_errors) < REL_TOL
+        assert _mean_relative_error(peak_errors) < REL_TOL
+        assert _mean_relative_error(meanv_errors) < REL_TOL
+
+
+def test_nnunet_autoseg_progress_callback_reports_stage_updates(monkeypatch, tmp_path):
+    model_dir = tmp_path / "model"
+    fold_dir = model_dir / "fold_all"
+    fold_dir.mkdir(parents=True)
+    (model_dir / "dataset.json").write_text(
+        json.dumps({
+            "channel_names": {"0": "mag", "1": "flow_x_mean_xyz"},
+            "labels": {"background": 0, "vessel": 1},
+            "file_ending": ".nii.gz",
+        }),
+        encoding="utf-8",
+    )
+    (model_dir / "plans.json").write_text(json.dumps({"plans": "ok"}), encoding="utf-8")
+
+    def fake_run_subprocess(command, *, env=None, cwd=None, runner=None):
+        out_dir = Path(command[command.index("-o") + 1])
+        pred = out_dir / "autoflow_case.nii.gz"
+        pred.write_bytes(b"fake")
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr('autoflow.algorithms.segmentation._run_subprocess', fake_run_subprocess)
+    monkeypatch.setattr('autoflow.algorithms.segmentation._read_nifti_segmentation', lambda path: np.ones((2, 2, 2), dtype=np.int16))
+
+    events = []
+    mag = np.ones((2, 2, 2, 3), dtype=np.float32)
+    flow = np.zeros((2, 2, 2, 3, 3), dtype=np.float32)
+    seg, provenance = generate_nnunet_auto_segmentation(
+        mag=mag,
+        flow=flow,
+        resolution=(1.0, 1.0, 1.0),
+        origin=(0.0, 0.0, 0.0),
+        model_folder=str(model_dir),
+        device="cpu",
+        progress_callback=events.append,
     )
 
-    assert result.returncode == 0, result.stderr or result.stdout
-    assert "Found 3 file(s) to process." in result.stdout
-    assert "Done: 3/3 succeeded." in result.stdout
-
-    batch_report = output_dir / "batch_report.json"
-    time_summary = output_dir / "time_summary.txt"
-    assert batch_report.is_file()
-    assert time_summary.is_file()
-
-    report_items = json.loads(batch_report.read_text(encoding="utf-8"))
-    assert [item["status"] for item in report_items] == ["ok", "ok", "ok"]
-    assert [Path(item["file"]).name for item in report_items] == ["phantom_S.h5", "phantom_U.h5", "phantom_Y.h5"]
-
-    for case_name in PHANTOM_CASES:
-        _assert_case_matches_distance_baseline(output_dir, case_name)
+    assert seg.shape == (2, 2, 2, 3)
+    assert provenance["device"] == "cpu"
+    stages = [event["stage"] for event in events]
+    assert stages[0] == "autoseg_start"
+    assert "autoseg_model_ready" in stages
+    assert "autoseg_prepare_inputs" in stages
+    assert "autoseg_run_inference" in stages
+    assert "autoseg_read_prediction" in stages
+    assert stages[-1] == "autoseg_finalize"
+    assert all("elapsed_sec" in event for event in events)

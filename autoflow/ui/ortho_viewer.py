@@ -37,7 +37,8 @@ class OrthoViewer(QtWidgets.QWidget):
         self.combo_content.addItems([
             "Flow X (cm/s)", "Flow Y (cm/s)", "Flow Z (cm/s)",
             "Magnitude", "PC-MRA", "Speed (cm/s)",
-            "WSS (Pa)", "TKE (J/m³)"
+            "WSS (Pa)", "TKE (J/m³)",
+            "Pressure Grad X (Pa/m)", "Pressure Grad Y (Pa/m)", "Pressure Grad Z (Pa/m)", "|Pressure Grad| (Pa/m)"
         ])
         self.combo_content.setCurrentIndex(4)
         self.combo_content.currentIndexChanged.connect(self._on_content_changed)
@@ -348,6 +349,34 @@ class OrthoViewer(QtWidgets.QWidget):
         vol = self._cached("tke_mesh_volume", key, _build)
         cmap, clim = self._scene_style("tke_volume", "hot", None)
         return vol, "TKE (J/m³)", {"cmap": cmap, "clim": clim}
+    def _get_pressure_gradient_volume(self, t, component=None):
+        ws = self.workspace
+        if ws.derived.pressure_gradient_array is None:
+            return None, "Pressure Gradient (no data)", {"cmap": "magma", "clim": None}
+        arr = np.asarray(ws.derived.pressure_gradient_array, dtype=float)
+        support = None if ws.derived.pressure_gradient_support_mask is None else np.asarray(ws.derived.pressure_gradient_support_mask, dtype=bool)
+        tidx = min(max(0, int(t)), arr.shape[3] - 1)
+        if component is None:
+            if ws.derived.pressure_gradient_magnitude is None:
+                vol = np.sqrt(np.sum(arr[..., tidx, :] ** 2, axis=-1))
+            else:
+                vol = np.asarray(ws.derived.pressure_gradient_magnitude[..., tidx], dtype=float)
+            if support is not None:
+                vol = np.where(support[..., tidx], vol, 0.0)
+            cmap, clim = self._scene_style("pressure_gradient_volume", "magma", None)
+            if clim is None and ws.derived.pressure_gradient_display_clim is not None:
+                clim = tuple(ws.derived.pressure_gradient_display_clim)
+            return np.asarray(vol, dtype=float), "|Pressure Grad| (Pa/m)", {"cmap": cmap, "clim": clim}
+        vol = np.asarray(arr[..., tidx, int(component)], dtype=float)
+        if support is not None:
+            vol = np.where(support[..., tidx], vol, 0.0)
+            finite = vol[support[..., tidx] & np.isfinite(vol)]
+        else:
+            finite = vol[np.isfinite(vol)]
+        vmax = float(np.percentile(np.abs(finite), 99.0)) if finite.size else 1e-6
+        vmax = max(vmax, 1e-6)
+        return vol, f"Pressure Grad {'XYZ'[int(component)]} (Pa/m)", {"cmap": "RdBu_r", "clim": (-vmax, vmax)}
+
     def _get_scalar_slice(self, t):
         ws = self.workspace
         content_idx = self.combo_content.currentIndex()
@@ -385,6 +414,14 @@ class OrthoViewer(QtWidgets.QWidget):
             return self._get_wss_volume(t)
         if content_idx == 7:
             return self._get_tke_volume(t)
+        if content_idx == 8:
+            return self._get_pressure_gradient_volume(t, component=0)
+        if content_idx == 9:
+            return self._get_pressure_gradient_volume(t, component=1)
+        if content_idx == 10:
+            return self._get_pressure_gradient_volume(t, component=2)
+        if content_idx == 11:
+            return self._get_pressure_gradient_volume(t, component=None)
         return None, "", {"cmap": "gray", "clim": None}
 
     def _get_mask_3d(self):

@@ -348,12 +348,185 @@ def _loader_correction_config(correction_config):
     return coerce_background_phase_correction_config(correction_config)
 
 
+def _coerce_venc_array(group):
+    if "VENC" in group:
+        return np.asarray(group["VENC"][:], dtype=float)
+    if "venc" in group:
+        return np.asarray(group["venc"][:], dtype=float)
+    return np.array([150.0, 150.0, 150.0], dtype=float)
+
+
+def _split_dual_venc_triplets(venc):
+    venc = np.asarray(venc, dtype=np.float32).reshape(-1)
+    if venc.size != 6:
+        raise ValueError(f"dual-venc Nv=7 expects 6 venc entries, got {venc.shape}")
+    return np.asarray(venc[:3], dtype=np.float32), np.asarray(venc[3:6], dtype=np.float32)
+
+
+def _dual_venc_triplet_ratio(lv, hv):
+    lv = np.asarray(lv, dtype=np.float32)
+    hv = np.asarray(hv, dtype=np.float32)
+    return np.divide(
+        hv,
+        np.clip(lv, 1e-12, None),
+        out=np.ones_like(hv, dtype=np.float32),
+        where=np.abs(lv) > 1e-12,
+    ).astype(np.float32)
+
+
+def _dual_venc_correct_alias(flow_lv_vtzyx, flow_hv_vtzyx, lv_triplet, ratio1, ratio2):
+    flow_lv_vtzyx = np.asarray(flow_lv_vtzyx, dtype=np.float32)
+    flow_hv_vtzyx = np.asarray(flow_hv_vtzyx, dtype=np.float32)
+    lv_triplet = np.asarray(lv_triplet, dtype=np.float32).reshape(3, 1, 1, 1, 1)
+    ratio1_arr = np.asarray(ratio1, dtype=np.float32).reshape(3, 1, 1, 1, 1)
+    ratio2_arr = np.asarray(ratio2, dtype=np.float32).reshape(3, 1, 1, 1, 1)
+
+    dlv = flow_hv_vtzyx - flow_lv_vtzyx
+
+    th1 = lv_triplet * (1.0 - ratio1_arr)
+    th2 = lv_triplet * (3.0 + ratio1_arr)
+    th3 = lv_triplet * (3.0 - ratio2_arr)
+    th4 = lv_triplet * (5.0 + ratio2_arr)
+
+    mask_p2 = (dlv >= th1) & (dlv <= th2)
+    mask_m2 = (dlv >= -th2) & (dlv <= -th1)
+    mask_p4 = (dlv >= th3) & (dlv <= th4)
+    mask_m4 = (dlv >= -th4) & (dlv <= -th3)
+
+    dual_alias_corr = np.zeros_like(flow_lv_vtzyx, dtype=np.float32)
+    dual_alias_corr = np.where(mask_p2, 2.0 * lv_triplet, dual_alias_corr)
+    dual_alias_corr = np.where(mask_m2, -2.0 * lv_triplet, dual_alias_corr)
+    dual_alias_corr = np.where(mask_p4, 4.0 * lv_triplet, dual_alias_corr)
+    dual_alias_corr = np.where(mask_m4, -4.0 * lv_triplet, dual_alias_corr)
+    return np.asarray(flow_lv_vtzyx + dual_alias_corr, dtype=np.float32), np.asarray(dual_alias_corr, dtype=np.float32)
+
+
+def _load_legacy_dual_venc_h5(
+    img_complex,
+    segmask,
+    venc,
+    resolution,
+    origin,
+    rr,
+    spatial_order,
+    venc_order,
+    cfg,
+    progress_callback=None,
+):
+    if img_complex.ndim != 5 or img_complex.shape[-1] != 7:
+        raise ValueError(f"legacy dual-venc H5 expects XYZT7 complex data, got {img_complex.shape}")
+
+    mag = np.abs(img_complex[..., 0]).astype(np.float32)
+    lv_venc, hv_venc = _split_dual_venc_triplets(venc)
+    lv_complex = np.concatenate([img_complex[..., :1], img_complex[..., 1:4]], axis=-1)
+    hv_complex = np.concatenate([img_complex[..., :1], img_complex[..., 4:7]], axis=-1)
+
+    lv_corr, _lv_stationary, lv_report = apply_background_phase_correction_to_complex(
+        lv_complex,
+        config=cfg,
+        progress_callback=_progress_prefix(progress_callback, "h5_dual_lv_"),
+        source_mode="legacy_dual_venc_h5_low",
+    )
+    hv_corr, _hv_stationary, hv_report = apply_background_phase_correction_to_complex(
+        hv_complex,
+        config=cfg,
+        progress_callback=_progress_prefix(progress_callback, "h5_dual_hv_"),
+        source_mode="legacy_dual_venc_h5_high",
+    )
+    lv_use = lv_corr if bool(lv_report.get("applied", False)) else lv_complex
+    hv_use = hv_corr if bool(hv_report.get("applied", False)) else hv_complex
+
+    flow_lv_raw = np.angle(lv_use[..., 1:4] * np.conj(lv_use[..., 0][..., None])).astype(np.float32)
+    flow_hv_raw = np.angle(hv_use[..., 1:4] * np.conj(hv_use[..., 0][..., None])).astype(np.float32)
+
+    segmask_for_reorient = segmask if segmask is not None else np.zeros(mag.shape, dtype=np.int16)
+    flow_lv, mag_out, seg_r, lv_venc_new, res_new = reorient(
+        mag,
+        flow_lv_raw,
+        segmask_for_reorient,
+        venc=lv_venc,
+        resolution=resolution,
+        spatial_order=spatial_order,
+        venc_order=venc_order,
+        target_spatial_order=("LR", "AP", "FH"),
+        target_venc_order=("LR", "AP", "FH"),
+        return_velocity=True,
+    )
+    flow_hv, _mag_hv, _seg_hv, hv_venc_new, _res_hv = reorient(
+        mag,
+        flow_hv_raw,
+        segmask_for_reorient,
+        venc=hv_venc,
+        resolution=resolution,
+        spatial_order=spatial_order,
+        venc_order=venc_order,
+        target_spatial_order=("LR", "AP", "FH"),
+        target_venc_order=("LR", "AP", "FH"),
+        return_velocity=True,
+    )
+
+    flow_lv_vtzyx = np.transpose(flow_lv, (4, 3, 2, 1, 0))
+    flow_hv_vtzyx = np.transpose(flow_hv, (4, 3, 2, 1, 0))
+    lv_triplet = np.asarray(lv_venc_new, dtype=np.float32)
+    hv_triplet = np.asarray(hv_venc_new, dtype=np.float32)
+    ratio_hv_lv = _dual_venc_triplet_ratio(lv_triplet, hv_triplet)
+    ratio1 = np.full(3, float(cfg.dual_venc_ratio1), dtype=np.float32)
+    ratio2 = np.full(3, float(cfg.dual_venc_ratio2), dtype=np.float32)
+
+    flow_dual_vtzyx, dual_alias_corr_vtzyx = _dual_venc_correct_alias(
+        flow_lv_vtzyx,
+        flow_hv_vtzyx,
+        lv_triplet,
+        ratio1,
+        ratio2,
+    )
+    flow_dual = np.transpose(flow_dual_vtzyx, (4, 3, 2, 1, 0)).astype(np.float32)
+    dual_alias_corr = np.transpose(dual_alias_corr_vtzyx, (4, 3, 2, 1, 0)).astype(np.float32)
+
+    meta = {
+        "background_phase_correction": {
+            "dual_venc_low": background_phase_report_for_metadata(lv_report),
+            "dual_venc_high": background_phase_report_for_metadata(hv_report),
+        },
+        "dual_venc": {
+            "enabled": True,
+            "input_channels": int(img_complex.shape[-1]),
+            "lv_venc": lv_triplet.astype(float).tolist(),
+            "hv_venc": hv_triplet.astype(float).tolist(),
+            "ratio1": ratio1.astype(float).tolist(),
+            "ratio2": ratio2.astype(float).tolist(),
+            "hv_lv_ratio": ratio_hv_lv.astype(float).tolist(),
+            "alias_shift_unique_cm_s": sorted({float(x) for x in np.unique(np.round(dual_alias_corr, decimals=6))}),
+        },
+    }
+    return normalize_loaded_case(
+        flow=flow_dual,
+        mag=mag_out,
+        segmentation=seg_r if segmask is not None else None,
+        resolution=np.asarray(res_new, dtype=float),
+        origin=origin,
+        venc=np.asarray(hv_triplet, dtype=float),
+        rr=float(rr),
+        sigma=None,
+        tke_array=None,
+        metadata=meta,
+        source_format="legacy_h5_dual_venc",
+        capabilities=LoaderCapabilities(
+            has_segmentation=segmask is not None,
+            has_tke=False,
+            has_complex_source=False,
+            supports_wss=True,
+            supports_plane_metrics=True,
+        ),
+    )
+
+
 def load_h5_data(path, correction_config=None, progress_callback=None):
     target_spatial_order = ("LR", "AP", "FH")
     target_venc_order = ("LR", "AP", "FH")
     cfg = _loader_correction_config(correction_config)
     with h5py.File(path, "r") as g:
-        VENC = g["VENC"][:] if "VENC" in g else np.array([150, 150, 150], dtype=float)
+        VENC = _coerce_venc_array(g)
         resolution = g["Resolution"][:] if "Resolution" in g else np.array([1, 1, 1], dtype=float)
         origin = g["Origin"][:] if "Origin" in g else np.array([0.0, 0.0, 0.0], dtype=float)
         rr = float(g["RR"][()]) if "RR" in g else 1000.0
@@ -371,6 +544,19 @@ def load_h5_data(path, correction_config=None, progress_callback=None):
                 segmask = None
 
             img_complex = np.asarray(img_ds[src_slices + (slice(None),) * (img_ds.ndim - 3)])
+            if img_complex.ndim == 5 and img_complex.shape[-1] == 7:
+                return _load_legacy_dual_venc_h5(
+                    img_complex,
+                    segmask,
+                    VENC,
+                    resolution,
+                    origin,
+                    rr,
+                    spatial_order,
+                    venc_order,
+                    cfg,
+                    progress_callback=progress_callback,
+                )
             img_complex_corr, _stationary_mask_raw, corr_report = apply_background_phase_correction_to_complex(
                 img_complex,
                 config=cfg,

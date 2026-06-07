@@ -1,10 +1,13 @@
+import h5py
 import numpy as np
 import pyvista as pv
+from scipy.ndimage import binary_erosion, gaussian_filter
 
 from .paths import _determine_plane_forward, _vector_orientation_text
 from .surfaces import (
     _build_branch_grid,
     _extract_plane_flow_region,
+    create_uniform_field_grid,
     create_uniform_grid,
     create_uniform_vector,
 )
@@ -21,6 +24,23 @@ def get_orthogonal_vectors(vectors, point_normals):
 
 def get_vector_magnitude(vectors):
     return np.sqrt(np.sum(vectors * vectors, axis=1))
+
+
+def align_tangential_samples(reference_vectors, target_vectors):
+    reference = np.asarray(reference_vectors, dtype=float)
+    target = np.asarray(target_vectors, dtype=float)
+    ref_mag = get_vector_magnitude(reference)
+    tgt_mag = get_vector_magnitude(target)
+    denom = np.maximum(ref_mag * tgt_mag, 1e-12)
+    direction = np.sum(reference * target, axis=1) / denom
+    return np.clip(direction, -1.0, 1.0) * tgt_mag
+
+
+def resolve_wss_inward_distance(spacing, inward_distance=None):
+    spacing_mm = np.asarray(spacing, dtype=float).reshape(3)
+    if inward_distance is None:
+        inward_distance = float(np.min(spacing_mm))
+    return max(float(inward_distance), 0.01)
 
 
 def calculate_gradient(pc0_tangent_mag, pc1_tangent_mag, pc2_tangent_mag, inward_distance, use_parabolic=True):
@@ -48,10 +68,7 @@ def cal_wss_from_surf(surf, velocity, viscosity=4.0, inward_distance=0.6,
     _, tang1 = get_orthogonal_vectors(extract_vectors(pc1), surf.point_normals)
     t1 = get_vector_magnitude(tang1)
     _, tang2 = get_orthogonal_vectors(extract_vectors(pc2), surf.point_normals)
-    t2 = get_vector_magnitude(tang2)
-    c = np.sum(tang1 * tang2, axis=1).clip(-1, 1)
-    t2 = c * t2
-
+    t2 = align_tangential_samples(tang1, tang2)
     surf["wss"] = calculate_gradient(t0, t1, t2, inward_distance, use_parabolic=parabolic_fitting) * float(viscosity)
     surf["wss_vectors"] = tang1
     return surf
@@ -123,7 +140,7 @@ def apply_internal_consistency_to_metrics(plane_metrics, path_info=None, forks=N
 def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes, RR=1000.0,
                           branch_labels_3d=None, path_info=None, forks=None,
                           paths=None, return_qc=False):
-    flow = np.asarray(flow_xyzt3, dtype=float)
+    flow = _ensure_flow5d(flow_xyzt3)
     mask = np.asarray(segmask_binary_4d, dtype=bool)
     spacing = np.asarray(spacing, dtype=float).reshape(-1)[:3]
     origin = np.asarray(origin, dtype=float).reshape(-1)[:3]
@@ -184,6 +201,295 @@ def _ensure_mask4d(mask4d):
     return mask4d
 
 
+def _ensure_flow5d(flow):
+    flow = np.asarray(flow, dtype=np.float32)
+    if flow.ndim != 5 or flow.shape[-1] != 3:
+        raise ValueError(f"flow must be XYZTV, got {flow.shape}")
+    return flow
+
+
+def _target_label_for_plane(plane, branch_labels_3d, spacing, origin):
+    if branch_labels_3d is None:
+        return None
+    target_label = int(getattr(plane, "label", 0) or 0)
+    if target_label > 0:
+        return target_label
+    ijk = np.rint((np.asarray(plane.center, dtype=float).reshape(3) - origin) / (spacing + 1e-12)).astype(int)
+    ijk = np.clip(ijk, 0, np.array(np.asarray(branch_labels_3d).shape) - 1)
+    return int(np.asarray(branch_labels_3d)[ijk[0], ijk[1], ijk[2]])
+
+
+def _extract_plane_field_region(mask_xyz, field_t, plane, spacing, origin, field_name, branch_grid=None, target_label=None):
+    mask_xyz = np.asarray(mask_xyz, dtype=bool)
+    if not np.any(mask_xyz):
+        return None
+    grid = create_uniform_field_grid(mask_xyz.astype(np.uint8), spacing, origin=origin, name="mask")
+    field_arr = np.asarray(field_t)
+    if field_arr.shape[:3] != mask_xyz.shape:
+        raise ValueError(f"{field_name} spatial shape {field_arr.shape[:3]} does not match mask {mask_xyz.shape}")
+    if field_arr.ndim == 3:
+        grid.cell_data[field_name] = field_arr.reshape(-1, order="F")
+    elif field_arr.ndim == 4 and field_arr.shape[-1] in (1, 3):
+        payload = field_arr if field_arr.shape[-1] != 1 else field_arr[..., 0]
+        if payload.ndim == 3:
+            grid.cell_data[field_name] = payload.reshape(-1, order="F")
+        else:
+            grid.cell_data[field_name] = payload.reshape(-1, payload.shape[-1], order="F")
+    else:
+        raise ValueError(f"{field_name} must be XYZ, XYZT-slice scalar, or XYZV, got {field_arr.shape}")
+    mesh = grid.threshold(0.1, scalars="mask")
+    if mesh is None or mesh.n_cells == 0:
+        return None
+    pg = mesh.slice(normal=np.asarray(plane.normal, dtype=float), origin=np.asarray(plane.center, dtype=float))
+    if pg is None or pg.n_cells == 0:
+        return None
+    pg = pg.compute_cell_sizes(area=True)
+    if branch_grid is not None and target_label is not None and int(target_label) > 0:
+        centers = pg.cell_centers().sample(branch_grid)
+        bid = np.asarray(centers.point_data.get("branch_id", []))
+        if len(bid) == 0:
+            return None
+        keep = np.where(bid == int(target_label))[0]
+        if len(keep) == 0:
+            return None
+        pg = pg.extract_cells(keep)
+        if pg is None or pg.n_cells == 0:
+            return None
+        pg = pg.compute_cell_sizes(area=True)
+    return pg
+
+
+def _nanpercentile_safe(values, q):
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return 0.0
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return 0.0
+    return float(np.nanpercentile(finite, q))
+
+
+def _weighted_mean(values, weights):
+    vals = np.asarray(values, dtype=float).reshape(-1)
+    wts = np.asarray(weights, dtype=float).reshape(-1)
+    if vals.size == 0 or wts.size != vals.size:
+        return 0.0
+    finite = np.isfinite(vals) & np.isfinite(wts) & (wts > 0)
+    if not np.any(finite):
+        return 0.0
+    vals = vals[finite]
+    wts = wts[finite]
+    denom = float(np.sum(wts))
+    if denom <= 1e-12:
+        return 0.0
+    return float(np.sum(vals * wts) / denom)
+
+
+def _append_summary(metric, prefix, series):
+    arr = np.asarray(series, dtype=float).reshape(-1)
+    metric[f"{prefix}_t"] = [float(x) for x in arr.tolist()]
+    metric[prefix] = float(np.mean(arr)) if arr.size else 0.0
+
+
+def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_labels_3d=None,
+                                    tke_array=None, pressure_gradient_array=None, wss_surfaces=None):
+    mask4d = _ensure_mask4d(mask4d)
+    spacing = np.asarray(spacing, dtype=float).reshape(3)
+    origin = np.asarray(origin, dtype=float).reshape(3)
+    Nt = int(mask4d.shape[3])
+    branch_grid = _build_branch_grid(branch_labels_3d, spacing, origin)
+    target_label = _target_label_for_plane(plane, branch_labels_3d, spacing, origin)
+    normal = np.asarray(plane.normal, dtype=float).reshape(3)
+    normal = normal / (np.linalg.norm(normal) + 1e-12)
+
+    summary = {}
+    pixelwise = {"timepoints": []}
+
+    has_tke = tke_array is not None
+    has_pressure_gradient = pressure_gradient_array is not None
+    has_wss = wss_surfaces is not None
+
+    if has_tke:
+        tke_array = _prepare_tke_array(mask4d, tke_array=tke_array, sigma=None)
+    if has_pressure_gradient:
+        pressure_gradient_array = np.asarray(pressure_gradient_array, dtype=np.float32)
+        if pressure_gradient_array.ndim != 5 or pressure_gradient_array.shape[-1] != 3:
+            raise ValueError(f"pressure_gradient_array must be XYZTV, got {pressure_gradient_array.shape}")
+
+    tke_mean_t = []
+    tke_peak_t = []
+    tke_p95_t = []
+    pg_mag_mean_t = []
+    pg_mag_peak_t = []
+    pg_mag_p95_t = []
+    pg_normal_mean_t = []
+    pg_normal_peak_t = []
+    pg_normal_p95_t = []
+    wss_mean_t = []
+    wss_peak_t = []
+    wss_p95_t = []
+
+    for tidx in range(Nt):
+        mask_t = mask4d[..., tidx]
+        entry = {"time_index": int(tidx)}
+
+        tke_series_vals = np.array([], dtype=float)
+        pg_mag_vals = np.array([], dtype=float)
+        pg_normal_vals = np.array([], dtype=float)
+        areas = np.array([], dtype=float)
+
+        if has_tke:
+            pg_tke = _extract_plane_field_region(
+                mask_t, tke_array[..., tidx], plane, spacing, origin, "tke",
+                branch_grid=branch_grid, target_label=target_label,
+            )
+            if pg_tke is not None and pg_tke.n_cells > 0:
+                if "tke" not in pg_tke.cell_data and "tke" in pg_tke.point_data:
+                    pg_tke = pg_tke.point_data_to_cell_data(pass_point_data=True)
+                tke_series_vals = np.asarray(pg_tke.cell_data.get("tke", []), dtype=float).reshape(-1)
+                areas = np.asarray(pg_tke.cell_data.get("Area", np.ones(pg_tke.n_cells, dtype=float)), dtype=float).reshape(-1)
+                entry["cell_area_mm2"] = areas.astype(np.float32)
+                entry["tke_J_m3"] = tke_series_vals.astype(np.float32)
+                entry["lumen_mask"] = np.ones_like(tke_series_vals, dtype=np.uint8)
+
+        if has_pressure_gradient:
+            pg_pg = _extract_plane_field_region(
+                mask_t, pressure_gradient_array[..., tidx, :], plane, spacing, origin, "pressure_gradient",
+                branch_grid=branch_grid, target_label=target_label,
+            )
+            if pg_pg is not None and pg_pg.n_cells > 0:
+                if "pressure_gradient" not in pg_pg.cell_data and "pressure_gradient" in pg_pg.point_data:
+                    pg_pg = pg_pg.point_data_to_cell_data(pass_point_data=True)
+                vec = np.asarray(pg_pg.cell_data.get("pressure_gradient", []), dtype=float)
+                if vec.ndim == 2 and vec.shape[1] == 3 and len(vec) == pg_pg.n_cells:
+                    if areas.size == 0:
+                        areas = np.asarray(pg_pg.cell_data.get("Area", np.ones(pg_pg.n_cells, dtype=float)), dtype=float).reshape(-1)
+                        entry.setdefault("cell_area_mm2", areas.astype(np.float32))
+                        entry.setdefault("lumen_mask", np.ones(len(areas), dtype=np.uint8))
+                    pg_mag_vals = np.linalg.norm(vec, axis=1)
+                    pg_normal_vals = np.dot(vec, normal)
+                    entry["pressure_gradient_mag_Pa_m"] = pg_mag_vals.astype(np.float32)
+                    entry["pressure_gradient_normal_Pa_m"] = pg_normal_vals.astype(np.float32)
+                    entry["pressure_gradient_vec_Pa_m"] = vec.astype(np.float32)
+
+        if tke_series_vals.size:
+            tke_mean_t.append(_weighted_mean(tke_series_vals, areas))
+            tke_peak_t.append(float(np.max(tke_series_vals)))
+            tke_p95_t.append(_nanpercentile_safe(tke_series_vals, 95.0))
+        else:
+            tke_mean_t.append(0.0)
+            tke_peak_t.append(0.0)
+            tke_p95_t.append(0.0)
+
+        if pg_mag_vals.size:
+            pg_mag_mean_t.append(_weighted_mean(pg_mag_vals, areas))
+            pg_mag_peak_t.append(float(np.max(pg_mag_vals)))
+            pg_mag_p95_t.append(_nanpercentile_safe(pg_mag_vals, 95.0))
+            pg_normal_mean_t.append(_weighted_mean(pg_normal_vals, areas))
+            pg_normal_peak_t.append(float(np.max(np.abs(pg_normal_vals))))
+            pg_normal_p95_t.append(_nanpercentile_safe(np.abs(pg_normal_vals), 95.0))
+        else:
+            pg_mag_mean_t.append(0.0)
+            pg_mag_peak_t.append(0.0)
+            pg_mag_p95_t.append(0.0)
+            pg_normal_mean_t.append(0.0)
+            pg_normal_peak_t.append(0.0)
+            pg_normal_p95_t.append(0.0)
+
+        wss_vals = np.array([], dtype=float)
+        surf = None if not has_wss or tidx >= len(wss_surfaces) else wss_surfaces[tidx]
+        if surf is not None and getattr(surf, "n_points", 0) > 0:
+            try:
+                wall = surf.slice(normal=normal, origin=np.asarray(plane.center, dtype=float))
+            except Exception:
+                wall = None
+            if wall is not None and getattr(wall, "n_points", 0) > 0:
+                if "wss" not in wall.point_data and "wss" in wall.cell_data:
+                    vals = np.asarray(wall.cell_data.get("wss", []), dtype=float).reshape(-1)
+                else:
+                    vals = np.asarray(wall.point_data.get("wss", []), dtype=float).reshape(-1)
+                wss_vals = vals[np.isfinite(vals)]
+        if wss_vals.size:
+            wss_mean_t.append(float(np.mean(wss_vals)))
+            wss_peak_t.append(float(np.max(wss_vals)))
+            wss_p95_t.append(_nanpercentile_safe(wss_vals, 95.0))
+        else:
+            wss_mean_t.append(0.0)
+            wss_peak_t.append(0.0)
+            wss_p95_t.append(0.0)
+
+        pixelwise["timepoints"].append(entry)
+
+    if has_tke:
+        _append_summary(summary, "tke_mean_J_m3", tke_mean_t)
+        _append_summary(summary, "tke_peak_J_m3", tke_peak_t)
+        _append_summary(summary, "tke_p95_J_m3", tke_p95_t)
+    if has_pressure_gradient:
+        _append_summary(summary, "pressure_gradient_mag_mean_Pa_m", pg_mag_mean_t)
+        _append_summary(summary, "pressure_gradient_mag_peak_Pa_m", pg_mag_peak_t)
+        _append_summary(summary, "pressure_gradient_mag_p95_Pa_m", pg_mag_p95_t)
+        _append_summary(summary, "pressure_gradient_normal_mean_Pa_m", pg_normal_mean_t)
+        _append_summary(summary, "pressure_gradient_normal_peak_Pa_m", pg_normal_peak_t)
+        _append_summary(summary, "pressure_gradient_normal_p95_Pa_m", pg_normal_p95_t)
+    if has_wss:
+        _append_summary(summary, "wss_wall_mean_Pa", wss_mean_t)
+        _append_summary(summary, "wss_wall_peak_Pa", wss_peak_t)
+        _append_summary(summary, "wss_wall_p95_Pa", wss_p95_t)
+    return summary, pixelwise
+
+
+def augment_plane_metrics_with_derived(plane_metrics, planes, mask4d, spacing, origin, branch_labels_3d=None,
+                                       tke_array=None, pressure_gradient_array=None, wss_surfaces=None):
+    metrics = [dict(m) for m in plane_metrics]
+    pixelwise = []
+    for idx, metric in enumerate(metrics):
+        if idx >= len(planes):
+            pixelwise.append({"plane_index": int(idx), "timepoints": []})
+            continue
+        summary, payload = summarize_plane_derived_metrics(
+            planes[idx], mask4d, spacing, origin, branch_labels_3d=branch_labels_3d,
+            tke_array=tke_array, pressure_gradient_array=pressure_gradient_array,
+            wss_surfaces=wss_surfaces,
+        )
+        metric.update(summary)
+        payload["plane_index"] = int(idx)
+        payload["center"] = np.asarray(planes[idx].center, dtype=float).reshape(3).tolist()
+        payload["normal"] = np.asarray(planes[idx].normal, dtype=float).reshape(3).tolist()
+        payload["label"] = int(getattr(planes[idx], "label", 0) or 0)
+        payload["path_index"] = int(getattr(planes[idx], "path_index", -1))
+        pixelwise.append(payload)
+    return metrics, pixelwise
+
+
+def save_plane_pixelwise_h5(path, plane_payloads, rr_ms=None, source_format=""):
+    with h5py.File(path, "w") as h5:
+        meta = h5.create_group("meta")
+        meta.create_dataset("version", data=np.bytes_("1.0"))
+        meta.create_dataset("source_format", data=np.bytes_(str(source_format or "")))
+        if rr_ms is not None:
+            meta.create_dataset("rr_ms", data=float(rr_ms))
+        planes_group = h5.create_group("planes")
+        for payload in plane_payloads:
+            plane_idx = int(payload.get("plane_index", len(planes_group)))
+            grp = planes_group.create_group(f"{plane_idx:03d}")
+            grp.create_dataset("center_xyz", data=np.asarray(payload.get("center", [0.0, 0.0, 0.0]), dtype=np.float32))
+            grp.create_dataset("normal_xyz", data=np.asarray(payload.get("normal", [1.0, 0.0, 0.0]), dtype=np.float32))
+            grp.attrs["label"] = int(payload.get("label", 0))
+            grp.attrs["path_index"] = int(payload.get("path_index", -1))
+            timepoints = payload.get("timepoints", [])
+            times_grp = grp.create_group("timepoints")
+            for entry in timepoints:
+                tidx = int(entry.get("time_index", len(times_grp)))
+                tgrp = times_grp.create_group(f"{tidx:03d}")
+                for key, value in entry.items():
+                    if key == "time_index" or value is None:
+                        continue
+                    arr = np.asarray(value)
+                    if arr.dtype.kind in {"U", "O"}:
+                        continue
+                    tgrp.create_dataset(key, data=arr, compression="gzip")
+
+
 def compute_tke_array_from_sigma(sigma, rho=1060.0):
     return (
         0.5
@@ -234,8 +540,8 @@ def compute_tke_metrics(mask4d, spacing, origin=(0, 0, 0), tke_array=None, sigma
 
 def compute_wss_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
                         smoothing_iteration=200, viscosity=4.0,
-                        inward_distance=0.6, parabolic_fitting=True,
-                        no_slip_condition=True):
+                        inward_distance=None, parabolic_fitting=True,
+                        no_slip_condition=False):
     mask4d = _ensure_mask4d(mask4d)
     flow = np.asarray(flow, dtype=float)
     if flow.ndim != 5 or flow.shape[-1] != 3:
@@ -244,6 +550,7 @@ def compute_wss_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
         raise ValueError(f"flow time dimension {flow.shape[3]} does not match mask {mask4d.shape[3]}")
 
     spacing = np.asarray(spacing, dtype=float).reshape(3)
+    inward_distance = resolve_wss_inward_distance(spacing, inward_distance)
     origin = np.asarray(origin, dtype=float).reshape(3)
     wss_volume = np.zeros(mask4d.shape, dtype=np.float32)
     surfs = []
@@ -275,44 +582,168 @@ def compute_wss_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
     }
 
 
+def compute_pressure_gradient_metrics(mask4d, flow, spacing, rr, rho=1060.0, viscosity=4.0,
+                                      smoothing_sigma=0.0, use_convective_acceleration=True):
+    mask4d = _ensure_mask4d(mask4d)
+    flow = np.asarray(flow, dtype=np.float32)
+    if flow.ndim != 5 or flow.shape[-1] != 3:
+        raise ValueError(f"flow must be XYZTV, got {flow.shape}")
+    if flow.shape[3] != mask4d.shape[3]:
+        raise ValueError(f"flow time dimension {flow.shape[3]} does not match mask {mask4d.shape[3]}")
+
+    spacing_mm = np.asarray(spacing, dtype=float).reshape(3)
+    spacing_m = spacing_mm / 1000.0
+    dt_s = float(rr) / 1000.0 / float(flow.shape[3])
+    rho = float(rho)
+    mu_pa_s = float(viscosity) / 1000.0
+    sigma = max(float(smoothing_sigma), 0.0)
+
+    velocity = np.asarray(flow, dtype=np.float32) / 100.0
+    mask_float = mask4d.astype(np.float32)
+    velocity = velocity * mask_float[..., None]
+    if sigma > 0.0:
+        for comp in range(3):
+            velocity[..., comp] = gaussian_filter(
+                velocity[..., comp],
+                sigma=(sigma, sigma, sigma, 0.0),
+                mode='nearest',
+            )
+        velocity = velocity * mask_float[..., None]
+
+    dx, dy, dz = [float(max(s, 1e-12)) for s in spacing_m]
+    vc = velocity[1:-1, 1:-1, 1:-1, 1:-1, :]
+    du_dt = (
+        velocity[1:-1, 1:-1, 1:-1, 2:, :]
+        - velocity[1:-1, 1:-1, 1:-1, :-2, :]
+    ) / (2.0 * max(dt_s, 1e-12))
+
+    conv = np.zeros_like(vc, dtype=np.float32)
+    lap = np.zeros_like(vc, dtype=np.float32)
+    for comp in range(3):
+        du_dx = (
+            velocity[2:, 1:-1, 1:-1, 1:-1, comp]
+            - velocity[:-2, 1:-1, 1:-1, 1:-1, comp]
+        ) / (2.0 * dx)
+        du_dy = (
+            velocity[1:-1, 2:, 1:-1, 1:-1, comp]
+            - velocity[1:-1, :-2, 1:-1, 1:-1, comp]
+        ) / (2.0 * dy)
+        du_dz = (
+            velocity[1:-1, 1:-1, 2:, 1:-1, comp]
+            - velocity[1:-1, 1:-1, :-2, 1:-1, comp]
+        ) / (2.0 * dz)
+        d2u_dx2 = (
+            velocity[2:, 1:-1, 1:-1, 1:-1, comp]
+            - 2.0 * velocity[1:-1, 1:-1, 1:-1, 1:-1, comp]
+            + velocity[:-2, 1:-1, 1:-1, 1:-1, comp]
+        ) / (dx * dx)
+        d2u_dy2 = (
+            velocity[1:-1, 2:, 1:-1, 1:-1, comp]
+            - 2.0 * velocity[1:-1, 1:-1, 1:-1, 1:-1, comp]
+            + velocity[1:-1, :-2, 1:-1, 1:-1, comp]
+        ) / (dy * dy)
+        d2u_dz2 = (
+            velocity[1:-1, 1:-1, 2:, 1:-1, comp]
+            - 2.0 * velocity[1:-1, 1:-1, 1:-1, 1:-1, comp]
+            + velocity[1:-1, 1:-1, :-2, 1:-1, comp]
+        ) / (dz * dz)
+        if use_convective_acceleration:
+            conv[..., comp] = vc[..., 0] * du_dx + vc[..., 1] * du_dy + vc[..., 2] * du_dz
+        lap[..., comp] = d2u_dx2 + d2u_dy2 + d2u_dz2
+
+    grad_inner = -rho * (du_dt + conv) + mu_pa_s * lap
+    support_mask = np.zeros(mask4d.shape, dtype=bool)
+    for tidx in range(mask4d.shape[3]):
+        support_mask[..., tidx] = binary_erosion(mask4d[..., tidx], structure=np.ones((3, 3, 3), dtype=bool), border_value=0)
+    support_inner = support_mask[1:-1, 1:-1, 1:-1, 1:-1]
+
+    grad = np.zeros(flow.shape, dtype=np.float32)
+    grad[1:-1, 1:-1, 1:-1, 1:-1, :] = grad_inner.astype(np.float32)
+    grad *= support_mask.astype(np.float32)[..., None]
+    grad_mag = np.sqrt(np.sum(np.square(grad, dtype=np.float32), axis=-1)).astype(np.float32)
+    grad_peak = np.max(grad_mag, axis=3).astype(np.float32)
+
+    finite_inner = grad_inner[np.isfinite(grad_inner) & support_inner[..., None]]
+    display_upper = float(np.percentile(np.abs(finite_inner), 99.0)) if finite_inner.size else 0.0
+
+    return {
+        'pressure_gradient_array': grad,
+        'pressure_gradient_magnitude': grad_mag,
+        'pressure_gradient_peak': grad_peak,
+        'pressure_gradient_dt_s': float(dt_s),
+        'pressure_gradient_support_mask': support_mask.astype(np.uint8),
+        'pressure_gradient_display_clim': (0.0, display_upper if display_upper > 0 else 1.0),
+    }
+
+
 def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
                             smoothing_iteration=200, viscosity=4.0,
-                            inward_distance=0.6, parabolic_fitting=True,
-                            no_slip_condition=True, step_size=5,
+                            inward_distance=None, parabolic_fitting=True,
+                            no_slip_condition=False, step_size=5,
                             tube_radius=0.1, rho=1060.0,
-                            save_pixelwise=False, tke_array=None, sigma=None):
+                            save_pixelwise=False, tke_array=None, sigma=None,
+                            rr=1000.0, pressure_gradient_smoothing_sigma=0.0,
+                            pressure_gradient_use_convective_acceleration=True,
+                            compute_wss=True, compute_tke=True,
+                            compute_pressure_gradient=True):
     mask4d = _ensure_mask4d(mask4d)
-    wss = compute_wss_metrics(
-        mask4d, flow, spacing, origin=origin,
-        smoothing_iteration=smoothing_iteration,
-        viscosity=viscosity,
-        inward_distance=inward_distance,
-        parabolic_fitting=parabolic_fitting,
-        no_slip_condition=no_slip_condition,
-    )
+    wss = None
+    if compute_wss:
+        wss = compute_wss_metrics(
+            mask4d, flow, spacing, origin=origin,
+            smoothing_iteration=smoothing_iteration,
+            viscosity=viscosity,
+            inward_distance=inward_distance,
+            parabolic_fitting=parabolic_fitting,
+            no_slip_condition=no_slip_condition,
+        )
     tke = None
-    if tke_array is not None or sigma is not None:
+    if compute_tke and (tke_array is not None or sigma is not None):
         tke = compute_tke_metrics(
             mask4d, spacing, origin=origin, tke_array=tke_array, sigma=sigma, rho=rho,
+        )
+    pressure_gradient = None
+    if compute_pressure_gradient:
+        pressure_gradient = compute_pressure_gradient_metrics(
+            mask4d,
+            flow,
+            spacing,
+            rr=rr,
+            rho=rho,
+            viscosity=viscosity,
+            smoothing_sigma=pressure_gradient_smoothing_sigma,
+            use_convective_acceleration=pressure_gradient_use_convective_acceleration,
         )
 
     spacing = np.asarray(spacing, dtype=float).reshape(3)
     origin = np.asarray(origin, dtype=float).reshape(3)
     result = {
-        "wss_surfaces": wss["wss_surfaces"],
-        "wss_volume": wss["wss_volume"],
+        "wss_surfaces": [] if wss is None else wss["wss_surfaces"],
+        "wss_volume": None if wss is None else wss["wss_volume"],
         "tke_volume": None if tke is None else tke["tke_volume"],
         "tke_array": None if tke is None else tke["tke_array"],
         "tke_peak": None if tke is None else tke["tke_peak"],
+        "pressure_gradient_array": None if pressure_gradient is None else pressure_gradient["pressure_gradient_array"],
+        "pressure_gradient_magnitude": None if pressure_gradient is None else pressure_gradient["pressure_gradient_magnitude"],
+        "pressure_gradient_peak": None if pressure_gradient is None else pressure_gradient["pressure_gradient_peak"],
+        "pressure_gradient_dt_s": None if pressure_gradient is None else pressure_gradient["pressure_gradient_dt_s"],
+        "pressure_gradient_support_mask": None if pressure_gradient is None else pressure_gradient["pressure_gradient_support_mask"],
+        "pressure_gradient_display_clim": None if pressure_gradient is None else pressure_gradient["pressure_gradient_display_clim"],
         "streamlines": [],
         "tube_radius": float(tube_radius),
     }
     if save_pixelwise:
         pixelwise_export = {
-            "wss": np.asarray(wss["wss_volume"], dtype=np.float32),
             "spacing": np.asarray(spacing, dtype=np.float32),
             "origin": np.asarray(origin, dtype=np.float32),
         }
+        if wss is not None:
+            pixelwise_export["wss"] = np.asarray(wss["wss_volume"], dtype=np.float32)
+        if pressure_gradient is not None:
+            pixelwise_export["pressure_gradient"] = np.asarray(pressure_gradient["pressure_gradient_array"], dtype=np.float32)
+            pixelwise_export["pressure_gradient_mag"] = np.asarray(pressure_gradient["pressure_gradient_magnitude"], dtype=np.float32)
+            pixelwise_export["pressure_gradient_peak"] = np.asarray(pressure_gradient["pressure_gradient_peak"], dtype=np.float32)
+            pixelwise_export["pressure_gradient_support_mask"] = np.asarray(pressure_gradient["pressure_gradient_support_mask"], dtype=np.uint8)
         if tke is not None:
             pixelwise_export["tke"] = np.asarray(tke["tke_peak"], dtype=np.float32)
             pixelwise_export["tke_time"] = np.asarray(tke["tke_array"], dtype=np.float32)
@@ -462,7 +893,7 @@ def compute_plane_metrics_multithread(flow_xyzt3, segmask_binary_4d, spacing, or
                                        branch_labels_3d=None, path_info=None, forks=None,
                                        paths=None, return_qc=False, max_workers=None):
     from concurrent.futures import ThreadPoolExecutor
-    flow = np.asarray(flow_xyzt3, dtype=float)
+    flow = _ensure_flow5d(flow_xyzt3)
     mask = np.asarray(segmask_binary_4d, dtype=bool)
     spacing = np.asarray(spacing, dtype=float).reshape(-1)[:3]
     origin = np.asarray(origin, dtype=float).reshape(-1)[:3]
@@ -529,6 +960,10 @@ def load_metrics_as_table(metrics_json_path, qc_json_path=None):
         "meanv_signed_cm_s",
         "forward_sign", "forward_sign_source",
         "local_path_direction", "normal_tangent_cos",
+        "tke_mean_J_m3", "tke_peak_J_m3", "tke_p95_J_m3",
+        "pressure_gradient_mag_mean_Pa_m", "pressure_gradient_mag_peak_Pa_m", "pressure_gradient_mag_p95_Pa_m",
+        "pressure_gradient_normal_mean_Pa_m", "pressure_gradient_normal_peak_Pa_m", "pressure_gradient_normal_p95_Pa_m",
+        "wss_wall_mean_Pa", "wss_wall_peak_Pa", "wss_wall_p95_Pa",
     ]
     table_rows = []
     for i, m in enumerate(metrics):

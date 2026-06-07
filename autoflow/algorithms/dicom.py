@@ -19,7 +19,7 @@ from .phase_correction import (
 )
 
 _H5_SUFFIXES = (".h5", ".hdf5")
-_DIR_TOKEN_RE = re.compile(r"(?<![A-Z])(RL|LR|AP|PA|HF|FH|SI|IS|RO|PE|SS)(?![A-Z])")
+_DIR_TOKEN_RE = re.compile(r"(?<![A-Z])(RL|LR|AP|PA|HF|FH|SI|IS|RO|PE|SS|IN|TH)(?![A-Z])")
 _RR_RE = re.compile(r"RR\s+(\d+)", re.IGNORECASE)
 
 
@@ -340,7 +340,8 @@ def _extract_component_label_from_text(ds):
             label = _normalize_direction_token(token)
             if label is not None:
                 return label
-            label = _label_from_axis_role(ds, token)
+            axis_role = "SS" if token in {"IN", "TH"} else token
+            label = _label_from_axis_role(ds, axis_role)
             if label is not None:
                 return label
     return None
@@ -1076,6 +1077,44 @@ def _extract_group_rescale(ds):
     return slope, intercept
 
 
+def _extract_siemens_phase_scale(ds, data=None, intercept=None):
+    intercept_value = _safe_float(intercept, default=None)
+    if intercept_value is not None and abs(intercept_value) > 1e-12:
+        return abs(intercept_value)
+
+    largest = _safe_float(getattr(ds, "LargestImagePixelValue", None), default=None)
+    smallest = _safe_float(getattr(ds, "SmallestImagePixelValue", None), default=None)
+    if largest is not None or smallest is not None:
+        candidates = [abs(value) for value in (largest, smallest) if value is not None]
+        if candidates:
+            return max(candidates)
+
+    bits_stored = _safe_float(getattr(ds, "BitsStored", None), default=None)
+    pixel_representation = int(_safe_float(getattr(ds, "PixelRepresentation", None), default=1) or 1)
+    if bits_stored is not None and bits_stored > 0:
+        bits_stored = int(bits_stored)
+        if pixel_representation == 1:
+            return float(2 ** max(bits_stored - 1, 0))
+        return float(max((2 ** bits_stored) - 1, 1))
+
+    if data is not None:
+        max_abs = float(np.nanmax(np.abs(np.asarray(data, dtype=float)))) if np.size(data) else 0.0
+        if np.isfinite(max_abs) and max_abs > 1e-12:
+            return max_abs
+
+    return None
+
+
+def _scale_siemens_velocity_frame(pixel, ds, venc, slope=1.0, intercept=0.0):
+    data = np.asarray(pixel, dtype=np.float32) * float(slope) + float(intercept)
+    if venc is None:
+        return np.asarray(data, dtype=np.float32)
+    phase_scale = _extract_siemens_phase_scale(ds, data=data, intercept=intercept)
+    if phase_scale is None or phase_scale <= 1e-12:
+        return np.asarray(data, dtype=np.float32)
+    return np.asarray((data / float(phase_scale)) * float(venc), dtype=np.float32)
+
+
 def _convert_group0_frame(ds, entry, pixel=None):
     pixel = np.asarray(ds.pixel_array if pixel is None else pixel, dtype=np.float32)
     slope = _safe_float(getattr(ds, "RescaleSlope", None), default=1.0)
@@ -1088,9 +1127,7 @@ def _convert_group0_frame(ds, entry, pixel=None):
 
     if "siemens" in manufacturer:
         venc = _extract_venc_from_text(getattr(ds, "SequenceName", ""))
-        data = pixel * slope + intercept
-        if venc is not None and abs(intercept) > 1e-12:
-            data = data / intercept * venc
+        data = _scale_siemens_velocity_frame(pixel, ds, venc, slope=slope, intercept=intercept)
         return data.astype(np.float32), venc
 
     if "philips" in manufacturer:
@@ -1233,9 +1270,7 @@ def _convert_group1_entry(ds, entry):
     slope, intercept = _extract_group_rescale(ds)
     label = entry.get("component_label")
     venc = _extract_multiframe_venc(ds) if label else None
-    data = pixel * slope + intercept
-    if label and venc is not None and abs(intercept) > 1e-12:
-        data = data / intercept * venc
+    data = _scale_siemens_velocity_frame(pixel, ds, venc, slope=slope, intercept=intercept) if label else pixel * slope + intercept
     slice_key = None
     for item in _iter_functional_groups(ds):
         frame_content = getattr(item, "FrameContentSequence", None)

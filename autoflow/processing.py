@@ -3,12 +3,19 @@ import glob
 import json
 import os
 import traceback
+import time
 
 import numpy as np
 
 from .core.models import StepId, Workspace
 from .core.pipeline import PipelineEngine
-from .algorithms import collect_input_cases, compute_derived_metrics, resolve_input_case
+from .algorithms import collect_input_cases, resolve_input_case
+from .algorithms.segmentation import (
+    generate_nnunet_auto_segmentation,
+    resolve_auto_segmentation_device,
+    resolve_nnunet_model_folder,
+    save_segmentation_file,
+)
 from .plane_io import (
     load_plane_positions,
     project_planes_to_workspace,
@@ -24,14 +31,121 @@ from .rendering import (
 from .reporting import load_metrics_from_output, print_metrics_summary, print_qc_summary
 
 
+def _has_cached_derived_metrics(ws):
+    has_wss = ws.derived.wss_volume is not None and np.size(ws.derived.wss_volume) > 0
+    has_pg = ws.derived.pressure_gradient_array is not None and np.size(ws.derived.pressure_gradient_array) > 0
+    has_tke = ws.derived.tke_array is not None or ws.derived.tke_volume is not None
+    source_tke = ws.source_tke_array
+    source_sigma = ws.source_sigma if ws.input_state.capabilities.has_complex_source else None
+    return has_wss and has_pg and (has_tke or (source_tke is None and source_sigma is None))
+
+
+def _build_cached_pixelwise_export(ws):
+    if not _has_cached_derived_metrics(ws):
+        return {}
+
+    pixelwise = {
+        "wss": np.asarray(ws.derived.wss_volume, dtype=np.float32),
+        "spacing": np.asarray(ws.resolution, dtype=np.float32),
+        "origin": np.asarray(ws.origin, dtype=np.float32),
+        "pressure_gradient": np.asarray(ws.derived.pressure_gradient_array, dtype=np.float32),
+        "pressure_gradient_mag": np.asarray(ws.derived.pressure_gradient_magnitude, dtype=np.float32),
+        "pressure_gradient_peak": np.asarray(ws.derived.pressure_gradient_peak, dtype=np.float32),
+        "pressure_gradient_support_mask": np.asarray(ws.derived.pressure_gradient_support_mask, dtype=np.uint8),
+    }
+    if ws.derived.tke_array is not None:
+        tke_time = np.asarray(ws.derived.tke_array, dtype=np.float32)
+        pixelwise["tke"] = np.asarray(np.max(tke_time, axis=3), dtype=np.float32)
+        pixelwise["tke_time"] = tke_time
+    return pixelwise
+
+
+def _format_timing_parts(parts):
+    return " ".join(f"{name}={seconds:.2f}s" for name, seconds in parts if seconds is not None)
+
+
+def _default_segmentation_sidecar_path(ws, out_dir, source="auto"):
+    base = os.path.splitext(os.path.basename(ws.paths.flow_path or ws.paths.segmask_path or "segmentation"))[0]
+    os.makedirs(out_dir, exist_ok=True)
+    return os.path.join(out_dir, f"{base}_{source}_segmentation.h5")
+
+
+def _make_cli_autoseg_progress_handler():
+    state = {"last_key": None}
+
+    def _handler(payload):
+        if not isinstance(payload, dict):
+            message = str(payload or "").strip()
+            if message:
+                print(f"  [autoseg] {message}")
+            return
+        stage = str(payload.get("stage", "") or "")
+        message = str(payload.get("message", "") or stage or "auto segmentation")
+        elapsed_sec = payload.get("elapsed_sec")
+        if elapsed_sec is not None:
+            message = f"{message} | elapsed={float(elapsed_sec):.2f}s"
+        key = (stage, payload.get("current"), payload.get("detail_current"), message)
+        if key == state["last_key"]:
+            return
+        state["last_key"] = key
+        print(f"  [autoseg] {message}")
+
+    return _handler
+
+
+def _run_cli_auto_segmentation(ws, out_dir, *, backend, model_folder, checkpoint_name, device, auto_label_map):
+    if ws.mag_raw is None or ws.flow_raw is None:
+        raise ValueError("auto segmentation requires loaded mag and flow data")
+    resolved_model = resolve_nnunet_model_folder(model_folder)
+    resolved_device = resolve_auto_segmentation_device(device)
+    print(f"  [autoseg] backend={backend} model={resolved_model} checkpoint={checkpoint_name} device={resolved_device}")
+    t_start = time.perf_counter()
+    seg, provenance = generate_nnunet_auto_segmentation(
+        mag=ws.mag_raw,
+        flow=ws.flow_raw,
+        resolution=ws.resolution,
+        origin=ws.origin,
+        model_folder=resolved_model,
+        backend=backend,
+        checkpoint_name=checkpoint_name,
+        device=resolved_device,
+        auto_label_map=auto_label_map,
+        progress_callback=_make_cli_autoseg_progress_handler(),
+    )
+    infer_elapsed = time.perf_counter() - t_start
+    ws.set_segmentation_source("auto", seg, provenance=provenance)
+    ws.activate_segmentation_source("auto")
+    sidecar = _default_segmentation_sidecar_path(ws, out_dir, source="auto")
+    t_save = time.perf_counter()
+    save_segmentation_file(
+        sidecar,
+        ws.get_active_segmentation(),
+        resolution=ws.resolution,
+        origin=ws.origin,
+        provenance=ws.get_active_segmentation_provenance(),
+    )
+    save_elapsed = time.perf_counter() - t_save
+    print(f"  [autoseg] sidecar saved: {sidecar} | save={save_elapsed:.2f}s total={infer_elapsed + save_elapsed:.2f}s")
+    return sidecar
+
+
 def process_single(
     input_source,
     out_dir,
     workspace=None,
     skip_derived=False,
+    skip_wss=False,
+    skip_tke=False,
+    skip_pressure_gradient=False,
     skip_plane_metrics=False,
     use_multithread=False,
     reuse_planes_path="",
+    autoseg=False,
+    autoseg_backend="nnUNet",
+    autoseg_model="",
+    autoseg_checkpoint="checkpoint_final.pth",
+    autoseg_device="auto",
+    autoseg_label_map="",
     fps=24,
     plane_rotation_frames=180,
     rotate_dynamic_video=False,
@@ -39,6 +153,7 @@ def process_single(
     dynamic_rotation_elevation_deg=None,
     make_plane_video=True,
     make_wss_video=True,
+    make_pressure_gradient_video=True,
     make_streamlines_video=True,
     make_tke_video=True,
     camera_view="iso",
@@ -71,29 +186,62 @@ def process_single(
     logger = lambda msg: None
     import time as _time
 
-    t_total_start = _time.time()
+    stage_times = {}
+    t_total_start = _time.perf_counter()
 
     print("[1/7] Loading data...")
+    t_stage = _time.perf_counter()
     engine.load_data(ws, logger, input_source=case)
+    elapsed = _time.perf_counter() - t_stage
+    stage_times["load"] = float(elapsed)
+    print(f"  -> load={elapsed:.2f}s")
+
+    if ws.segmask_raw is None and autoseg:
+        print("[1.5/7] Auto segmentation...")
+        t_stage = _time.perf_counter()
+        sidecar = _run_cli_auto_segmentation(
+            ws,
+            out_dir,
+            backend=autoseg_backend,
+            model_folder=autoseg_model,
+            checkpoint_name=autoseg_checkpoint,
+            device=autoseg_device,
+            auto_label_map=autoseg_label_map,
+        )
+        elapsed = _time.perf_counter() - t_stage
+        stage_times["autoseg"] = float(elapsed)
+        print(f"  -> auto segmentation ready: {sidecar} | time={elapsed:.2f}s")
 
     print("[2/7] Generate Skeleton...")
+    t_stage = _time.perf_counter()
     result = engine.run_step(ws, StepId.GENERATE_SKELETON, logger)
-    print(f"  -> {result.message}")
+    elapsed = _time.perf_counter() - t_stage
+    stage_times["skeleton"] = float(elapsed)
+    print(f"  -> {result.message} | time={elapsed:.2f}s")
 
     print("[3/7] Generate Graph (+ branches/forks)...")
+    t_stage = _time.perf_counter()
     result = engine.run_step(ws, StepId.GENERATE_GRAPH, logger)
-    print(f"  -> {result.message}")
+    elapsed = _time.perf_counter() - t_stage
+    stage_times["graph"] = float(elapsed)
+    print(f"  -> {result.message} | time={elapsed:.2f}s")
 
     print("[4/7] Generate Planes...")
+    t_stage = _time.perf_counter()
     result = engine.run_step(ws, StepId.GENERATE_PLANES, logger)
-    print(f"  -> {result.message}")
+    elapsed = _time.perf_counter() - t_stage
+    stage_times["planes"] = float(elapsed)
+    print(f"  -> {result.message} | time={elapsed:.2f}s")
 
     if reuse_planes_path:
         print(f"[5/7] Reuse Plane Positions: {reuse_planes_path}")
+        t_stage = _time.perf_counter()
         plane_items = load_plane_positions(reuse_planes_path)
         ws.planes = project_planes_to_workspace(plane_items, ws)
         planes_json = engine._save_planes_json(ws)
-        print(f"  -> Reused {len(ws.planes)} planes saved={planes_json}")
+        elapsed = _time.perf_counter() - t_stage
+        stage_times["reuse_planes"] = float(elapsed)
+        print(f"  -> Reused {len(ws.planes)} planes saved={planes_json} | time={elapsed:.2f}s")
     else:
         print("[5/7] Use generated planes")
 
@@ -101,62 +249,65 @@ def process_single(
         print("[6/7] Skipped plane metrics")
     else:
         print("[6/7] Calculate & Save Metrics...")
+        t_step = _time.perf_counter()
+        step_parts = []
+        if not skip_derived and ws.segmask_raw is not None and not ws.derived.pixelwise_export:
+            t_part = _time.perf_counter()
+            engine._ensure_derived_metrics(ws, save_pixelwise=True, refresh_scene_objects=False)
+            step_parts.append(("derived_prep", _time.perf_counter() - t_part))
+        t_part = _time.perf_counter()
         _, _, metric_msg = engine._compute_plane_metrics_internal(
             ws,
             save=True,
             use_multithread=use_multithread,
         )
-        print(f"  -> {metric_msg}")
+        step_parts.append(("plane_metrics", _time.perf_counter() - t_part))
         try:
+            t_part = _time.perf_counter()
             engine._save_planes_json(ws)
+            step_parts.append(("planes_json", _time.perf_counter() - t_part))
         except Exception:
             pass
+        elapsed = _time.perf_counter() - t_step
+        stage_times["plane_metrics"] = float(elapsed)
+        print(f"  -> {metric_msg} | {_format_timing_parts(step_parts + [('total', elapsed)])}")
 
     pixelwise_result = {}
     if not skip_derived:
         if ws.segmask_raw is None:
             print("[7/7] Skipped derived metrics (no segmentation)")
         else:
-            print("[7/7] Compute Derived Metrics (WSS/TKE)...")
-            dp = ws.derived_params
-            engine.preprocess(ws)
-            source_tke = ws.source_tke_array
-            source_sigma = ws.source_sigma if ws.input_state.capabilities.has_complex_source else None
-
-            derived = compute_derived_metrics(
-                flow=ws.flow_raw * ws.segmask_binary[..., None],
-                mask4d=ws.segmask_binary,
-                spacing=ws.resolution,
-                origin=ws.origin,
-                smoothing_iteration=dp.smoothing_iteration,
-                viscosity=dp.viscosity,
-                inward_distance=dp.inward_distance,
-                parabolic_fitting=dp.parabolic_fitting,
-                no_slip_condition=dp.no_slip_condition,
-                step_size=dp.step_size,
-                tube_radius=dp.tube_radius,
-                rho=dp.rho,
-                save_pixelwise=True,
-                tke_array=source_tke,
-                sigma=source_sigma,
-            )
-            ws.derived.wss_surfaces = derived["wss_surfaces"]
-            ws.derived.wss_volume = derived.get("wss_volume")
-            ws.derived.tke_volume = derived["tke_volume"]
-            ws.derived.tke_array = derived.get("tke_array")
-            ws.derived.pixelwise_export = derived.get("pixelwise_export", {})
+            print("[7/7] Compute Derived Metrics (WSS/TKE/Pressure Gradient)...")
+            t_step = _time.perf_counter()
+            step_parts = []
+            if not ws.derived.pixelwise_export:
+                if not _has_cached_derived_metrics(ws):
+                    t_part = _time.perf_counter()
+                    engine._ensure_derived_metrics(ws, save_pixelwise=True, refresh_scene_objects=False)
+                    step_parts.append(("derived_compute", _time.perf_counter() - t_part))
+                else:
+                    t_part = _time.perf_counter()
+                    ws.derived.pixelwise_export = _build_cached_pixelwise_export(ws)
+                    step_parts.append(("pixelwise_build", _time.perf_counter() - t_part))
             pixelwise_result = ws.derived.pixelwise_export
             pixel_path = os.path.join(out_dir, "derived_metrics_pixelwise.npz")
             if pixelwise_result:
+                t_part = _time.perf_counter()
                 np.savez_compressed(pixel_path, **pixelwise_result)
+                step_parts.append(("npz_write", _time.perf_counter() - t_part))
                 print(f"  -> Saved pixelwise: {pixel_path}")
             ws.pipeline.mark_done(StepId.COMPUTE_DERIVED_METRICS)
             tke_suffix = "" if ws.derived.tke_array is not None or ws.derived.tke_volume is not None else " tke=unavailable"
-            print(f"  -> Derived: Nt={len(ws.derived.wss_surfaces)}{tke_suffix}")
+            elapsed = _time.perf_counter() - t_step
+            stage_times["derived_export"] = float(elapsed)
+            print(f"  -> Derived: Nt={len(ws.derived.wss_surfaces)}{tke_suffix} | {_format_timing_parts(step_parts + [('total', elapsed)])}")
     else:
-        print("[7/7] Skipped derived metrics (WSS/TKE)")
+        print("[7/7] Skipped derived metrics (WSS/TKE/Pressure Gradient)")
 
-    total_time_sec = _time.time() - t_total_start
+    total_time_sec = _time.perf_counter() - t_total_start
+    timing_summary = _format_timing_parts([(name, seconds) for name, seconds in stage_times.items()])
+    if timing_summary:
+        print(f"  => Stage timing: {timing_summary}")
     print(f"  => Total pipeline took {total_time_sec:.2f}s")
 
     plane_positions_path = save_plane_positions(ws, os.path.join(out_dir, "plane_positions.json"), source_path=case.input_path)
@@ -289,6 +440,7 @@ def process_single(
         "reused_planes_file": reuse_planes_path,
         "videos": video_paths,
         "pixelwise_export": {k: list(np.asarray(v).shape) for k, v in pixelwise_result.items()} if pixelwise_result else {},
+        "plane_pixelwise_file": ws.derived.plane_pixelwise_file,
     }
     summary_path = os.path.join(out_dir, "summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
@@ -320,10 +472,13 @@ def build_base_workspace():
     ws.plane_gen_params.end_distance = globals().get("END_DIST", 0.0)
     ws.skeleton_params.remove_small_cc = globals().get("REMOVE_SMALL_CC", True)
     ws.skeleton_params.min_cc_volume_mm3 = globals().get("MIN_CC_VOLUME", 50.0)
-    ws.streamline_params.max_steps = 2000
-    ws.streamline_params.min_seeds = 50
+    ws.streamline_params.max_steps = globals().get("MAX_STEPS", 2000)
+    ws.streamline_params.min_seeds = globals().get("MIN_SEEDS", 50)
     ws.streamline_params.seed_ratio = globals().get("SEED_RATIO", 0.02)
+    ws.streamline_params.terminal_speed = globals().get("TERMINAL_SPEED", 0.01)
+    ws.streamline_params.rng_seed = globals().get("RNG_SEED", 0)
     ws.streamline_params.tube_radius = globals().get("TUBE_RADIUS", 0.05)
+    ws.streamline_params.pathline_color = globals().get("PATHLINE_COLOR", globals().get("PLANE_PATHLINE_COLOR", "deepskyblue"))
     return ws
 
 

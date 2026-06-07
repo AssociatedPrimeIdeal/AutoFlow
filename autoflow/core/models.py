@@ -40,9 +40,9 @@ class StepId(Enum):
             StepId.GENERATE_PLANES: "Generate Planes",
             StepId.EDIT_PLANES: "Edit Planes",
             StepId.GENERATE_STREAMLINES: "Generate Streamlines",
-            StepId.PLANE_STREAMLINES: "Plane Streamlines",
+            StepId.PLANE_STREAMLINES: "Pathlines",
             StepId.COMPUTE_PLANE_METRICS: "Calculate && Save Metrics",
-            StepId.COMPUTE_DERIVED_METRICS: "WSS / TKE",
+            StepId.COMPUTE_DERIVED_METRICS: "WSS / TKE / Pressure Gradient",
         }[self]
 
     @staticmethod
@@ -57,16 +57,16 @@ class StepId(Enum):
     @staticmethod
     def bottom_row_steps():
         return [
-            StepId.EDIT_SKELETON,
-            StepId.EDIT_GRAPH,
+            StepId.COMPUTE_DERIVED_METRICS,
+            StepId.GENERATE_STREAMLINES,
+            StepId.PLANE_STREAMLINES,
         ]
 
     @staticmethod
     def extra_row_steps():
         return [
-            StepId.GENERATE_STREAMLINES,
-            StepId.PLANE_STREAMLINES,
-            StepId.COMPUTE_DERIVED_METRICS,
+            StepId.EDIT_SKELETON,
+            StepId.EDIT_GRAPH,
         ]
 
 
@@ -88,6 +88,15 @@ class SkeletonParams:
     do_opening: bool = False
     gaussian_sigma: float = 0.5
     gaussian_enabled: bool = True
+    dilation_iters: int = 0
+    erosion_iters: int = 0
+    opening_iters: int = 0
+    closing_iters: int = 0
+    label_map: Dict[str, int] = field(default_factory=dict)
+    label_groups: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    single_label_group_name: str = "single_label"
+    single_label_browser_color: str = "#d9480f"
+    default_group_browser_color: str = "#1c7ed6"
 
     def to_dict(self):
         return {
@@ -97,19 +106,123 @@ class SkeletonParams:
             "do_opening": self.do_opening,
             "gaussian_sigma": self.gaussian_sigma,
             "gaussian_enabled": self.gaussian_enabled,
+            "dilation_iters": int(self.dilation_iters),
+            "erosion_iters": int(self.erosion_iters),
+            "opening_iters": int(self.opening_iters),
+            "closing_iters": int(self.closing_iters),
+            "label_map": {str(k): int(v) for k, v in self.label_map.items()},
+            "label_groups": copy.deepcopy(self.label_groups),
+            "single_label_group_name": str(self.single_label_group_name),
+            "single_label_browser_color": str(self.single_label_browser_color),
+            "default_group_browser_color": str(self.default_group_browser_color),
         }
 
     @staticmethod
     def from_dict(d):
-        if "keep_largest_cc" in d and "remove_small_cc" not in d:
-            d["remove_small_cc"] = d["keep_largest_cc"]
+        payload = dict(d or {})
+        if "keep_largest_cc" in payload and "remove_small_cc" not in payload:
+            payload["remove_small_cc"] = payload["keep_largest_cc"]
+        raw_label_map = dict(payload.get("label_map", {}))
+        label_map = {}
+        for key, value in raw_label_map.items():
+            try:
+                label_map[str(key)] = int(value)
+            except Exception:
+                continue
+        label_groups = {}
+        for group_name, raw_cfg in dict(payload.get("label_groups", {})).items():
+            cfg = copy.deepcopy(raw_cfg if isinstance(raw_cfg, dict) else {"labels": raw_cfg})
+            labels = []
+            for item in list(cfg.get("labels", [])):
+                if isinstance(item, str):
+                    token = item.strip()
+                    if token in label_map:
+                        labels.append(int(label_map[token]))
+                        continue
+                    try:
+                        labels.append(int(token))
+                    except Exception:
+                        continue
+                else:
+                    try:
+                        labels.append(int(item))
+                    except Exception:
+                        continue
+            cfg["labels"] = labels
+            preprocess = cfg.get("preprocess", {})
+            cfg["preprocess"] = copy.deepcopy(preprocess) if isinstance(preprocess, dict) else {}
+            label_groups[str(group_name)] = cfg
         return SkeletonParams(
-            remove_small_cc=bool(d.get("remove_small_cc", False)),
-            min_cc_volume_mm3=float(d.get("min_cc_volume_mm3", 50.0)),
-            do_closing=bool(d.get("do_closing", True)),
-            do_opening=bool(d.get("do_opening", False)),
-            gaussian_sigma=float(d.get("gaussian_sigma", 0.5)),
-            gaussian_enabled=bool(d.get("gaussian_enabled", True)))
+            remove_small_cc=bool(payload.get("remove_small_cc", False)),
+            min_cc_volume_mm3=float(payload.get("min_cc_volume_mm3", 50.0)),
+            do_closing=bool(payload.get("do_closing", True)),
+            do_opening=bool(payload.get("do_opening", False)),
+            gaussian_sigma=float(payload.get("gaussian_sigma", 0.5)),
+            gaussian_enabled=bool(payload.get("gaussian_enabled", True)),
+            dilation_iters=int(payload.get("dilation_iters", 0) or 0),
+            erosion_iters=int(payload.get("erosion_iters", 0) or 0),
+            opening_iters=int(payload.get("opening_iters", 0) or 0),
+            closing_iters=int(payload.get("closing_iters", 0) or 0),
+            label_map=label_map,
+            label_groups=label_groups,
+            single_label_group_name=str(payload.get("single_label_group_name", "single_label") or "single_label"),
+            single_label_browser_color=str(payload.get("single_label_browser_color", "#d9480f") or "#d9480f"),
+            default_group_browser_color=str(payload.get("default_group_browser_color", "#1c7ed6") or "#1c7ed6"),
+        )
+
+    def browser_color_for_group(self, group_name):
+        cfg = self.label_groups.get(str(group_name), {})
+        color = str(cfg.get("browser_color", "") or "")
+        if color:
+            return color
+        if str(group_name) == str(self.single_label_group_name):
+            return str(self.single_label_browser_color)
+        return str(self.default_group_browser_color)
+
+    def scene_color_for_group(self, group_name, kind="scene"):
+        cfg = self.label_groups.get(str(group_name), {})
+        if kind == "skeleton" and cfg.get("skeleton_color"):
+            return str(cfg.get("skeleton_color"))
+        if kind == "graph" and cfg.get("graph_color"):
+            return str(cfg.get("graph_color"))
+        if kind == "path" and cfg.get("path_color"):
+            return str(cfg.get("path_color"))
+        if kind == "plane" and cfg.get("plane_color"):
+            return str(cfg.get("plane_color"))
+        if cfg.get("scene_color"):
+            return str(cfg.get("scene_color"))
+        return self.browser_color_for_group(group_name)
+
+    def params_for_group(self, group_name):
+        cfg = self.label_groups.get(str(group_name), {})
+        overrides = cfg.get("preprocess", {}) if isinstance(cfg.get("preprocess", {}), dict) else {}
+        params = SkeletonParams(
+            remove_small_cc=self.remove_small_cc,
+            min_cc_volume_mm3=self.min_cc_volume_mm3,
+            do_closing=self.do_closing,
+            do_opening=self.do_opening,
+            gaussian_sigma=self.gaussian_sigma,
+            gaussian_enabled=self.gaussian_enabled,
+            dilation_iters=self.dilation_iters,
+            erosion_iters=self.erosion_iters,
+            opening_iters=self.opening_iters,
+            closing_iters=self.closing_iters,
+        )
+        for key in [
+            "remove_small_cc",
+            "min_cc_volume_mm3",
+            "do_closing",
+            "do_opening",
+            "gaussian_sigma",
+            "gaussian_enabled",
+            "dilation_iters",
+            "erosion_iters",
+            "opening_iters",
+            "closing_iters",
+        ]:
+            if key in overrides and overrides.get(key) is not None:
+                setattr(params, key, overrides.get(key))
+        return params
 
 
 @dataclass
@@ -153,6 +266,8 @@ class StreamlineParams:
     min_seeds: int = 50
     terminal_speed: float = 0.01
     rng_seed: int = 0
+    tube_radius: float = 0.05
+    pathline_color: str = "deepskyblue"
 
     def to_dict(self):
         return {
@@ -161,6 +276,8 @@ class StreamlineParams:
             "min_seeds": self.min_seeds,
             "terminal_speed": self.terminal_speed,
             "rng_seed": self.rng_seed,
+            "tube_radius": self.tube_radius,
+            "pathline_color": str(self.pathline_color),
         }
 
     @staticmethod
@@ -168,9 +285,11 @@ class StreamlineParams:
         return StreamlineParams(
             seed_ratio=float(d.get("seed_ratio", 0.02)),
             max_steps=int(d.get("max_steps", 2000)),
-            min_seeds=50,
+            min_seeds=int(d.get("min_seeds", 50)),
             terminal_speed=float(d.get("terminal_speed", 0.01)),
             rng_seed=int(d.get("rng_seed", 0)),
+            tube_radius=float(d.get("tube_radius", 0.05)),
+            pathline_color=str(d.get("pathline_color", d.get("plane_pathline_color", "deepskyblue")) or "deepskyblue"),
         )
 
 
@@ -178,12 +297,14 @@ class StreamlineParams:
 class DerivedMetricsParams:
     smoothing_iteration: int = 200
     viscosity: float = 4.0
-    inward_distance: float = 0.6
+    inward_distance: Optional[float] = None
     parabolic_fitting: bool = True
-    no_slip_condition: bool = True
+    no_slip_condition: bool = False
     step_size: int = 5
     tube_radius: float = 0.1
     rho: float = 1060.0
+    pressure_gradient_smoothing_sigma: float = 0.0
+    pressure_gradient_use_convective_acceleration: bool = True
     use_multithread: bool = False
 
     def to_dict(self):
@@ -196,20 +317,30 @@ class DerivedMetricsParams:
             "step_size": self.step_size,
             "tube_radius": self.tube_radius,
             "rho": self.rho,
+            "pressure_gradient_smoothing_sigma": self.pressure_gradient_smoothing_sigma,
+            "pressure_gradient_use_convective_acceleration": self.pressure_gradient_use_convective_acceleration,
             "use_multithread": self.use_multithread,
         }
 
     @staticmethod
     def from_dict(d):
+        inward_distance = d.get("inward_distance", None)
+        if isinstance(inward_distance, str):
+            token = inward_distance.strip().lower()
+            inward_distance = None if token in {"", "auto", "none"} else float(inward_distance)
+        elif inward_distance is not None:
+            inward_distance = float(inward_distance)
         return DerivedMetricsParams(
             smoothing_iteration=int(d.get("smoothing_iteration", 200)),
             viscosity=float(d.get("viscosity", 4.0)),
-            inward_distance=float(d.get("inward_distance", 0.6)),
+            inward_distance=inward_distance,
             parabolic_fitting=bool(d.get("parabolic_fitting", True)),
-            no_slip_condition=bool(d.get("no_slip_condition", True)),
+            no_slip_condition=bool(d.get("no_slip_condition", False)),
             step_size=int(d.get("step_size", 5)),
             tube_radius=float(d.get("tube_radius", 0.1)),
             rho=float(d.get("rho", 1060.0)),
+            pressure_gradient_smoothing_sigma=float(d.get("pressure_gradient_smoothing_sigma", 0.0)),
+            pressure_gradient_use_convective_acceleration=bool(d.get("pressure_gradient_use_convective_acceleration", True)),
             use_multithread=bool(d.get("use_multithread", False)),
         )
 
@@ -343,6 +474,8 @@ class SceneObject:
     name: str
     kind: ObjectKind
     data_key: str
+    group_name: str = ""
+    browser_color: str = ""
     visible: bool = True
     opacity: float = 1.0
     color: str = "white"
@@ -366,6 +499,7 @@ class PlaneData:
     label: int = 1
     path_index: int = 0
     distance: float = 0.0
+    group_name: str = ""
     metrics: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -383,8 +517,14 @@ class DerivedResults:
     wss_volume: Optional[np.ndarray] = None
     tke_volume: Any = None
     tke_array: Optional[np.ndarray] = None
+    pressure_gradient_array: Optional[np.ndarray] = None
+    pressure_gradient_magnitude: Optional[np.ndarray] = None
+    pressure_gradient_peak: Optional[np.ndarray] = None
+    pressure_gradient_support_mask: Optional[np.ndarray] = None
+    pressure_gradient_display_clim: Optional[Tuple[float, float]] = None
     streamlines: List[Any] = field(default_factory=list)
     pixelwise_export: Dict[str, Any] = field(default_factory=dict)
+    plane_pixelwise_file: str = ""
 
 
 @dataclass
@@ -438,9 +578,9 @@ class SegmentationState:
     threshold_closing: bool = True
     threshold_opening: bool = False
     auto_backend: str = "nnUNet"
-    auto_model: str = ""
-    auto_checkpoint: str = ""
-    auto_device: str = "cpu"
+    auto_model: str = "autoflow/segmodel/nnUNetTrainer_500epochs__nnUNetPlans__3d_fullres_iso1mm"
+    auto_checkpoint: str = "checkpoint_final.pth"
+    auto_device: str = "auto"
     auto_label_map: str = ""
 
     @staticmethod
@@ -534,9 +674,9 @@ class SegmentationState:
             threshold_closing=bool(payload.get("threshold_closing", True)),
             threshold_opening=bool(payload.get("threshold_opening", False)),
             auto_backend=str(payload.get("auto_backend", "nnUNet")),
-            auto_model=str(payload.get("auto_model", "")),
-            auto_checkpoint=str(payload.get("auto_checkpoint", "")),
-            auto_device=str(payload.get("auto_device", "cpu")),
+            auto_model=str(payload.get("auto_model", "autoflow/segmodel/nnUNetTrainer_500epochs__nnUNetPlans__3d_fullres_iso1mm")),
+            auto_checkpoint=str(payload.get("auto_checkpoint", "checkpoint_final.pth")),
+            auto_device=str(payload.get("auto_device", "auto")),
             auto_label_map=str(payload.get("auto_label_map", "")),
         )
 
@@ -565,6 +705,8 @@ class Workspace:
     segmask_labels: Optional[np.ndarray] = None
     segmask_binary: Optional[np.ndarray] = None
     segmask_3d: Optional[np.ndarray] = None
+    group_order: List[str] = field(default_factory=list)
+    multilabel_groups: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     mag_raw: Optional[np.ndarray] = None
     source_sigma: Optional[np.ndarray] = None
@@ -586,9 +728,9 @@ class Workspace:
     streamline_seeds: Optional[np.ndarray] = None
     streamline_cache: Dict[int, Any] = field(default_factory=dict)
     streamline_active: bool = False
-    plane_streamline_cache: Dict[int, Any] = field(default_factory=dict)
-    plane_streamline_active: bool = False
-    plane_streamline_plane_idx: int = -1
+    pathline_cache: Dict[int, Dict[int, Any]] = field(default_factory=dict)
+    active_pathline_plane_indices: List[int] = field(default_factory=list)
+    pathline_colors: Dict[int, str] = field(default_factory=dict)
     derived: DerivedResults = field(default_factory=DerivedResults)
 
     scene_objects: Dict[str, SceneObject] = field(default_factory=dict)
@@ -731,11 +873,23 @@ class Workspace:
         self.streamline_active = False
         self.remove_object_by_data_key("streamlines_live")
 
+    def clear_pathlines(self):
+        self.pathline_cache.clear()
+        self.active_pathline_plane_indices = []
+        self.remove_objects_by_prefix("pathline_")
+
+    def pathline_color_for_plane(self, plane_idx):
+        plane_idx = int(plane_idx)
+        color = str(self.pathline_colors.get(plane_idx, "") or "")
+        if color:
+            return color
+        return str(self.streamline_params.pathline_color or "deepskyblue")
+
+    def set_pathline_color_for_plane(self, plane_idx, color):
+        self.pathline_colors[int(plane_idx)] = str(color or self.streamline_params.pathline_color or "deepskyblue")
+
     def clear_plane_streamlines(self):
-        self.plane_streamline_cache.clear()
-        self.plane_streamline_active = False
-        self.plane_streamline_plane_idx = -1
-        self.remove_object_by_data_key("plane_streamlines_live")
+        self.clear_pathlines()
 
     def reset_segmentation_results(self):
         for attr in [
@@ -747,6 +901,8 @@ class Workspace:
             "branch_labels",
         ]:
             setattr(self, attr, None)
+        self.group_order = []
+        self.multilabel_groups = {}
         self.graph = GraphData()
         self.centerline_paths = []
         self.centerline_node_paths = []
@@ -757,7 +913,7 @@ class Workspace:
         self.selected_path_index = -1
         self.pipeline.reset()
         self.clear_streamlines()
-        self.clear_plane_streamlines()
+        self.clear_pathlines()
         self.derived = DerivedResults()
         self.remove_object_by_data_key("segmask_pre_surface")
         self.remove_object_by_data_key("skeleton_points")
@@ -765,8 +921,13 @@ class Workspace:
         self.remove_object_by_data_key("segmask_3d_surface")
         self.remove_object_by_data_key("graph_lines")
         self.remove_object_by_data_key("fork_markers")
+        self.remove_objects_by_prefix("segmask_group_")
+        self.remove_objects_by_prefix("skeleton_")
+        self.remove_objects_by_prefix("graph_")
+        self.remove_objects_by_prefix("forks_")
         self.remove_object_by_data_key("wss_surface_live")
         self.remove_object_by_data_key("tke_volume")
+        self.remove_object_by_data_key("pressure_gradient_volume")
         self.remove_object_by_data_key("derived_streamlines_live")
         self.remove_objects_by_prefix("plane_")
         self.remove_objects_by_prefix("path_")
@@ -795,6 +956,8 @@ class Workspace:
                       "skeleton_points", "skeleton_mask", "branch_labels", "flow_raw",
                       "streamline_seeds", "mag_raw", "source_sigma", "source_tke_array"]:
             setattr(self, attr, None)
+        self.group_order = []
+        self.multilabel_groups = {}
         self.graph = GraphData()
         self.centerline_paths = []
         self.centerline_node_paths = []
@@ -804,9 +967,9 @@ class Workspace:
         self.planes = []
         self.streamline_cache = {}
         self.streamline_active = False
-        self.plane_streamline_cache = {}
-        self.plane_streamline_active = False
-        self.plane_streamline_plane_idx = -1
+        self.pathline_cache = {}
+        self.active_pathline_plane_indices = []
+        self.pathline_colors = {}
         self.derived = DerivedResults()
         self.scene_objects = {}
         self.current_t = 0
@@ -817,6 +980,34 @@ class Workspace:
     def snapshot_dict(self):
         def arr(v):
             return None if v is None else np.asarray(v).tolist()
+        group_payload = {}
+        for group_name, state in self.multilabel_groups.items():
+            graph_state = state.get("graph", GraphData())
+            group_payload[str(group_name)] = {
+                "labels": [int(x) for x in state.get("labels", [])],
+                "browser_color": str(state.get("browser_color", "") or ""),
+                "scene_color": str(state.get("scene_color", "") or ""),
+                "segmask_binary": arr(state.get("segmask_binary")),
+                "segmask_3d": arr(state.get("segmask_3d")),
+                "clean_mask_3d": arr(state.get("clean_mask_3d")),
+                "skeleton_points": arr(state.get("skeleton_points")),
+                "skeleton_mask": arr(state.get("skeleton_mask")),
+                "graph": {
+                    "points": arr(graph_state.points if isinstance(graph_state, GraphData) else graph_state.get("points")),
+                    "edges": arr(graph_state.edges if isinstance(graph_state, GraphData) else graph_state.get("edges")),
+                },
+                "branch_labels": arr(state.get("branch_labels")),
+                "centerline_paths": [arr(x) for x in state.get("centerline_paths", [])],
+                "centerline_node_paths": [list(map(int, x)) for x in state.get("centerline_node_paths", [])],
+                "centerline_paths_smooth": [arr(x) for x in state.get("centerline_paths_smooth", [])],
+                "path_info": copy.deepcopy(state.get("path_info", [])),
+                "forks": copy.deepcopy(state.get("forks", [])),
+                "planes": [{"center": arr(p.center), "normal": arr(p.normal), "label": int(p.label),
+                            "path_index": int(p.path_index), "distance": float(p.distance), "group_name": str(p.group_name),
+                            "metrics": copy.deepcopy(p.metrics)} for p in state.get("planes", [])],
+                "path_index_offset": int(state.get("path_index_offset", 0)),
+                "plane_index_offset": int(state.get("plane_index_offset", 0)),
+            }
         return {
             "paths": {"segmask_path": self.paths.segmask_path, "flow_path": self.paths.flow_path,
                       "workspace_path": self.paths.workspace_path, "output_dir": self.paths.output_dir},
@@ -839,6 +1030,8 @@ class Workspace:
             "segmask_labels": arr(self.segmask_labels),
             "segmask_binary": arr(self.segmask_binary),
             "segmask_3d": arr(self.segmask_3d),
+            "group_order": [str(x) for x in self.group_order],
+            "multilabel_groups": group_payload,
             "mag_raw": arr(self.mag_raw),
             "source_sigma": arr(self.source_sigma),
             "source_tke_array": arr(self.source_tke_array),
@@ -853,12 +1046,15 @@ class Workspace:
             "forks": copy.deepcopy(self.forks),
             "planes": [{"center": arr(p.center), "normal": arr(p.normal), "label": int(p.label),
                         "path_index": int(p.path_index), "distance": float(p.distance),
-                        "metrics": copy.deepcopy(p.metrics)} for p in self.planes],
+                        "group_name": str(p.group_name), "metrics": copy.deepcopy(p.metrics)} for p in self.planes],
             "flow_raw": arr(self.flow_raw),
             "streamline_seeds": arr(self.streamline_seeds),
             "streamline_active": self.streamline_active,
+            "active_pathline_plane_indices": [int(x) for x in self.active_pathline_plane_indices],
+            "pathline_colors": {str(int(k)): str(v) for k, v in self.pathline_colors.items()},
             "scene_objects": [
                 {"uid": o.uid, "name": o.name, "kind": o.kind.value, "data_key": o.data_key,
+                 "group_name": o.group_name, "browser_color": o.browser_color,
                  "visible": o.visible, "opacity": o.opacity, "color": o.color,
                  "scalars": o.scalars, "cmap": o.cmap,
                  "clim": list(o.clim) if o.clim else None,
@@ -897,6 +1093,44 @@ class Workspace:
         self.segmask_labels = nparr("segmask_labels", np.int16)
         self.segmask_binary = None if d.get("segmask_binary") is None else np.asarray(d["segmask_binary"], dtype=bool)
         self.segmask_3d = None if d.get("segmask_3d") is None else np.asarray(d["segmask_3d"], dtype=bool)
+        self.group_order = [str(x) for x in d.get("group_order", [])]
+        self.multilabel_groups = {}
+        for group_name, state in dict(d.get("multilabel_groups", {})).items():
+            graph_state = state.get("graph", {}) if isinstance(state, dict) else {}
+            planes = []
+            for p in state.get("planes", []):
+                planes.append(PlaneData(
+                    center=np.asarray(p.get("center", [0.0, 0.0, 0.0]), dtype=float),
+                    normal=np.asarray(p.get("normal", [1.0, 0.0, 0.0]), dtype=float),
+                    label=int(p.get("label", 1)),
+                    path_index=int(p.get("path_index", 0)),
+                    distance=float(p.get("distance", 0.0)),
+                    group_name=str(p.get("group_name", group_name) or group_name),
+                    metrics=copy.deepcopy(p.get("metrics", {})),
+                ))
+            self.multilabel_groups[str(group_name)] = {
+                "labels": [int(x) for x in state.get("labels", [])],
+                "browser_color": str(state.get("browser_color", "") or ""),
+                "scene_color": str(state.get("scene_color", "") or ""),
+                "segmask_binary": None if state.get("segmask_binary") is None else np.asarray(state.get("segmask_binary"), dtype=bool),
+                "segmask_3d": None if state.get("segmask_3d") is None else np.asarray(state.get("segmask_3d"), dtype=bool),
+                "clean_mask_3d": None if state.get("clean_mask_3d") is None else np.asarray(state.get("clean_mask_3d"), dtype=bool),
+                "skeleton_points": None if state.get("skeleton_points") is None else np.asarray(state.get("skeleton_points"), dtype=float),
+                "skeleton_mask": None if state.get("skeleton_mask") is None else np.asarray(state.get("skeleton_mask"), dtype=bool),
+                "graph": GraphData(
+                    points=np.asarray(graph_state.get("points", []), dtype=float).reshape(-1, 3) if graph_state.get("points") else np.empty((0, 3)),
+                    edges=np.asarray(graph_state.get("edges", []), dtype=int).reshape(-1, 2) if graph_state.get("edges") else np.empty((0, 2), dtype=int),
+                ),
+                "branch_labels": None if state.get("branch_labels") is None else np.asarray(state.get("branch_labels"), dtype=np.int16),
+                "centerline_paths": [np.asarray(x, dtype=float) for x in state.get("centerline_paths", [])],
+                "centerline_node_paths": [list(map(int, x)) for x in state.get("centerline_node_paths", [])],
+                "centerline_paths_smooth": [np.asarray(x, dtype=float) for x in state.get("centerline_paths_smooth", [])],
+                "path_info": copy.deepcopy(state.get("path_info", [])),
+                "forks": copy.deepcopy(state.get("forks", [])),
+                "planes": planes,
+                "path_index_offset": int(state.get("path_index_offset", 0)),
+                "plane_index_offset": int(state.get("plane_index_offset", 0)),
+            }
         if self.segmentation.original.data is None and self.segmask_raw is not None:
             self.set_segmentation_source("original", self.segmask_raw, provenance={"source": "original"})
             if not self.segmentation.active_source:
@@ -921,19 +1155,20 @@ class Workspace:
             self.planes.append(PlaneData(
                 center=np.asarray(p["center"], dtype=float), normal=np.asarray(p["normal"], dtype=float),
                 label=int(p.get("label", 1)), path_index=int(p.get("path_index", 0)),
-                distance=float(p.get("distance", 0.0)), metrics=copy.deepcopy(p.get("metrics", {}))))
+                distance=float(p.get("distance", 0.0)), group_name=str(p.get("group_name", "") or ""), metrics=copy.deepcopy(p.get("metrics", {}))))
         self.flow_raw = nparr("flow_raw")
         self.streamline_seeds = nparr("streamline_seeds")
         self.streamline_cache = {}
         self.streamline_active = bool(d.get("streamline_active", False))
-        self.plane_streamline_cache = {}
-        self.plane_streamline_active = False
-        self.plane_streamline_plane_idx = -1
+        self.pathline_cache = {}
+        self.active_pathline_plane_indices = [int(x) for x in d.get("active_pathline_plane_indices", [])]
+        self.pathline_colors = {int(k): str(v) for k, v in d.get("pathline_colors", {}).items()}
         self.scene_objects = {}
         for it in d.get("scene_objects", []):
             uid = it["uid"]
             self.scene_objects[uid] = SceneObject(
                 uid=uid, name=it["name"], kind=ObjectKind(it["kind"]), data_key=it["data_key"],
+                group_name=str(it.get("group_name", "") or ""), browser_color=str(it.get("browser_color", "") or ""),
                 visible=bool(it.get("visible", True)), opacity=float(it.get("opacity", 1.0)),
                 color=it.get("color", "white"), scalars=it.get("scalars"),
                 cmap=it.get("cmap", "turbo"),

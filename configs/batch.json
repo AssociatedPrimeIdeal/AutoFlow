@@ -1,0 +1,7 @@
+{
+  "output_dir": "./results",
+  "skip_derived": false,
+  "skip_plane_metrics": false,
+  "use_multithread": true,
+  "reuse_planes": ""
+}

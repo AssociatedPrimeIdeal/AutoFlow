@@ -92,6 +92,7 @@ from .surfaces import (
     extract_plane_cross_section,
     _flow_grid_for_t,
     _extract_plane_flow_region,
+    create_uniform_field_grid,
     create_vector_volume_from_flow,
     create_uniform_grid,
     create_uniform_vector,
@@ -105,6 +106,7 @@ from .segmentation import (
     load_segmentation_file,
     compute_reference_scalar,
     generate_threshold_segmentation,
+    generate_nnunet_auto_segmentation,
     save_segmentation_file,
 )
 
@@ -112,6 +114,7 @@ from .streamlines import (
     generate_seed_points,
     generate_streamlines_at_t,
     generate_streamlines_from_plane_at_t,
+    generate_pathlines_from_plane_at_t,
 )
 
 from .metrics import (
@@ -126,7 +129,10 @@ from .metrics import (
     compute_tke_array_from_sigma,
     compute_tke_metrics,
     compute_wss_metrics,
+    compute_pressure_gradient_metrics,
     compute_derived_metrics,
+    augment_plane_metrics_with_derived,
+    save_plane_pixelwise_h5,
     _compute_single_plane_metric,
     compute_plane_metrics_multithread,
     load_metrics_as_table,
@@ -175,14 +181,17 @@ __all__ = [
     "load_segmentation_file",
     "compute_reference_scalar",
     "generate_threshold_segmentation",
+    "generate_nnunet_auto_segmentation",
     "save_segmentation_file",
     "extract_plane_cross_section",
+    "create_uniform_field_grid",
     "create_vector_volume_from_flow",
     "create_uniform_grid",
     "create_uniform_vector",
     "generate_seed_points",
     "generate_streamlines_at_t",
     "generate_streamlines_from_plane_at_t",
+    "generate_pathlines_from_plane_at_t",
     "extract_vectors",
     "get_orthogonal_vectors",
     "get_vector_magnitude",
@@ -194,7 +203,10 @@ __all__ = [
     "compute_tke_array_from_sigma",
     "compute_tke_metrics",
     "compute_wss_metrics",
+    "compute_pressure_gradient_metrics",
     "compute_derived_metrics",
+    "augment_plane_metrics_with_derived",
+    "save_plane_pixelwise_h5",
     "compute_plane_metrics_multithread",
     "load_metrics_as_table",
 ]

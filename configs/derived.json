@@ -1,0 +1,12 @@
+{
+  "smoothing_iteration": 200,
+  "viscosity": 4.0,
+  "inward_distance": "auto",
+  "parabolic_fitting": true,
+  "no_slip_condition": false,
+  "step_size": 5,
+  "tube_radius": 0.1,
+  "rho": 1060.0,
+  "pressure_gradient_smoothing_sigma": 0.0,
+  "pressure_gradient_use_convective_acceleration": true
+}

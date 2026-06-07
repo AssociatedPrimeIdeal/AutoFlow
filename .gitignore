@@ -5,7 +5,8 @@ __pycache__/
 .ipynb_checkpoints/
 *.ipynb
 !library_demo.ipynb
-
+/autoflow/segmodel/
+/wss_mri_calculator_pr/
 # Local data and generated outputs
 /111/
 /results/
@@ -18,7 +19,7 @@ Thumbs.db
 /data/planes.json
 /data/plane_metrics.json
 /data/plane_qc.json
-
+/data/phantom_P.h5
 TODO.md
 GIT_COMMANDS.local.md
 AGENTS.md

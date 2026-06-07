@@ -1,0 +1,27 @@
+{
+  "visible": true,
+  "opacity": 0.35,
+  "active_label": 1,
+  "editing_enabled": false,
+  "tool": "brush",
+  "brush_radius": 3,
+  "edit_all_timepoints": true,
+  "mode": "input",
+  "input_source": "original",
+  "import_path": "",
+  "threshold_scalar": "pcmra",
+  "threshold_value": {
+    "mode": "manual",
+    "min_percent": 10.0,
+    "max_percent": 100.0
+  },
+  "threshold_keep_largest_cc": true,
+  "threshold_min_component_volume_mm3": 0.0,
+  "threshold_closing": true,
+  "threshold_opening": false,
+  "auto_backend": "nnUNet",
+  "auto_model": "autoflow/segmodel/nnUNetTrainer_500epochs__nnUNetPlans__3d_fullres_iso1mm",
+  "auto_checkpoint": "checkpoint_final.pth",
+  "auto_device": "auto",
+  "auto_label_map": ""
+}

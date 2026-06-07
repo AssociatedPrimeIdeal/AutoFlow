@@ -38,12 +38,16 @@ class BackgroundPhaseCorrectionConfig:
     enabled: bool = True
     corr_fit_order: int = 3
     threshold: float = 0.1
+    dual_venc_ratio1: float = 0.0
+    dual_venc_ratio2: float = 0.0
 
     def to_dict(self):
         return {
             "enabled": bool(self.enabled),
             "corr_fit_order": int(self.corr_fit_order),
             "threshold": float(self.threshold),
+            "dual_venc_ratio1": float(self.dual_venc_ratio1),
+            "dual_venc_ratio2": float(self.dual_venc_ratio2),
         }
 
     @staticmethod
@@ -53,6 +57,8 @@ class BackgroundPhaseCorrectionConfig:
             enabled=bool(payload.get("enabled", False)),
             corr_fit_order=int(payload.get("corr_fit_order", 3)),
             threshold=float(payload.get("threshold", 0.1)),
+            dual_venc_ratio1=float(payload.get("dual_venc_ratio1", 0.0)),
+            dual_venc_ratio2=float(payload.get("dual_venc_ratio2", 0.0)),
         )
 
 

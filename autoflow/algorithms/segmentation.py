@@ -1,8 +1,14 @@
 import json
 import os
+import shutil
+import subprocess
+import time
 from datetime import datetime, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import h5py
+import nibabel as nib
 import numpy as np
 from scipy.ndimage import binary_closing, binary_opening
 
@@ -277,3 +283,489 @@ def save_segmentation_file(path, segmentation, resolution=None, origin=None, pro
         if provenance:
             f.attrs["provenance_json"] = json.dumps(provenance, ensure_ascii=False)
     return path
+
+
+def _nnunet_normalize_channel_name(name):
+    token = str(name or "").strip().lower()
+    aliases = {
+        "mag_mean": "mag_mean_xyz",
+        "mean_mag": "mag_mean_xyz",
+        "mag_std": "mag_std_xyz",
+        "std_mag": "mag_std_xyz",
+        "pcmra_mean": "pcmra_mean_xyz",
+        "pcmra_std": "pcmra_std_xyz",
+        "flow_x_mean": "flow_x_mean_xyz",
+        "flow_y_mean": "flow_y_mean_xyz",
+        "flow_z_mean": "flow_z_mean_xyz",
+        "flow_mag_mean": "flow_mag_mean_xyz",
+        "flow_x_std": "flow_x_std_xyz",
+        "flow_y_std": "flow_y_std_xyz",
+        "flow_z_std": "flow_z_std_xyz",
+        "flow_mag_std": "flow_mag_std_xyz",
+    }
+    return aliases.get(token, token)
+
+
+def _nnunet_spatial_affine(resolution, origin):
+    res = np.asarray(resolution, dtype=np.float32).reshape(-1)
+    if res.size == 1:
+        res = np.repeat(res, 3)
+    origin = np.asarray(origin, dtype=np.float32).reshape(-1)
+    if origin.size == 1:
+        origin = np.repeat(origin, 3)
+    affine = np.eye(4, dtype=np.float32)
+    affine[0, 0] = float(res[0])
+    affine[1, 1] = float(res[1])
+    affine[2, 2] = float(res[2])
+    affine[:3, 3] = np.asarray(origin[:3], dtype=np.float32)
+    return affine
+
+
+def _ensure_nnunet_mag_flow(mag, flow):
+    mag = np.asarray(mag, dtype=np.float32)
+    flow = np.asarray(flow, dtype=np.float32)
+    if flow.ndim == 4 and flow.shape[-1] == 3:
+        flow = flow[..., np.newaxis, :]
+    if flow.ndim != 5 or flow.shape[-1] != 3:
+        raise ValueError(f"flow must be XYZTV or XYZV with 3 components, got shape={flow.shape}")
+    nt = int(flow.shape[3])
+    if mag.ndim == 3:
+        mag = np.repeat(mag[..., np.newaxis], nt, axis=3)
+    elif mag.ndim == 4 and mag.shape[3] == 1 and nt > 1:
+        mag = np.repeat(mag, nt, axis=3)
+    elif mag.ndim != 4:
+        raise ValueError(f"mag must be XYZT or XYZ, got shape={mag.shape}")
+    if mag.shape[3] != nt:
+        if mag.shape[3] == 1:
+            mag = np.repeat(mag, nt, axis=3)
+        else:
+            raise ValueError(f"mag time dimension {mag.shape[3]} does not match flow {nt}")
+    return mag, flow
+
+
+def _ordered_mapping_values(payload):
+    if isinstance(payload, dict):
+        def _sort_key(item):
+            key = item[0]
+            try:
+                return (0, int(key))
+            except Exception:
+                return (1, str(key))
+
+        return [value for _, value in sorted(payload.items(), key=_sort_key)]
+    if isinstance(payload, list):
+        return list(payload)
+    raise ValueError(f"expected mapping or list, got {type(payload).__name__}")
+
+
+def _load_nnunet_model_metadata(model_folder):
+    model_path = Path(model_folder).expanduser()
+    if not model_path.is_absolute():
+        model_path = Path.cwd() / model_path
+    model_path = model_path.resolve()
+    if model_path.name.startswith("fold_") and not (model_path / "dataset.json").is_file():
+        model_path = model_path.parent
+    if not model_path.is_dir():
+        raise FileNotFoundError(f"nnUNet model folder not found: {model_path}")
+
+    dataset_json_path = model_path / "dataset.json"
+    plans_json_path = model_path / "plans.json"
+    if not dataset_json_path.is_file():
+        raise FileNotFoundError(f"missing nnUNet dataset.json: {dataset_json_path}")
+    if not plans_json_path.is_file():
+        raise FileNotFoundError(f"missing nnUNet plans.json: {plans_json_path}")
+
+    with dataset_json_path.open("r", encoding="utf-8") as f:
+        dataset_json = json.load(f)
+    if not isinstance(dataset_json, dict):
+        raise ValueError(f"dataset.json must contain a JSON object: {dataset_json_path}")
+
+    return model_path, dataset_json
+
+
+def _detect_nnunet_folds(model_path):
+    folds = []
+    has_fold_all = False
+    for child in sorted(model_path.iterdir()):
+        if not child.is_dir() or not child.name.startswith("fold_"):
+            continue
+        suffix = child.name[len("fold_"):]
+        if suffix == "all":
+            has_fold_all = True
+            continue
+        if suffix.isdigit():
+            folds.append(int(suffix))
+    if folds:
+        return [str(fold) for fold in sorted(set(folds))]
+    if has_fold_all:
+        return ["all"]
+    raise FileNotFoundError(f"no nnUNet fold_* folders found in {model_path}")
+
+
+def _nnunet_channel_volume(channel_name, mag, flow, channel_index=0):
+    token = _nnunet_normalize_channel_name(channel_name)
+    speed = np.linalg.norm(flow, axis=-1)
+    mag_mean = np.mean(mag, axis=3)
+    mag_std = np.std(mag, axis=3)
+    pcmra = mag * speed
+    pcmra_mean = np.mean(pcmra, axis=3)
+    pcmra_std = np.std(pcmra, axis=3)
+    flow_x = flow[..., 0]
+    flow_y = flow[..., 1]
+    flow_z = flow[..., 2]
+    flow_x_mean = np.mean(flow_x, axis=3)
+    flow_y_mean = np.mean(flow_y, axis=3)
+    flow_z_mean = np.mean(flow_z, axis=3)
+    flow_mag_mean = np.mean(speed, axis=3)
+    flow_x_std = np.std(flow_x, axis=3)
+    flow_y_std = np.std(flow_y, axis=3)
+    flow_z_std = np.std(flow_z, axis=3)
+    flow_mag_std = np.std(speed, axis=3)
+    channels = {
+        "mag": mag_mean,
+        "mag_mean_xyz": mag_mean,
+        "mag_std_xyz": mag_std,
+        "pcmra": pcmra_mean,
+        "pcmra_mean_xyz": pcmra_mean,
+        "pcmra_std_xyz": pcmra_std,
+        "flow_x_mean_xyz": flow_x_mean,
+        "flow_y_mean_xyz": flow_y_mean,
+        "flow_z_mean_xyz": flow_z_mean,
+        "flow_mag_mean_xyz": flow_mag_mean,
+        "flow_x_std_xyz": flow_x_std,
+        "flow_y_std_xyz": flow_y_std,
+        "flow_z_std_xyz": flow_z_std,
+        "flow_mag_std_xyz": flow_mag_std,
+    }
+    if token in channels:
+        return np.asarray(channels[token], dtype=np.float32)
+    default_order = [
+        "mag_std_xyz",
+        "mag_mean_xyz",
+        "pcmra_std_xyz",
+        "pcmra_mean_xyz",
+        "flow_x_mean_xyz",
+        "flow_y_mean_xyz",
+        "flow_z_mean_xyz",
+        "flow_mag_mean_xyz",
+        "flow_x_std_xyz",
+        "flow_y_std_xyz",
+        "flow_z_std_xyz",
+        "flow_mag_std_xyz",
+    ]
+    if 0 <= int(channel_index) < len(default_order):
+        return np.asarray(channels[default_order[int(channel_index)]], dtype=np.float32)
+    raise ValueError(
+        f"unsupported nnUNet channel '{channel_name}'. Supported channels: {sorted(channels.keys())}"
+    )
+
+
+def _parse_nnunet_label_map(label_map_spec, model_labels):
+    if label_map_spec is None:
+        return {}
+    if isinstance(label_map_spec, str):
+        text = label_map_spec.strip()
+        if not text:
+            return {}
+        try:
+            payload = json.loads(text)
+        except Exception as exc:
+            raise ValueError(f"auto_label_map must be valid JSON: {exc}") from exc
+    elif isinstance(label_map_spec, dict):
+        payload = label_map_spec
+    else:
+        raise ValueError(f"auto_label_map must be JSON object or string, got {type(label_map_spec).__name__}")
+    if not payload:
+        return {}
+    if not isinstance(payload, dict):
+        raise ValueError("auto_label_map must decode to a JSON object")
+
+    name_to_id = {}
+    if isinstance(model_labels, dict):
+        for key, value in model_labels.items():
+            try:
+                label_id = int(value)
+            except Exception:
+                continue
+            name_to_id[str(key).strip().lower()] = label_id
+
+    mapping = {}
+    for raw_key, raw_value in payload.items():
+        try:
+            target_id = int(raw_value)
+        except Exception as exc:
+            raise ValueError(f"auto_label_map values must be integers, got {raw_value!r}") from exc
+        key_token = str(raw_key).strip()
+        if key_token.lstrip("-").isdigit():
+            source_id = int(key_token)
+        else:
+            lookup = key_token.lower()
+            if lookup not in name_to_id:
+                raise ValueError(
+                    f"auto_label_map key {raw_key!r} is not numeric and not present in model labels"
+                )
+            source_id = int(name_to_id[lookup])
+        mapping[source_id] = target_id
+    return mapping
+
+
+def _apply_label_map(segmentation, label_map):
+    seg = np.asarray(segmentation, dtype=np.int16).copy()
+    if not label_map:
+        return seg
+    for source_id, target_id in label_map.items():
+        seg[seg == int(source_id)] = int(target_id)
+    return seg
+
+
+def _write_nifti_volume(volume, affine, path):
+    img = nib.Nifti1Image(np.asarray(volume, dtype=np.float32), affine)
+    nib.save(img, str(path))
+
+
+def _read_nifti_segmentation(path):
+    arr = np.asarray(nib.load(str(path)).get_fdata(), dtype=np.float32)
+    if arr.ndim != 3:
+        raise ValueError(f"expected 3D nnUNet segmentation, got shape={arr.shape}")
+    return np.rint(arr).astype(np.int16)
+
+
+def _run_subprocess(command, *, env=None, cwd=None, runner=None):
+    runner = subprocess.run if runner is None else runner
+    return runner(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=cwd,
+    )
+
+
+def _emit_progress(progress_callback, *, stage, message, current=None, total=None, elapsed_sec=None, **extra):
+    if progress_callback is None:
+        return
+    payload = {
+        "stage": str(stage or ""),
+        "message": str(message or ""),
+    }
+    if current is not None:
+        payload["current"] = int(current)
+    if total is not None:
+        payload["total"] = int(total)
+    if elapsed_sec is not None:
+        payload["elapsed_sec"] = float(elapsed_sec)
+    payload.update(extra)
+    progress_callback(payload)
+
+
+def default_nnunet_model_folder():
+    return (
+        Path(__file__).resolve().parents[1]
+        / "segmodel"
+        / "nnUNetTrainer_500epochs__nnUNetPlans__3d_fullres_iso1mm"
+    )
+
+
+def resolve_nnunet_model_folder(model_folder=""):
+    candidate = str(model_folder or "").strip()
+    if candidate:
+        return str(Path(candidate).expanduser())
+    default_path = default_nnunet_model_folder()
+    if default_path.is_dir():
+        return str(default_path)
+    raise FileNotFoundError(
+        "nnUNet model folder not configured and bundled default model is missing: "
+        f"{default_path}"
+    )
+
+
+def resolve_auto_segmentation_device(device="cpu"):
+    token = str(device or "").strip().lower()
+    if token in {"", "auto", "cuda_if_available"}:
+        try:
+            import torch
+
+            return "cuda" if bool(torch.cuda.is_available()) else "cpu"
+        except Exception:
+            return "cpu"
+    if token in {"cpu", "cuda"}:
+        return token
+    return str(device)
+
+
+def generate_nnunet_auto_segmentation(
+    mag,
+    flow,
+    resolution,
+    origin,
+    model_folder,
+    *,
+    backend="nnUNet",
+    checkpoint_name="checkpoint_final.pth",
+    device="cpu",
+    auto_label_map="",
+    case_id="autoflow_case",
+    step_size=0.5,
+    disable_tta=True,
+    num_processes_preprocessing=3,
+    num_processes_segmentation_export=3,
+    runner=None,
+    progress_callback=None,
+):
+    if str(backend or "").strip().lower() != "nnunet":
+        raise ValueError(f"unsupported auto segmentation backend: {backend}")
+
+    t_total_start = time.perf_counter()
+    total_stages = 5
+    _emit_progress(
+        progress_callback,
+        stage="autoseg_start",
+        message="Resolving nnUNet model and input metadata...",
+        current=0,
+        total=total_stages,
+        elapsed_sec=0.0,
+    )
+
+    model_folder = resolve_nnunet_model_folder(model_folder)
+    resolved_device = resolve_auto_segmentation_device(device)
+    mag, flow = _ensure_nnunet_mag_flow(mag, flow)
+    time_count = int(flow.shape[3])
+    model_path, dataset_json = _load_nnunet_model_metadata(model_folder)
+    channel_names = _ordered_mapping_values(dataset_json.get("channel_names") or dataset_json.get("modality") or {})
+    if not channel_names:
+        raise ValueError(f"model folder does not define any channel names: {model_path}")
+    file_ending = str(dataset_json.get("file_ending", ".nii.gz"))
+    if not file_ending.startswith("."):
+        file_ending = f".{file_ending}"
+    label_map = _parse_nnunet_label_map(auto_label_map, dataset_json.get("labels", {}))
+    folds = _detect_nnunet_folds(model_path)
+    affine = _nnunet_spatial_affine(resolution, origin)
+    _emit_progress(
+        progress_callback,
+        stage="autoseg_model_ready",
+        message=f"Resolved nnUNet model: {model_path.name} | device={resolved_device}",
+        current=1,
+        total=total_stages,
+        elapsed_sec=time.perf_counter() - t_total_start,
+        backend="nnUNet",
+        device=str(resolved_device),
+        checkpoint=str(checkpoint_name),
+        model_folder=str(model_path),
+    )
+
+    with TemporaryDirectory(prefix="autoflow_nnunet_") as tmp_root:
+        tmp_root = Path(tmp_root)
+        input_dir = tmp_root / "input"
+        output_dir = tmp_root / "output"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        _emit_progress(
+            progress_callback,
+            stage="autoseg_prepare_inputs",
+            message=f"Preparing {len(channel_names)} nnUNet input channel(s)...",
+            current=2,
+            total=total_stages,
+            elapsed_sec=time.perf_counter() - t_total_start,
+            detail_current=0,
+            detail_total=len(channel_names),
+        )
+        for idx, channel_name in enumerate(channel_names):
+            volume = _nnunet_channel_volume(channel_name, mag, flow, channel_index=idx)
+            _write_nifti_volume(volume, affine, input_dir / f"{case_id}_{idx:04d}{file_ending}")
+            _emit_progress(
+                progress_callback,
+                stage="autoseg_prepare_inputs",
+                message=f"Writing nnUNet input channel {idx + 1}/{len(channel_names)}: {channel_name}",
+                current=2,
+                total=total_stages,
+                elapsed_sec=time.perf_counter() - t_total_start,
+                detail_current=idx + 1,
+                detail_total=len(channel_names),
+                channel_name=str(channel_name),
+            )
+
+        command = [
+            shutil.which("nnUNetv2_predict_from_modelfolder") or "nnUNetv2_predict_from_modelfolder",
+            "-i", str(input_dir),
+            "-o", str(output_dir),
+            "-m", str(model_path),
+            "-f", *folds,
+            "-chk", str(checkpoint_name),
+            "-npp", str(int(num_processes_preprocessing)),
+            "-nps", str(int(num_processes_segmentation_export)),
+            "-device", str(resolved_device),
+        ]
+        if step_size is not None:
+            command.extend(["-step_size", str(float(step_size))])
+        if disable_tta:
+            command.append("--disable_tta")
+        _emit_progress(
+            progress_callback,
+            stage="autoseg_run_inference",
+            message=f"Running nnUNet inference on {resolved_device}...",
+            current=3,
+            total=total_stages,
+            elapsed_sec=time.perf_counter() - t_total_start,
+            command=[str(x) for x in command],
+        )
+        result = _run_subprocess(command, runner=runner)
+        if getattr(result, "returncode", 0) != 0:
+            stdout = getattr(result, "stdout", "") or ""
+            stderr = getattr(result, "stderr", "") or ""
+            raise RuntimeError(
+                "nnUNet inference failed\n"
+                f"command: {' '.join(map(str, command))}\n"
+                f"stdout:\n{stdout}\n"
+                f"stderr:\n{stderr}"
+            )
+
+        prediction_path = output_dir / f"{case_id}{file_ending}"
+        if not prediction_path.is_file() and file_ending == ".nii.gz":
+            prediction_path = output_dir / f"{case_id}.nii.gz"
+        if not prediction_path.is_file():
+            raise FileNotFoundError(f"nnUNet prediction not found: {prediction_path}")
+
+        _emit_progress(
+            progress_callback,
+            stage="autoseg_read_prediction",
+            message="Reading nnUNet prediction...",
+            current=4,
+            total=total_stages,
+            elapsed_sec=time.perf_counter() - t_total_start,
+            prediction_file=str(prediction_path),
+        )
+        seg_3d = _read_nifti_segmentation(prediction_path)
+        seg_3d = _apply_label_map(seg_3d, label_map)
+        seg_4d = broadcast_segmentation_to_time(seg_3d, time_count)
+        elapsed_total = time.perf_counter() - t_total_start
+        _emit_progress(
+            progress_callback,
+            stage="autoseg_finalize",
+            message="Finalizing auto segmentation volume...",
+            current=5,
+            total=total_stages,
+            elapsed_sec=elapsed_total,
+            prediction_file=str(prediction_path),
+        )
+        provenance = {
+            "source": "auto",
+            "backend": "nnUNet",
+            "model_folder": str(model_path),
+            "checkpoint": str(checkpoint_name),
+            "device": str(resolved_device),
+            "folds": list(folds),
+            "channel_names": list(channel_names),
+            "label_map": {str(k): int(v) for k, v in label_map.items()},
+            "case_id": str(case_id),
+            "created_at": segmentation_timestamp(),
+            "command": [str(x) for x in command],
+            "input_dir": str(input_dir),
+            "output_dir": str(output_dir),
+            "prediction_file": str(prediction_path),
+            "elapsed_sec": float(elapsed_total),
+        }
+        return seg_4d, provenance
+
+

@@ -461,7 +461,7 @@ def render_streamlines_video(
         ws.origin,
         ratio=ws.streamline_params.seed_ratio,
         rng_seed=ws.streamline_params.rng_seed,
-        min_seeds=50,
+        min_seeds=ws.streamline_params.min_seeds,
     )
 
     v_max = _streamline_speed_max(ws)
@@ -512,7 +512,7 @@ def render_streamlines_video(
             max_steps=ws.streamline_params.max_steps,
             terminal_speed=ws.streamline_params.terminal_speed,
             seed_ratio=ws.streamline_params.seed_ratio,
-            min_seeds=50,
+            min_seeds=ws.streamline_params.min_seeds,
             rng_seed=ws.streamline_params.rng_seed,
         )
         sl = _ensure_streamline_scalars(sl)
@@ -522,14 +522,19 @@ def render_streamlines_video(
         plotter.add_mesh(surf, opacity=0.18, color="lightgray")
 
         if sl is not None and sl.n_points > 0:
+            sl_show = sl
+            render_lines_as_tubes = True
+            if float(ws.streamline_params.tube_radius) > 0.0 and hasattr(sl, "tube"):
+                sl_show = sl.tube(radius=float(ws.streamline_params.tube_radius))
+                render_lines_as_tubes = False
             plotter.add_mesh(
-                sl,
+                sl_show,
                 scalars="Velocity",
                 cmap="turbo",
                 clim=clim,
                 show_scalar_bar=True,
                 scalar_bar_args=_scalar_bar_args("Velocity (m/s)", streamline_bar_cfg),
-                render_lines_as_tubes=True,
+                render_lines_as_tubes=render_lines_as_tubes,
                 line_width=3,
             )
 

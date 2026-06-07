@@ -9,6 +9,7 @@ from ..algorithms import (
     generate_seed_points,
     generate_streamlines_at_t,
     generate_streamlines_from_plane_at_t,
+    generate_pathlines_from_plane_at_t,
     create_uniform_grid,
 )
 
@@ -18,9 +19,23 @@ def _parse_indexed_data_key(data_key, prefix):
     if not isinstance(data_key, str) or not data_key.startswith(token):
         return None
     suffix = data_key[len(token):]
-    if suffix.isdigit():
-        return int(suffix)
+    tail = suffix.rsplit("_", 1)[-1]
+    if tail.isdigit():
+        return int(tail)
     return None
+
+
+def _parse_group_name_from_data_key(data_key, prefix):
+    token = f"{prefix}_"
+    if not isinstance(data_key, str) or not data_key.startswith(token):
+        return ""
+    suffix = data_key[len(token):]
+    parts = suffix.rsplit("_", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return str(parts[0])
+    if suffix and not suffix.isdigit():
+        return str(suffix)
+    return ""
 
 
 def _path_polydata(path, origin):
@@ -537,6 +552,18 @@ class SceneController:
                 return None
             return self._cached(data_key, 0, lambda: build_surface_from_mask3d(ws.segmask_3d, sp, org, smooth_iter=1000))
 
+        if isinstance(data_key, str) and data_key.startswith("segmask_group_"):
+            group_name = str(data_key[len("segmask_group_"):])
+            group_state = ws.multilabel_groups.get(group_name, {})
+            mask = group_state.get("segmask_3d")
+            if mask is None:
+                return None
+            return self._cached(
+                data_key,
+                0,
+                lambda: build_surface_from_mask3d(np.asarray(mask, dtype=bool), sp, org, smooth_iter=1000),
+            )
+
         if data_key == "skeleton_points":
             if ws.skeleton_points is None or len(ws.skeleton_points) == 0:
                 return None
@@ -547,16 +574,47 @@ class SceneController:
                 return None
             return self._cached(data_key, 0, lambda: build_surface_from_mask3d(ws.skeleton_mask, sp, org, smooth_iter=1000))
 
+        if isinstance(data_key, str) and data_key.startswith("skeleton_"):
+            group_name = str(data_key[len("skeleton_"):])
+            if group_name and group_name != "points":
+                group_state = ws.multilabel_groups.get(group_name, {})
+                pts = group_state.get("skeleton_points")
+                if pts is None or len(pts) == 0:
+                    return None
+                return pv.PolyData(np.asarray(pts, dtype=float) + np.asarray(org, dtype=float).reshape(1, 3))
+
         if data_key == "graph_lines":
             if ws.graph is None or len(ws.graph.points) == 0:
                 return None
             return graph_to_polydata(np.asarray(ws.graph.points) + np.asarray(org).reshape(1, 3), ws.graph.edges)
 
+        if isinstance(data_key, str) and data_key.startswith("graph_"):
+            group_name = str(data_key[len("graph_"):])
+            if group_name and group_name != "lines":
+                group_state = ws.multilabel_groups.get(group_name, {})
+                graph = group_state.get("graph")
+                if graph is None or len(getattr(graph, "points", [])) == 0:
+                    return None
+                return graph_to_polydata(np.asarray(graph.points) + np.asarray(org).reshape(1, 3), graph.edges)
+
+        if isinstance(data_key, str) and data_key.startswith("forks_"):
+            group_name = str(data_key[len("forks_"):])
+            group_state = ws.multilabel_groups.get(group_name, {})
+            forks = list(group_state.get("forks", []))
+            pts = [
+                np.asarray(f.get("crosspoint", [0.0, 0.0, 0.0]), dtype=float) + np.asarray(org, dtype=float).reshape(3)
+                for f in forks
+            ]
+            if not pts:
+                return None
+            return pv.PolyData(np.asarray(pts, dtype=float).reshape(-1, 3))
+
         if data_key == "streamlines_live":
             return self._get_streamline_mesh(t)
 
-        if data_key == "plane_streamlines_live":
-            return self._get_plane_streamline_mesh(t)
+        idx = _parse_indexed_data_key(data_key, "pathline")
+        if idx is not None:
+            return self._get_pathline_mesh(idx, t)
 
         if data_key == "wss_surface_live":
             if not ws.derived.wss_surfaces:
@@ -590,6 +648,34 @@ class SceneController:
                     return mask_mesh.sample(tke_grid)
                 return self._cached(data_key, t, _build_tke_t)
             return ws.derived.tke_volume
+
+        if data_key == "pressure_gradient_volume":
+            if ws.derived.pressure_gradient_magnitude is None:
+                return None
+            def _build_pressure_gradient_t():
+                arr = np.asarray(ws.derived.pressure_gradient_magnitude, dtype=np.float32)
+                if arr.ndim == 4:
+                    vol_t = arr[..., min(max(0, int(t)), arr.shape[3] - 1)]
+                else:
+                    vol_t = arr
+                if ws.segmask_binary is not None:
+                    if ws.segmask_binary.ndim == 4:
+                        mask_t = ws.segmask_binary[..., min(max(0, int(t)), ws.segmask_binary.shape[3] - 1)]
+                    else:
+                        mask_t = ws.segmask_binary
+                elif ws.segmask_3d is not None:
+                    mask_t = ws.segmask_3d
+                else:
+                    mask_t = np.ones(vol_t.shape, dtype=bool)
+                vol_t = vol_t * np.asarray(mask_t, dtype=np.float32)
+
+                grad_grid = create_uniform_grid(vol_t, sp, origin=org, name="PressureGradient")
+                mask_grid = create_uniform_grid(np.asarray(mask_t, dtype=np.float32), sp, origin=org, name="mask")
+                mask_mesh = mask_grid.threshold(0.1, scalars="mask")
+                if mask_mesh is None or mask_mesh.n_cells == 0:
+                    return None
+                return mask_mesh.sample(grad_grid)
+            return self._cached(data_key, t, _build_pressure_gradient_t)
 
         if data_key == "derived_streamlines_live":
             if not ws.derived.streamlines:
@@ -691,31 +777,33 @@ class SceneController:
         ws.streamline_cache[t] = sl
         return sl
 
-    def _get_plane_streamline_mesh(self, t):
+    def _get_pathline_mesh(self, plane_idx, t):
         ws = self.workspace
-        if not ws.plane_streamline_active:
+        if int(plane_idx) not in ws.active_pathline_plane_indices:
             return None
-        if t in ws.plane_streamline_cache:
-            return ws.plane_streamline_cache[t]
+        plane_cache = ws.pathline_cache.setdefault(int(plane_idx), {})
+        if t in plane_cache:
+            return plane_cache[t]
         if ws.flow_raw is None or ws.segmask_binary is None:
             return None
-        pidx = ws.plane_streamline_plane_idx
-        if pidx < 0 or pidx >= len(ws.planes):
+        if plane_idx < 0 or plane_idx >= len(ws.planes):
             return None
-        plane = ws.planes[pidx]
+        plane = ws.planes[int(plane_idx)]
         p = ws.streamline_params
         mask_t = ws.segmask_binary[..., min(max(0, int(t)), ws.segmask_binary.shape[3] - 1)]
-        sl = generate_streamlines_from_plane_at_t(
+        sl = generate_pathlines_from_plane_at_t(
             ws.flow_raw, t, plane, ws.resolution, ws.origin,
+            mask_4d=ws.segmask_binary,
             mask_3d=mask_t,
             max_steps=p.max_steps,
             terminal_speed=p.terminal_speed,
             seed_ratio=p.seed_ratio,
             min_seeds=p.min_seeds,
             rng_seed=p.rng_seed,
+            rr=ws.rr,
             branch_labels_3d=ws.branch_labels,
         )
-        ws.plane_streamline_cache[t] = sl
+        plane_cache[t] = sl
         return sl
 
     def trigger_streamlines(self):
@@ -739,28 +827,52 @@ class SceneController:
         ws.add_object(name="streamlines", kind=ObjectKind.FLOW,
                       data_key="streamlines_live", visible=True, opacity=1.0,
                       scalars="Velocity", cmap="turbo", dynamic=True,
-                      show_scalar_bar=True, scalar_bar_title="Velocity (m/s)")
+                      show_scalar_bar=True, scalar_bar_title="Velocity (m/s)",
+                      tube_radius=ws.streamline_params.tube_radius)
+        self.sync_from_workspace()
+
+    def trigger_pathlines(self, plane_indices=None):
+        ws = self.workspace
+        if ws.flow_raw is None or ws.segmask_3d is None:
+            self.logger("Cannot generate Pathlines: need flow + segmask_3d")
+            return
+        if plane_indices is None:
+            plane_indices = list(range(len(ws.planes)))
+        valid = sorted({int(idx) for idx in plane_indices if 0 <= int(idx) < len(ws.planes)})
+        if not valid:
+            self.logger("Cannot generate Pathlines: no valid planes")
+            return
+        ws.clear_pathlines()
+        ws.active_pathline_plane_indices = valid
+        p = ws.streamline_params
+        self.logger(f"Pathlines enabled for planes {valid}: seed_ratio={p.seed_ratio} min_seeds={p.min_seeds} max_steps={p.max_steps} terminal_speed={p.terminal_speed} rng_seed={p.rng_seed} color={p.pathline_color}")
+        for plane_idx in valid:
+            group_name = str(getattr(ws.planes[int(plane_idx)], "group_name", "") or "")
+            if group_name:
+                name = f"pathline_{group_name}_{int(plane_idx)}"
+                data_key = name
+            else:
+                name = f"pathline_{int(plane_idx)}"
+                data_key = name
+            ws.add_object(
+                name=name,
+                kind=ObjectKind.FLOW,
+                data_key=data_key,
+                group_name=group_name,
+                browser_color=ws.skeleton_params.browser_color_for_group(group_name) if group_name else "",
+                visible=True,
+                opacity=1.0,
+                color=ws.pathline_color_for_plane(plane_idx),
+                dynamic=True,
+                show_scalar_bar=False,
+                tube_radius=ws.streamline_params.tube_radius,
+            )
+        self.invalidate_cache("pathline_")
         self.sync_from_workspace()
 
     def trigger_plane_streamlines(self, plane_idx):
-        ws = self.workspace
-        if ws.flow_raw is None or ws.segmask_3d is None:
-            self.logger("Cannot generate plane streamlines: need flow + segmask_3d")
-            return
-        if plane_idx < 0 or plane_idx >= len(ws.planes):
-            self.logger(f"Invalid plane index: {plane_idx}")
-            return
-        ws.plane_streamline_cache.clear()
-        ws.plane_streamline_active = True
-        ws.plane_streamline_plane_idx = plane_idx
-        p = ws.streamline_params
-        self.logger(f"Plane streamlines enabled from plane {plane_idx}: seed_ratio={p.seed_ratio} min_seeds={p.min_seeds} max_steps={p.max_steps} terminal_speed={p.terminal_speed} rng_seed={p.rng_seed}")
-        ws.remove_object_by_data_key("plane_streamlines_live")
-        ws.add_object(name="plane_streamlines", kind=ObjectKind.FLOW,
-                      data_key="plane_streamlines_live", visible=True, opacity=1.0,
-                      scalars="Velocity", cmap="turbo", dynamic=True,
-                      show_scalar_bar=True, scalar_bar_title="Velocity (m/s)")
-        self.sync_from_workspace()
+        _ = plane_idx
+        self.trigger_pathlines()
 
     def clear_streamlines(self):
         self.workspace.clear_streamlines()
@@ -768,11 +880,14 @@ class SceneController:
         self.sync_from_workspace()
         self.logger("Streamlines cleared")
 
-    def clear_plane_streamlines(self):
-        self.workspace.clear_plane_streamlines()
-        self.invalidate_cache("plane_streamlines")
+    def clear_pathlines(self):
+        self.workspace.clear_pathlines()
+        self.invalidate_cache("pathline_")
         self.sync_from_workspace()
-        self.logger("Plane streamlines cleared")
+        self.logger("Pathlines cleared")
+
+    def clear_plane_streamlines(self):
+        self.clear_pathlines()
 
     def find_plane_uid_at_position(self, picked_point):
         ws = self.workspace
@@ -805,11 +920,8 @@ class SceneController:
         for uid, obj in ws.scene_objects.items():
             if obj.kind != ObjectKind.BRANCH:
                 continue
-            if not obj.data_key.startswith("smooth_path_"):
-                continue
-            try:
-                pidx = int(obj.data_key.split("_")[2])
-            except Exception:
+            pidx = _parse_indexed_data_key(obj.data_key, "smooth_path")
+            if pidx is None:
                 continue
             if pidx >= len(ws.centerline_paths_smooth):
                 continue
