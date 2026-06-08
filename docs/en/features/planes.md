@@ -10,7 +10,7 @@
 
 ## What It Does
 Plane generation creates cross-sectional analysis planes along vessel paths.
-In grouped multi-label workflows, every plane keeps the group name of the path it came from, so plane and pathline objects can stay grouped in the GUI.
+In grouped multi-label workflows, every plane keeps the group name of the path it came from, so plane and pathline objects can stay grouped in the GUI while still showing short browser-visible names such as `plane 5`.
 
 ## When To Use It
 - use it after graph and path generation
@@ -69,7 +69,7 @@ summary = run_case("case.h5", config=config)
 | --- | --- | --- |
 | `planes.json` | planes exist | serialized plane geometry |
 | `plane_positions.json` | planes exist | reusable plane position file |
-| plane scene objects | GUI or pipeline plane step succeeds | grouped plane objects such as `plane_aorta_systemic_branches_5` |
+| plane scene objects | GUI or pipeline plane step succeeds | grouped plane objects with stable internal keys such as `plane_aorta_systemic_branches_5`, shown in the browser as `plane 5` |
 
 ## Limitations
 - depends on graph and path quality
@@ -95,4 +95,4 @@ summary = run_case("case.h5", config=config)
 | --- | --- | --- |
 | no planes are created | graph or paths are missing | run skeleton and graph first |
 | plane positions look poor | path geometry is noisy | improve graph quality or adjust planes manually in the GUI |
-| planes are grouped differently than expected | grouped label configuration does not match the label mask | review `configs/skeleton.json -> label_groups` and regenerate graph and planes |
+| planes are grouped differently than expected | grouped label configuration does not match the label mask | review `configs/labels.json -> label_groups` and regenerate graph and planes |

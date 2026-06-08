@@ -10,7 +10,7 @@
 
 ## 功能说明
 平面生成功能会沿 vessel path 布置横截面分析平面。
-在 grouped multi-label 工作流里，每个平面都会保留它所属 path 的 group 名称，这样 GUI 里的平面和路径线都能继续按 group 管理。
+在 grouped multi-label 工作流里，每个平面都会保留它所属 path 的 group 名称，这样 GUI 里的平面和路径线都能继续按 group 管理，同时 Browser 里仍然只显示简短名字，例如 `plane 5`。
 
 ## 何时使用
 - 图和路径生成完成后使用
@@ -69,7 +69,7 @@ summary = run_case("case.h5", config=config)
 | --- | --- | --- |
 | `planes.json` | 有平面后 | 平面几何序列化结果 |
 | `plane_positions.json` | 有平面后 | 可复用平面位置文件 |
-| GUI 场景中的平面对象 | GUI 或 pipeline 成功后 | 如 `plane_aorta_systemic_branches_5` 这样的分组平面对象 |
+| GUI 场景中的平面对象 | GUI 或 pipeline 成功后 | 内部 key 如 `plane_aorta_systemic_branches_5` 的分组平面对象；Browser 中显示为 `plane 5` |
 
 ## 限制
 - 依赖 graph 和 path 质量
@@ -94,4 +94,4 @@ summary = run_case("case.h5", config=config)
 | --- | --- | --- |
 | 没有生成平面 | graph 或 path 不存在 | 先生成 skeleton 和 graph |
 | 平面位置不合理 | path 几何噪声较大 | 优化 graph，或在 GUI 里手工调整 |
-| 平面的分组不符合预期 | 当前 `label_groups` 配置和 label mask 不匹配 | 检查 `configs/skeleton.json -> label_groups`，然后重新生成 graph 和 planes |
+| 平面的分组不符合预期 | 当前 `label_groups` 配置和 label mask 不匹配 | 检查 `configs/labels.json -> label_groups`，然后重新生成 graph 和 planes |

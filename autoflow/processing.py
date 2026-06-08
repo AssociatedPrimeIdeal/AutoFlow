@@ -414,6 +414,27 @@ def process_single(
         print("\n  === Fork QC Summary ===")
         print_qc_summary(qc_data, ws.forks)
 
+    if ws.derived.pwv_results:
+        print("\n  === PWV Summary ===")
+        for result in ws.derived.pwv_results:
+            name = str(result.get("name", "pwv") or "pwv")
+            status = str(result.get("status", "unknown") or "unknown")
+            valid = int(result.get("valid_plane_count", 0) or 0)
+            total = int(result.get("plane_count", 0) or 0)
+            pwv = result.get("pwv_m_s")
+            message = str(result.get("message", "") or "")
+            line = f"  - {name}: status={status} valid_planes={valid}/{total}"
+            if pwv is not None:
+                line += f" pwv={float(pwv):.4g} m/s"
+            if message:
+                line += f" | {message}"
+            print(line)
+
+    pwv_plot_files = {}
+    for result in list(ws.derived.pwv_results or []):
+        plot_file = str(result.get("plot_file", "") or "")
+        if plot_file:
+            pwv_plot_files[str(result.get("name", "pwv") or "pwv")] = plot_file
     summary = {
         "input": case.input_path,
         "input_kind": case.input_kind,
@@ -436,6 +457,9 @@ def process_single(
         "forks": ws.forks,
         "plane_metrics": ws.derived.plane_metrics,
         "plane_qc": ws.derived.plane_qc,
+        "pwv_results": ws.derived.pwv_results,
+        "pwv_file": ws.derived.pwv_file,
+        "pwv_plot_files": pwv_plot_files,
         "plane_positions_file": plane_positions_path,
         "reused_planes_file": reuse_planes_path,
         "videos": video_paths,

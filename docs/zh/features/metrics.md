@@ -11,6 +11,8 @@
 ## 功能说明
 平面指标会对每个平面计算时间分辨的截面指标，并写入 JSON 和 HDF5 输出。
 
+如果 `configs/pwv.json -> enabled` 为真，平面指标步骤还会额外计算每个 PWV group 的 PWV，并写出 PWV 输出。
+
 ## 何时使用
 - 平面生成之后使用
 - 需要流量、面积、平均速度、峰值速度、净流量等截面指标时使用
@@ -55,6 +57,8 @@ autoflow-run case.h5 --output-dir results/case
 | `plane_qc.json` | 平面指标成功后 | fork 和 path 的 QC |
 | `plane_metrics_pixelwise.h5` | 平面指标成功后 | 按平面保存的像素级派生采样 |
 | `planes.json` 中附带的摘要 | 平面指标成功后 | 平面几何和摘要一起保存 |
+| `pwv.json` | 启用 PWV 时 | 配置好的 label group 的 PWV 结果 |
+| `pwv_<group>.png` | PWV 绘图成功后 | PWV 图 |
 
 ## 限制
 - 必须有分割
@@ -67,7 +71,7 @@ autoflow-run case.h5 --output-dir results/case
 | --- | --- | --- | --- |
 | 平面指标计算 | `autoflow/algorithms/metrics.py` | `autoflow/core/pipeline.py` | `tests/test_smoke_phantoms.py`, `tests/test_pressure_gradient_phantom.py` |
 | 平面指标保存格式 | `autoflow/core/pipeline.py`, `autoflow/plane_io.py` | `autoflow/reporting.py` | `tests/test_pressure_gradient_phantom.py` |
-| GUI 中的平面指标刷新 | `autoflow/ui/app.py`, `autoflow/ui/ortho_viewer.py` | `autoflow/core/pipeline.py` | GUI smoke 覆盖 |
+| GUI 中的平面指标刷新和 PWV dock | `autoflow/ui/app.py`, `autoflow/ui/ortho_viewer.py` | `autoflow/core/pipeline.py`, `autoflow/algorithms/pwv.py` | GUI 手工验证 |
 
 ## 测试
 

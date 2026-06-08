@@ -52,6 +52,24 @@ def _path_polydata(path, origin):
     return poly
 
 
+def _pwv_planes_polydata(planes, origin, plane_size=25.0):
+    rows = list(planes or [])
+    if not rows:
+        return None
+    org = np.asarray(origin, dtype=float).reshape(3)
+    meshes = []
+    for row in rows:
+        center = np.asarray(row.get("center", [0.0, 0.0, 0.0]), dtype=float).reshape(3) + org
+        normal = np.asarray(row.get("normal", [1.0, 0.0, 0.0]), dtype=float).reshape(3)
+        if np.linalg.norm(normal) <= 1e-12:
+            normal = np.array([1.0, 0.0, 0.0], dtype=float)
+        meshes.append(pv.Plane(center=center, direction=normal, i_size=float(plane_size), j_size=float(plane_size)))
+    merged = meshes[0].copy(deep=True)
+    for mesh in meshes[1:]:
+        merged = merged.merge(mesh)
+    return merged
+
+
 class SceneController:
     def __init__(self, plotter, workspace, logger):
         self.plotter = plotter
@@ -518,6 +536,11 @@ class SceneController:
                 }
         else:
             kw["color"] = obj.color
+        if obj.data_key == "pwv_planes":
+            kw["show_edges"] = True
+            kw["edge_color"] = "black"
+            kw["line_width"] = max(float(obj.line_width), 2.0)
+            return kw
         if obj.kind.value in ("Skeleton", "Aux"):
             kw["render_points_as_spheres"] = True
             kw["point_size"] = obj.point_size
@@ -681,6 +704,12 @@ class SceneController:
             if not ws.derived.streamlines:
                 return None
             return ws.derived.streamlines[min(max(0, t), len(ws.derived.streamlines) - 1)]
+
+        if data_key == "pwv_planes":
+            if not ws.derived.pwv_planes:
+                return None
+            plane_size = max(10.0, float(np.mean(np.asarray(sp, dtype=float).reshape(3))) * 12.0)
+            return self._cached(data_key, 0, lambda: _pwv_planes_polydata(ws.derived.pwv_planes, org, plane_size=plane_size))
 
         idx = _parse_indexed_data_key(data_key, "smooth_path")
         if idx is not None:
@@ -849,11 +878,11 @@ class SceneController:
         for plane_idx in valid:
             group_name = str(getattr(ws.planes[int(plane_idx)], "group_name", "") or "")
             if group_name:
-                name = f"pathline_{group_name}_{int(plane_idx)}"
-                data_key = name
+                name = f"pathline {int(plane_idx)}"
+                data_key = f"pathline_{group_name}_{int(plane_idx)}"
             else:
-                name = f"pathline_{int(plane_idx)}"
-                data_key = name
+                name = f"pathline {int(plane_idx)}"
+                data_key = f"pathline_{int(plane_idx)}"
             ws.add_object(
                 name=name,
                 kind=ObjectKind.FLOW,

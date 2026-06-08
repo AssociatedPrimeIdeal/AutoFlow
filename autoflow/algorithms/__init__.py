@@ -137,6 +137,13 @@ from .metrics import (
     compute_plane_metrics_multithread,
     load_metrics_as_table,
 )
+
+from .pwv import (
+    compute_pwv_groups,
+    detect_waveform_foot_time_ms,
+    save_pwv_plot,
+    save_pwv_results,
+)
 __all__ = [
     "LoadedCase",
     "LoaderCapabilities",
@@ -209,4 +216,8 @@ __all__ = [
     "save_plane_pixelwise_h5",
     "compute_plane_metrics_multithread",
     "load_metrics_as_table",
+    "compute_pwv_groups",
+    "detect_waveform_foot_time_ms",
+    "save_pwv_plot",
+    "save_pwv_results",
 ]

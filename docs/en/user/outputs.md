@@ -9,6 +9,8 @@
 | `plane_metrics.json` | plane metrics run | time-resolved plane metrics | `autoflow/core/pipeline.py` |
 | `plane_qc.json` | plane metrics run | fork and path QC | `autoflow/core/pipeline.py` |
 | `plane_metrics_pixelwise.h5` | plane metrics run | per-plane pixelwise derived samples | `autoflow/core/pipeline.py` |
+| `pwv.json` | PWV is enabled and plane metrics run | PWV fit results for each configured PWV group | `autoflow/core/pipeline.py`, `autoflow/algorithms/pwv.py` |
+| `pwv_<group>.png` | PWV plotting succeeds | per-group time-to-foot versus slice-position plot | `autoflow/algorithms/pwv.py` |
 | `derived_metrics_pixelwise.npz` | derived metrics run | whole-volume WSS, pressure gradient, and optional TKE arrays | `autoflow/processing.py` |
 | `summary.json` | every processed case | single-case summary | `autoflow/processing.py` |
 | `batch_report.json` | batch run | batch summary report | `autoflow/api.py`, `autoflow/processing.py` |
@@ -36,6 +38,8 @@
 - `derived_metrics_pixelwise.npz` stores whole-volume derived arrays
 - `plane_metrics_pixelwise.h5` stores per-plane slice-cellwise samples
 - TKE outputs remain optional and are absent for inputs that do not carry TKE
+- `pwv.json` is also mirrored into `summary.json` as `pwv_results`, `pwv_file`, and `pwv_plot_files`
 - `planes.json` stores per-plane `path_info` when path metadata is available; grouped multi-label workflows can therefore expose `path_info.group_name` in that file
-- GUI scene objects are not saved files, but grouped workflows name them with stable prefixes such as `segmask_group_<group>`, `skeleton_<group>`, `graph_<group>`, `smooth_path_<group>_<path_idx>`, `plane_<group>_<plane_idx>`, and `pathline_<group>_<plane_idx>`
+- GUI scene objects are not saved files, but grouped workflows keep stable internal keys such as `segmask_group_<group>`, `skeleton_<group>`, `graph_<group>`, `smooth_path_<group>_<path_idx>`, `plane_<group>_<plane_idx>`, and `pathline_<group>_<plane_idx>` while showing shorter browser-visible names like `plane 5` and `pathline 5`
+- PWV scene planes are represented as one grouped browser object named `PWV planes`
 - `plane_positions.json` stays geometry-focused and does not store browser colors or GUI-only group-title styling

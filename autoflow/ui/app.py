@@ -8,6 +8,8 @@ from functools import partial
 
 import numpy as np
 import pyvista as pv
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 from PyQt5 import QtCore, QtGui, QtWidgets
 from pyvistaqt import QtInteractor
 from pyvista import _vtk
@@ -273,6 +275,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bot_splitter.addWidget(log_w)
         bot_splitter.setSizes([40, 80, 60])
         self._build_segmentation_dock()
+        self._build_pwv_dock()
 
     def _build_browser(self, parent):
         grp = QtWidgets.QGroupBox("Browser")
@@ -519,6 +522,161 @@ class MainWindow(QtWidgets.QMainWindow):
         self.segmentation_panel.btn_redo.clicked.connect(self._redo_segmentation_edit)
         self.segmentation_panel.btn_apply.clicked.connect(self._apply_segmentation_edits)
         self.segmentation_panel.btn_cancel.clicked.connect(self._cancel_segmentation_edits)
+
+    def _build_pwv_dock(self):
+        self.pwv_dock = QtWidgets.QDockWidget("PWV", self)
+        self.pwv_dock.setObjectName("PWVDock")
+        panel = QtWidgets.QWidget(self)
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        header = QtWidgets.QHBoxLayout()
+        header.addWidget(QtWidgets.QLabel("Group"))
+        self.combo_pwv_group = QtWidgets.QComboBox()
+        self.combo_pwv_group.currentIndexChanged.connect(self._on_pwv_group_changed)
+        header.addWidget(self.combo_pwv_group, 1)
+        layout.addLayout(header)
+
+        self.label_pwv_status = QtWidgets.QLabel("No PWV results.")
+        self.label_pwv_status.setWordWrap(True)
+        layout.addWidget(self.label_pwv_status)
+
+        self.fig_pwv = Figure(figsize=(5.2, 3.6), dpi=90, facecolor="white")
+        self.canvas_pwv = FigureCanvas(self.fig_pwv)
+        self.ax_pwv = self.fig_pwv.add_subplot(111)
+        layout.addWidget(self.canvas_pwv, 1)
+
+        self.pwv_dock.setWidget(panel)
+        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self.pwv_dock)
+        self.tabifyDockWidget(self.segmentation_dock, self.pwv_dock)
+
+    def _on_pwv_group_changed(self, _index=None):
+        self._plot_pwv_result(self._selected_pwv_result())
+
+    def _selected_pwv_result(self):
+        idx = self.combo_pwv_group.currentData()
+        results = list(self.workspace.derived.pwv_results or [])
+        if idx is None:
+            return None
+        try:
+            idx = int(idx)
+        except Exception:
+            return None
+        if not (0 <= idx < len(results)):
+            return None
+        return results[idx]
+
+    def _clear_pwv_axes(self, message="No PWV results."):
+        self.ax_pwv.clear()
+        self.ax_pwv.set_title("PWV")
+        self.ax_pwv.set_xlabel("Slice Position (mm)")
+        self.ax_pwv.set_ylabel("Time-to-Foot (ms)")
+        self.ax_pwv.grid(True, alpha=0.25)
+        self.ax_pwv.text(0.5, 0.5, str(message), ha="center", va="center", transform=self.ax_pwv.transAxes)
+        self.fig_pwv.tight_layout()
+        self.canvas_pwv.draw_idle()
+
+    def _plot_pwv_result(self, result):
+        if result is None:
+            self.label_pwv_status.setText("No PWV results.")
+            self._clear_pwv_axes()
+            return
+        self.ax_pwv.clear()
+        self.ax_pwv.set_title(str(result.get("name", "PWV")))
+        self.ax_pwv.set_xlabel("Slice Position (mm)")
+        self.ax_pwv.set_ylabel("Time-to-Foot (ms)")
+        self.ax_pwv.grid(True, alpha=0.25)
+
+        positions = np.asarray(result.get("position_mm", []), dtype=float).reshape(-1)
+        foot_times = np.asarray(result.get("time_to_foot_ms", []), dtype=float).reshape(-1)
+        plot_color = str(self.workspace.pwv_params.plot_color or "#2b8a3e")
+        fit_color = str(self.workspace.pwv_params.fit_color or "#f08c00")
+        if positions.size > 0 and foot_times.size > 0:
+            self.ax_pwv.scatter(positions, foot_times, color=plot_color, label="Planes")
+            slope = result.get("fit_slope_ms_per_mm")
+            intercept = result.get("fit_intercept_ms")
+            pwv = result.get("pwv_m_s")
+            if slope is not None and intercept is not None:
+                xfit = np.linspace(float(np.min(positions)), float(np.max(positions)), 100)
+                yfit = float(intercept) + float(slope) * xfit
+                label = "Fit"
+                if pwv is not None:
+                    label = f"Fit PWV={float(pwv):.3g} m/s"
+                self.ax_pwv.plot(xfit, yfit, color=fit_color, linewidth=2.0, label=label)
+            self.ax_pwv.legend(loc="best")
+        else:
+            self.ax_pwv.text(
+                0.5,
+                0.5,
+                str(result.get("message", "No valid PWV points")),
+                ha="center",
+                va="center",
+                transform=self.ax_pwv.transAxes,
+            )
+
+        status = str(result.get("status", "") or "unknown")
+        valid_count = int(result.get("valid_plane_count", 0) or 0)
+        plane_count = int(result.get("plane_count", 0) or 0)
+        longest_path = result.get("longest_path_length_mm")
+        pwv = result.get("pwv_m_s")
+        fit_r2 = result.get("fit_r2")
+        lines = [f"Status: {status}   Valid planes: {valid_count}/{plane_count}"]
+        extras = []
+        if pwv is not None:
+            extras.append(f"PWV: {float(pwv):.4g} m/s")
+        if fit_r2 is not None:
+            extras.append(f"R2: {float(fit_r2):.3f}")
+        if longest_path is not None:
+            extras.append(f"Longest path: {float(longest_path):.1f} mm")
+        if extras:
+            lines.append("   ".join(extras))
+        message = str(result.get("message", "") or "")
+        if message:
+            lines.append(message)
+        plot_file = str(result.get("plot_file", "") or "")
+        if plot_file:
+            lines.append(f"Plot file: {plot_file}")
+        plot_error = str(result.get("plot_error", "") or "")
+        if plot_error:
+            lines.append(f"Plot error: {plot_error}")
+        self.label_pwv_status.setText("\n".join(lines))
+        self.fig_pwv.tight_layout()
+        self.canvas_pwv.draw_idle()
+
+    def _refresh_pwv_plot(self):
+        results = list(self.workspace.derived.pwv_results or [])
+        current_name = ""
+        current = self._selected_pwv_result()
+        if current is not None:
+            current_name = str(current.get("name", "") or "")
+        self.combo_pwv_group.blockSignals(True)
+        self.combo_pwv_group.clear()
+        for idx, result in enumerate(results):
+            name = str(result.get("name", f"group_{idx}") or f"group_{idx}")
+            status = str(result.get("status", "") or "")
+            pwv = result.get("pwv_m_s")
+            label = name
+            if pwv is not None:
+                label = f"{name} ({float(pwv):.3g} m/s)"
+            elif status:
+                label = f"{name} [{status}]"
+            self.combo_pwv_group.addItem(label, int(idx))
+        self.combo_pwv_group.setEnabled(bool(results))
+        if results:
+            target_idx = 0
+            if current_name:
+                for idx, result in enumerate(results):
+                    if str(result.get("name", "") or "") == current_name:
+                        target_idx = idx
+                        break
+            self.combo_pwv_group.setCurrentIndex(target_idx)
+        self.combo_pwv_group.blockSignals(False)
+        if not results:
+            self.label_pwv_status.setText("No PWV results.")
+            self._clear_pwv_axes()
+            return
+        self._plot_pwv_result(self._selected_pwv_result())
 
     def _build_menu(self):
         mb = self.menuBar()
@@ -1970,7 +2128,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 state.setdefault("planes", []).append(plane)
                 ws.multilabel_groups[group_name] = state
             ws.add_object(
-                name=self._plane_data_key("plane", i),
+                name=f"plane {int(i)}",
                 kind=ObjectKind.PLANE,
                 data_key=self._plane_data_key("plane", i),
                 group_name=group_name,
@@ -1991,6 +2149,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sync_params_to_ui()
         self._refresh_selection_info()
         self._refresh_segmentation_ui()
+        self._refresh_pwv_plot()
         self._refresh_scene()
 
     def _refresh_browser(self):

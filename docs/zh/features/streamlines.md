@@ -11,7 +11,7 @@
 | Python API | Partial | 支持离线流线视频 |
 
 ## 功能说明
-流线用于看瞬时流动轨迹，路径线用于看 GUI 中从平面发射的时间分辨粒子轨迹。在 grouped multi-label 工作流里，路径线会继承平面的 group 名称，所以对象命名会像 `pathline_aorta_systemic_branches_5`，而不只是 `Pathline 5`。
+流线用于看瞬时流动轨迹，路径线用于看 GUI 中从平面发射的时间分辨粒子轨迹。在 grouped multi-label 工作流里，路径线内部会继承平面的 group 名称，而 Browser 里显示给用户的名字会更短，例如 `pathline 5`。
 
 ## 何时使用
 - 想看瞬时流场趋势时用流线
@@ -96,4 +96,4 @@ summary = run_case("case.h5", config=config)
 | --- | --- | --- |
 | 流线被跳过 | 没有分割或没有 flow | 检查输入和分割 |
 | 路径线被跳过 | 没有平面 | 先生成平面 |
-| Browser 里路径线分组不符合预期 | `label_groups` 配置不符合当前 label mask | 检查 `configs/skeleton.json` 里的分组并重新生成平面和路径线 |
+| Browser 里路径线分组不符合预期 | `label_groups` 配置不符合当前 label mask | 检查 `configs/labels.json` 里的分组并重新生成平面和路径线 |

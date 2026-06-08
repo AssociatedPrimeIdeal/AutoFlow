@@ -37,9 +37,21 @@ results, last_case_out = run_batch(config)
 ### 从配置目录构建默认值
 
 ```python
-from autoflow import AutoFlowConfig
+from autoflow import AutoFlowConfig, build_workspace
 config = AutoFlowConfig.from_config_dir("./configs")
+workspace = build_workspace(config)
 ```
+
+### 通过配置文件启用 PWV
+
+```python
+from autoflow import AutoFlowConfig, run_case
+
+config = AutoFlowConfig.from_config_dir("./configs")
+summary = run_case("case.h5", config=config)
+```
+
+PWV 当前由 `configs/pwv.json` 控制，而不是单独的 `AutoFlowConfig` 字段。只要从 `config_dir` 构建 workspace，就会带上 PWV group 和绘图默认值。
 
 ### Dual-VENC `Nv=7` 配置
 

@@ -44,6 +44,17 @@ config = AutoFlowConfig.from_config_dir("./configs")
 workspace = build_workspace(config)
 ```
 
+### Enable PWV through config files
+
+```python
+from autoflow import AutoFlowConfig, run_case
+
+config = AutoFlowConfig.from_config_dir("./configs")
+summary = run_case("case.h5", config=config)
+```
+
+PWV is currently controlled by `configs/pwv.json` rather than a dedicated `AutoFlowConfig` field. The workspace built from `config_dir` carries the PWV groups and plotting defaults.
+
 ### Launch the GUI from Python
 
 ```python
@@ -89,3 +100,4 @@ Main code:
 - interactive GUI editing is not exposed as a stable batch API
 - GUI pathlines are interactive behavior, not a public batch-processing API
 - offline videos are supported through config flags in `run_case()` and `run_batch()`
+- PWV is available through the config bundle loaded by `AutoFlowConfig.from_config_dir()` and `build_workspace()`

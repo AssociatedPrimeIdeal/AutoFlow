@@ -4,26 +4,34 @@
 
 | Entry point | Status | Notes |
 | --- | --- | --- |
-| GUI | Supported | includes interactive skeleton editing for single-group cases |
+| GUI | Supported | interactive skeleton editing is still limited to single-group cases |
 | CLI | Supported | batch generation only |
 | Python API | Supported | through pipeline execution |
 
-## What It Does
+## What it does
 Skeleton generation reduces the vessel mask to a centerline-style structure that seeds graph construction.
-For grouped multi-label segmentations, AutoFlow first reduces 4D labels to 3D by majority vote along time, removes small connected components per label, merges labels into configured groups, applies per-group preprocessing, and then skeletonizes each group separately.
 
-## When To Use It
+For grouped multi-label segmentations, AutoFlow now:
+
+1. reduces 4D labels to 3D by majority vote along time
+2. removes small connected components per label when enabled
+3. merges labels into configured groups from `configs/labels.json`
+4. keeps only the largest connected component for each group mask
+5. applies per-group preprocessing
+6. skeletonizes each group separately
+
+## When to use it
 - use it after segmentation is available
 - use it before graph and plane generation
-- do not use it when no segmentation is loaded
+- use it when you want grouped vessel trees instead of one merged binary tree
 
-## Quick Use
+## Quick use
 
 ### GUI
 1. load or create segmentation
 2. click `Generate Skeleton`
-3. inspect grouped skeleton objects such as `skeleton_aorta_systemic_branches` in the browser
-4. optionally click `Edit Skeleton` for interactive correction when exactly one segmentation group is active
+3. inspect grouped skeleton objects in the browser
+4. optionally click `Edit Skeleton` when exactly one segmentation group is active
 
 ### CLI
 
@@ -35,35 +43,32 @@ autoflow-run case.h5 --output-dir results/case
 
 ```python
 from autoflow import AutoFlowConfig, run_case
+
 summary = run_case("case.h5", config=AutoFlowConfig(output_dir="./results/case"))
 ```
 
 ## Inputs
 
-| Input | Required | Meaning | Example |
-| --- | --- | --- | --- |
-| segmentation | yes | binary or label mask used to derive a skeleton | original, imported, threshold, or auto segmentation |
-| resolution | yes | voxel spacing for volume-aware preprocessing | from loader |
+| Input | Required | Meaning |
+| --- | --- | --- |
+| segmentation | yes | binary mask or label mask used to derive the skeleton |
+| resolution | yes | voxel spacing for volume-aware cleanup and preprocessing |
+| `configs/labels.json` | for grouped label workflows | label map, label groups, colors, and per-group preprocessing |
 
 ## Parameters
 
-| Parameter | Type | Default | Where set | Effect | Code owner |
+| Parameter | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `remove_small_cc` | bool | `True` | `configs/skeleton.json` | remove small connected components | `autoflow/core/models.py` |
+| `remove_small_cc` | bool | `True` | `configs/skeleton.json` | remove small connected components before grouped preprocessing | `autoflow/core/models.py` |
 | `min_cc_volume_mm3` | float | `50.0` | `configs/skeleton.json` | component-volume threshold | `autoflow/core/models.py` |
-| `do_closing` | bool | `True` | `configs/skeleton.json` | morphological closing before skeletonization | `autoflow/algorithms/preprocess.py` |
-| `do_opening` | bool | `False` | `configs/skeleton.json` | morphological opening before skeletonization | `autoflow/algorithms/preprocess.py` |
-| `gaussian_sigma` | float | `0.5` | `configs/skeleton.json` | smoothing strength | `autoflow/algorithms/preprocess.py` |
-| `gaussian_enabled` | bool | `True` | `configs/skeleton.json` | enable or disable Gaussian smoothing | `autoflow/algorithms/preprocess.py` |
-| `dilation_iters` | int | `0` | `configs/skeleton.json` | global dilation iterations before skeletonization | `autoflow/algorithms/preprocess.py` |
-| `erosion_iters` | int | `0` | `configs/skeleton.json` | global erosion iterations before skeletonization | `autoflow/algorithms/preprocess.py` |
-| `opening_iters` | int | `0` | `configs/skeleton.json` | global opening iterations before skeletonization | `autoflow/algorithms/preprocess.py` |
-| `closing_iters` | int | `0` | `configs/skeleton.json` | global closing iterations before skeletonization | `autoflow/algorithms/preprocess.py` |
-| `label_map` | mapping | built-in vessel defaults | `configs/skeleton.json` | maps label names to integer label values | `autoflow/config.py` |
-| `label_groups` | mapping | built-in vessel groups | `configs/skeleton.json` | merges labels into named groups and defines colors plus preprocessing overrides | `autoflow/core/models.py` |
-| `single_label_group_name` | string | `single_label` | `configs/skeleton.json` | fallback group name for binary or one-label inputs | `autoflow/core/models.py` |
-| `single_label_browser_color` | string | `#d9480f` | `configs/skeleton.json` | browser title color for the single-label fallback | `autoflow/core/models.py` |
-| `default_group_browser_color` | string | `#1c7ed6` | `configs/skeleton.json` | browser title color when a group has no explicit color | `autoflow/core/models.py` |
+| `do_closing` | bool | `True` | `configs/skeleton.json` | global closing before skeletonization | `autoflow/algorithms/preprocess.py` |
+| `do_opening` | bool | `False` | `configs/skeleton.json` | global opening before skeletonization | `autoflow/algorithms/preprocess.py` |
+| `gaussian_sigma` | float | `0.5` | `configs/skeleton.json` | global smoothing strength | `autoflow/algorithms/preprocess.py` |
+| `gaussian_enabled` | bool | `True` | `configs/skeleton.json` | enable or disable global Gaussian smoothing | `autoflow/algorithms/preprocess.py` |
+| `label_map` | mapping | built-in vessel defaults | `configs/labels.json` | maps symbolic vessel names to integer label values | `autoflow/config.py` |
+| `label_groups` | mapping | built-in vessel groups | `configs/labels.json` | merges labels into named groups and defines colors plus preprocessing overrides | `autoflow/core/models.py` |
+| `label_groups.<group>.preprocess` | mapping | `{}` | `configs/labels.json` | per-group preprocessing overrides before skeletonization | `autoflow/algorithms/preprocess.py` |
+| `single_label_group_name` | string | `single_label` | `configs/labels.json` | fallback group name for binary or one-label inputs | `autoflow/core/models.py` |
 
 ## Outputs
 
@@ -75,25 +80,24 @@ summary = run_case("case.h5", config=AutoFlowConfig(output_dir="./results/case")
 ## Limitations
 - segmentation is required
 - quality depends directly on segmentation quality
-- there is no standalone skeleton file export documented as a public output
 - interactive skeleton editing is only available when exactly one segmentation group is active
 
-## Where To Change Code
+## Where to change code
 
 | Change you want | Edit here | Also check | Tests |
 | --- | --- | --- | --- |
-| preprocessing before skeletonization | `autoflow/algorithms/preprocess.py` | `autoflow/core/models.py` | `tests/test_smoke_phantoms.py` |
-| skeleton extraction | `autoflow/algorithms/skeleton.py` | `autoflow/core/pipeline.py` | `tests/test_smoke_phantoms.py` |
-| interactive skeleton edit behavior | `autoflow/ui/app.py`, `autoflow/ui/editors.py` | `autoflow/core/pipeline.py` | GUI smoke coverage |
+| preprocessing before skeletonization | `autoflow/algorithms/preprocess.py` | `autoflow/core/models.py`, `autoflow/config.py` | `tests/test_smoke_phantoms.py` |
+| grouped skeleton pipeline flow | `autoflow/core/pipeline.py` | `autoflow/algorithms/skeleton.py` | `tests/test_smoke_phantoms.py` |
+| interactive skeleton edit behavior | `autoflow/ui/app.py`, `autoflow/ui/editors.py` | `autoflow/core/pipeline.py` | GUI manual verification |
 
 ## Tests
-
 - `~/miniconda3/envs/ryy/bin/python -m pytest tests/test_smoke_phantoms.py -q`
 
-## Common Problems
+## Common problems
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
 | skeleton step is skipped | no segmentation | create or load segmentation first |
 | skeleton contains many small branches | noisy segmentation | raise cleanup thresholds or improve segmentation |
-| `Edit Skeleton` is unavailable | more than one segmentation group is active | use a single-label or single-group case, or change group configuration |
+| one grouped vessel disappears | only a tiny disconnected component existed after grouping | review the segmentation or adjust grouping so the desired vessel is in the largest connected component |
+| `Edit Skeleton` is unavailable | more than one segmentation group is active | use a single-group case or simplify `configs/labels.json` |

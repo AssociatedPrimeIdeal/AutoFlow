@@ -27,3 +27,4 @@ app.png
 autoflow_mri.egg-info/
 build/
 /scripts/
+data/phantom_*.h5

@@ -78,6 +78,7 @@ Behavior details:
 - if `--autoseg` is enabled and the case has no segmentation, auto segmentation runs before skeleton and graph steps
 - CLI auto segmentation prints backend/model/device details, stage progress, and per-case timing for inference plus sidecar save
 - if TKE is unavailable, WSS and pressure gradient still run when possible and TKE stays unavailable
+- if `configs/pwv.json -> enabled` is true, the plane-metrics stage also computes PWV and writes `pwv.json` plus per-group PNG plots
 
 ## Parameter Tables
 
@@ -117,6 +118,14 @@ Behavior details:
 | `--cross-section-dist` | float mm | `5.0` | `configs/planes.json` | spacing between planes in distance mode | `autoflow/algorithms/planes.py` |
 | `--start-dist` | float mm | `5.0` | `configs/planes.json` | offset from path start | `autoflow/algorithms/planes.py` |
 | `--end-dist` | float mm | `0.0` | `configs/planes.json` | stop offset near path end | `autoflow/algorithms/planes.py` |
+
+### PWV
+
+PWV is currently config-driven rather than flag-driven.
+
+- enable it in `configs/pwv.json`
+- define one or more PWV groups in `configs/pwv.json -> groups`
+- batch runs then compute PWV during the plane-metrics stage
 
 ### Skeleton preprocessing
 

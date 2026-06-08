@@ -35,6 +35,7 @@ The main window contains:
 - bottom selection panel
 - bottom log
 - right segmentation dock
+- right PWV dock
 
 The left browser is group-aware. When the loaded segmentation produces multiple vessel groups, the browser shows one top-level section per group so you can toggle an entire group at once.
 
@@ -88,7 +89,7 @@ Current `Run All` order:
 | Panel | Main purpose | Main code |
 | --- | --- | --- |
 | `Input / Background Correction` | loader and DICOM settings | `autoflow/ui/app.py`, `autoflow/config.py` |
-| `Generate Skeleton Parameters` | cleanup and morphology controls; grouped label maps and group colors are loaded from `configs/skeleton.json` | `autoflow/ui/app.py`, `autoflow/config.py` |
+| `Generate Skeleton Parameters` | cleanup and morphology controls; grouped label maps and group colors are loaded from `configs/labels.json` | `autoflow/ui/app.py`, `autoflow/config.py` |
 | `Generate Planes Parameters` | center-plane or distance-plane generation | `autoflow/ui/app.py` |
 | `Streamline Parameters` | seed density, steps, terminal speed, colors | `autoflow/ui/app.py` |
 | `WSS Parameters` | WSS-specific controls | `autoflow/ui/app.py` |
@@ -117,15 +118,23 @@ Grouped label-mask behavior:
 - binary masks and single-label masks are treated as one group
 - 4D label masks are reduced to 3D labels by majority vote along time before vessel steps run
 - connected-component cleanup runs per label value before labels are merged into groups
-- label grouping, browser colors, and per-group preprocessing come from `configs/skeleton.json`
+- each grouped vessel mask is reduced to its largest connected component before skeletonization
+- label grouping, browser colors, and per-group preprocessing come from `configs/labels.json`
 - each group can apply its own Gaussian smoothing and morphology overrides before skeletonization
+
+PWV behavior:
+
+- if `configs/pwv.json -> enabled` is true, the plane-metrics step also computes PWV groups and writes PWV outputs
+- the GUI shows one `PWV` dock with a group selector and a time-to-foot versus slice-position plot
+- PWV planes appear in the browser as one grouped item named `PWV planes`; the GUI does not list every PWV plane separately
 
 ## Selection, Browser, And Timeline
 
 - the browser creates one top-level row per segmentation group and one `Global` row for non-grouped scene objects
 - checking or unchecking a group row shows or hides every object in that group
-- group title colors use `label_groups.<group>.browser_color` from `configs/skeleton.json`, with fallback colors for unmatched or single-label cases
-- grouped objects use names such as `segmask_group_aorta_systemic_branches`, `skeleton_aorta_systemic_branches`, `graph_aorta_systemic_branches`, `smooth_path_aorta_systemic_branches_3`, `plane_aorta_systemic_branches_5`, and `pathline_aorta_systemic_branches_5`
+- group title colors use `label_groups.<group>.browser_color` from `configs/labels.json`, with fallback colors for unmatched or single-label cases
+- grouped objects keep stable internal data keys such as `smooth_path_aorta_systemic_branches_3`, `plane_aorta_systemic_branches_5`, and `pathline_aorta_systemic_branches_5`
+- browser-visible names are intentionally shorter, for example `path 3`, `plane 5`, and `pathline 5`
 - right-clicking an individual grouped pathline in the browser opens `Set Pathline Color`, which changes only that pathline
 - selecting a plane updates selection info and the ortho viewer
 - selecting a path shows path-level information

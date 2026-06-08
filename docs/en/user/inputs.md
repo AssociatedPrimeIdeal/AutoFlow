@@ -74,8 +74,9 @@ AutoFlow normalizes loaders to `LoadedCase`.
 - downstream vessel steps accept binary masks, 3D label masks, and 4D label masks
 - 4D label masks are reduced to a 3D label volume by majority vote along the time axis before skeleton, graph, plane, or pathline generation
 - connected-component cleanup runs per label value before groups are built
-- label values are merged into groups using `configs/skeleton.json -> label_map` and `label_groups`
-- each group can override preprocessing through `label_groups.<group>.preprocess`, including Gaussian smoothing, dilation, erosion, opening, and closing
+- label values are merged into groups using `configs/labels.json -> label_map` and `label_groups`
+- each grouped vessel mask is reduced to its largest connected component before skeletonization
+- each group can override preprocessing through `configs/labels.json -> label_groups.<group>.preprocess`, including Gaussian smoothing, dilation, erosion, opening, and closing
 - when only one foreground label exists, AutoFlow falls back to one group so single-label segmentations still work with the same pipeline
 
 ## Code References

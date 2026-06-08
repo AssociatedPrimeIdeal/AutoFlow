@@ -9,6 +9,8 @@
 | `plane_metrics.json` | 计算平面指标后 | 时间分辨平面指标 | `autoflow/core/pipeline.py` |
 | `plane_qc.json` | 计算平面指标后 | fork/path 的 QC | `autoflow/core/pipeline.py` |
 | `plane_metrics_pixelwise.h5` | 计算平面指标后 | 按平面保存的像素级派生采样 | `autoflow/core/pipeline.py` |
+| `pwv.json` | 启用 PWV 且计算平面指标后 | 每个 PWV group 的拟合结果 | `autoflow/core/pipeline.py`, `autoflow/algorithms/pwv.py` |
+| `pwv_<group>.png` | PWV 绘图成功后 | 每组的 time-to-foot 对 slice-position 图 | `autoflow/algorithms/pwv.py` |
 | `derived_metrics_pixelwise.npz` | 跑派生指标后 | 全体积 WSS、压力梯度和可选 TKE | `autoflow/processing.py` |
 | `summary.json` | 每个病例都会有 | 单病例摘要 | `autoflow/processing.py` |
 | `batch_report.json` | 批处理后 | 批量摘要 | `autoflow/api.py`, `autoflow/processing.py` |
@@ -36,6 +38,8 @@
 - `derived_metrics_pixelwise.npz` 保存全体积派生数组
 - `plane_metrics_pixelwise.h5` 保存按平面的 slice-cell 级采样
 - 对没有 TKE 的输入，TKE 相关输出会自然缺失
+- `summary.json` 里还会同步保存 `pwv_results`、`pwv_file`、`pwv_plot_files`
 - `planes.json` 在有 path 元信息时会写出 `path_info`；如果平面来自 grouped multi-label 工作流，`path_info` 里可以带 `group_name`
-- GUI 场景对象不是导出文件，但 grouped 工作流会使用稳定前缀命名，例如 `segmask_group_<group>`、`skeleton_<group>`、`graph_<group>`、`smooth_path_<group>_<path_idx>`、`plane_<group>_<plane_idx>`、`pathline_<group>_<plane_idx>`
+- GUI 场景对象不是导出文件，但 grouped 工作流内部会保留稳定 key，例如 `segmask_group_<group>`、`skeleton_<group>`、`graph_<group>`、`smooth_path_<group>_<path_idx>`、`plane_<group>_<plane_idx>`、`pathline_<group>_<plane_idx>`；Browser 里显示的名字则更短，例如 `plane 5`、`pathline 5`
+- PWV 场景平面在 Browser 里只显示为一个分组对象 `PWV planes`
 - `plane_positions.json` 只保存几何信息，不保存 Browser 标题颜色或 GUI 专用分组样式

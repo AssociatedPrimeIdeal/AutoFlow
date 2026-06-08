@@ -11,7 +11,7 @@
 | Python API | Partial | offline streamline video through batch config |
 
 ## What It Does
-Streamlines show instantaneous flow trajectories. Pathlines show time-resolved particle travel launched from planes in the GUI. In grouped multi-label workflows, each generated pathline keeps the plane group name, so objects are named like `pathline_aorta_systemic_branches_5` instead of only `Pathline 5`.
+Streamlines show instantaneous flow trajectories. Pathlines show time-resolved particle travel launched from planes in the GUI. In grouped multi-label workflows, each generated pathline keeps the plane group name internally, while the browser shows short visible names such as `pathline 5`.
 
 ## When To Use It
 - use streamlines for qualitative inspection of instantaneous flow patterns
@@ -96,4 +96,4 @@ summary = run_case("case.h5", config=config)
 | --- | --- | --- |
 | streamlines are skipped | no segmentation or no flow | load a segmented flow case |
 | pathlines are skipped | no planes | generate planes first |
-| pathlines look mixed across vessels in the browser | grouped labels were not configured as expected | check `configs/skeleton.json -> label_groups` and regenerate planes and pathlines |
+| pathlines look mixed across vessels in the browser | grouped labels were not configured as expected | check `configs/labels.json -> label_groups` and regenerate planes and pathlines |

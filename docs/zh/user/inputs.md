@@ -73,8 +73,9 @@ AutoFlow 会把 loader 输出统一成 `LoadedCase`。
 - 后续血管步骤支持 binary mask、3D label mask 和 4D label mask
 - 4D label mask 会在骨架、图、平面、路径线步骤前，先沿时间维度做多数决得到 3D label
 - 连通域清理是按每个 label 值分别做的，再构建 group
-- label 值通过 `configs/skeleton.json -> label_map` 和 `label_groups` 合并成 group
-- 每个 group 可以通过 `label_groups.<group>.preprocess` 单独覆盖高斯平滑、膨胀、腐蚀、开运算、闭运算
+- label 值通过 `configs/labels.json -> label_map` 和 `label_groups` 合并成 group
+- 每个 group 的血管 mask 在骨架化前会再保留最大连通域
+- 每个 group 可以通过 `configs/labels.json -> label_groups.<group>.preprocess` 单独覆盖高斯平滑、膨胀、腐蚀、开运算、闭运算
 - 如果前景里最终只有一个 label，AutoFlow 会自动退化成单 group 流程，所以 single-label 分割不需要单独适配
 
 ## 代码参考

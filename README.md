@@ -14,8 +14,8 @@ It currently supports:
 - segmentation from embedded masks, imported masks, thresholding, and nnUNet auto segmentation
 - grouped multi-label segmentation with config-driven label maps, per-group preprocessing, and grouped visualization
 - skeleton, graph, branch, path, and plane generation
-- plane metrics, WSS, optional TKE, pressure-gradient, streamlines, and GUI pathlines
-- offline result export to JSON, NPZ, H5, and video
+- plane metrics, config-driven PWV, WSS, optional TKE, pressure-gradient, streamlines, and GUI pathlines
+- offline result export to JSON, NPZ, H5, PNG, and video
 
 ![Demo](https://github.com/user-attachments/assets/e2c17a9e-6a47-4f85-ba0d-c35b622802b1)
 
@@ -71,6 +71,8 @@ Typical outputs under `./results/demo/<case_name>/`:
 - `plane_positions.json`
 - `plane_metrics.json`
 - `plane_qc.json`
+- `pwv.json` when PWV is enabled
+- `pwv_<group>.png` when PWV plotting succeeds
 - `summary.json`
 
 GUI:
@@ -99,15 +101,19 @@ AutoFlow keeps default hyperparameters in per-module JSON files under `configs/`
 - `batch.json`
 - `loader.json`
 - `skeleton.json`
+- `labels.json`
 - `planes.json`
 - `streamlines.json`
 - `derived.json`
+- `pwv.json`
 - `segmentation.json`
 - `rendering.json`
 
 Important grouped-mask note:
 
-- `skeleton.json` owns the default label map, label-group definitions, browser colors, and per-group preprocessing used by grouped multi-label vessel workflows.
+- `skeleton.json` owns skeleton cleanup and morphology defaults.
+- `labels.json` owns label maps, label groups, browser colors, and per-group preprocessing used by grouped multi-label vessel workflows.
+- `pwv.json` owns PWV groups, spacing, waveform selection, and plot styling.
 
 Typical usage:
 
@@ -156,6 +162,7 @@ Detailed documentation now lives under `docs/` in English and Chinese.
 - [Graph and Paths](docs/en/features/graph-paths.md)
 - [Planes](docs/en/features/planes.md)
 - [Plane Metrics](docs/en/features/metrics.md)
+- [PWV](docs/en/features/pwv.md)
 - [WSS, TKE, Pressure Gradient](docs/en/features/wss-tke-pressure.md)
 - [Streamlines and Pathlines](docs/en/features/streamlines.md)
 - [Videos](docs/en/features/videos.md)
@@ -187,6 +194,7 @@ Detailed documentation now lives under `docs/` in English and Chinese.
 - [图与路径](docs/zh/features/graph-paths.md)
 - [平面](docs/zh/features/planes.md)
 - [平面指标](docs/zh/features/metrics.md)
+- [PWV](docs/zh/features/pwv.md)
 - [WSS / TKE / 压力梯度](docs/zh/features/wss-tke-pressure.md)
 - [流线与路径线](docs/zh/features/streamlines.md)
 - [视频](docs/zh/features/videos.md)
@@ -203,10 +211,11 @@ Detailed documentation now lives under `docs/` in English and Chinese.
 
 - input loading supports legacy complex H5, normalized H5, and direct DICOM directories
 - loader output is normalized around `LoadedCase` with required `mag`, `flow`, `resolution`, `origin`, `venc`, and `rr`
-- grouped multi-label segmentations can be reduced from 4D labels to 3D by time majority vote, cleaned per label, merged by config groups, and rendered back as grouped skeleton, graph, path, plane, and pathline objects
+- grouped multi-label segmentations can be reduced from 4D labels to 3D by time majority vote, cleaned per label, reduced to the largest connected component per group before skeletonization, and rendered back as grouped skeleton, graph, path, plane, and pathline objects
 - TKE is optional; mag/flow-only inputs must not synthesize fake TKE
 - auto segmentation is currently executable in both CLI and GUI when the nnUNet backend and model folder are available
-- the GUI Browser can show and hide a whole segmentation group at once, and group title colors come from `configs/skeleton.json`
+- the GUI Browser can show and hide a whole segmentation group at once, and group title colors come from `configs/labels.json`
+- when PWV is enabled, the GUI adds a `PWV` dock and exposes PWV planes as one `PWV planes` browser item instead of one item per PWV plane
 - `Run All` in the GUI runs `Generate Skeleton -> Generate Graph -> Generate Planes -> Calculate && Save Metrics -> WSS / TKE / Pressure Gradient`
 - offline videos are driven mainly by CLI and Python batch workflows
 

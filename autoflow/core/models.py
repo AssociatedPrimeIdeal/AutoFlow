@@ -346,6 +346,196 @@ class DerivedMetricsParams:
 
 
 @dataclass
+class LabelParams:
+    label_map: Dict[str, int] = field(default_factory=dict)
+    label_groups: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    single_label_group_name: str = "single_label"
+    single_label_browser_color: str = "#d9480f"
+    default_group_browser_color: str = "#1c7ed6"
+
+    def to_dict(self):
+        return {
+            "label_map": {str(k): int(v) for k, v in self.label_map.items()},
+            "label_groups": copy.deepcopy(self.label_groups),
+            "single_label_group_name": str(self.single_label_group_name),
+            "single_label_browser_color": str(self.single_label_browser_color),
+            "default_group_browser_color": str(self.default_group_browser_color),
+        }
+
+    @staticmethod
+    def from_dict(d):
+        payload = dict(d or {})
+        raw_label_map = dict(payload.get("label_map", {}))
+        label_map = {}
+        for key, value in raw_label_map.items():
+            try:
+                label_map[str(key)] = int(value)
+            except Exception:
+                continue
+        label_groups = {}
+        for group_name, raw_cfg in dict(payload.get("label_groups", {})).items():
+            cfg = copy.deepcopy(raw_cfg if isinstance(raw_cfg, dict) else {"labels": raw_cfg})
+            labels = []
+            for item in list(cfg.get("labels", [])):
+                if isinstance(item, str):
+                    token = item.strip()
+                    if token in label_map:
+                        labels.append(int(label_map[token]))
+                        continue
+                    try:
+                        labels.append(int(token))
+                    except Exception:
+                        continue
+                else:
+                    try:
+                        labels.append(int(item))
+                    except Exception:
+                        continue
+            cfg["labels"] = labels
+            preprocess = cfg.get("preprocess", {})
+            cfg["preprocess"] = copy.deepcopy(preprocess) if isinstance(preprocess, dict) else {}
+            label_groups[str(group_name)] = cfg
+        return LabelParams(
+            label_map=label_map,
+            label_groups=label_groups,
+            single_label_group_name=str(payload.get("single_label_group_name", "single_label") or "single_label"),
+            single_label_browser_color=str(payload.get("single_label_browser_color", "#d9480f") or "#d9480f"),
+            default_group_browser_color=str(payload.get("default_group_browser_color", "#1c7ed6") or "#1c7ed6"),
+        )
+
+    def browser_color_for_group(self, group_name):
+        cfg = self.label_groups.get(str(group_name), {})
+        color = str(cfg.get("browser_color", "") or "")
+        if color:
+            return color
+        if str(group_name) == str(self.single_label_group_name):
+            return str(self.single_label_browser_color)
+        return str(self.default_group_browser_color)
+
+    def scene_color_for_group(self, group_name, kind="scene"):
+        cfg = self.label_groups.get(str(group_name), {})
+        if kind == "skeleton" and cfg.get("skeleton_color"):
+            return str(cfg.get("skeleton_color"))
+        if kind == "graph" and cfg.get("graph_color"):
+            return str(cfg.get("graph_color"))
+        if kind == "path" and cfg.get("path_color"):
+            return str(cfg.get("path_color"))
+        if kind == "plane" and cfg.get("plane_color"):
+            return str(cfg.get("plane_color"))
+        if kind == "pwv_plane" and cfg.get("pwv_plane_color"):
+            return str(cfg.get("pwv_plane_color"))
+        if cfg.get("scene_color"):
+            return str(cfg.get("scene_color"))
+        return self.browser_color_for_group(group_name)
+
+
+@dataclass
+class PwvGroupParams:
+    name: str = ""
+    labels: List[int] = field(default_factory=list)
+
+    def to_dict(self):
+        return {
+            "name": str(self.name),
+            "labels": [int(x) for x in self.labels],
+        }
+
+
+@dataclass
+class PwvParams:
+    enabled: bool = False
+    groups: List[PwvGroupParams] = field(default_factory=list)
+    plane_interval_mm: float = 10.0
+    start_distance: float = 0.0
+    end_distance: float = 0.0
+    smoothing_window: int = 15
+    smoothing_polyorder: int = 2
+    inter_time: int = 10
+    waveform_key: str = "flowrate_signed_mL_s"
+    foot_savgol_window: int = 5
+    foot_savgol_polyorder: int = 2
+    minimum_valid_planes: int = 2
+    scene_visible: bool = True
+    scene_color: str = "#ffd43b"
+    plot_color: str = "#2b8a3e"
+    fit_color: str = "#f08c00"
+    plot_dpi: int = 160
+
+    def to_dict(self):
+        return {
+            "enabled": bool(self.enabled),
+            "groups": [item.to_dict() for item in self.groups],
+            "plane_interval_mm": float(self.plane_interval_mm),
+            "start_distance": float(self.start_distance),
+            "end_distance": float(self.end_distance),
+            "smoothing_window": int(self.smoothing_window),
+            "smoothing_polyorder": int(self.smoothing_polyorder),
+            "inter_time": int(self.inter_time),
+            "waveform_key": str(self.waveform_key),
+            "foot_savgol_window": int(self.foot_savgol_window),
+            "foot_savgol_polyorder": int(self.foot_savgol_polyorder),
+            "minimum_valid_planes": int(self.minimum_valid_planes),
+            "scene_visible": bool(self.scene_visible),
+            "scene_color": str(self.scene_color),
+            "plot_color": str(self.plot_color),
+            "fit_color": str(self.fit_color),
+            "plot_dpi": int(self.plot_dpi),
+        }
+
+    @staticmethod
+    def _coerce_labels(raw_labels, label_map):
+        labels = []
+        for item in list(raw_labels or []):
+            if isinstance(item, str):
+                token = item.strip()
+                if token in label_map:
+                    labels.append(int(label_map[token]))
+                    continue
+                try:
+                    labels.append(int(token))
+                except Exception:
+                    continue
+            else:
+                try:
+                    labels.append(int(item))
+                except Exception:
+                    continue
+        return sorted(set(int(x) for x in labels if int(x) != 0))
+
+    @staticmethod
+    def from_dict(d, label_map=None):
+        payload = dict(d or {})
+        resolved_label_map = dict(label_map or {})
+        groups = []
+        for idx, raw_group in enumerate(list(payload.get("groups", []))):
+            item = raw_group if isinstance(raw_group, dict) else {"labels": raw_group}
+            labels = PwvParams._coerce_labels(item.get("labels", []), resolved_label_map)
+            if not labels:
+                continue
+            name = str(item.get("name", "") or f"pwv_{idx}")
+            groups.append(PwvGroupParams(name=name, labels=labels))
+        return PwvParams(
+            enabled=bool(payload.get("enabled", False)),
+            groups=groups,
+            plane_interval_mm=float(payload.get("plane_interval_mm", 10.0)),
+            start_distance=float(payload.get("start_distance", 0.0)),
+            end_distance=float(payload.get("end_distance", 0.0)),
+            smoothing_window=int(payload.get("smoothing_window", 15)),
+            smoothing_polyorder=int(payload.get("smoothing_polyorder", 2)),
+            inter_time=int(payload.get("inter_time", 10)),
+            waveform_key=str(payload.get("waveform_key", "flowrate_signed_mL_s") or "flowrate_signed_mL_s"),
+            foot_savgol_window=int(payload.get("foot_savgol_window", 5)),
+            foot_savgol_polyorder=int(payload.get("foot_savgol_polyorder", 2)),
+            minimum_valid_planes=max(2, int(payload.get("minimum_valid_planes", 2) or 2)),
+            scene_visible=bool(payload.get("scene_visible", True)),
+            scene_color=str(payload.get("scene_color", "#ffd43b") or "#ffd43b"),
+            plot_color=str(payload.get("plot_color", "#2b8a3e") or "#2b8a3e"),
+            fit_color=str(payload.get("fit_color", "#f08c00") or "#f08c00"),
+            plot_dpi=max(72, int(payload.get("plot_dpi", 160) or 160)),
+        )
+
+
+@dataclass
 class DicomParameterOverrides:
     resolution: Optional[List[float]] = None
     venc: Optional[List[float]] = None
@@ -525,6 +715,9 @@ class DerivedResults:
     streamlines: List[Any] = field(default_factory=list)
     pixelwise_export: Dict[str, Any] = field(default_factory=dict)
     plane_pixelwise_file: str = ""
+    pwv_results: List[Dict[str, Any]] = field(default_factory=list)
+    pwv_planes: List[Dict[str, Any]] = field(default_factory=list)
+    pwv_file: str = ""
 
 
 @dataclass
@@ -688,9 +881,11 @@ class Workspace:
     loader_params: LoaderParams = field(default_factory=LoaderParams)
     preprocess_params: PreprocessParams = field(default_factory=PreprocessParams)
     skeleton_params: SkeletonParams = field(default_factory=SkeletonParams)
+    label_params: LabelParams = field(default_factory=LabelParams)
     plane_gen_params: PlaneGenerationParams = field(default_factory=PlaneGenerationParams)
     streamline_params: StreamlineParams = field(default_factory=StreamlineParams)
     derived_params: DerivedMetricsParams = field(default_factory=DerivedMetricsParams)
+    pwv_params: PwvParams = field(default_factory=PwvParams)
     input_state: InputState = field(default_factory=InputState)
     segmentation: SegmentationState = field(default_factory=SegmentationState)
 
@@ -928,6 +1123,7 @@ class Workspace:
         self.remove_object_by_data_key("wss_surface_live")
         self.remove_object_by_data_key("tke_volume")
         self.remove_object_by_data_key("pressure_gradient_volume")
+        self.remove_object_by_data_key("pwv_planes")
         self.remove_object_by_data_key("derived_streamlines_live")
         self.remove_objects_by_prefix("plane_")
         self.remove_objects_by_prefix("path_")
@@ -941,9 +1137,11 @@ class Workspace:
             ("loader_params", LoaderParams()),
             ("preprocess_params", PreprocessParams()),
             ("skeleton_params", SkeletonParams()),
+            ("label_params", LabelParams()),
             ("plane_gen_params", PlaneGenerationParams()),
             ("streamline_params", StreamlineParams()),
             ("derived_params", DerivedMetricsParams()),
+            ("pwv_params", PwvParams()),
             ("input_state", InputState()),
             ("segmentation", SegmentationState()),
         ]:
@@ -1015,9 +1213,11 @@ class Workspace:
             "loader_params": self.loader_params.to_dict(),
             "preprocess_params": self.preprocess_params.to_dict(),
             "skeleton_params": self.skeleton_params.to_dict(),
+            "label_params": self.label_params.to_dict(),
             "plane_gen_params": self.plane_gen_params.to_dict(),
             "streamline_params": self.streamline_params.to_dict(),
             "derived_params": self.derived_params.to_dict(),
+            "pwv_params": self.pwv_params.to_dict(),
             "input_state": self.input_state.to_dict(),
             "segmentation": self.segmentation.to_dict(),
             "resolution": arr(self.resolution),
@@ -1052,6 +1252,14 @@ class Workspace:
             "streamline_active": self.streamline_active,
             "active_pathline_plane_indices": [int(x) for x in self.active_pathline_plane_indices],
             "pathline_colors": {str(int(k)): str(v) for k, v in self.pathline_colors.items()},
+            "derived": {
+                "plane_metrics": copy.deepcopy(self.derived.plane_metrics),
+                "plane_qc": copy.deepcopy(self.derived.plane_qc),
+                "plane_pixelwise_file": str(self.derived.plane_pixelwise_file or ""),
+                "pwv_results": copy.deepcopy(self.derived.pwv_results),
+                "pwv_planes": copy.deepcopy(self.derived.pwv_planes),
+                "pwv_file": str(self.derived.pwv_file or ""),
+            },
             "scene_objects": [
                 {"uid": o.uid, "name": o.name, "kind": o.kind.value, "data_key": o.data_key,
                  "group_name": o.group_name, "browser_color": o.browser_color,
@@ -1073,9 +1281,11 @@ class Workspace:
         self.loader_params = LoaderParams.from_dict(d.get("loader_params", {}))
         self.preprocess_params = PreprocessParams.from_dict(d.get("preprocess_params", {}))
         self.skeleton_params = SkeletonParams.from_dict(d.get("skeleton_params", {}))
+        self.label_params = LabelParams.from_dict(d.get("label_params", {}))
         self.plane_gen_params = PlaneGenerationParams.from_dict(d.get("plane_gen_params", {}))
         self.streamline_params = StreamlineParams.from_dict(d.get("streamline_params", {}))
         self.derived_params = DerivedMetricsParams.from_dict(d.get("derived_params", {}))
+        self.pwv_params = PwvParams.from_dict(d.get("pwv_params", {}), label_map=self.label_params.label_map)
         self.input_state = InputState.from_dict(d.get("input_state", {}))
         self.segmentation = SegmentationState.from_dict(d.get("segmentation", {}))
         self.resolution = np.asarray(d.get("resolution", [1, 1, 1]), dtype=float)
@@ -1163,6 +1373,15 @@ class Workspace:
         self.pathline_cache = {}
         self.active_pathline_plane_indices = [int(x) for x in d.get("active_pathline_plane_indices", [])]
         self.pathline_colors = {int(k): str(v) for k, v in d.get("pathline_colors", {}).items()}
+        derived_state = d.get("derived", {}) if isinstance(d.get("derived", {}), dict) else {}
+        self.derived = DerivedResults(
+            plane_metrics=copy.deepcopy(derived_state.get("plane_metrics", [])),
+            plane_qc=copy.deepcopy(derived_state.get("plane_qc", {})),
+            plane_pixelwise_file=str(derived_state.get("plane_pixelwise_file", "") or ""),
+            pwv_results=copy.deepcopy(derived_state.get("pwv_results", [])),
+            pwv_planes=copy.deepcopy(derived_state.get("pwv_planes", [])),
+            pwv_file=str(derived_state.get("pwv_file", "") or ""),
+        )
         self.scene_objects = {}
         for it in d.get("scene_objects", []):
             uid = it["uid"]

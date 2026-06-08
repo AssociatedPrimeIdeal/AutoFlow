@@ -5,8 +5,10 @@ from typing import Any, Dict, Optional
 
 from .core.models import (
     DerivedMetricsParams,
+    LabelParams,
     LoaderParams,
     PlaneGenerationParams,
+    PwvParams,
     SegmentationState,
     SkeletonParams,
     StreamlineParams,
@@ -193,6 +195,8 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "erosion_iters": 0,
         "opening_iters": 0,
         "closing_iters": 0,
+    },
+    "labels": {
         "single_label_group_name": "single_label",
         "single_label_browser_color": "#d9480f",
         "default_group_browser_color": "#1c7ed6",
@@ -228,6 +232,25 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "rho": 1060.0,
         "pressure_gradient_smoothing_sigma": 0.0,
         "pressure_gradient_use_convective_acceleration": True,
+    },
+    "pwv": {
+        "enabled": False,
+        "groups": [],
+        "plane_interval_mm": 10.0,
+        "start_distance": 0.0,
+        "end_distance": 0.0,
+        "smoothing_window": 15,
+        "smoothing_polyorder": 2,
+        "inter_time": 10,
+        "waveform_key": "flowrate_signed_mL_s",
+        "foot_savgol_window": 5,
+        "foot_savgol_polyorder": 2,
+        "minimum_valid_planes": 2,
+        "scene_visible": True,
+        "scene_color": "#ffd43b",
+        "plot_color": "#2b8a3e",
+        "fit_color": "#f08c00",
+        "plot_dpi": 160,
     },
     "segmentation": {
         "visible": True,
@@ -328,11 +351,29 @@ def load_config_bundle(config_dir: Optional[str] = None) -> Dict[str, Dict[str, 
 
 
 def apply_config_bundle_to_workspace(workspace: Workspace, config_bundle: Dict[str, Dict[str, Any]]) -> Workspace:
+    skeleton_cfg = config_bundle.get("skeleton", {})
+    labels_cfg = dict(config_bundle.get("labels", {}))
+    for key in [
+        "label_map",
+        "label_groups",
+        "single_label_group_name",
+        "single_label_browser_color",
+        "default_group_browser_color",
+    ]:
+        if key not in labels_cfg and key in skeleton_cfg:
+            labels_cfg[key] = copy.deepcopy(skeleton_cfg[key])
     workspace.loader_params = LoaderParams.from_dict(config_bundle.get("loader", {}))
-    workspace.skeleton_params = SkeletonParams.from_dict(config_bundle.get("skeleton", {}))
+    workspace.skeleton_params = SkeletonParams.from_dict(skeleton_cfg)
+    workspace.label_params = LabelParams.from_dict(labels_cfg)
+    workspace.skeleton_params.label_map = copy.deepcopy(workspace.label_params.label_map)
+    workspace.skeleton_params.label_groups = copy.deepcopy(workspace.label_params.label_groups)
+    workspace.skeleton_params.single_label_group_name = str(workspace.label_params.single_label_group_name)
+    workspace.skeleton_params.single_label_browser_color = str(workspace.label_params.single_label_browser_color)
+    workspace.skeleton_params.default_group_browser_color = str(workspace.label_params.default_group_browser_color)
     workspace.plane_gen_params = PlaneGenerationParams.from_dict(config_bundle.get("planes", {}))
     workspace.streamline_params = StreamlineParams.from_dict(config_bundle.get("streamlines", {}))
     workspace.derived_params = DerivedMetricsParams.from_dict(config_bundle.get("derived", {}))
+    workspace.pwv_params = PwvParams.from_dict(config_bundle.get("pwv", {}), label_map=workspace.label_params.label_map)
     workspace.derived_params.use_multithread = bool(
         config_bundle.get("batch", {}).get("use_multithread", workspace.derived_params.use_multithread)
     )

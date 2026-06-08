@@ -11,6 +11,8 @@
 ## What It Does
 Plane metrics compute time-resolved cross-sectional measurements for each plane and save them to JSON and HDF5 outputs.
 
+When `configs/pwv.json -> enabled` is true, the plane-metrics step also computes PWV for each configured PWV group and writes PWV outputs.
+
 ## When To Use It
 - use it after planes exist
 - use it when you need flow, area, mean velocity, peak velocity, net flow, and derived plane summaries
@@ -55,6 +57,8 @@ Use the standard `run_case()` or `run_batch()` flow. Plane metrics run unless `s
 | `plane_qc.json` | plane metrics run | QC for forks and paths |
 | `plane_metrics_pixelwise.h5` | plane metrics run | per-plane slice-cellwise derived samples |
 | plane summaries in `planes.json` | plane metrics run | geometry plus attached summaries |
+| `pwv.json` | PWV is enabled | saved PWV results for configured label groups |
+| `pwv_<group>.png` | PWV plotting succeeds | saved PWV plots |
 
 ## Limitations
 - segmentation is required
@@ -67,7 +71,7 @@ Use the standard `run_case()` or `run_batch()` flow. Plane metrics run unless `s
 | --- | --- | --- | --- |
 | plane metric computation | `autoflow/algorithms/metrics.py` | `autoflow/core/pipeline.py` | `tests/test_smoke_phantoms.py`, `tests/test_pressure_gradient_phantom.py` |
 | plane metric save format | `autoflow/core/pipeline.py`, `autoflow/plane_io.py` | `autoflow/reporting.py` | `tests/test_pressure_gradient_phantom.py` |
-| GUI plane metric refresh | `autoflow/ui/app.py`, `autoflow/ui/ortho_viewer.py` | `autoflow/core/pipeline.py` | GUI smoke coverage |
+| GUI plane metric refresh and PWV dock | `autoflow/ui/app.py`, `autoflow/ui/ortho_viewer.py` | `autoflow/core/pipeline.py`, `autoflow/algorithms/pwv.py` | GUI manual verification |
 
 ## Tests
 

@@ -78,6 +78,7 @@ autoflow-run ./data/demo_data.h5 \
 - 启用 `--autoseg` 且输入无分割时，会在骨架和图之前先补自动分割
 - CLI 自动分割会打印 backend/model/device、阶段进度，以及推理和 sidecar 保存耗时
 - 没有 TKE 时，不会伪造 TKE；能算的 WSS 和压力梯度仍会继续
+- 如果 `configs/pwv.json -> enabled` 为真，平面指标阶段还会额外计算 PWV，并写出 `pwv.json` 和每组 PNG 图
 
 ## 参数表
 
@@ -117,6 +118,14 @@ autoflow-run ./data/demo_data.h5 \
 | `--cross-section-dist` | float mm | `5.0` | `configs/planes.json` | 距离模式平面间距 | `autoflow/algorithms/planes.py` |
 | `--start-dist` | float mm | `5.0` | `configs/planes.json` | 起点偏移 | `autoflow/algorithms/planes.py` |
 | `--end-dist` | float mm | `0.0` | `configs/planes.json` | 终点偏移 | `autoflow/algorithms/planes.py` |
+
+### PWV
+
+当前 PWV 由配置驱动，而不是单独的 CLI flag。
+
+- 在 `configs/pwv.json` 里启用
+- 在 `configs/pwv.json -> groups` 里定义一个或多个 PWV group
+- 批处理运行时会在平面指标阶段自动计算 PWV
 
 ### 自动分割
 

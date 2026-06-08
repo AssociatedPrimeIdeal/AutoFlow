@@ -14,6 +14,9 @@ from ..algorithms import (
     compute_plane_metrics_multithread,
     augment_plane_metrics_with_derived, save_plane_pixelwise_h5,
     generate_seed_points,
+    largest_connected_component,
+    compute_pwv_groups,
+    save_pwv_results,
     segmentation_timestamp,
 )
 
@@ -41,6 +44,15 @@ class PipelineEngine:
     def _group_object_name(self, prefix, group_name, index=None):
         return self._group_data_key(prefix, group_name, index=index)
 
+    def _indexed_object_name(self, prefix, index):
+        label_map = {
+            "plane": "plane",
+            "smooth_path": "path",
+            "pathline": "pathline",
+        }
+        label = str(label_map.get(prefix, prefix)).replace("_", " ")
+        return f"{label} {int(index)}"
+
     def _plane_group_name(self, ws, plane_idx):
         if not (0 <= int(plane_idx) < len(ws.planes)):
             return ""
@@ -57,6 +69,62 @@ class PipelineEngine:
         if group_name:
             return self._group_object_name(prefix, group_name, plane_idx)
         return f"{prefix}_{int(plane_idx)}"
+
+    def _clear_pwv_state(self, ws):
+        ws.derived.pwv_results = []
+        ws.derived.pwv_planes = []
+        ws.derived.pwv_file = ""
+        ws.remove_object_by_data_key("pwv_planes")
+
+    def _register_pwv_scene_object(self, ws):
+        ws.remove_object_by_data_key("pwv_planes")
+        if not list(ws.derived.pwv_planes or []):
+            return
+        ws.add_object(
+            name="PWV planes",
+            kind=ObjectKind.AUX,
+            data_key="pwv_planes",
+            group_name="PWV",
+            browser_color=str(ws.pwv_params.scene_color or "#ffd43b"),
+            visible=bool(ws.pwv_params.scene_visible),
+            opacity=0.45,
+            color=str(ws.pwv_params.scene_color or "#ffd43b"),
+            line_width=2,
+        )
+
+    def _compute_pwv_internal(self, ws, save=True):
+        self._clear_pwv_state(ws)
+        if not bool(getattr(ws.pwv_params, "enabled", False)):
+            return [], "PWV skipped: disabled"
+        if ws.segmask_raw is None:
+            return [], self._missing_segmentation_message(ws, "PWV")
+        if not ws.has_flow():
+            return [], "PWV skipped: no flow"
+        groups = list(getattr(ws.pwv_params, "groups", []) or [])
+        if not groups:
+            return [], "PWV skipped: no groups configured"
+        out_dir = self._output_dir(ws) if save else ""
+        results, scene_planes = compute_pwv_groups(
+            ws.flow_raw,
+            ws.segmask_raw,
+            ws.resolution,
+            ws.origin,
+            ws.rr,
+            ws.skeleton_params,
+            ws.pwv_params,
+            out_dir=out_dir,
+        )
+        ws.derived.pwv_results = list(results or [])
+        ws.derived.pwv_planes = list(scene_planes or [])
+        if save:
+            ws.derived.pwv_file = save_pwv_results(ws.derived.pwv_results, os.path.join(out_dir, "pwv.json"))
+        self._register_pwv_scene_object(ws)
+        ok_count = sum(1 for item in ws.derived.pwv_results if str(item.get("status", "")) == "ok")
+        total = len(ws.derived.pwv_results)
+        msg = f"PWV: {ok_count}/{total} groups"
+        if ws.derived.pwv_file:
+            msg += f" saved={ws.derived.pwv_file}"
+        return ws.derived.pwv_results, msg
 
     def _label_name_for_value(self, ws, label_value):
         for name, value in dict(ws.skeleton_params.label_map or {}).items():
@@ -219,10 +287,14 @@ class PipelineEngine:
         ws.derived.wss_volume = None
         ws.derived.pixelwise_export = {}
         ws.derived.plane_pixelwise_file = ""
+        ws.derived.pwv_results = []
+        ws.derived.pwv_planes = []
+        ws.derived.pwv_file = ""
         ws.data_loaded = True
 
         for data_key in ["segmask_raw_surface", "segmask_pre_surface", "wss_surface_live", "tke_volume", "pressure_gradient_volume"]:
             ws.remove_object_by_data_key(data_key)
+        ws.remove_object_by_data_key("pwv_planes")
         if ws.segmask_raw is not None:
             ws.add_object(name="segmask_raw", kind=ObjectKind.SEGMENTATION,
                           data_key="segmask_raw_surface", visible=True, opacity=0.3,
@@ -275,9 +347,11 @@ class PipelineEngine:
             group_name = str(spec["name"])
             labels = [int(x) for x in spec["labels"]]
             group_mask_3d = np.isin(voted_labels_3d, labels)
+            group_mask_3d = largest_connected_component(group_mask_3d)
             group_binary = self._repeat_mask_to_time(group_mask_3d, time_count)
             group_params = ws.skeleton_params.params_for_group(group_name)
             processed_mask_3d = preprocess_mask_for_skeleton(group_mask_3d, group_params, resolution=ws.resolution)
+            processed_mask_3d = largest_connected_component(processed_mask_3d)
             previous_state = dict(previous_groups.get(group_name, {})) if isinstance(previous_groups.get(group_name, {}), dict) else {}
             global_binary |= np.asarray(group_binary, dtype=bool)
             global_mask_3d |= np.asarray(processed_mask_3d, dtype=bool)
@@ -340,6 +414,7 @@ class PipelineEngine:
                 StepId.GENERATE_SKELETON, True, True,
                 self._missing_segmentation_message(ws, "Skeleton"),
             )
+        self._clear_pwv_state(ws)
         self.preprocess(ws)
         points_all = []
         skeleton_mask = np.zeros_like(ws.segmask_3d, dtype=bool)
@@ -383,6 +458,7 @@ class PipelineEngine:
                 StepId.GENERATE_GRAPH, True, True,
                 self._missing_segmentation_message(ws, "Graph"),
             )
+        self._clear_pwv_state(ws)
         if ws.skeleton_points is None or len(ws.skeleton_points) == 0:
             skel_result = self._step_generate_skeleton(ws)
             if skel_result.skipped or not skel_result.success:
@@ -597,6 +673,9 @@ class PipelineEngine:
             save_plane_pixelwise_h5(plane_pixelwise_path, plane_pixelwise, rr_ms=ws.rr, source_format=ws.input_state.source_format)
             ws.derived.plane_pixelwise_file = plane_pixelwise_path
             msg += f" saved={plane_metric_path} qc={qc_path} pixelwise={plane_pixelwise_path}"
+            if not ws.derived.pwv_results or not ws.derived.pwv_file:
+                _pwv_results, pwv_msg = self._compute_pwv_internal(ws, save=True)
+                msg += f" | {pwv_msg}"
         return metrics, qc, msg
 
     def _save_planes_json(self, ws):
@@ -630,6 +709,7 @@ class PipelineEngine:
                 StepId.GENERATE_PLANES, True, True,
                 self._missing_segmentation_message(ws, "Planes"),
             )
+        self._clear_pwv_state(ws)
         if ws.graph is None or len(ws.graph.points) == 0:
             graph_result = self._step_generate_graph(ws)
             if graph_result.skipped or not graph_result.success:
@@ -667,7 +747,7 @@ class PipelineEngine:
                 adjusted_planes.append(plane)
                 global_plane_idx = plane_offset + local_idx
                 ws.add_object(
-                    name=self._group_object_name("plane", group_name, global_plane_idx),
+                    name=self._indexed_object_name("plane", global_plane_idx),
                     kind=ObjectKind.PLANE,
                     data_key=self._group_data_key("plane", group_name, global_plane_idx),
                     group_name=group_name,
@@ -679,14 +759,8 @@ class PipelineEngine:
                 )
             for local_idx, _path in enumerate(adjusted_smooth_paths):
                 global_path_idx = path_offset + local_idx
-                direction_text = ""
-                if 0 <= int(global_path_idx) < len(ws.path_info):
-                    direction_text = ws.path_info[int(global_path_idx)].get("direction_text", "")
-                name = self._group_object_name("smooth_path", group_name, global_path_idx)
-                if direction_text:
-                    name = f"{name} [{direction_text}]"
                 ws.add_object(
-                    name=name,
+                    name=self._indexed_object_name("smooth_path", global_path_idx),
                     kind=ObjectKind.BRANCH,
                     data_key=self._group_data_key("smooth_path", group_name, global_path_idx),
                     group_name=group_name,
@@ -763,7 +837,7 @@ class PipelineEngine:
         for plane_idx in active_indices:
             group_name = self._plane_group_name(ws, plane_idx)
             ws.add_object(
-                name=self._plane_object_name("pathline", ws, plane_idx), kind=ObjectKind.FLOW,
+                name=self._indexed_object_name("pathline", plane_idx), kind=ObjectKind.FLOW,
                 data_key=self._plane_data_key("pathline", ws, plane_idx), group_name=group_name,
                 browser_color=ws.skeleton_params.browser_color_for_group(group_name) if group_name else "",
                 visible=True, opacity=1.0,

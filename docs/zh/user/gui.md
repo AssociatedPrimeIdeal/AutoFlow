@@ -34,6 +34,7 @@ autoflow-gui --config-dir ./configs
 - 底部 Selection
 - 底部 Log
 - 右侧 Segmentation dock
+- 右侧 PWV dock
 
 左侧 Browser 支持按分割 group 分组。一个多 label 分割如果被拆成多个血管 group，Browser 会给每个 group 建一个顶层条目，方便整组显隐。
 
@@ -87,7 +88,7 @@ autoflow-gui --config-dir ./configs
 | 面板 | 主要作用 |
 | --- | --- |
 | `Input / Background Correction` | loader 和 DICOM 设置 |
-| `Generate Skeleton Parameters` | 清理和形态学参数；label map、label group、group 颜色来自 `configs/skeleton.json` |
+| `Generate Skeleton Parameters` | 清理和形态学参数；label map、label group、group 颜色来自 `configs/labels.json` |
 | `Generate Planes Parameters` | 中心平面或按距离布面 |
 | `Streamline Parameters` | seed 密度、步数、终止阈值、颜色 |
 | `WSS Parameters` | WSS 相关参数 |
@@ -116,15 +117,23 @@ grouped label-mask 行为：
 - binary mask 和 single-label mask 会被当成一个 group
 - 4D label mask 会在后续血管步骤前，先沿时间维度做多数决得到 3D label
 - 小连通域清理是按每个 label 值分别做的，再按 group 合并
-- label 归组、Browser 颜色、每组预处理来自 `configs/skeleton.json`
+- 每个 group 的血管 mask 在骨架化前还会再保留最大连通域
+- label 归组、Browser 颜色、每组预处理来自 `configs/labels.json`
 - 每个 group 可以单独覆盖高斯平滑、膨胀、腐蚀、开运算、闭运算参数
+
+PWV 行为：
+
+- 如果 `configs/pwv.json -> enabled` 为真，平面指标步骤还会额外计算 PWV group，并写出 PWV 输出
+- GUI 会显示一个 `PWV` dock，里面可以切换 group，并查看 slice position 对 time-to-foot 的拟合图
+- PWV 平面在 Browser 中只显示为一个名为 `PWV planes` 的分组对象，不会把每个 PWV plane 单独列出来
 
 ## 选择、Browser 和 Timeline
 
 - Browser 会为每个 segmentation group 建一个顶层条目，没有 group 的对象放在 `Global`
 - 勾选或取消一个 group 顶层条目，会同时控制这个 group 下所有对象的显隐
 - group 标题颜色来自 `label_groups.<group>.browser_color`；single-label 或未匹配 group 时使用 fallback 颜色
-- group 对象命名采用前缀区分，例如 `segmask_group_aorta_systemic_branches`、`skeleton_aorta_systemic_branches`、`graph_aorta_systemic_branches`、`smooth_path_aorta_systemic_branches_3`、`plane_aorta_systemic_branches_5`、`pathline_aorta_systemic_branches_5`
+- grouped 对象内部仍使用稳定 data key，例如 `smooth_path_aorta_systemic_branches_3`、`plane_aorta_systemic_branches_5`、`pathline_aorta_systemic_branches_5`
+- Browser 里显示给用户的名字会更短，例如 `path 3`、`plane 5`、`pathline 5`
 - 右键单条路径线可以只改这一条路径线的颜色
 - 选中平面会更新 selection 和 ortho viewer
 - 选中 path 会显示 path 级信息

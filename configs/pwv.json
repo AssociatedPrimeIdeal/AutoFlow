@@ -1,0 +1,19 @@
+{
+  "enabled": false,
+  "groups": [],
+  "plane_interval_mm": 10.0,
+  "start_distance": 0.0,
+  "end_distance": 0.0,
+  "smoothing_window": 15,
+  "smoothing_polyorder": 2,
+  "inter_time": 10,
+  "waveform_key": "flowrate_signed_mL_s",
+  "foot_savgol_window": 5,
+  "foot_savgol_polyorder": 2,
+  "minimum_valid_planes": 2,
+  "scene_visible": true,
+  "scene_color": "#ffd43b",
+  "plot_color": "#2b8a3e",
+  "fit_color": "#f08c00",
+  "plot_dpi": 160
+}
