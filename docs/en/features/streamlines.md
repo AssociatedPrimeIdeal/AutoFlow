@@ -29,7 +29,7 @@ Streamlines show instantaneous flow trajectories. Pathlines show time-resolved p
 ### CLI
 
 ```bash
-autoflow-run case.h5 --output-dir results/case --streamlines-video
+autoflow-run case.h5 --output-dir results/case --video streamlines
 ```
 
 ### Python API
@@ -38,7 +38,7 @@ autoflow-run case.h5 --output-dir results/case --streamlines-video
 from autoflow import AutoFlowConfig, run_case
 config = AutoFlowConfig(
     output_dir="./results/case",
-    make_streamlines_video=True,
+    requested_videos=["streamlines"],
 )
 summary = run_case("case.h5", config=config)
 ```
@@ -63,6 +63,8 @@ summary = run_case("case.h5", config=config)
 | `rng_seed` | int | `0` | `configs/streamlines.json` | deterministic seed generation | `autoflow/core/models.py` |
 | `tube_radius` | float | `0.05` | `configs/streamlines.json` | rendered tube thickness | `autoflow/core/models.py` |
 | `pathline_color` | string | `deepskyblue` | `configs/streamlines.json` or GUI | default color for newly generated pathlines; each pathline can later be recolored individually in the browser | `autoflow/ui/app.py` |
+| `streamlines.render.clim` | list[float, float] | `[0.0, 1.0]` | `configs/streamlines.json` | streamline display range in GUI and videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
+| `streamlines.render.show_scalar_bar` | bool | `True` | `configs/streamlines.json` | show or hide the streamline colorbar in GUI and videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
 
 ## Outputs
 

@@ -42,6 +42,27 @@ DEFAULT_STREAMLINE_BAR_CFG = {
     "label_font_size": 32,
 }
 
+DEFAULT_PRESSURE_GRADIENT_BAR_CFG = {
+    "position_x": 0.75,
+    "position_y": 0.2,
+    "height": 0.22,
+    "width": 0.05,
+    "title_font_size": 40,
+    "label_font_size": 32,
+}
+
+DEFAULT_PLANE_VIDEO_CFG = {
+    "show_skeleton": True,
+    "skeleton_point_size": 10.0,
+    "default": {
+        "skeleton_color": "",
+        "plane_size": None,
+        "plane_color": "yellow",
+        "plane_opacity": 0.75,
+    },
+    "groups": {},
+}
+
 DEFAULT_SKELETON_LABEL_MAP = {
     "background": 0,
     "AAO": 1,
@@ -211,6 +232,7 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "smoothing_window": 15,
         "smoothing_polyorder": 2,
         "inter_time": 10,
+        "render": copy.deepcopy(DEFAULT_PLANE_VIDEO_CFG),
     },
     "streamlines": {
         "seed_ratio": 0.02,
@@ -220,18 +242,44 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "rng_seed": 0,
         "tube_radius": 0.05,
         "pathline_color": "deepskyblue",
+        "render": {
+            "clim": [0.0, 1.0],
+            "show_scalar_bar": True,
+            "bar_cfg": dict(DEFAULT_STREAMLINE_BAR_CFG),
+        },
     },
     "derived": {
-        "smoothing_iteration": 200,
+    },
+    "fluid": {
+        "rho": 1060.0,
         "viscosity": 4.0,
+    },
+    "wss": {
+        "smoothing_iteration": 200,
         "inward_distance": "auto",
         "parabolic_fitting": True,
         "no_slip_condition": False,
-        "step_size": 5,
-        "tube_radius": 0.1,
-        "rho": 1060.0,
-        "pressure_gradient_smoothing_sigma": 0.0,
-        "pressure_gradient_use_convective_acceleration": True,
+        "render": {
+            "clim": [0.0, 10.0],
+            "show_scalar_bar": True,
+            "bar_cfg": dict(DEFAULT_WSS_BAR_CFG),
+        },
+    },
+    "tke": {
+        "render": {
+            "clim": [0.0, 100.0],
+            "show_scalar_bar": True,
+            "bar_cfg": dict(DEFAULT_TKE_BAR_CFG),
+        },
+    },
+    "pressure_gradient": {
+        "smoothing_sigma": 0.0,
+        "use_convective_acceleration": True,
+        "render": {
+            "clim": None,
+            "show_scalar_bar": True,
+            "bar_cfg": dict(DEFAULT_PRESSURE_GRADIENT_BAR_CFG),
+        },
     },
     "pwv": {
         "enabled": False,
@@ -242,9 +290,15 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "smoothing_window": 15,
         "smoothing_polyorder": 2,
         "inter_time": 10,
-        "waveform_key": "flowrate_signed_mL_s",
+        "waveform_key": "flowrate_mL_s",
+        "transit_time_method": "foot_to_foot",
+        "foot_method": "tangent",
         "foot_savgol_window": 5,
         "foot_savgol_polyorder": 2,
+        "foot_threshold_percent": 10.0,
+        "xcorr_window": "full",
+        "xcorr_interp_factor": 10,
+        "allow_cycle_wrap": True,
         "minimum_valid_planes": 2,
         "scene_visible": True,
         "scene_color": "#ffd43b",
@@ -295,12 +349,7 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "dynamic_time_repeat": 3,
         "add_plane_idx": False,
         "add_path_idx": False,
-        "wss_clim": [0.0, 10.0],
-        "wss_bar_cfg": dict(DEFAULT_WSS_BAR_CFG),
-        "tke_clim": [0.0, 100.0],
-        "tke_bar_cfg": dict(DEFAULT_TKE_BAR_CFG),
-        "streamline_clim": [0.0, 1.0],
-        "streamline_bar_cfg": dict(DEFAULT_STREAMLINE_BAR_CFG),
+        "window_size": [1600, 1200],
     },
 }
 
@@ -350,6 +399,124 @@ def load_config_bundle(config_dir: Optional[str] = None) -> Dict[str, Dict[str, 
     return {name: load_config_module(name, config_dir=config_dir) for name in CONFIG_MODULES}
 
 
+def _coerce_render_clim(value: Any) -> Optional[tuple[float, float]]:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        return None
+    if len(value) < 2:
+        return None
+    return (float(value[0]), float(value[1]))
+
+
+def _coerce_window_size(value: Any) -> tuple[int, int]:
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return (1600, 1200)
+    return (max(int(value[0]), 1), max(int(value[1]), 1))
+
+
+def _feature_render_cfg(module_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    render_cfg = module_cfg.get("render", {}) if isinstance(module_cfg, dict) else {}
+    return dict(render_cfg) if isinstance(render_cfg, dict) else {}
+
+
+def _resolve_clim(primary: Any, fallback: Any, default: Optional[tuple[float, float]]) -> Optional[tuple[float, float]]:
+    value = _coerce_render_clim(primary)
+    if value is not None:
+        return value
+    value = _coerce_render_clim(fallback)
+    if value is not None:
+        return value
+    return default
+
+
+def _resolve_bar_cfg(primary: Any, fallback: Any, default: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = dict(default)
+    if isinstance(fallback, dict):
+        cfg.update(copy.deepcopy(fallback))
+    if isinstance(primary, dict):
+        cfg.update(copy.deepcopy(primary))
+    return cfg
+
+
+def resolve_render_settings(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    rendering_cfg = dict(config_bundle.get("rendering", {}))
+    plane_cfg = dict(config_bundle.get("planes", {}))
+    wss_cfg = dict(config_bundle.get("wss", {}))
+    tke_cfg = dict(config_bundle.get("tke", {}))
+    pressure_gradient_cfg = dict(config_bundle.get("pressure_gradient", {}))
+    streamline_cfg = dict(config_bundle.get("streamlines", {}))
+
+    plane_render_cfg = _feature_render_cfg(plane_cfg)
+    wss_render_cfg = _feature_render_cfg(wss_cfg)
+    tke_render_cfg = _feature_render_cfg(tke_cfg)
+    pressure_gradient_render_cfg = _feature_render_cfg(pressure_gradient_cfg)
+    streamline_render_cfg = _feature_render_cfg(streamline_cfg)
+
+    plane_video_cfg = copy.deepcopy(DEFAULT_PLANE_VIDEO_CFG)
+    legacy_plane_cfg = rendering_cfg.get("plane_video", {})
+    if isinstance(legacy_plane_cfg, dict):
+        plane_video_cfg = _deep_merge(plane_video_cfg, legacy_plane_cfg)
+    if plane_render_cfg:
+        plane_video_cfg = _deep_merge(plane_video_cfg, plane_render_cfg)
+
+    return {
+        "fps": int(rendering_cfg.get("fps", 12)),
+        "plane_rotation_frames": int(rendering_cfg.get("plane_rotation_frames", 180)),
+        "make_plane_video": bool(rendering_cfg.get("make_plane_video", False)),
+        "make_wss_video": bool(rendering_cfg.get("make_wss_video", False)),
+        "make_pressure_gradient_video": bool(rendering_cfg.get("make_pressure_gradient_video", False)),
+        "make_streamlines_video": bool(rendering_cfg.get("make_streamlines_video", False)),
+        "make_tke_video": bool(rendering_cfg.get("make_tke_video", False)),
+        "camera_view": str(rendering_cfg.get("camera_view", "right")),
+        "camera_distance_scale": float(rendering_cfg.get("camera_distance_scale", 1.5)),
+        "rotate_dynamic_video": bool(rendering_cfg.get("rotate_dynamic_video", True)),
+        "dynamic_rotation_frames": int(rendering_cfg.get("dynamic_rotation_frames", 180)),
+        "dynamic_rotation_elevation_deg": rendering_cfg.get("dynamic_rotation_elevation_deg", 10.0),
+        "dynamic_time_repeat": int(rendering_cfg.get("dynamic_time_repeat", 3)),
+        "add_plane_idx": bool(rendering_cfg.get("add_plane_idx", False)),
+        "add_path_idx": bool(rendering_cfg.get("add_path_idx", False)),
+        "plane_video_cfg": plane_video_cfg,
+        "window_size": _coerce_window_size(rendering_cfg.get("window_size", rendering_cfg.get("figsize", [1600, 1200]))),
+        "wss_clim": _resolve_clim(wss_render_cfg.get("clim", None), rendering_cfg.get("wss_clim", None), (0.0, 10.0)),
+        "wss_show_scalar_bar": bool(wss_render_cfg.get("show_scalar_bar", rendering_cfg.get("wss_show_scalar_bar", True))),
+        "wss_bar_cfg": _resolve_bar_cfg(wss_render_cfg.get("bar_cfg", None), rendering_cfg.get("wss_bar_cfg", None), DEFAULT_WSS_BAR_CFG),
+        "tke_clim": _resolve_clim(tke_render_cfg.get("clim", None), rendering_cfg.get("tke_clim", None), (0.0, 100.0)),
+        "tke_show_scalar_bar": bool(tke_render_cfg.get("show_scalar_bar", rendering_cfg.get("tke_show_scalar_bar", True))),
+        "tke_bar_cfg": _resolve_bar_cfg(tke_render_cfg.get("bar_cfg", None), rendering_cfg.get("tke_bar_cfg", None), DEFAULT_TKE_BAR_CFG),
+        "pressure_gradient_clim": _resolve_clim(pressure_gradient_render_cfg.get("clim", None), rendering_cfg.get("pressure_gradient_clim", None), None),
+        "pressure_gradient_show_scalar_bar": bool(pressure_gradient_render_cfg.get("show_scalar_bar", rendering_cfg.get("pressure_gradient_show_scalar_bar", True))),
+        "pressure_gradient_bar_cfg": _resolve_bar_cfg(pressure_gradient_render_cfg.get("bar_cfg", None), rendering_cfg.get("pressure_gradient_bar_cfg", None), DEFAULT_PRESSURE_GRADIENT_BAR_CFG),
+        "streamline_clim": _resolve_clim(streamline_render_cfg.get("clim", None), rendering_cfg.get("streamline_clim", None), (0.0, 1.0)),
+        "streamline_show_scalar_bar": bool(streamline_render_cfg.get("show_scalar_bar", rendering_cfg.get("streamline_show_scalar_bar", True))),
+        "streamline_bar_cfg": _resolve_bar_cfg(streamline_render_cfg.get("bar_cfg", None), rendering_cfg.get("streamline_bar_cfg", None), DEFAULT_STREAMLINE_BAR_CFG),
+    }
+
+
+def _build_derived_metrics_config(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    legacy_cfg = dict(config_bundle.get("derived", {}))
+    fluid_cfg = dict(config_bundle.get("fluid", {}))
+    wss_cfg = dict(config_bundle.get("wss", {}))
+    tke_cfg = dict(config_bundle.get("tke", {}))
+    pressure_gradient_cfg = dict(config_bundle.get("pressure_gradient", {}))
+    shared_viscosity = float(fluid_cfg.get("viscosity", legacy_cfg.get("viscosity", 4.0)))
+    shared_rho = float(fluid_cfg.get("rho", legacy_cfg.get("rho", 1060.0)))
+    return {
+        "wss_smoothing_iteration": int(wss_cfg.get("smoothing_iteration", legacy_cfg.get("wss_smoothing_iteration", legacy_cfg.get("smoothing_iteration", 200)))),
+        "wss_viscosity": float(wss_cfg.get("viscosity", legacy_cfg.get("wss_viscosity", shared_viscosity))),
+        "wss_inward_distance": wss_cfg.get("inward_distance", legacy_cfg.get("wss_inward_distance", legacy_cfg.get("inward_distance", "auto"))),
+        "wss_parabolic_fitting": bool(wss_cfg.get("parabolic_fitting", legacy_cfg.get("wss_parabolic_fitting", legacy_cfg.get("parabolic_fitting", True)))),
+        "wss_no_slip_condition": bool(wss_cfg.get("no_slip_condition", legacy_cfg.get("wss_no_slip_condition", legacy_cfg.get("no_slip_condition", False)))),
+        "tke_rho": float(tke_cfg.get("rho", legacy_cfg.get("tke_rho", shared_rho))),
+        "pressure_gradient_rho": float(pressure_gradient_cfg.get("rho", legacy_cfg.get("pressure_gradient_rho", shared_rho))),
+        "pressure_gradient_viscosity": float(pressure_gradient_cfg.get("viscosity", legacy_cfg.get("pressure_gradient_viscosity", shared_viscosity))),
+        "pressure_gradient_smoothing_sigma": float(pressure_gradient_cfg.get("smoothing_sigma", legacy_cfg.get("pressure_gradient_smoothing_sigma", 0.0))),
+        "pressure_gradient_use_convective_acceleration": bool(pressure_gradient_cfg.get("use_convective_acceleration", legacy_cfg.get("pressure_gradient_use_convective_acceleration", True))),
+        "step_size": int(legacy_cfg.get("step_size", 5)),
+        "tube_radius": float(legacy_cfg.get("tube_radius", 0.1)),
+    }
+
+
 def apply_config_bundle_to_workspace(workspace: Workspace, config_bundle: Dict[str, Dict[str, Any]]) -> Workspace:
     skeleton_cfg = config_bundle.get("skeleton", {})
     labels_cfg = dict(config_bundle.get("labels", {}))
@@ -372,8 +539,9 @@ def apply_config_bundle_to_workspace(workspace: Workspace, config_bundle: Dict[s
     workspace.skeleton_params.default_group_browser_color = str(workspace.label_params.default_group_browser_color)
     workspace.plane_gen_params = PlaneGenerationParams.from_dict(config_bundle.get("planes", {}))
     workspace.streamline_params = StreamlineParams.from_dict(config_bundle.get("streamlines", {}))
-    workspace.derived_params = DerivedMetricsParams.from_dict(config_bundle.get("derived", {}))
+    workspace.derived_params = DerivedMetricsParams.from_dict(_build_derived_metrics_config(config_bundle))
     workspace.pwv_params = PwvParams.from_dict(config_bundle.get("pwv", {}), label_map=workspace.label_params.label_map)
+    workspace.render_settings = resolve_render_settings(config_bundle)
     workspace.derived_params.use_multithread = bool(
         config_bundle.get("batch", {}).get("use_multithread", workspace.derived_params.use_multithread)
     )
@@ -388,7 +556,7 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
     plane_cfg = config_bundle.get("planes", {})
     skeleton_cfg = config_bundle.get("skeleton", {})
     streamline_cfg = config_bundle.get("streamlines", {})
-    rendering_cfg = config_bundle.get("rendering", {})
+    render_settings = resolve_render_settings(config_bundle)
     return {
         "output_dir": str(batch_cfg.get("output_dir", "./results")),
         "skip_derived": bool(batch_cfg.get("skip_derived", False)),
@@ -417,25 +585,5 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
         "rng_seed": int(streamline_cfg.get("rng_seed", 0)),
         "tube_radius": float(streamline_cfg.get("tube_radius", 0.05)),
         "pathline_color": str(streamline_cfg.get("pathline_color", streamline_cfg.get("plane_pathline_color", "deepskyblue")) or "deepskyblue"),
-        "fps": int(rendering_cfg.get("fps", 12)),
-        "plane_rotation_frames": int(rendering_cfg.get("plane_rotation_frames", 180)),
-        "make_plane_video": bool(rendering_cfg.get("make_plane_video", False)),
-        "make_wss_video": bool(rendering_cfg.get("make_wss_video", False)),
-        "make_pressure_gradient_video": bool(rendering_cfg.get("make_pressure_gradient_video", False)),
-        "make_streamlines_video": bool(rendering_cfg.get("make_streamlines_video", False)),
-        "make_tke_video": bool(rendering_cfg.get("make_tke_video", False)),
-        "camera_view": str(rendering_cfg.get("camera_view", "right")),
-        "camera_distance_scale": float(rendering_cfg.get("camera_distance_scale", 1.5)),
-        "rotate_dynamic_video": bool(rendering_cfg.get("rotate_dynamic_video", True)),
-        "dynamic_rotation_frames": int(rendering_cfg.get("dynamic_rotation_frames", 180)),
-        "dynamic_rotation_elevation_deg": rendering_cfg.get("dynamic_rotation_elevation_deg", 10.0),
-        "dynamic_time_repeat": int(rendering_cfg.get("dynamic_time_repeat", 3)),
-        "add_plane_idx": bool(rendering_cfg.get("add_plane_idx", False)),
-        "add_path_idx": bool(rendering_cfg.get("add_path_idx", False)),
-        "wss_clim": tuple(float(x) for x in list(rendering_cfg.get("wss_clim", [0.0, 10.0]))[:2]),
-        "wss_bar_cfg": copy.deepcopy(rendering_cfg.get("wss_bar_cfg", DEFAULT_WSS_BAR_CFG)),
-        "tke_clim": tuple(float(x) for x in list(rendering_cfg.get("tke_clim", [0.0, 100.0]))[:2]),
-        "tke_bar_cfg": copy.deepcopy(rendering_cfg.get("tke_bar_cfg", DEFAULT_TKE_BAR_CFG)),
-        "streamline_clim": tuple(float(x) for x in list(rendering_cfg.get("streamline_clim", [0.0, 1.0]))[:2]),
-        "streamline_bar_cfg": copy.deepcopy(rendering_cfg.get("streamline_bar_cfg", DEFAULT_STREAMLINE_BAR_CFG)),
+        **copy.deepcopy(render_settings),
     }

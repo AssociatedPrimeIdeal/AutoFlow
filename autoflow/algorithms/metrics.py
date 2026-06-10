@@ -685,22 +685,38 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
                             rr=1000.0, pressure_gradient_smoothing_sigma=0.0,
                             pressure_gradient_use_convective_acceleration=True,
                             compute_wss=True, compute_tke=True,
-                            compute_pressure_gradient=True):
+                            compute_pressure_gradient=True,
+                            wss_smoothing_iteration=None,
+                            wss_viscosity=None,
+                            wss_inward_distance=None,
+                            wss_parabolic_fitting=None,
+                            wss_no_slip_condition=None,
+                            tke_rho=None,
+                            pressure_gradient_rho=None,
+                            pressure_gradient_viscosity=None):
     mask4d = _ensure_mask4d(mask4d)
+    wss_smoothing_iteration = smoothing_iteration if wss_smoothing_iteration is None else wss_smoothing_iteration
+    wss_viscosity = viscosity if wss_viscosity is None else wss_viscosity
+    wss_inward_distance = inward_distance if wss_inward_distance is None else wss_inward_distance
+    wss_parabolic_fitting = parabolic_fitting if wss_parabolic_fitting is None else wss_parabolic_fitting
+    wss_no_slip_condition = no_slip_condition if wss_no_slip_condition is None else wss_no_slip_condition
+    tke_rho = rho if tke_rho is None else tke_rho
+    pressure_gradient_rho = rho if pressure_gradient_rho is None else pressure_gradient_rho
+    pressure_gradient_viscosity = viscosity if pressure_gradient_viscosity is None else pressure_gradient_viscosity
     wss = None
     if compute_wss:
         wss = compute_wss_metrics(
             mask4d, flow, spacing, origin=origin,
-            smoothing_iteration=smoothing_iteration,
-            viscosity=viscosity,
-            inward_distance=inward_distance,
-            parabolic_fitting=parabolic_fitting,
-            no_slip_condition=no_slip_condition,
+            smoothing_iteration=wss_smoothing_iteration,
+            viscosity=wss_viscosity,
+            inward_distance=wss_inward_distance,
+            parabolic_fitting=wss_parabolic_fitting,
+            no_slip_condition=wss_no_slip_condition,
         )
     tke = None
     if compute_tke and (tke_array is not None or sigma is not None):
         tke = compute_tke_metrics(
-            mask4d, spacing, origin=origin, tke_array=tke_array, sigma=sigma, rho=rho,
+            mask4d, spacing, origin=origin, tke_array=tke_array, sigma=sigma, rho=tke_rho,
         )
     pressure_gradient = None
     if compute_pressure_gradient:
@@ -709,8 +725,8 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
             flow,
             spacing,
             rr=rr,
-            rho=rho,
-            viscosity=viscosity,
+            rho=pressure_gradient_rho,
+            viscosity=pressure_gradient_viscosity,
             smoothing_sigma=pressure_gradient_smoothing_sigma,
             use_convective_acceleration=pressure_gradient_use_convective_acceleration,
         )

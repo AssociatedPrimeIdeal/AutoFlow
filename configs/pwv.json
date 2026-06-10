@@ -1,15 +1,30 @@
 {
-  "enabled": false,
-  "groups": [],
+  "enabled": true,
+  "groups": [
+    {
+      "name": "Aorta",
+      "labels": ["AAO", "ARCH", "DAO"]
+    },
+    {
+      "name": "Portal Vein",
+      "labels": ["PV"]
+    }
+  ],
   "plane_interval_mm": 10.0,
   "start_distance": 0.0,
   "end_distance": 0.0,
   "smoothing_window": 15,
   "smoothing_polyorder": 2,
   "inter_time": 10,
-  "waveform_key": "flowrate_signed_mL_s",
+  "waveform_key": "flowrate_mL_s",
+  "transit_time_method": "foot_to_foot",
+  "foot_method": "tangent",
   "foot_savgol_window": 5,
   "foot_savgol_polyorder": 2,
+  "foot_threshold_percent": 10.0,
+  "xcorr_window": "full",
+  "xcorr_interp_factor": 10,
+  "allow_cycle_wrap": true,
   "minimum_valid_planes": 2,
   "scene_visible": true,
   "scene_color": "#ffd43b",

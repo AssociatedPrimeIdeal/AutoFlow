@@ -49,14 +49,21 @@ autoflow-run ./data/demo_data.h5 \
   --cross-section-dist 15
 ```
 
-### Export offline videos
+### Opt in to optional computations
 
 ```bash
 autoflow-run ./data/demo_data.h5 \
   --output-dir ./results/demo \
-  --plane-video \
-  --wss-video \
-  --streamlines-video
+  --with pwv,wss
+```
+
+### Export selected offline videos
+
+```bash
+autoflow-run ./data/demo_data.h5 \
+  --output-dir ./results/demo \
+  --with wss,pg \
+  --video plane,wss,pg
 ```
 
 ## Execution Order
@@ -69,16 +76,19 @@ The current batch order in `process_single()` is:
 4. `Generate Graph`
 5. `Generate Planes`
 6. plane metrics
-7. derived metrics export
-8. enabled video export
+7. optional PWV or derived metrics selected by `--with`
+8. optional video export selected by `--video`
 
 Behavior details:
 
 - if segmentation is missing, segmentation-dependent steps are skipped
 - if `--autoseg` is enabled and the case has no segmentation, auto segmentation runs before skeleton and graph steps
 - CLI auto segmentation prints backend/model/device details, stage progress, and per-case timing for inference plus sidecar save
+- default CLI runs only through plane metrics
+- `--with pwv,wss,tke,pg` enables one or more optional computations
 - if TKE is unavailable, WSS and pressure gradient still run when possible and TKE stays unavailable
-- if `configs/pwv.json -> enabled` is true, the plane-metrics stage also computes PWV and writes `pwv.json` plus per-group PNG plots
+- PWV still requires `configs/pwv.json -> enabled` plus at least one configured PWV group
+- each selected stage and each rendered video writes elapsed seconds into `summary.json`
 
 ## Parameter Tables
 
@@ -95,7 +105,8 @@ Behavior details:
 
 | CLI flag | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `--skip-derived` | bool | `False` | `configs/batch.json` | skip WSS, TKE, and pressure-gradient export | `autoflow/processing.py` |
+| `--with` | csv | empty | command line | opt in to `pwv`, `wss`, `tke`, and/or `pg` | `autoflow/cli.py`, `autoflow/processing.py` |
+| `--skip-derived` | bool | `False` | `configs/batch.json` | remove WSS, TKE, and pressure-gradient from the requested set | `autoflow/processing.py` |
 | `--skip-plane-metrics` | bool | `False` | `configs/batch.json` | skip plane metric export | `autoflow/processing.py` |
 | `--single-thread` | bool | multithread on | `configs/batch.json` | disable multithreaded plane metrics | `autoflow/core/pipeline.py` |
 
@@ -121,11 +132,21 @@ Behavior details:
 
 ### PWV
 
-PWV is currently config-driven rather than flag-driven.
+PWV is opt-in from the CLI and still uses `configs/pwv.json` for PWV group definitions.
 
+- pass `--with pwv`
 - enable it in `configs/pwv.json`
 - define one or more PWV groups in `configs/pwv.json -> groups`
-- batch runs then compute PWV during the plane-metrics stage
+
+WSS, TKE, and pressure-gradient compute defaults are now split by metric:
+
+- `configs/fluid.json` for shared fluid properties such as `rho` and `viscosity`
+- `configs/wss.json` for WSS computation
+- `configs/tke.json` for TKE density
+- `configs/pressure_gradient.json` for pressure-gradient computation
+- `configs/planes.json` for plane render styling
+- `configs/wss.json`, `configs/tke.json`, `configs/pressure_gradient.json`, and `configs/streamlines.json` for metric-specific render ranges and optional colorbars
+- `configs/rendering.json` for shared video controls such as `window_size`, `rotate_dynamic_video`, and camera behavior
 
 ### Skeleton preprocessing
 
@@ -159,14 +180,12 @@ Note:
 
 ### Video export
 
-| CLI flag | Type | Default | Where configured | Effect | Code owner |
+| CLI flag or config key | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `--plane-video` | bool | `False` | `configs/rendering.json` | export `planes_rotate.mp4` | `autoflow/rendering/videos.py` |
-| `--wss-video` | bool | `False` | `configs/rendering.json` | export WSS video | `autoflow/rendering/videos.py` |
-| `--streamlines-video` | bool | `False` | `configs/rendering.json` | export streamline video | `autoflow/rendering/videos.py` |
-| `--tke-video` | bool | `False` | `configs/rendering.json` | export TKE video when TKE exists | `autoflow/rendering/videos.py` |
+| `--video` | csv | empty | command line | export one or more of `plane`, `wss`, `tke`, `pg`, `streamlines` | `autoflow/cli.py`, `autoflow/processing.py` |
 | `--fps` | int | `12` | `configs/rendering.json` | output frame rate | `autoflow/rendering/videos.py` |
 | `--plane-rotation-frames` | int | `180` | `configs/rendering.json` | frame count for plane rotation video | `autoflow/rendering/videos.py` |
+| `window_size` | list[int, int] | `[1600, 1200]` | `configs/rendering.json` | output render size; use this instead of a Matplotlib-style `figsize` | `autoflow/rendering/videos.py` |
 | `--camera-view` | string | `right` | `configs/rendering.json` | camera preset for dynamic videos | `autoflow/rendering/videos.py` |
 | `--camera-distance-scale` | float | `1.5` | `configs/rendering.json` | scale camera distance | `autoflow/rendering/videos.py` |
 | `--rotate-dynamic-video` / `--no-rotate-dynamic-video` | bool | `True` | `configs/rendering.json` | rotate or keep fixed dynamic videos | `autoflow/rendering/videos.py` |
@@ -175,6 +194,12 @@ Note:
 | `--dynamic-rotation-elevation-deg` | float | `10.0` | `configs/rendering.json` | dynamic rotation elevation override | `autoflow/rendering/videos.py` |
 | `--add-plane-idx` | bool | `False` | `configs/rendering.json` | annotate plane indices in plane video | `autoflow/rendering/videos.py` |
 | `--add-path-idx` / `--no-path-idx` | bool | `False` | `configs/rendering.json` | annotate path indices in plane video | `autoflow/rendering/videos.py` |
+| `planes.render.default.plane_color` | string | `yellow` | `configs/planes.json` | default plane color in GUI and plane video | `autoflow/ui/app.py`, `autoflow/rendering/videos.py` |
+| `wss.render.show_scalar_bar` | bool | `True` | `configs/wss.json` | show or hide the WSS colorbar in GUI and exported videos | `autoflow/rendering/videos.py` |
+| `tke.render.show_scalar_bar` | bool | `True` | `configs/tke.json` | show or hide the TKE colorbar in GUI and exported videos | `autoflow/rendering/videos.py` |
+| `pressure_gradient.render.clim` | list[float, float] | `[0.0, 500.0]` | `configs/pressure_gradient.json` | explicit pressure-gradient display range | `autoflow/rendering/videos.py` |
+| `pressure_gradient.render.show_scalar_bar` | bool | `True` | `configs/pressure_gradient.json` | show or hide the pressure-gradient colorbar in GUI and exported videos | `autoflow/rendering/videos.py` |
+| `streamlines.render.show_scalar_bar` | bool | `True` | `configs/streamlines.json` | show or hide the streamline colorbar in GUI and exported videos | `autoflow/rendering/videos.py` |
 
 ## Outputs
 

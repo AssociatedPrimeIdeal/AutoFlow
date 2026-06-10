@@ -9,10 +9,10 @@
 | `plane_metrics.json` | plane metrics run | time-resolved plane metrics | `autoflow/core/pipeline.py` |
 | `plane_qc.json` | plane metrics run | fork and path QC | `autoflow/core/pipeline.py` |
 | `plane_metrics_pixelwise.h5` | plane metrics run | per-plane pixelwise derived samples | `autoflow/core/pipeline.py` |
-| `pwv.json` | PWV is enabled and plane metrics run | PWV fit results for each configured PWV group | `autoflow/core/pipeline.py`, `autoflow/algorithms/pwv.py` |
-| `pwv_<group>.png` | PWV plotting succeeds | per-group time-to-foot versus slice-position plot | `autoflow/algorithms/pwv.py` |
+| `pwv.json` | PWV is enabled and PWV runs | PWV fit results for each configured PWV group | `autoflow/core/pipeline.py`, `autoflow/algorithms/pwv.py` |
+| `pwv_<group>.png` | PWV plotting succeeds | per-group two-panel plot with time-to-foot fit and all plane flowrate waveforms | `autoflow/algorithms/pwv.py` |
 | `derived_metrics_pixelwise.npz` | derived metrics run | whole-volume WSS, pressure gradient, and optional TKE arrays | `autoflow/processing.py` |
-| `summary.json` | every processed case | single-case summary | `autoflow/processing.py` |
+| `summary.json` | every processed case; also updated by GUI video export when present | single-case summary including request flags plus stage and video timings | `autoflow/processing.py`, `autoflow/ui/app.py` |
 | `batch_report.json` | batch run | batch summary report | `autoflow/api.py`, `autoflow/processing.py` |
 | `time_summary.txt` | batch run | timing summary | `autoflow/api.py`, `autoflow/processing.py` |
 
@@ -20,10 +20,11 @@
 
 | Output | Created when | Meaning |
 | --- | --- | --- |
-| `planes_rotate.mp4` | `--plane-video` | rotating plane overview |
-| `streamlines_video.mp4` or `streamlines_rotate.mp4` | `--streamlines-video` | time-resolved streamline movie |
-| `wss_video.mp4` or `wss_rotate.mp4` | `--wss-video` | WSS movie |
-| `tke_video.mp4` or `tke_rotate.mp4` | `--tke-video` and TKE available | TKE movie |
+| `planes_rotate.mp4` | `plane` video export requested from CLI, Python API, or GUI | rotating plane overview |
+| `streamlines_video.mp4` or `streamlines_rotate.mp4` | `streamlines` video export requested from CLI, Python API, or GUI | time-resolved streamline movie |
+| `wss_video.mp4` or `wss_rotate.mp4` | `wss` video export requested from CLI, Python API, or GUI | WSS movie |
+| `tke_video.mp4` or `tke_rotate.mp4` | `tke` video export requested and TKE available | TKE movie |
+| `pressure_gradient_video.mp4` or `pressure_gradient_rotate.mp4` | `pg` video export requested from CLI, Python API, or GUI | pressure-gradient magnitude movie |
 
 ## Segmentation Sidecars
 
@@ -39,6 +40,8 @@
 - `plane_metrics_pixelwise.h5` stores per-plane slice-cellwise samples
 - TKE outputs remain optional and are absent for inputs that do not carry TKE
 - `pwv.json` is also mirrored into `summary.json` as `pwv_results`, `pwv_file`, and `pwv_plot_files`
+- `summary.json` records `requested_metrics`, `requested_videos`, `stage_times_sec`, and `video_times_sec`
+- GUI `Export Videos...` also updates `summary.json` with refreshed `videos`, refreshed `video_times_sec`, and a `gui_video_export` record for that export run
 - `planes.json` stores per-plane `path_info` when path metadata is available; grouped multi-label workflows can therefore expose `path_info.group_name` in that file
 - GUI scene objects are not saved files, but grouped workflows keep stable internal keys such as `segmask_group_<group>`, `skeleton_<group>`, `graph_<group>`, `smooth_path_<group>_<path_idx>`, `plane_<group>_<plane_idx>`, and `pathline_<group>_<plane_idx>` while showing shorter browser-visible names like `plane 5` and `pathline 5`
 - PWV scene planes are represented as one grouped browser object named `PWV planes`

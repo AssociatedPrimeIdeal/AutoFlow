@@ -27,7 +27,7 @@
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
-| TKE view or TKE video is unavailable | input does not include TKE or complex source data | this is expected for many mag/flow-only inputs |
+| TKE view or TKE video is unavailable | input does not include TKE or complex source data, or `tke` was not requested | this is expected for many mag/flow-only inputs |
 
 ## DICOM Import Looks Wrong
 
@@ -36,12 +36,19 @@
 | wrong axis or velocity direction | DICOM parameter override is wrong | inspect and correct resolution, venc, spatial order, venc order, and RR in the DICOM confirmation dialog |
 | very slow load | low worker count | try `--dicom-read-workers` for CLI or tune loader defaults |
 
+## Video Export Warnings
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| repeated `vtkEGLRenderWindow ... Unable to eglMakeCurrent: 12290` lines during GUI export | off-screen export tried to create a second local render context while a display-backed GUI VTK context was already active | rerun with the updated build; if the host still prefers display-backed export, launch `autoflow-gui` with `AUTOFLOW_OFFSCREEN_MODE=display` |
+
 ## Plane Metrics Or Derived Metrics Look Incomplete
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
 | no planes generated | graph or segmentation is missing | generate segmentation, skeleton, and graph first |
 | pressure-gradient boundary looks trimmed | support mask excludes boundary voxels | expected behavior; check `pressure_gradient_support_mask` |
+| expected PWV, WSS, TKE, or pressure-gradient outputs are missing | the stage was not requested from CLI or API | rerun with `--with ...` or `requested_metrics=[...]` |
 
 ## Where To Inspect Code
 

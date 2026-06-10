@@ -12,6 +12,8 @@
 ## What It Does
 This feature computes wall shear stress, pressure-gradient fields, and optional TKE outputs from the loaded velocity data and segmentation.
 
+Rendering controls are now split by metric: `configs/wss.json -> render`, `configs/tke.json -> render`, and `configs/pressure_gradient.json -> render`. The same settings drive offline videos and the live GUI scene objects.
+
 ## When To Use It
 - use it after segmentation and planes exist
 - use it when WSS or pressure-gradient maps are needed
@@ -29,11 +31,11 @@ This feature computes wall shear stress, pressure-gradient fields, and optional 
 ### CLI
 
 ```bash
-autoflow-run case.h5 --output-dir results/case
+autoflow-run case.h5 --output-dir results/case --with wss,tke,pg
 ```
 
 ### Python API
-Use `run_case()` or `run_batch()` with `skip_derived=False`.
+Use `run_case()` or `run_batch()` with `requested_metrics=["wss", "tke", "pg"]` or any subset.
 
 ## Inputs
 
@@ -48,21 +50,30 @@ Use `run_case()` or `run_batch()` with `skip_derived=False`.
 
 | Parameter | Type | Default | Where set | Effect |
 | --- | --- | --- | --- | --- |
-| `smoothing_iteration` | int | `200` | `configs/derived.json` | smoothing for WSS processing |
-| `viscosity` | float | `4.0` | `configs/derived.json` | viscosity value for WSS |
-| `inward_distance` | float or `auto` | `auto` | `configs/derived.json` | near-wall sample distance |
-| `parabolic_fitting` | bool | `True` | `configs/derived.json` | WSS fitting mode |
-| `no_slip_condition` | bool | `False` | `configs/derived.json` | WSS no-slip toggle |
-| `rho` | float | `1060.0` | `configs/derived.json` | density used by pressure-gradient logic |
-| `pressure_gradient_smoothing_sigma` | float | `0.0` | `configs/derived.json` | pressure-gradient smoothing |
-| `pressure_gradient_use_convective_acceleration` | bool | `True` | `configs/derived.json` | include convective acceleration |
-| `skip_derived` | bool | `False` | batch config or CLI/API | disable the entire derived-export step |
+| `smoothing_iteration` | int | `200` | `configs/wss.json` | smoothing for WSS processing |
+| `viscosity` | float | shared from `configs/fluid.json` | `configs/fluid.json` or `configs/wss.json` | viscosity value for WSS |
+| `inward_distance` | float or `auto` | `auto` | `configs/wss.json` | near-wall sample distance |
+| `parabolic_fitting` | bool | `True` | `configs/wss.json` | WSS fitting mode |
+| `no_slip_condition` | bool | `False` | `configs/wss.json` | WSS no-slip toggle |
+| `rho` | float | shared from `configs/fluid.json` | `configs/fluid.json` or `configs/tke.json` | density used by TKE |
+| `rho` | float | shared from `configs/fluid.json` | `configs/fluid.json` or `configs/pressure_gradient.json` | density used by pressure-gradient logic |
+| `viscosity` | float | shared from `configs/fluid.json` | `configs/fluid.json` or `configs/pressure_gradient.json` | viscosity used by pressure-gradient logic |
+| `smoothing_sigma` | float | `0.0` | `configs/pressure_gradient.json` | pressure-gradient smoothing |
+| `use_convective_acceleration` | bool | `True` | `configs/pressure_gradient.json` | include convective acceleration |
+| `wss.render.clim` | list[float, float] | `[0.0, 10.0]` | `configs/wss.json` | WSS display range in GUI and videos |
+| `wss.render.show_scalar_bar` | bool | `True` | `configs/wss.json` | show or hide the WSS colorbar in GUI and videos |
+| `tke.render.clim` | list[float, float] | `[0.0, 100.0]` | `configs/tke.json` | TKE display range in GUI and videos |
+| `tke.render.show_scalar_bar` | bool | `True` | `configs/tke.json` | show or hide the TKE colorbar in GUI and videos |
+| `pressure_gradient.render.clim` | list[float, float] | `[0.0, 500.0]` | `configs/pressure_gradient.json` | pressure-gradient display range in GUI and videos |
+| `pressure_gradient.render.show_scalar_bar` | bool | `True` | `configs/pressure_gradient.json` | show or hide the pressure-gradient colorbar in GUI and videos |
+| `requested_metrics` / `--with` | csv | empty | CLI/API | opt in to `wss`, `tke`, and/or `pg` |
+| `skip_derived` | bool | `False` | batch config or CLI/API | remove all requested WSS, TKE, and pressure-gradient work |
 
 ## Outputs
 
 | Output file or object | Created when | Meaning |
 | --- | --- | --- |
-| `derived_metrics_pixelwise.npz` | derived export runs | whole-volume WSS, pressure gradient, and optional TKE arrays |
+| `derived_metrics_pixelwise.npz` | requested derived export runs | whole-volume WSS, pressure gradient, and optional TKE arrays |
 | WSS surfaces in workspace | derived step succeeds | WSS scene data |
 | pressure-gradient arrays in workspace | derived step succeeds | volume arrays and support mask |
 | TKE arrays in workspace | TKE exists | optional TKE output |

@@ -20,6 +20,7 @@ Thumbs.db
 /data/plane_metrics.json
 /data/plane_qc.json
 /data/phantom_P.h5
+/data/
 TODO.md
 GIT_COMMANDS.local.md
 AGENTS.md

@@ -49,6 +49,7 @@ def _run_phantom_p_case():
         use_multithread=False,
         use_center_plane=False,
         cross_section_dist=PLANE_SPACING_MM,
+        requested_metrics=["pg"],
         make_plane_video=False,
         make_wss_video=False,
         make_streamlines_video=False,

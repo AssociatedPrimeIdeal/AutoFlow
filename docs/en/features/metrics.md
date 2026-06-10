@@ -5,17 +5,18 @@
 | Entry point | Status | Notes |
 | --- | --- | --- |
 | GUI | Supported | `Calculate && Save Metrics` step |
-| CLI | Supported | part of default batch order |
+| CLI | Supported | part of default batch order; derived plane summaries are opt-in |
 | Python API | Supported | through batch and case APIs |
 
 ## What It Does
 Plane metrics compute time-resolved cross-sectional measurements for each plane and save them to JSON and HDF5 outputs.
 
-When `configs/pwv.json -> enabled` is true, the plane-metrics step also computes PWV for each configured PWV group and writes PWV outputs.
+Plane metrics run by default. PWV and derived plane summaries are only added when requested from the CLI or API.
 
 ## When To Use It
 - use it after planes exist
-- use it when you need flow, area, mean velocity, peak velocity, net flow, and derived plane summaries
+- use it when you need flow, area, mean velocity, peak velocity, and net flow
+- add `--with wss,tke,pg` if you also want derived plane summaries
 - do not expect it to run without segmentation
 
 ## Quick Use
@@ -29,6 +30,10 @@ When `configs/pwv.json -> enabled` is true, the plane-metrics step also computes
 
 ```bash
 autoflow-run case.h5 --output-dir results/case
+```
+
+```bash
+autoflow-run case.h5 --output-dir results/case --with pwv,wss,pg
 ```
 
 ### Python API
@@ -63,7 +68,7 @@ Use the standard `run_case()` or `run_batch()` flow. Plane metrics run unless `s
 ## Limitations
 - segmentation is required
 - plane metrics depend on valid plane placement
-- derived summaries attached to planes depend on derived-metric availability
+- derived summaries attached to planes depend on opting in to the corresponding derived metrics
 
 ## Where To Change Code
 

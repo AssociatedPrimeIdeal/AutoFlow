@@ -36,8 +36,8 @@ What this does:
 3. generate graph
 4. generate planes
 5. calculate plane metrics
-6. calculate derived metrics
-7. export any enabled videos
+6. only run PWV, WSS, TKE, or pressure gradient when requested
+7. only export videos when requested
 
 Typical outputs under `./results/demo/<case_name>/`:
 
@@ -100,14 +100,13 @@ autoflow-run ./data/demo_data.h5 \
   --autoseg
 ```
 
-### Export videos
+### Opt in to extra metrics and videos
 
 ```bash
 autoflow-run ./data/demo_data.h5 \
   --output-dir ./results/demo \
-  --plane-video \
-  --wss-video \
-  --streamlines-video
+  --with pwv,wss,tke,pg \
+  --video plane,wss,tke,pg
 ```
 
 ## Next Pages

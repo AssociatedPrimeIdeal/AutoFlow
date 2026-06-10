@@ -24,11 +24,79 @@ from .plane_io import (
 )
 from .rendering import (
     render_plane_rotation_video,
+    render_pressure_gradient_video,
     render_streamlines_video,
     render_tke_video,
     render_wss_video,
 )
 from .reporting import load_metrics_from_output, print_metrics_summary, print_qc_summary
+
+
+DERIVED_METRIC_KEYS = ("pwv", "wss", "tke", "pg")
+VIDEO_KEYS = ("plane", "wss", "tke", "pg", "streamlines")
+
+
+def _normalize_requested_items(items, valid_items, *, default=()):
+    valid = tuple(str(item) for item in valid_items)
+    valid_set = set(valid)
+    if items is None:
+        return tuple(str(item) for item in default)
+    if isinstance(items, str):
+        raw_items = [part.strip() for part in items.split(",")]
+    else:
+        raw_items = []
+        for item in list(items):
+            raw_items.extend(str(item).split(","))
+    normalized = []
+    seen = set()
+    for item in raw_items:
+        token = str(item).strip().lower()
+        if not token:
+            continue
+        if token not in valid_set:
+            raise ValueError(f"unsupported item: {item}; valid options: {', '.join(valid)}")
+        if token in seen:
+            continue
+        normalized.append(token)
+        seen.add(token)
+    return tuple(normalized)
+
+
+def _requested_metric_flags(requested_metrics, *, skip_derived=False, skip_wss=False, skip_tke=False, skip_pressure_gradient=False):
+    selected = set(_normalize_requested_items(requested_metrics, DERIVED_METRIC_KEYS, default=()))
+    if skip_derived:
+        selected.difference_update({"wss", "tke", "pg"})
+    if skip_wss:
+        selected.discard("wss")
+    if skip_tke:
+        selected.discard("tke")
+    if skip_pressure_gradient:
+        selected.discard("pg")
+    return {
+        "pwv": "pwv" in selected,
+        "wss": "wss" in selected,
+        "tke": "tke" in selected,
+        "pg": "pg" in selected,
+    }
+
+
+def _requested_video_flags(requested_videos):
+    selected = set(_normalize_requested_items(requested_videos, VIDEO_KEYS, default=()))
+    return {
+        "plane": "plane" in selected,
+        "wss": "wss" in selected,
+        "tke": "tke" in selected,
+        "pg": "pg" in selected,
+        "streamlines": "streamlines" in selected,
+    }
+
+
+def _record_timing(mapping, name, elapsed):
+    mapping[str(name)] = float(elapsed)
+
+
+def _timing_payload(mapping):
+    return {str(name): float(seconds) for name, seconds in mapping.items()}
 
 
 def _has_cached_derived_metrics(ws):
@@ -146,34 +214,63 @@ def process_single(
     autoseg_checkpoint="checkpoint_final.pth",
     autoseg_device="auto",
     autoseg_label_map="",
+    requested_metrics=None,
+    requested_videos=None,
     fps=24,
     plane_rotation_frames=180,
     rotate_dynamic_video=False,
     dynamic_rotation_frames=180,
     dynamic_rotation_elevation_deg=None,
-    make_plane_video=True,
-    make_wss_video=True,
-    make_pressure_gradient_video=True,
-    make_streamlines_video=True,
-    make_tke_video=True,
+    make_plane_video=False,
+    make_wss_video=False,
+    make_pressure_gradient_video=False,
+    make_streamlines_video=False,
+    make_tke_video=False,
     camera_view="iso",
     camera_distance_scale=1.0,
     add_plane_idx=False,
     add_path_idx=False,
+    plane_video_cfg=None,
+    window_size=None,
     wss_clim=None,
+    wss_show_scalar_bar=True,
     wss_bar_cfg=None,
     tke_clim=None,
+    tke_show_scalar_bar=True,
     tke_bar_cfg=None,
+    pressure_gradient_clim=None,
+    pressure_gradient_show_scalar_bar=True,
+    pressure_gradient_bar_cfg=None,
     streamline_clim=None,
+    streamline_show_scalar_bar=True,
     streamline_bar_cfg=None,
     dynamic_time_repeat=1,
 ):
     case = resolve_input_case(input_source)
     input_label = case.display_name or case.input_path
 
+    metric_flags = _requested_metric_flags(
+        requested_metrics,
+        skip_derived=skip_derived,
+        skip_wss=skip_wss,
+        skip_tke=skip_tke,
+        skip_pressure_gradient=skip_pressure_gradient,
+    )
+    video_flags = _requested_video_flags(requested_videos)
+    if requested_videos is None:
+        video_flags = {
+            "plane": bool(make_plane_video),
+            "wss": bool(make_wss_video),
+            "tke": bool(make_tke_video),
+            "pg": bool(make_pressure_gradient_video),
+            "streamlines": bool(make_streamlines_video),
+        }
+
     print(f"\n{'=' * 60}")
     print(f"Processing: {input_label}")
     print(f"Output dir: {out_dir}")
+    print(f"With metrics: {', '.join(name for name, enabled in metric_flags.items() if enabled) or 'plane-only'}")
+    print(f"With videos: {', '.join(name for name, enabled in video_flags.items() if enabled) or 'none'}")
     print(f"{'=' * 60}")
 
     os.makedirs(out_dir, exist_ok=True)
@@ -187,13 +284,14 @@ def process_single(
     import time as _time
 
     stage_times = {}
+    video_times = {}
     t_total_start = _time.perf_counter()
 
     print("[1/7] Loading data...")
     t_stage = _time.perf_counter()
     engine.load_data(ws, logger, input_source=case)
     elapsed = _time.perf_counter() - t_stage
-    stage_times["load"] = float(elapsed)
+    _record_timing(stage_times, "load", elapsed)
     print(f"  -> load={elapsed:.2f}s")
 
     if ws.segmask_raw is None and autoseg:
@@ -209,57 +307,66 @@ def process_single(
             auto_label_map=autoseg_label_map,
         )
         elapsed = _time.perf_counter() - t_stage
-        stage_times["autoseg"] = float(elapsed)
+        _record_timing(stage_times, "autoseg", elapsed)
         print(f"  -> auto segmentation ready: {sidecar} | time={elapsed:.2f}s")
 
     print("[2/7] Generate Skeleton...")
     t_stage = _time.perf_counter()
     result = engine.run_step(ws, StepId.GENERATE_SKELETON, logger)
     elapsed = _time.perf_counter() - t_stage
-    stage_times["skeleton"] = float(elapsed)
+    _record_timing(stage_times, "skeleton", elapsed)
     print(f"  -> {result.message} | time={elapsed:.2f}s")
 
     print("[3/7] Generate Graph (+ branches/forks)...")
     t_stage = _time.perf_counter()
     result = engine.run_step(ws, StepId.GENERATE_GRAPH, logger)
     elapsed = _time.perf_counter() - t_stage
-    stage_times["graph"] = float(elapsed)
+    _record_timing(stage_times, "graph", elapsed)
     print(f"  -> {result.message} | time={elapsed:.2f}s")
 
     print("[4/7] Generate Planes...")
     t_stage = _time.perf_counter()
     result = engine.run_step(ws, StepId.GENERATE_PLANES, logger)
     elapsed = _time.perf_counter() - t_stage
-    stage_times["planes"] = float(elapsed)
+    _record_timing(stage_times, "planes", elapsed)
     print(f"  -> {result.message} | time={elapsed:.2f}s")
 
     if reuse_planes_path:
-        print(f"[5/7] Reuse Plane Positions: {reuse_planes_path}")
+        print(f"[5/8] Reuse Plane Positions: {reuse_planes_path}")
         t_stage = _time.perf_counter()
         plane_items = load_plane_positions(reuse_planes_path)
         ws.planes = project_planes_to_workspace(plane_items, ws)
         planes_json = engine._save_planes_json(ws)
         elapsed = _time.perf_counter() - t_stage
-        stage_times["reuse_planes"] = float(elapsed)
+        _record_timing(stage_times, "reuse_planes", elapsed)
         print(f"  -> Reused {len(ws.planes)} planes saved={planes_json} | time={elapsed:.2f}s")
     else:
-        print("[5/7] Use generated planes")
+        print("[5/8] Use generated planes")
 
+    include_plane_derived = any(metric_flags[key] for key in ("wss", "tke", "pg"))
     if skip_plane_metrics:
-        print("[6/7] Skipped plane metrics")
+        print("[6/8] Skipped plane metrics")
     else:
-        print("[6/7] Calculate & Save Metrics...")
+        print("[6/8] Calculate & Save Metrics...")
         t_step = _time.perf_counter()
         step_parts = []
-        if not skip_derived and ws.segmask_raw is not None and not ws.derived.pixelwise_export:
+        if include_plane_derived and ws.segmask_raw is not None:
             t_part = _time.perf_counter()
-            engine._ensure_derived_metrics(ws, save_pixelwise=True, refresh_scene_objects=False)
+            engine._ensure_derived_metrics(
+                ws,
+                save_pixelwise=False,
+                refresh_scene_objects=False,
+                compute_wss=metric_flags["wss"],
+                compute_tke=metric_flags["tke"],
+                compute_pressure_gradient=metric_flags["pg"],
+            )
             step_parts.append(("derived_prep", _time.perf_counter() - t_part))
         t_part = _time.perf_counter()
         _, _, metric_msg = engine._compute_plane_metrics_internal(
             ws,
             save=True,
             use_multithread=use_multithread,
+            include_derived=include_plane_derived,
         )
         step_parts.append(("plane_metrics", _time.perf_counter() - t_part))
         try:
@@ -269,27 +376,47 @@ def process_single(
         except Exception:
             pass
         elapsed = _time.perf_counter() - t_step
-        stage_times["plane_metrics"] = float(elapsed)
+        _record_timing(stage_times, "plane_metrics", elapsed)
         print(f"  -> {metric_msg} | {_format_timing_parts(step_parts + [('total', elapsed)])}")
 
     pixelwise_result = {}
-    if not skip_derived:
+    if not skip_plane_metrics and metric_flags["pwv"]:
+        print("[7/8] Compute PWV...")
+        t_step = _time.perf_counter()
+        result = engine.run_step(ws, StepId.COMPUTE_PWV, logger)
+        elapsed = _time.perf_counter() - t_step
+        _record_timing(stage_times, "pwv", elapsed)
+        print(f"  -> {result.message} | time={elapsed:.2f}s")
+    elif skip_plane_metrics:
+        print("[7/8] Skipped PWV (plane metrics skipped)")
+    else:
+        print("[7/8] Skipped PWV (not requested)")
+
+    if any(metric_flags[key] for key in ("wss", "tke", "pg")):
         if ws.segmask_raw is None:
-            print("[7/7] Skipped derived metrics (no segmentation)")
+            print("[8/8] Skipped derived metrics (no segmentation)")
         else:
-            print("[7/7] Compute Derived Metrics (WSS/TKE/Pressure Gradient)...")
+            labels = []
+            if metric_flags["wss"]:
+                labels.append("WSS")
+            if metric_flags["tke"]:
+                labels.append("TKE")
+            if metric_flags["pg"]:
+                labels.append("Pressure Gradient")
+            print(f"[8/8] Compute Derived Metrics ({'/'.join(labels)})...")
             t_step = _time.perf_counter()
             step_parts = []
-            if not ws.derived.pixelwise_export:
-                if not _has_cached_derived_metrics(ws):
-                    t_part = _time.perf_counter()
-                    engine._ensure_derived_metrics(ws, save_pixelwise=True, refresh_scene_objects=False)
-                    step_parts.append(("derived_compute", _time.perf_counter() - t_part))
-                else:
-                    t_part = _time.perf_counter()
-                    ws.derived.pixelwise_export = _build_cached_pixelwise_export(ws)
-                    step_parts.append(("pixelwise_build", _time.perf_counter() - t_part))
-            pixelwise_result = ws.derived.pixelwise_export
+            t_part = _time.perf_counter()
+            engine._ensure_derived_metrics(
+                ws,
+                save_pixelwise=True,
+                refresh_scene_objects=False,
+                compute_wss=metric_flags["wss"],
+                compute_tke=metric_flags["tke"],
+                compute_pressure_gradient=metric_flags["pg"],
+            )
+            step_parts.append(("derived_compute", _time.perf_counter() - t_part))
+            pixelwise_result = dict(ws.derived.pixelwise_export or {})
             pixel_path = os.path.join(out_dir, "derived_metrics_pixelwise.npz")
             if pixelwise_result:
                 t_part = _time.perf_counter()
@@ -299,10 +426,10 @@ def process_single(
             ws.pipeline.mark_done(StepId.COMPUTE_DERIVED_METRICS)
             tke_suffix = "" if ws.derived.tke_array is not None or ws.derived.tke_volume is not None else " tke=unavailable"
             elapsed = _time.perf_counter() - t_step
-            stage_times["derived_export"] = float(elapsed)
-            print(f"  -> Derived: Nt={len(ws.derived.wss_surfaces)}{tke_suffix} | {_format_timing_parts(step_parts + [('total', elapsed)])}")
+            _record_timing(stage_times, "derived_export", elapsed)
+            print(f"  -> Derived: wss={metric_flags['wss']} tke={metric_flags['tke']} pg={metric_flags['pg']}{tke_suffix} | {_format_timing_parts(step_parts + [('total', elapsed)])}")
     else:
-        print("[7/7] Skipped derived metrics (WSS/TKE/Pressure Gradient)")
+        print("[8/8] Skipped derived metrics (not requested)")
 
     total_time_sec = _time.perf_counter() - t_total_start
     timing_summary = _format_timing_parts([(name, seconds) for name, seconds in stage_times.items()])
@@ -314,93 +441,128 @@ def process_single(
     print(f"Plane positions saved: {plane_positions_path}")
 
     video_paths = {}
-    if make_plane_video:
-        try:
-            video_paths["planes"] = render_plane_rotation_video(
-                ws,
-                out_dir,
-                fps=fps,
-                n_frames=plane_rotation_frames,
-                smoothing_iteration=ws.derived_params.smoothing_iteration,
-                distance_scale=camera_distance_scale,
-                add_plane_idx=add_plane_idx,
-                add_path_idx=add_path_idx,
-            )
-            if video_paths["planes"]:
-                print(f"Plane video saved: {video_paths['planes']}")
-        except Exception:
-            print("[WARN] Plane video failed")
-            print(traceback.format_exc())
-            video_paths["planes"] = ""
 
-    if make_streamlines_video:
+    def _run_video(name, enabled, runner, available=True):
+        if not enabled:
+            return
+        if not available:
+            video_paths[name] = ""
+            print(f"[WARN] {name} video skipped: upstream data unavailable")
+            return
         try:
-            video_paths["streamlines"] = render_streamlines_video(
-                ws,
-                out_dir,
-                fps=fps,
-                smoothing_iteration=ws.derived_params.smoothing_iteration,
-                view=camera_view,
-                distance_scale=camera_distance_scale,
-                streamline_clim=streamline_clim,
-                streamline_bar_cfg=streamline_bar_cfg,
-                rotate=rotate_dynamic_video,
-                rotation_frames=dynamic_rotation_frames,
-                elevation_deg=dynamic_rotation_elevation_deg,
-                time_repeat=dynamic_time_repeat,
-            )
-            if video_paths["streamlines"]:
-                print(f"Streamlines video saved: {video_paths['streamlines']}")
+            t_video = _time.perf_counter()
+            video_paths[name] = runner() or ""
+            elapsed_local = _time.perf_counter() - t_video
+            _record_timing(video_times, name, elapsed_local)
+            if video_paths[name]:
+                print(f"{name.capitalize()} video saved: {video_paths[name]} | time={elapsed_local:.2f}s")
+            else:
+                print(f"[WARN] {name} video produced no output | time={elapsed_local:.2f}s")
         except Exception:
-            print("[WARN] Streamlines video failed")
+            print(f"[WARN] {name.capitalize()} video failed")
             print(traceback.format_exc())
-            video_paths["streamlines"] = ""
+            video_paths[name] = ""
 
-    if not skip_derived and make_wss_video:
-        try:
-            video_paths["wss"] = render_wss_video(
-                ws,
-                out_dir,
-                fps=fps,
-                smoothing_iteration=ws.derived_params.smoothing_iteration,
-                view=camera_view,
-                distance_scale=camera_distance_scale,
-                wss_clim=wss_clim,
-                wss_bar_cfg=wss_bar_cfg,
-                rotate=rotate_dynamic_video,
-                rotation_frames=dynamic_rotation_frames,
-                elevation_deg=dynamic_rotation_elevation_deg,
-                time_repeat=dynamic_time_repeat,
-            )
-            if video_paths["wss"]:
-                print(f"WSS video saved: {video_paths['wss']}")
-        except Exception:
-            print("[WARN] WSS video failed")
-            print(traceback.format_exc())
-            video_paths["wss"] = ""
-
-    if not skip_derived and make_tke_video:
-        try:
-            video_paths["tke"] = render_tke_video(
-                ws,
-                out_dir,
-                fps=fps,
-                smoothing_iteration=ws.derived_params.smoothing_iteration,
-                view=camera_view,
-                distance_scale=camera_distance_scale,
-                tke_clim=tke_clim,
-                tke_bar_cfg=tke_bar_cfg,
-                rotate=rotate_dynamic_video,
-                rotation_frames=dynamic_rotation_frames,
-                elevation_deg=dynamic_rotation_elevation_deg,
-                time_repeat=dynamic_time_repeat,
-            )
-            if video_paths["tke"]:
-                print(f"TKE video saved: {video_paths['tke']}")
-        except Exception:
-            print("[WARN] TKE video failed")
-            print(traceback.format_exc())
-            video_paths["tke"] = ""
+    _run_video(
+        "plane",
+        video_flags["plane"],
+        lambda: render_plane_rotation_video(
+            ws,
+            out_dir,
+            fps=fps,
+            n_frames=plane_rotation_frames,
+            smoothing_iteration=ws.derived_params.smoothing_iteration,
+            distance_scale=camera_distance_scale,
+            add_plane_idx=add_plane_idx,
+            add_path_idx=add_path_idx,
+            plane_video_cfg=plane_video_cfg,
+            window_size=window_size,
+        ),
+    )
+    _run_video(
+        "streamlines",
+        video_flags["streamlines"],
+        lambda: render_streamlines_video(
+            ws,
+            out_dir,
+            fps=fps,
+            smoothing_iteration=ws.derived_params.smoothing_iteration,
+            view=camera_view,
+            distance_scale=camera_distance_scale,
+            streamline_clim=streamline_clim,
+            show_scalar_bar=streamline_show_scalar_bar,
+            streamline_bar_cfg=streamline_bar_cfg,
+            rotate=rotate_dynamic_video,
+            rotation_frames=dynamic_rotation_frames,
+            elevation_deg=dynamic_rotation_elevation_deg,
+            time_repeat=dynamic_time_repeat,
+            window_size=window_size,
+        ),
+        available=ws.flow_raw is not None and ws.segmask_binary is not None and ws.segmask_3d is not None,
+    )
+    _run_video(
+        "wss",
+        video_flags["wss"],
+        lambda: render_wss_video(
+            ws,
+            out_dir,
+            fps=fps,
+            smoothing_iteration=ws.derived_params.smoothing_iteration,
+            view=camera_view,
+            distance_scale=camera_distance_scale,
+            wss_clim=wss_clim,
+            show_scalar_bar=wss_show_scalar_bar,
+            wss_bar_cfg=wss_bar_cfg,
+            rotate=rotate_dynamic_video,
+            rotation_frames=dynamic_rotation_frames,
+            elevation_deg=dynamic_rotation_elevation_deg,
+            time_repeat=dynamic_time_repeat,
+            window_size=window_size,
+        ),
+        available=ws.derived.wss_surfaces is not None and len(ws.derived.wss_surfaces) > 0,
+    )
+    _run_video(
+        "tke",
+        video_flags["tke"],
+        lambda: render_tke_video(
+            ws,
+            out_dir,
+            fps=fps,
+            smoothing_iteration=ws.derived_params.smoothing_iteration,
+            view=camera_view,
+            distance_scale=camera_distance_scale,
+            tke_clim=tke_clim,
+            show_scalar_bar=tke_show_scalar_bar,
+            tke_bar_cfg=tke_bar_cfg,
+            rotate=rotate_dynamic_video,
+            rotation_frames=dynamic_rotation_frames,
+            elevation_deg=dynamic_rotation_elevation_deg,
+            time_repeat=dynamic_time_repeat,
+            window_size=window_size,
+        ),
+        available=ws.derived.tke_array is not None or ws.derived.tke_volume is not None,
+    )
+    _run_video(
+        "pg",
+        video_flags["pg"],
+        lambda: render_pressure_gradient_video(
+            ws,
+            out_dir,
+            fps=fps,
+            smoothing_iteration=ws.derived_params.smoothing_iteration,
+            view=camera_view,
+            distance_scale=camera_distance_scale,
+            pressure_gradient_clim=pressure_gradient_clim,
+            show_scalar_bar=pressure_gradient_show_scalar_bar,
+            pressure_gradient_bar_cfg=pressure_gradient_bar_cfg,
+            rotate=rotate_dynamic_video,
+            rotation_frames=dynamic_rotation_frames,
+            elevation_deg=dynamic_rotation_elevation_deg,
+            time_repeat=dynamic_time_repeat,
+            window_size=window_size,
+        ),
+        available=ws.derived.pressure_gradient_magnitude is not None,
+    )
 
     table_rows, raw_metrics, qc_data = (None, None, None)
     if not skip_plane_metrics:
@@ -446,7 +608,11 @@ def process_single(
         "source_format": ws.input_state.source_format,
         "source_group": ws.input_state.source_group,
         "capabilities": ws.input_state.capabilities.to_dict(),
+        "requested_metrics": dict(metric_flags),
+        "requested_videos": dict(video_flags),
         "total_time_sec": float(total_time_sec),
+        "stage_times_sec": _timing_payload(stage_times),
+        "video_times_sec": _timing_payload(video_times),
         "n_planes": len(ws.planes),
         "n_skeleton_pts": len(ws.skeleton_points) if ws.skeleton_points is not None else 0,
         "n_graph_nodes": len(ws.graph.points),
@@ -515,12 +681,15 @@ def run_batch():
     skip_derived = globals().get("SKIP_DERIVED", False)
     use_multithread = globals().get("USE_MULTITHREAD", True)
     reuse_planes = globals().get("REUSE_PLANES", "")
+    requested_metrics = globals().get("WITH", globals().get("REQUESTED_METRICS", []))
+    requested_videos = globals().get("VIDEO", globals().get("REQUESTED_VIDEOS", []))
     fps = globals().get("FPS", 12)
     plane_rotation_frames = globals().get("PLANE_ROTATION_FRAMES", 180)
-    make_plane_video = globals().get("MAKE_PLANE_VIDEO", True)
-    make_wss_video = globals().get("MAKE_WSS_VIDEO", True)
-    make_streamlines_video = globals().get("MAKE_STREAMLINES_VIDEO", True)
-    make_tke_video = globals().get("MAKE_TKE_VIDEO", True)
+    make_plane_video = globals().get("MAKE_PLANE_VIDEO", False)
+    make_wss_video = globals().get("MAKE_WSS_VIDEO", False)
+    make_pressure_gradient_video = globals().get("MAKE_PRESSURE_GRADIENT_VIDEO", False)
+    make_streamlines_video = globals().get("MAKE_STREAMLINES_VIDEO", False)
+    make_tke_video = globals().get("MAKE_TKE_VIDEO", False)
     camera_view = globals().get("CAMERA_VIEW", "posterior")
     camera_distance_scale = globals().get("CAMERA_DISTANCE_SCALE", 1.5)
     skip_plane_metrics = globals().get("SKIP_PLANE_METRICS", False)
@@ -529,18 +698,29 @@ def run_batch():
     dynamic_rotation_elevation_deg = globals().get("DYNAMIC_ROTATION_ELEVATION_DEG", None)
     add_plane_idx = globals().get("ADD_PLANE_IDX", False)
     add_path_idx = globals().get("ADD_PATH_IDX", False)
+    plane_video_cfg = globals().get("PLANE_VIDEO_CFG", None)
+    window_size = globals().get("WINDOW_SIZE", None)
 
     wss_clim = globals().get("WSS_CLIM", (0, 5))
+    wss_show_scalar_bar = globals().get("WSS_SHOW_SCALAR_BAR", True)
     wss_bar_cfg = globals().get(
         "WSS_BAR_CFG",
         {"position_x": 0.75, "position_y": 0.2, "height": 0.22, "width": 0.05, "title_font_size": 40, "label_font_size": 32},
     )
     tke_clim = globals().get("TKE_CLIM", (0, 2))
+    tke_show_scalar_bar = globals().get("TKE_SHOW_SCALAR_BAR", True)
     tke_bar_cfg = globals().get(
         "TKE_BAR_CFG",
         {"position_x": 0.75, "position_y": 0.2, "height": 0.22, "width": 0.05, "title_font_size": 40, "label_font_size": 32},
     )
+    pressure_gradient_clim = globals().get("PRESSURE_GRADIENT_CLIM", None)
+    pressure_gradient_show_scalar_bar = globals().get("PRESSURE_GRADIENT_SHOW_SCALAR_BAR", True)
+    pressure_gradient_bar_cfg = globals().get(
+        "PRESSURE_GRADIENT_BAR_CFG",
+        {"position_x": 0.75, "position_y": 0.2, "height": 0.22, "width": 0.05, "title_font_size": 40, "label_font_size": 32},
+    )
     streamline_clim = globals().get("STREAMLINE_CLIM", (0, 0.6))
+    streamline_show_scalar_bar = globals().get("STREAMLINE_SHOW_SCALAR_BAR", True)
     streamline_bar_cfg = globals().get(
         "STREAMLINE_BAR_CFG",
         {"position_x": 0.75, "position_y": 0.2, "height": 0.22, "width": 0.05, "title_font_size": 40, "label_font_size": 32},
@@ -581,21 +761,32 @@ def run_batch():
                 skip_derived=skip_derived,
                 use_multithread=use_multithread,
                 reuse_planes_path=reuse_file,
+                requested_metrics=requested_metrics,
+                requested_videos=requested_videos,
                 fps=fps,
                 plane_rotation_frames=plane_rotation_frames,
                 make_plane_video=make_plane_video,
                 make_wss_video=make_wss_video,
+                make_pressure_gradient_video=make_pressure_gradient_video,
                 make_streamlines_video=make_streamlines_video,
                 make_tke_video=make_tke_video,
                 camera_view=camera_view,
                 camera_distance_scale=camera_distance_scale,
                 add_plane_idx=add_plane_idx,
                 add_path_idx=add_path_idx,
+                plane_video_cfg=plane_video_cfg,
+                window_size=window_size,
                 wss_clim=wss_clim,
+                wss_show_scalar_bar=wss_show_scalar_bar,
                 wss_bar_cfg=wss_bar_cfg,
                 tke_clim=tke_clim,
+                tke_show_scalar_bar=tke_show_scalar_bar,
                 tke_bar_cfg=tke_bar_cfg,
+                pressure_gradient_clim=pressure_gradient_clim,
+                pressure_gradient_show_scalar_bar=pressure_gradient_show_scalar_bar,
+                pressure_gradient_bar_cfg=pressure_gradient_bar_cfg,
                 streamline_clim=streamline_clim,
+                streamline_show_scalar_bar=streamline_show_scalar_bar,
                 streamline_bar_cfg=streamline_bar_cfg,
                 skip_plane_metrics=skip_plane_metrics,
                 rotate_dynamic_video=rotate_dynamic_video,

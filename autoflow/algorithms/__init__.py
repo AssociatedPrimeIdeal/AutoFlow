@@ -143,6 +143,8 @@ from .pwv import (
     detect_waveform_foot_time_ms,
     save_pwv_plot,
     save_pwv_results,
+    _plot_pwv_axes,
+    _plot_plane_flowrate_axes,
 )
 __all__ = [
     "LoadedCase",
@@ -220,4 +222,6 @@ __all__ = [
     "detect_waveform_foot_time_ms",
     "save_pwv_plot",
     "save_pwv_results",
+    "_plot_pwv_axes",
+    "_plot_plane_flowrate_axes",
 ]

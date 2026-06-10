@@ -1,3 +1,4 @@
+import copy
 from dataclasses import dataclass, field
 import json
 import os
@@ -8,6 +9,8 @@ import numpy as np
 
 from .case_types import InputCase
 from .config import (
+    DEFAULT_PRESSURE_GRADIENT_BAR_CFG,
+    DEFAULT_PLANE_VIDEO_CFG,
     DEFAULT_STREAMLINE_BAR_CFG,
     DEFAULT_TKE_BAR_CFG,
     DEFAULT_WSS_BAR_CFG,
@@ -64,6 +67,9 @@ class AutoFlowConfig:
     autoseg_device: str = "auto"
     autoseg_label_map: str = ""
 
+    requested_metrics: Sequence[str] = field(default_factory=list)
+    requested_videos: Sequence[str] = field(default_factory=list)
+
     fps: int = 12
     plane_rotation_frames: int = 180
     make_plane_video: bool = False
@@ -81,12 +87,20 @@ class AutoFlowConfig:
 
     add_plane_idx: bool = False
     add_path_idx: bool = False
+    plane_video_cfg: Dict[str, Any] = field(default_factory=lambda: copy.deepcopy(DEFAULT_PLANE_VIDEO_CFG))
+    window_size: Tuple[int, int] = (1600, 1200)
 
     wss_clim: Tuple[float, float] = (0.0, 10.0)
+    wss_show_scalar_bar: bool = True
     wss_bar_cfg: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_WSS_BAR_CFG))
     tke_clim: Tuple[float, float] = (0.0, 100.0)
+    tke_show_scalar_bar: bool = True
     tke_bar_cfg: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_TKE_BAR_CFG))
+    pressure_gradient_clim: Optional[Tuple[float, float]] = None
+    pressure_gradient_show_scalar_bar: bool = True
+    pressure_gradient_bar_cfg: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_PRESSURE_GRADIENT_BAR_CFG))
     streamline_clim: Tuple[float, float] = (0.0, 1.0)
+    streamline_show_scalar_bar: bool = True
     streamline_bar_cfg: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_STREAMLINE_BAR_CFG))
 
     @classmethod
@@ -100,6 +114,7 @@ class AutoFlowConfig:
 
 DEFAULT_WSS_BAR_CFG = DEFAULT_WSS_BAR_CFG
 DEFAULT_TKE_BAR_CFG = DEFAULT_TKE_BAR_CFG
+DEFAULT_PRESSURE_GRADIENT_BAR_CFG = DEFAULT_PRESSURE_GRADIENT_BAR_CFG
 DEFAULT_STREAMLINE_BAR_CFG = DEFAULT_STREAMLINE_BAR_CFG
 
 
@@ -165,6 +180,8 @@ def run_case(
         autoseg_checkpoint=cfg.autoseg_checkpoint,
         autoseg_device=cfg.autoseg_device,
         autoseg_label_map=cfg.autoseg_label_map,
+        requested_metrics=list(cfg.requested_metrics),
+        requested_videos=list(cfg.requested_videos),
         fps=cfg.fps,
         plane_rotation_frames=cfg.plane_rotation_frames,
         rotate_dynamic_video=cfg.rotate_dynamic_video,
@@ -179,11 +196,19 @@ def run_case(
         camera_distance_scale=cfg.camera_distance_scale,
         add_plane_idx=cfg.add_plane_idx,
         add_path_idx=cfg.add_path_idx,
+        plane_video_cfg=copy.deepcopy(cfg.plane_video_cfg),
+        window_size=cfg.window_size,
         wss_clim=cfg.wss_clim,
+        wss_show_scalar_bar=cfg.wss_show_scalar_bar,
         wss_bar_cfg=dict(cfg.wss_bar_cfg),
         tke_clim=cfg.tke_clim,
+        tke_show_scalar_bar=cfg.tke_show_scalar_bar,
         tke_bar_cfg=dict(cfg.tke_bar_cfg),
+        pressure_gradient_clim=cfg.pressure_gradient_clim,
+        pressure_gradient_show_scalar_bar=cfg.pressure_gradient_show_scalar_bar,
+        pressure_gradient_bar_cfg=dict(cfg.pressure_gradient_bar_cfg),
         streamline_clim=cfg.streamline_clim,
+        streamline_show_scalar_bar=cfg.streamline_show_scalar_bar,
         streamline_bar_cfg=dict(cfg.streamline_bar_cfg),
         dynamic_time_repeat=cfg.dynamic_time_repeat,
     )
@@ -252,6 +277,8 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 autoseg_checkpoint=config.autoseg_checkpoint,
                 autoseg_device=config.autoseg_device,
                 autoseg_label_map=config.autoseg_label_map,
+                requested_metrics=list(config.requested_metrics),
+                requested_videos=list(config.requested_videos),
                 fps=config.fps,
                 plane_rotation_frames=config.plane_rotation_frames,
                 make_plane_video=config.make_plane_video,
@@ -267,11 +294,19 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 dynamic_time_repeat=config.dynamic_time_repeat,
                 add_plane_idx=config.add_plane_idx,
                 add_path_idx=config.add_path_idx,
+                plane_video_cfg=copy.deepcopy(config.plane_video_cfg),
+                window_size=config.window_size,
                 wss_clim=config.wss_clim,
+                wss_show_scalar_bar=config.wss_show_scalar_bar,
                 wss_bar_cfg=dict(config.wss_bar_cfg),
                 tke_clim=config.tke_clim,
+                tke_show_scalar_bar=config.tke_show_scalar_bar,
                 tke_bar_cfg=dict(config.tke_bar_cfg),
+                pressure_gradient_clim=config.pressure_gradient_clim,
+                pressure_gradient_show_scalar_bar=config.pressure_gradient_show_scalar_bar,
+                pressure_gradient_bar_cfg=dict(config.pressure_gradient_bar_cfg),
                 streamline_clim=config.streamline_clim,
+                streamline_show_scalar_bar=config.streamline_show_scalar_bar,
                 streamline_bar_cfg=dict(config.streamline_bar_cfg),
             )
             summary = run_case(case, output_dir=case_out, config=case_cfg, workspace=base_ws)

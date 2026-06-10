@@ -35,9 +35,9 @@ The main window contains:
 - bottom selection panel
 - bottom log
 - right segmentation dock
-- right PWV dock
+- right analysis dock
 
-The left browser is group-aware. When the loaded segmentation produces multiple vessel groups, the browser shows one top-level section per group so you can toggle an entire group at once.
+The left browser is group-aware. When the loaded segmentation produces multiple vessel groups, the browser shows one top-level section per group, then type sections such as `Paths`, `Planes`, and `Pathlines`, so you can toggle a whole group or one object class at once.
 
 ## File Menu
 
@@ -47,6 +47,12 @@ The left browser is group-aware. When the loaded segmentation produces multiple 
 | `Import DICOM Directory` | scan a DICOM directory and choose a case | `autoflow/ui/app.py`, `autoflow/ui/dicom_confirm.py` |
 | `Clear Workspace` | clear loaded data and restore config defaults in the UI | `autoflow/ui/app.py` |
 | `Exit` | close the GUI | `autoflow/ui/app.py` |
+
+## Export Menu
+
+| Menu item | What it does | Main code |
+| --- | --- | --- |
+| `Export Videos...` | choose an output directory and export selected plane, WSS, TKE, pressure-gradient, or streamline videos | `autoflow/ui/app.py`, `autoflow/rendering/videos.py` |
 
 ## Standard Workflow
 
@@ -59,7 +65,8 @@ The left browser is group-aware. When the loaded segmentation produces multiple 
 7. run steps individually or click `Run All`
 8. inspect group sections in the browser, 3D view, ortho viewer, and selection panel
 9. right-click an individual pathline if you want to change only that pathline color
-10. save the active segmentation if you want to reuse it later
+10. use `Export > Export Videos...` when you want selected offline MP4 exports
+11. save the active segmentation if you want to reuse it later
 
 ## Step Buttons
 
@@ -82,7 +89,8 @@ Current `Run All` order:
 2. `Generate Graph`
 3. `Generate Planes`
 4. `Calculate && Save Metrics`
-5. `WSS / TKE / Pressure Gradient`
+5. `Compute PWV`
+6. `WSS / TKE / Pressure Gradient`
 
 ## Parameter Panels
 
@@ -91,6 +99,7 @@ Current `Run All` order:
 | `Input / Background Correction` | loader and DICOM settings | `autoflow/ui/app.py`, `autoflow/config.py` |
 | `Generate Skeleton Parameters` | cleanup and morphology controls; grouped label maps and group colors are loaded from `configs/labels.json` | `autoflow/ui/app.py`, `autoflow/config.py` |
 | `Generate Planes Parameters` | center-plane or distance-plane generation | `autoflow/ui/app.py` |
+| `PWV Parameters` | enable PWV, edit groups, waveform selection, spacing, and plot styling | `autoflow/ui/app.py` |
 | `Streamline Parameters` | seed density, steps, terminal speed, colors | `autoflow/ui/app.py` |
 | `WSS Parameters` | WSS-specific controls | `autoflow/ui/app.py` |
 | `Flow / TKE / Pressure Gradient Parameters` | derived metrics controls | `autoflow/ui/app.py` |
@@ -124,20 +133,39 @@ Grouped label-mask behavior:
 
 PWV behavior:
 
-- if `configs/pwv.json -> enabled` is true, the plane-metrics step also computes PWV groups and writes PWV outputs
-- the GUI shows one `PWV` dock with a group selector and a time-to-foot versus slice-position plot
+- the `PWV Parameters` panel exposes the same core settings as `configs/pwv.json`, including `enabled`, groups, waveform key, spacing, transit-time method, foot definition, cross-correlation window, cross-correlation interpolation factor, cycle-wrap correction, smoothing, minimum valid planes, and plot colors. The default foot-to-foot waveform is `flowrate_mL_s`
+- when `Allow Cycle Wrap` is enabled, foot detection can follow an upstroke that starts at the end of the cardiac cycle and peaks in the first frames instead of pinning those planes to `0 ms`
+- group labels can be entered as symbolic names from `configs/labels.json` such as `AAO, ARCH, DAO` or as integer ids
+- step buttons use the current GUI PWV values immediately after `Load`, `Clear Workspace`, or manual edits; the values do not write back to `configs/pwv.json` automatically
+- the GUI shows one `Analysis` dock with a `Display` selector. `PWV` keeps the group selector and two-panel PWV plot. `Plane Curve` shows the selected plane's chosen metric across cardiac phase. `Internal Consistency` shows the selected path or plane's path-level and branch-level internal consistency
 - PWV planes appear in the browser as one grouped item named `PWV planes`; the GUI does not list every PWV plane separately
+
+
+## Video Export
+
+Use `Export > Export Videos...` for interactive offline export.
+
+- choose an output directory
+- select any combination of `plane`, `wss`, `tke`, `pg`, and `streamlines`
+- `plane` is checked by default
+- WSS, TKE, and pressure-gradient exports compute missing derived data before rendering
+- GUI video export reads shared camera and sizing defaults from `configs/rendering.json`
+- GUI live planes read `configs/planes.json -> render`
+- GUI live WSS, TKE, pressure-gradient, and streamline objects read the corresponding `*.json -> render` block, including optional colorbar visibility
+- if `summary.json` already exists in the output directory, the GUI updates `videos`, `video_times_sec`, and adds `gui_video_export`
+
+`Run All` does not export videos automatically. Video export is a separate top-level menu action.
 
 ## Selection, Browser, And Timeline
 
 - the browser creates one top-level row per segmentation group and one `Global` row for non-grouped scene objects
-- checking or unchecking a group row shows or hides every object in that group
+- checking or unchecking a group row shows or hides every object in that group, and checking or unchecking a type row such as `Planes` or `Pathlines` controls that whole class inside the group
 - group title colors use `label_groups.<group>.browser_color` from `configs/labels.json`, with fallback colors for unmatched or single-label cases
 - grouped objects keep stable internal data keys such as `smooth_path_aorta_systemic_branches_3`, `plane_aorta_systemic_branches_5`, and `pathline_aorta_systemic_branches_5`
 - browser-visible names are intentionally shorter, for example `path 3`, `plane 5`, and `pathline 5`
 - right-clicking an individual grouped pathline in the browser opens `Set Pathline Color`, which changes only that pathline
-- selecting a plane updates selection info and the ortho viewer
-- selecting a path shows path-level information
+- selecting a plane updates selection info, the ortho viewer, and the `Analysis` plane/path views
+- selecting a path shows path-level information and updates `Analysis -> Internal Consistency`
 - the timeline controls time-resolved scene objects and ortho slices
 
 ## Ortho Viewer
@@ -163,9 +191,10 @@ Use the GUI when you need:
 - skeleton or graph editing in single-group cases
 - plane dragging and immediate metric recomputation
 - time navigation through 3D and ortho views
+- interactive selection of which offline videos to export
 
 Use the CLI when you need:
 
 - unattended batch processing
 - repeated runs over many cases
-- offline video export pipelines
+- unattended or repeated offline video export pipelines

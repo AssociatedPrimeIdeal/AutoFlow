@@ -25,6 +25,7 @@ class StepId(Enum):
     EDIT_GRAPH = "step_edit_graph"
     GENERATE_PLANES = "step_planes"
     EDIT_PLANES = "step_edit_planes"
+    COMPUTE_PWV = "step_pwv"
     GENERATE_STREAMLINES = "step_streamlines"
     PLANE_STREAMLINES = "step_plane_streamlines"
     COMPUTE_PLANE_METRICS = "step_plane_metrics"
@@ -39,6 +40,7 @@ class StepId(Enum):
             StepId.EDIT_GRAPH: "Edit Graph",
             StepId.GENERATE_PLANES: "Generate Planes",
             StepId.EDIT_PLANES: "Edit Planes",
+            StepId.COMPUTE_PWV: "Compute PWV",
             StepId.GENERATE_STREAMLINES: "Generate Streamlines",
             StepId.PLANE_STREAMLINES: "Pathlines",
             StepId.COMPUTE_PLANE_METRICS: "Calculate && Save Metrics",
@@ -52,6 +54,7 @@ class StepId(Enum):
             StepId.GENERATE_GRAPH,
             StepId.GENERATE_PLANES,
             StepId.COMPUTE_PLANE_METRICS,
+            StepId.COMPUTE_PWV,
         ]
 
     @staticmethod
@@ -295,54 +298,115 @@ class StreamlineParams:
 
 @dataclass
 class DerivedMetricsParams:
-    smoothing_iteration: int = 200
-    viscosity: float = 4.0
-    inward_distance: Optional[float] = None
-    parabolic_fitting: bool = True
-    no_slip_condition: bool = False
-    step_size: int = 5
-    tube_radius: float = 0.1
-    rho: float = 1060.0
+    wss_smoothing_iteration: int = 200
+    wss_viscosity: float = 4.0
+    wss_inward_distance: Optional[float] = None
+    wss_parabolic_fitting: bool = True
+    wss_no_slip_condition: bool = False
+    tke_rho: float = 1060.0
+    pressure_gradient_rho: float = 1060.0
+    pressure_gradient_viscosity: float = 4.0
     pressure_gradient_smoothing_sigma: float = 0.0
     pressure_gradient_use_convective_acceleration: bool = True
+    step_size: int = 5
+    tube_radius: float = 0.1
     use_multithread: bool = False
 
     def to_dict(self):
         return {
-            "smoothing_iteration": self.smoothing_iteration,
-            "viscosity": self.viscosity,
-            "inward_distance": self.inward_distance,
-            "parabolic_fitting": self.parabolic_fitting,
-            "no_slip_condition": self.no_slip_condition,
-            "step_size": self.step_size,
-            "tube_radius": self.tube_radius,
-            "rho": self.rho,
+            "wss_smoothing_iteration": self.wss_smoothing_iteration,
+            "wss_viscosity": self.wss_viscosity,
+            "wss_inward_distance": self.wss_inward_distance,
+            "wss_parabolic_fitting": self.wss_parabolic_fitting,
+            "wss_no_slip_condition": self.wss_no_slip_condition,
+            "tke_rho": self.tke_rho,
+            "pressure_gradient_rho": self.pressure_gradient_rho,
+            "pressure_gradient_viscosity": self.pressure_gradient_viscosity,
             "pressure_gradient_smoothing_sigma": self.pressure_gradient_smoothing_sigma,
             "pressure_gradient_use_convective_acceleration": self.pressure_gradient_use_convective_acceleration,
+            "step_size": self.step_size,
+            "tube_radius": self.tube_radius,
             "use_multithread": self.use_multithread,
         }
 
     @staticmethod
     def from_dict(d):
-        inward_distance = d.get("inward_distance", None)
+        payload = dict(d or {})
+        inward_distance = payload.get("wss_inward_distance", payload.get("inward_distance", None))
         if isinstance(inward_distance, str):
             token = inward_distance.strip().lower()
             inward_distance = None if token in {"", "auto", "none"} else float(inward_distance)
         elif inward_distance is not None:
             inward_distance = float(inward_distance)
+        legacy_viscosity = float(payload.get("viscosity", 4.0))
+        legacy_rho = float(payload.get("rho", 1060.0))
         return DerivedMetricsParams(
-            smoothing_iteration=int(d.get("smoothing_iteration", 200)),
-            viscosity=float(d.get("viscosity", 4.0)),
-            inward_distance=inward_distance,
-            parabolic_fitting=bool(d.get("parabolic_fitting", True)),
-            no_slip_condition=bool(d.get("no_slip_condition", False)),
-            step_size=int(d.get("step_size", 5)),
-            tube_radius=float(d.get("tube_radius", 0.1)),
-            rho=float(d.get("rho", 1060.0)),
-            pressure_gradient_smoothing_sigma=float(d.get("pressure_gradient_smoothing_sigma", 0.0)),
-            pressure_gradient_use_convective_acceleration=bool(d.get("pressure_gradient_use_convective_acceleration", True)),
-            use_multithread=bool(d.get("use_multithread", False)),
+            wss_smoothing_iteration=int(payload.get("wss_smoothing_iteration", payload.get("smoothing_iteration", 200))),
+            wss_viscosity=float(payload.get("wss_viscosity", legacy_viscosity)),
+            wss_inward_distance=inward_distance,
+            wss_parabolic_fitting=bool(payload.get("wss_parabolic_fitting", payload.get("parabolic_fitting", True))),
+            wss_no_slip_condition=bool(payload.get("wss_no_slip_condition", payload.get("no_slip_condition", False))),
+            tke_rho=float(payload.get("tke_rho", legacy_rho)),
+            pressure_gradient_rho=float(payload.get("pressure_gradient_rho", legacy_rho)),
+            pressure_gradient_viscosity=float(payload.get("pressure_gradient_viscosity", legacy_viscosity)),
+            pressure_gradient_smoothing_sigma=float(payload.get("pressure_gradient_smoothing_sigma", 0.0)),
+            pressure_gradient_use_convective_acceleration=bool(payload.get("pressure_gradient_use_convective_acceleration", True)),
+            step_size=int(payload.get("step_size", 5)),
+            tube_radius=float(payload.get("tube_radius", 0.1)),
+            use_multithread=bool(payload.get("use_multithread", False)),
         )
+
+    @property
+    def smoothing_iteration(self):
+        return self.wss_smoothing_iteration
+
+    @smoothing_iteration.setter
+    def smoothing_iteration(self, value):
+        self.wss_smoothing_iteration = int(value)
+
+    @property
+    def viscosity(self):
+        return self.wss_viscosity
+
+    @viscosity.setter
+    def viscosity(self, value):
+        val = float(value)
+        self.wss_viscosity = val
+        self.pressure_gradient_viscosity = val
+
+    @property
+    def inward_distance(self):
+        return self.wss_inward_distance
+
+    @inward_distance.setter
+    def inward_distance(self, value):
+        self.wss_inward_distance = value
+
+    @property
+    def parabolic_fitting(self):
+        return self.wss_parabolic_fitting
+
+    @parabolic_fitting.setter
+    def parabolic_fitting(self, value):
+        self.wss_parabolic_fitting = bool(value)
+
+    @property
+    def no_slip_condition(self):
+        return self.wss_no_slip_condition
+
+    @no_slip_condition.setter
+    def no_slip_condition(self, value):
+        self.wss_no_slip_condition = bool(value)
+
+    @property
+    def rho(self):
+        return self.pressure_gradient_rho
+
+    @rho.setter
+    def rho(self, value):
+        val = float(value)
+        self.tke_rho = val
+        self.pressure_gradient_rho = val
 
 
 @dataclass
@@ -451,9 +515,15 @@ class PwvParams:
     smoothing_window: int = 15
     smoothing_polyorder: int = 2
     inter_time: int = 10
-    waveform_key: str = "flowrate_signed_mL_s"
+    waveform_key: str = "flowrate_mL_s"
+    transit_time_method: str = "foot_to_foot"
+    foot_method: str = "tangent"
     foot_savgol_window: int = 5
     foot_savgol_polyorder: int = 2
+    foot_threshold_percent: float = 10.0
+    xcorr_window: str = "full"
+    xcorr_interp_factor: int = 10
+    allow_cycle_wrap: bool = True
     minimum_valid_planes: int = 2
     scene_visible: bool = True
     scene_color: str = "#ffd43b"
@@ -472,8 +542,14 @@ class PwvParams:
             "smoothing_polyorder": int(self.smoothing_polyorder),
             "inter_time": int(self.inter_time),
             "waveform_key": str(self.waveform_key),
+            "transit_time_method": str(self.transit_time_method),
+            "foot_method": str(self.foot_method),
             "foot_savgol_window": int(self.foot_savgol_window),
             "foot_savgol_polyorder": int(self.foot_savgol_polyorder),
+            "foot_threshold_percent": float(self.foot_threshold_percent),
+            "xcorr_window": str(self.xcorr_window),
+            "xcorr_interp_factor": int(self.xcorr_interp_factor),
+            "allow_cycle_wrap": bool(self.allow_cycle_wrap),
             "minimum_valid_planes": int(self.minimum_valid_planes),
             "scene_visible": bool(self.scene_visible),
             "scene_color": str(self.scene_color),
@@ -523,9 +599,15 @@ class PwvParams:
             smoothing_window=int(payload.get("smoothing_window", 15)),
             smoothing_polyorder=int(payload.get("smoothing_polyorder", 2)),
             inter_time=int(payload.get("inter_time", 10)),
-            waveform_key=str(payload.get("waveform_key", "flowrate_signed_mL_s") or "flowrate_signed_mL_s"),
+            waveform_key=str(payload.get("waveform_key", "flowrate_mL_s") or "flowrate_mL_s"),
+            transit_time_method=str(payload.get("transit_time_method", "foot_to_foot") or "foot_to_foot"),
+            foot_method=str(payload.get("foot_method", "tangent") or "tangent"),
             foot_savgol_window=int(payload.get("foot_savgol_window", 5)),
             foot_savgol_polyorder=int(payload.get("foot_savgol_polyorder", 2)),
+            foot_threshold_percent=float(payload.get("foot_threshold_percent", 10.0) or 10.0),
+            xcorr_window=str(payload.get("xcorr_window", "full") or "full"),
+            xcorr_interp_factor=max(1, int(payload.get("xcorr_interp_factor", 10) or 10)),
+            allow_cycle_wrap=bool(payload.get("allow_cycle_wrap", True)),
             minimum_valid_planes=max(2, int(payload.get("minimum_valid_planes", 2) or 2)),
             scene_visible=bool(payload.get("scene_visible", True)),
             scene_color=str(payload.get("scene_color", "#ffd43b") or "#ffd43b"),
@@ -677,6 +759,7 @@ class SceneObject:
     tube_radius: float = 0.0
     show_scalar_bar: bool = False
     scalar_bar_title: Optional[str] = None
+    scalar_bar_cfg: Dict[str, Any] = field(default_factory=dict)
     dynamic: bool = False
     actor: Any = None
     label_actor: Any = None
@@ -927,6 +1010,7 @@ class Workspace:
     active_pathline_plane_indices: List[int] = field(default_factory=list)
     pathline_colors: Dict[int, str] = field(default_factory=dict)
     derived: DerivedResults = field(default_factory=DerivedResults)
+    render_settings: Dict[str, Any] = field(default_factory=dict)
 
     scene_objects: Dict[str, SceneObject] = field(default_factory=dict)
     current_t: int = 0
@@ -1260,6 +1344,7 @@ class Workspace:
                 "pwv_planes": copy.deepcopy(self.derived.pwv_planes),
                 "pwv_file": str(self.derived.pwv_file or ""),
             },
+            "render_settings": copy.deepcopy(self.render_settings),
             "scene_objects": [
                 {"uid": o.uid, "name": o.name, "kind": o.kind.value, "data_key": o.data_key,
                  "group_name": o.group_name, "browser_color": o.browser_color,
@@ -1268,7 +1353,7 @@ class Workspace:
                  "clim": list(o.clim) if o.clim else None,
                  "point_size": o.point_size, "line_width": o.line_width,
                  "tube_radius": o.tube_radius, "show_scalar_bar": o.show_scalar_bar,
-                 "scalar_bar_title": o.scalar_bar_title, "dynamic": o.dynamic}
+                 "scalar_bar_title": o.scalar_bar_title, "scalar_bar_cfg": copy.deepcopy(o.scalar_bar_cfg), "dynamic": o.dynamic}
                 for o in self.scene_objects.values()],
             "current_t": self.current_t, "data_loaded": self.data_loaded,
             "selected_path_index": int(self.selected_path_index),
@@ -1382,6 +1467,7 @@ class Workspace:
             pwv_planes=copy.deepcopy(derived_state.get("pwv_planes", [])),
             pwv_file=str(derived_state.get("pwv_file", "") or ""),
         )
+        self.render_settings = copy.deepcopy(d.get("render_settings", {}))
         self.scene_objects = {}
         for it in d.get("scene_objects", []):
             uid = it["uid"]
@@ -1395,7 +1481,9 @@ class Workspace:
                 point_size=int(it.get("point_size", 8)), line_width=int(it.get("line_width", 2)),
                 tube_radius=float(it.get("tube_radius", 0.0)),
                 show_scalar_bar=bool(it.get("show_scalar_bar", False)),
-                scalar_bar_title=it.get("scalar_bar_title"), dynamic=bool(it.get("dynamic", False)))
+                scalar_bar_title=it.get("scalar_bar_title"),
+                scalar_bar_cfg=copy.deepcopy(it.get("scalar_bar_cfg", {})),
+                dynamic=bool(it.get("dynamic", False)))
         self.current_t = int(d.get("current_t", 0))
         self.data_loaded = bool(d.get("data_loaded", False))
         self.selected_path_index = int(d.get("selected_path_index", -1))

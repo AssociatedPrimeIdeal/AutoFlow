@@ -55,6 +55,15 @@ CLI:
 autoflow-run ./data/demo_data.h5 --output-dir ./results/demo
 ```
 
+Optional metrics and videos are opt-in:
+
+```bash
+autoflow-run ./data/demo_data.h5 \
+  --output-dir ./results/demo \
+  --with pwv,wss,pg \
+  --video plane,wss,pg
+```
+
 This runs the standard batch order:
 
 1. load data
@@ -62,8 +71,8 @@ This runs the standard batch order:
 3. generate graph
 4. generate planes
 5. calculate plane metrics
-6. calculate derived metrics
-7. export enabled videos
+6. optionally calculate PWV, WSS, TKE, or pressure gradient when requested
+7. optionally export requested videos
 
 Typical outputs under `./results/demo/<case_name>/`:
 
@@ -73,13 +82,15 @@ Typical outputs under `./results/demo/<case_name>/`:
 - `plane_qc.json`
 - `pwv.json` when PWV is enabled
 - `pwv_<group>.png` when PWV plotting succeeds
-- `summary.json`
+- `summary.json` with `stage_times_sec`, `video_times_sec`, and request flags
 
 GUI:
 
 ```bash
 autoflow-gui
 ```
+
+Use `Export > Export Videos...` for interactive selective export of `plane`, `wss`, `tke`, `pg`, and `streamlines` videos.
 
 Python API:
 
@@ -105,9 +116,28 @@ AutoFlow keeps default hyperparameters in per-module JSON files under `configs/`
 - `planes.json`
 - `streamlines.json`
 - `derived.json`
+- `fluid.json`
+- `wss.json`
+- `tke.json`
+- `pressure_gradient.json`
 - `pwv.json`
 - `segmentation.json`
 - `rendering.json`
+  includes only shared video and camera defaults such as `window_size`, `rotate_dynamic_video`, `dynamic_rotation_frames`, `camera_view`, and `make_*_video`
+
+Metric config split:
+
+- `fluid.json` owns shared fluid properties such as `rho` and `viscosity`.
+- `wss.json` owns WSS compute parameters.
+- `wss.json -> render` owns WSS display range and optional colorbar settings for GUI and offline videos.
+- `tke.json` only needs metric-specific overrides when you want to override the shared fluid density.
+- `tke.json -> render` owns TKE display range and optional colorbar settings for GUI and offline videos.
+- `pressure_gradient.json` owns pressure-gradient compute parameters.
+- `pressure_gradient.json -> render` owns pressure-gradient display range and optional colorbar settings for GUI and offline videos.
+- `planes.json -> render` owns plane skeleton and plane styling for GUI display and plane videos.
+- `streamlines.json -> render` owns streamline display range and optional colorbar settings for GUI and offline videos.
+- `derived.json` is now just a legacy compatibility placeholder.
+- `rendering.json` stays the central place for shared video sizing, rotation, camera, and output toggles.
 
 Important grouped-mask note:
 
@@ -141,7 +171,7 @@ Override rules:
 
 ## Documentation
 
-Detailed documentation now lives under `docs/` in English and Chinese.
+Detailed documentation now lives under `docs/en/`.
 
 ### English
 
@@ -175,38 +205,6 @@ Detailed documentation now lives under `docs/` in English and Chinese.
 - [Config System](docs/en/developer/config-system.md)
 - [Testing](docs/en/developer/testing.md)
 
-### 中文
-
-**用户文档**
-
-- [快速开始](docs/zh/user/quickstart.md)
-- [CLI 指南](docs/zh/user/cli.md)
-- [GUI 指南](docs/zh/user/gui.md)
-- [Python API](docs/zh/user/python-api.md)
-- [输入](docs/zh/user/inputs.md)
-- [输出](docs/zh/user/outputs.md)
-- [故障排查](docs/zh/user/troubleshooting.md)
-
-**功能文档**
-
-- [分割](docs/zh/features/segmentation.md)
-- [骨架](docs/zh/features/skeleton.md)
-- [图与路径](docs/zh/features/graph-paths.md)
-- [平面](docs/zh/features/planes.md)
-- [平面指标](docs/zh/features/metrics.md)
-- [PWV](docs/zh/features/pwv.md)
-- [WSS / TKE / 压力梯度](docs/zh/features/wss-tke-pressure.md)
-- [流线与路径线](docs/zh/features/streamlines.md)
-- [视频](docs/zh/features/videos.md)
-
-**开发者文档**
-
-- [架构](docs/zh/developer/architecture.md)
-- [功能到代码映射](docs/zh/developer/feature-to-code-map.md)
-- [变更配方](docs/zh/developer/change-recipes.md)
-- [配置系统](docs/zh/developer/config-system.md)
-- [测试](docs/zh/developer/testing.md)
-
 ## Current Status Highlights
 
 - input loading supports legacy complex H5, normalized H5, and direct DICOM directories
@@ -215,9 +213,9 @@ Detailed documentation now lives under `docs/` in English and Chinese.
 - TKE is optional; mag/flow-only inputs must not synthesize fake TKE
 - auto segmentation is currently executable in both CLI and GUI when the nnUNet backend and model folder are available
 - the GUI Browser can show and hide a whole segmentation group at once, and group title colors come from `configs/labels.json`
-- when PWV is enabled, the GUI adds a `PWV` dock and exposes PWV planes as one `PWV planes` browser item instead of one item per PWV plane
-- `Run All` in the GUI runs `Generate Skeleton -> Generate Graph -> Generate Planes -> Calculate && Save Metrics -> WSS / TKE / Pressure Gradient`
-- offline videos are driven mainly by CLI and Python batch workflows
+- when PWV is enabled, the GUI uses one `Analysis` dock for PWV, plane cardiac-phase curves, and path/branch internal consistency, and still exposes PWV planes as one `PWV planes` browser item
+- `Run All` in the GUI runs `Generate Skeleton -> Generate Graph -> Generate Planes -> Calculate && Save Metrics -> Compute PWV -> WSS / TKE / Pressure Gradient`
+- offline videos can be exported from CLI, Python batch, or GUI `Export > Export Videos...`; CLI and Python remain the repeatable batch path
 
 ## Documentation Checklist For PRs
 

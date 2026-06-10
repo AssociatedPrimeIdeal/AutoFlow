@@ -72,20 +72,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--autoseg-device", default=None, help="Auto segmentation device: auto, cpu, or cuda.")
     parser.add_argument("--autoseg-label-map", default=None, help="Optional JSON label remap passed to auto segmentation.")
 
+    parser.add_argument(
+        "--with",
+        dest="requested_metrics",
+        default=None,
+        help="Comma-separated optional computations to enable. Supported: pwv,wss,tke,pg. Default computes only plane metrics.",
+    )
+    parser.add_argument(
+        "--video",
+        dest="requested_videos",
+        default=None,
+        help="Comma-separated videos to export. Supported: plane,wss,tke,pg,streamlines.",
+    )
     parser.add_argument("--fps", type=int, default=None, help="Output video FPS.")
     parser.add_argument("--plane-rotation-frames", type=int, default=None, help="Frame count for plane rotation video.")
-    parser.add_argument("--plane-video", dest="make_plane_video", action="store_true", help="Generate plane rotation video.")
-    parser.add_argument("--wss-video", dest="make_wss_video", action="store_true", help="Generate WSS video.")
-    parser.add_argument("--pressure-gradient-video", dest="make_pressure_gradient_video", action="store_true", help="Generate pressure-gradient magnitude video.")
-    parser.add_argument("--streamlines-video", dest="make_streamlines_video", action="store_true", help="Generate streamline video.")
-    parser.add_argument("--tke-video", dest="make_tke_video", action="store_true", help="Generate TKE video.")
-    parser.set_defaults(
-        make_plane_video=None,
-        make_wss_video=None,
-        make_pressure_gradient_video=None,
-        make_streamlines_video=None,
-        make_tke_video=None,
-    )
 
     parser.add_argument("--camera-view", default=None, help="Camera preset used for rendered videos.")
     parser.add_argument("--camera-distance-scale", type=float, default=None, help="Camera distance scale for rendered videos.")
@@ -128,13 +128,10 @@ def main() -> None:
         "autoseg_checkpoint": args.autoseg_checkpoint,
         "autoseg_device": args.autoseg_device,
         "autoseg_label_map": args.autoseg_label_map,
+        "requested_metrics": [] if args.requested_metrics is None else [args.requested_metrics],
+        "requested_videos": [] if args.requested_videos is None else [args.requested_videos],
         "fps": args.fps,
         "plane_rotation_frames": args.plane_rotation_frames,
-        "make_plane_video": args.make_plane_video,
-        "make_wss_video": args.make_wss_video,
-        "make_pressure_gradient_video": args.make_pressure_gradient_video,
-        "make_streamlines_video": args.make_streamlines_video,
-        "make_tke_video": args.make_tke_video,
         "camera_view": args.camera_view,
         "camera_distance_scale": args.camera_distance_scale,
         "rotate_dynamic_video": args.rotate_dynamic_video,

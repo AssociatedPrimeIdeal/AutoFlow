@@ -526,7 +526,7 @@ class SceneController:
             if obj.clim:
                 kw["clim"] = obj.clim
             if obj.scalar_bar_title:
-                kw["scalar_bar_args"] = {
+                scalar_bar_args = {
                     "title": obj.scalar_bar_title,
                     "vertical": True,
                     "title_font_size": 14,
@@ -534,6 +534,9 @@ class SceneController:
                     "n_labels": 5,
                     "fmt": "%.3g",
                 }
+                if isinstance(obj.scalar_bar_cfg, dict):
+                    scalar_bar_args.update(obj.scalar_bar_cfg)
+                kw["scalar_bar_args"] = scalar_bar_args
         else:
             kw["color"] = obj.color
         if obj.data_key == "pwv_planes":
@@ -851,12 +854,14 @@ class SceneController:
         ws.streamline_cache.clear()
         ws.streamline_active = True
         p = ws.streamline_params
+        render_cfg = dict(getattr(ws, "render_settings", {}) or {})
         self.logger(f"Streamlines enabled: seed_ratio={p.seed_ratio} max_steps={p.max_steps} min_seeds={p.min_seeds} terminal_speed={p.terminal_speed} rng_seed={p.rng_seed}")
         ws.remove_object_by_data_key("streamlines_live")
         ws.add_object(name="streamlines", kind=ObjectKind.FLOW,
                       data_key="streamlines_live", visible=True, opacity=1.0,
-                      scalars="Velocity", cmap="turbo", dynamic=True,
-                      show_scalar_bar=True, scalar_bar_title="Velocity (m/s)",
+                      scalars="Velocity", cmap="turbo", clim=render_cfg.get("streamline_clim"), dynamic=True,
+                      show_scalar_bar=bool(render_cfg.get("streamline_show_scalar_bar", True)), scalar_bar_title="Velocity (m/s)",
+                      scalar_bar_cfg=dict(render_cfg.get("streamline_bar_cfg", {}) or {}),
                       tube_radius=ws.streamline_params.tube_radius)
         self.sync_from_workspace()
 

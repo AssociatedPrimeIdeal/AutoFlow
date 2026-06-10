@@ -7,7 +7,11 @@ import h5py
 import numpy as np
 
 from autoflow import AutoFlowConfig, run_batch
+from autoflow.algorithms.pwv import compute_cross_correlation_delay_ms, detect_waveform_foot_time_ms
 from autoflow.algorithms.segmentation import generate_nnunet_auto_segmentation
+from autoflow.config import bundle_to_autoflow_kwargs
+from autoflow.core.models import SkeletonParams
+from autoflow.rendering.videos import _path_color, _path_group_name
 
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
@@ -158,3 +162,186 @@ def test_nnunet_autoseg_progress_callback_reports_stage_updates(monkeypatch, tmp
     assert "autoseg_read_prediction" in stages
     assert stages[-1] == "autoseg_finalize"
     assert all("elapsed_sec" in event for event in events)
+
+def test_pwv_timing_methods_on_synthetic_waveforms():
+    rr_ms = 1000.0
+    x = np.linspace(0.0, 1.0, 20, endpoint=False)
+    proximal = np.exp(-0.5 * ((x - 0.25) / 0.08) ** 2)
+    distal = np.roll(proximal, 2)
+
+    foot_prox, meta_prox = detect_waveform_foot_time_ms(
+        proximal, rr_ms, method="tangent", allow_cycle_wrap=True
+    )
+    foot_dist, meta_dist = detect_waveform_foot_time_ms(
+        distal, rr_ms, method="threshold", threshold_percent=10.0, allow_cycle_wrap=True
+    )
+    assert foot_prox is not None
+    assert foot_dist is not None
+    assert meta_prox.get("method") == "tangent"
+    assert meta_dist.get("method") == "threshold"
+
+    delay_ms, cc_meta = compute_cross_correlation_delay_ms(
+        proximal, distal, rr_ms, window="full", allow_cycle_wrap=True
+    )
+    assert delay_ms is not None
+    assert abs(float(cc_meta.get("lag_samples")) - 2.0) < 0.15
+    assert abs(float(delay_ms) - 100.0) < 10.0
+    assert int(cc_meta.get("interp_factor")) == 10
+
+    delay_upstroke_ms, up_meta = compute_cross_correlation_delay_ms(
+        proximal, distal, rr_ms, window="upstroke", allow_cycle_wrap=True
+    )
+    assert delay_upstroke_ms is not None
+    assert abs(float(delay_upstroke_ms) - 100.0) < 10.0
+    assert abs(float(up_meta.get("offset_lag_samples")) - 2.0) < 0.15
+
+
+def test_pwv_wrapped_tangent_and_subframe_xcorr():
+    rr_ms = 1000.0
+    waveform = np.array([
+        -15.166193483117201,
+        418.84413044447297,
+        435.4283063098984,
+        354.5884270552724,
+        288.8676802814978,
+        137.02311573973498,
+        60.88961149981558,
+        16.682423130255852,
+        2.4873332685670873,
+        25.087174459539828,
+        24.03118575795991,
+        14.845060197501105,
+        24.57764249657329,
+        14.24500673573191,
+        2.2664627477484784,
+        -0.5951218100742958,
+        3.0340050909445813,
+        16.08187168750316,
+        8.482758977647443,
+        -8.544392118097038,
+    ], dtype=float)
+    foot_ms, foot_meta = detect_waveform_foot_time_ms(
+        waveform, rr_ms, method="tangent", allow_cycle_wrap=True
+    )
+    assert foot_ms is not None
+    assert foot_meta.get("cycle_wrapped") is True
+    assert int(foot_meta.get("slope_index_wrapped")) >= waveform.size
+    assert int(foot_meta.get("baseline_index")) == waveform.size - 1
+    assert 900.0 < float(foot_ms) < 1000.0
+
+    x = np.linspace(0.0, 1.0, 20, endpoint=False)
+    proximal = np.exp(-0.5 * ((x - 0.25) / 0.08) ** 2)
+    shifted = np.exp(-0.5 * ((((x - 0.25 - 0.075) + 0.5) % 1.0) - 0.5) ** 2 / (0.08 ** 2))
+    delay_ms, cc_meta = compute_cross_correlation_delay_ms(
+        proximal, shifted, rr_ms, window="full", allow_cycle_wrap=True, interp_factor=20
+    )
+    assert delay_ms is not None
+    assert abs(float(delay_ms) - 75.0) < 15.0
+    assert abs(float(cc_meta.get("lag_samples")) - 1.5) < 0.25
+    assert int(cc_meta.get("interp_factor")) == 20
+
+
+def test_plane_video_path_color_uses_group_scene_color():
+    skeleton_params = SkeletonParams(
+        label_groups={
+            "aorta": {"path_color": "#f76707"},
+            "pulmonary": {"path_color": "#4dabf7"},
+        }
+    )
+
+    class _Ws:
+        pass
+
+    ws = _Ws()
+    ws.skeleton_params = skeleton_params
+    ws.path_info = [
+        {"group_name": "aorta"},
+        {"group_name": "pulmonary"},
+        {},
+    ]
+    ws.group_order = ["aorta", "pulmonary"]
+    ws.multilabel_groups = {
+        "aorta": {"path_index_offset": 0, "centerline_paths_smooth": [np.zeros((2, 3))]},
+        "pulmonary": {"path_index_offset": 1, "centerline_paths_smooth": [np.zeros((2, 3))]},
+    }
+
+    assert _path_group_name(ws, 0) == "aorta"
+    assert _path_group_name(ws, 1) == "pulmonary"
+    assert _path_group_name(ws, 2) == ""
+    assert _path_color(ws, 0) == "#f76707"
+    assert _path_color(ws, 1) == "#4dabf7"
+    assert _path_color(ws, 2) == "deepskyblue"
+
+
+def test_config_dir_reads_feature_render_settings_from_metric_jsons(tmp_path):
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    rendering_payload = {
+        "window_size": [1111, 777],
+        "rotate_dynamic_video": False,
+    }
+    planes_payload = {
+        "render": {
+            "default": {
+                "plane_color": "#123456",
+                "plane_opacity": 0.25,
+            }
+        }
+    }
+    wss_payload = {
+        "render": {
+            "clim": [1.0, 9.0],
+            "show_scalar_bar": False,
+            "bar_cfg": {"width": 0.11},
+        }
+    }
+    tke_payload = {
+        "render": {
+            "clim": [2.0, 22.0],
+        }
+    }
+    pressure_gradient_payload = {
+        "render": {
+            "clim": [3.0, 33.0],
+            "show_scalar_bar": False,
+        }
+    }
+    streamlines_payload = {
+        "render": {
+            "clim": [4.0, 44.0],
+            "show_scalar_bar": False,
+            "bar_cfg": {"position_x": 0.66},
+        }
+    }
+    (config_dir / "rendering.json").write_text(json.dumps(rendering_payload), encoding="utf-8")
+    (config_dir / "planes.json").write_text(json.dumps(planes_payload), encoding="utf-8")
+    (config_dir / "wss.json").write_text(json.dumps(wss_payload), encoding="utf-8")
+    (config_dir / "tke.json").write_text(json.dumps(tke_payload), encoding="utf-8")
+    (config_dir / "pressure_gradient.json").write_text(json.dumps(pressure_gradient_payload), encoding="utf-8")
+    (config_dir / "streamlines.json").write_text(json.dumps(streamlines_payload), encoding="utf-8")
+
+    cfg = AutoFlowConfig.from_config_dir(str(config_dir))
+    resolved = bundle_to_autoflow_kwargs({
+        "rendering": rendering_payload,
+        "planes": planes_payload,
+        "wss": wss_payload,
+        "tke": tke_payload,
+        "pressure_gradient": pressure_gradient_payload,
+        "streamlines": streamlines_payload,
+    })
+
+    assert cfg.window_size == (1111, 777)
+    assert cfg.rotate_dynamic_video is False
+    assert cfg.plane_video_cfg["default"]["plane_color"] == "#123456"
+    assert cfg.plane_video_cfg["default"]["plane_opacity"] == 0.25
+    assert cfg.wss_clim == (1.0, 9.0)
+    assert cfg.wss_show_scalar_bar is False
+    assert cfg.wss_bar_cfg["width"] == 0.11
+    assert cfg.tke_clim == (2.0, 22.0)
+    assert cfg.pressure_gradient_clim == (3.0, 33.0)
+    assert cfg.pressure_gradient_show_scalar_bar is False
+    assert cfg.streamline_clim == (4.0, 44.0)
+    assert cfg.streamline_show_scalar_bar is False
+    assert cfg.streamline_bar_cfg["position_x"] == 0.66
+    assert resolved["wss_clim"] == (1.0, 9.0)
+    assert resolved["streamline_clim"] == (4.0, 44.0)

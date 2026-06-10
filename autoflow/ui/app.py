@@ -1,6 +1,7 @@
 import json
 from dataclasses import dataclass
 import os
+import re
 import sys
 import time
 import traceback
@@ -24,15 +25,24 @@ from ..algorithms import (
     generate_nnunet_auto_segmentation,
     save_segmentation_file,
     segmentation_timestamp,
+    _plot_plane_flowrate_axes,
+    _plot_pwv_axes,
 )
-from ..core.models import DicomParameterOverrides, ObjectKind, StepId, Workspace
+from ..core.models import DicomParameterOverrides, ObjectKind, PwvParams, StepId, Workspace
 from ..core.pipeline import PipelineEngine
-from ..config import apply_config_bundle_to_workspace, load_config_bundle
+from ..config import apply_config_bundle_to_workspace, bundle_to_autoflow_kwargs, load_config_bundle
 from ..algorithms import compute_plane_metrics, apply_internal_consistency_to_metrics, compute_plane_metrics_multithread, augment_plane_metrics_with_derived, save_plane_pixelwise_h5
 from .editors import PlaneEditor, SkeletonEditor
 from .dicom_confirm import DicomImportDialog
 from .ortho_viewer import OrthoViewer
 from .segmentation import SegmentationConfigDialog, SegmentationDock, SOURCE_LABELS
+from ..rendering import (
+    render_plane_rotation_video,
+    render_pressure_gradient_video,
+    render_streamlines_video,
+    render_tke_video,
+    render_wss_video,
+)
 from .viewer import SceneController
 
 
@@ -68,12 +78,54 @@ def _default_segmentation_color(label_id):
     return palette[idx]
 
 
+_ANALYSIS_MODE_ITEMS = [
+    ("PWV", "pwv"),
+    ("Plane Curve", "plane_curve"),
+    ("Internal Consistency", "internal_consistency"),
+]
+
+
+_PLANE_CURVE_SERIES_OPTIONS = [
+    ("flowrate_mL_s", "Flowrate (mL/s)"),
+    ("flowrate_forward_mL_s", "Forward Flowrate (mL/s)"),
+    ("flowrate_reverse_mL_s", "Reverse Flowrate (mL/s)"),
+    ("flowrate_signed_mL_s", "Signed Flowrate (mL/s)"),
+    ("area_mm2", "Area (mm^2)"),
+    ("meanv_cm_s_t", "Mean Velocity (cm/s)"),
+    ("meanv_forward_cm_s_t", "Forward Mean Velocity (cm/s)"),
+    ("meanv_reverse_cm_s_t", "Reverse Mean Velocity (cm/s)"),
+    ("meanv_signed_cm_s_t", "Signed Mean Velocity (cm/s)"),
+    ("tke_mean_J_m3_t", "TKE Mean (J/m^3)"),
+    ("tke_peak_J_m3_t", "TKE Peak (J/m^3)"),
+    ("tke_p95_J_m3_t", "TKE P95 (J/m^3)"),
+    ("pressure_gradient_mag_mean_Pa_m_t", "Pressure Gradient Mean (Pa/m)"),
+    ("pressure_gradient_mag_peak_Pa_m_t", "Pressure Gradient Peak (Pa/m)"),
+    ("pressure_gradient_mag_p95_Pa_m_t", "Pressure Gradient P95 (Pa/m)"),
+    ("pressure_gradient_normal_mean_Pa_m_t", "Normal Pressure Gradient Mean (Pa/m)"),
+    ("pressure_gradient_normal_peak_Pa_m_t", "Normal Pressure Gradient Peak (Pa/m)"),
+    ("pressure_gradient_normal_p95_Pa_m_t", "Normal Pressure Gradient P95 (Pa/m)"),
+    ("wss_wall_mean_Pa_t", "WSS Mean (Pa)"),
+    ("wss_wall_peak_Pa_t", "WSS Peak (Pa)"),
+    ("wss_wall_p95_Pa_t", "WSS P95 (Pa)"),
+]
+
+
 @dataclass
 class _AutoSegmentationResult:
     seg: np.ndarray
     provenance: dict
     sidecar: str
     elapsed_sec: float
+
+
+@dataclass
+class _VideoExportOptions:
+    out_dir: str
+    export_plane: bool
+    export_wss: bool
+    export_tke: bool
+    export_pg: bool
+    export_streamlines: bool
 
 
 class _AutoSegmentationWorker(QtCore.QObject):
@@ -231,6 +283,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_preprocess_params()
         self._build_skeleton_params()
         self._build_plane_params()
+        self._build_pwv_params()
         self._build_streamline_params()
         self._build_derived_params()
         self.params_layout.addStretch()
@@ -306,7 +359,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 b.clicked.connect(partial(self._run_single_step, s))
                 self.step_buttons[s] = b
                 gl.addWidget(b, row_idx, i)
-        btn_run_all = QtWidgets.QPushButton("▶▶ Run All (Generate → Metrics → WSS/TKE/PG)")
+        btn_run_all = QtWidgets.QPushButton("▶▶ Run All (Generate → Metrics → PWV → WSS/TKE/PG)")
         btn_run_all.setStyleSheet("QPushButton { background-color: #2a6; color: white; font-weight: bold; padding: 4px; }")
         btn_run_all.clicked.connect(self._run_all_pipeline)
         gl.addWidget(btn_run_all, 3, 0, 1, 4)
@@ -409,6 +462,99 @@ class MainWindow(QtWidgets.QMainWindow):
         fl.addRow("Pathline Color", self.edit_pathline_color)
         self.params_layout.addWidget(grp)
 
+    def _build_pwv_params(self):
+        grp = QtWidgets.QGroupBox("PWV Parameters")
+        layout = QtWidgets.QVBoxLayout(grp)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        form = QtWidgets.QFormLayout()
+        self.chk_pwv_enabled = QtWidgets.QCheckBox()
+        self.edit_pwv_interval = QtWidgets.QLineEdit("10.0")
+        self.edit_pwv_start = QtWidgets.QLineEdit("0.0")
+        self.edit_pwv_end = QtWidgets.QLineEdit("0.0")
+        self.edit_pwv_smooth_win = QtWidgets.QLineEdit("15")
+        self.edit_pwv_smooth_poly = QtWidgets.QLineEdit("2")
+        self.edit_pwv_inter_time = QtWidgets.QLineEdit("10")
+        self.edit_pwv_waveform = QtWidgets.QLineEdit("flowrate_mL_s")
+        self.combo_pwv_tt_method = QtWidgets.QComboBox()
+        self.combo_pwv_tt_method.addItems(["foot_to_foot", "cross_correlation"])
+        self.combo_pwv_foot_method = QtWidgets.QComboBox()
+        self.combo_pwv_foot_method.addItems(["tangent", "threshold"])
+        self.edit_pwv_foot_win = QtWidgets.QLineEdit("5")
+        self.edit_pwv_foot_poly = QtWidgets.QLineEdit("2")
+        self.edit_pwv_foot_threshold = QtWidgets.QLineEdit("10.0")
+        self.combo_pwv_xcorr_window = QtWidgets.QComboBox()
+        self.combo_pwv_xcorr_window.addItems(["full", "upstroke"])
+        self.edit_pwv_xcorr_interp = QtWidgets.QLineEdit("10")
+        self.chk_pwv_allow_wrap = QtWidgets.QCheckBox()
+        self.chk_pwv_allow_wrap.setChecked(True)
+        self.edit_pwv_min_planes = QtWidgets.QLineEdit("2")
+        self.chk_pwv_scene_visible = QtWidgets.QCheckBox()
+        self.chk_pwv_scene_visible.setChecked(True)
+        self.edit_pwv_scene_color = QtWidgets.QLineEdit("#ffd43b")
+        self.edit_pwv_plot_color = QtWidgets.QLineEdit("#2b8a3e")
+        self.edit_pwv_fit_color = QtWidgets.QLineEdit("#f08c00")
+        self.edit_pwv_plot_dpi = QtWidgets.QLineEdit("160")
+
+        form.addRow("Enable PWV", self.chk_pwv_enabled)
+        form.addRow("Plane Interval (mm)", self.edit_pwv_interval)
+        form.addRow("Start Distance (mm)", self.edit_pwv_start)
+        form.addRow("End Distance (mm)", self.edit_pwv_end)
+        form.addRow("Path SavGol Window", self.edit_pwv_smooth_win)
+        form.addRow("Path SavGol Polyorder", self.edit_pwv_smooth_poly)
+        form.addRow("Inter-time", self.edit_pwv_inter_time)
+        form.addRow("Waveform Key", self.edit_pwv_waveform)
+        form.addRow("Transit-Time Method", self.combo_pwv_tt_method)
+        form.addRow("Foot Method", self.combo_pwv_foot_method)
+        form.addRow("Foot SavGol Window", self.edit_pwv_foot_win)
+        form.addRow("Foot SavGol Polyorder", self.edit_pwv_foot_poly)
+        form.addRow("Foot Threshold (%)", self.edit_pwv_foot_threshold)
+        form.addRow("XCorr Window", self.combo_pwv_xcorr_window)
+        form.addRow("XCorr Interp", self.edit_pwv_xcorr_interp)
+        form.addRow("Allow Cycle Wrap", self.chk_pwv_allow_wrap)
+        form.addRow("Minimum Valid Planes", self.edit_pwv_min_planes)
+        form.addRow("Show PWV Planes", self.chk_pwv_scene_visible)
+        form.addRow("PWV Plane Color", self.edit_pwv_scene_color)
+        form.addRow("Plot Color", self.edit_pwv_plot_color)
+        form.addRow("Fit Color", self.edit_pwv_fit_color)
+        form.addRow("Plot DPI", self.edit_pwv_plot_dpi)
+        layout.addLayout(form)
+
+        group_box = QtWidgets.QGroupBox("PWV Groups")
+        group_layout = QtWidgets.QVBoxLayout(group_box)
+        group_layout.setContentsMargins(6, 6, 6, 6)
+        group_layout.setSpacing(6)
+        self.table_pwv_groups = QtWidgets.QTableWidget(0, 2)
+        self.table_pwv_groups.setHorizontalHeaderLabels(["Name", "Labels"])
+        self.table_pwv_groups.verticalHeader().setVisible(False)
+        self.table_pwv_groups.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table_pwv_groups.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.table_pwv_groups.setAlternatingRowColors(True)
+        self.table_pwv_groups.setMinimumHeight(130)
+        header = self.table_pwv_groups.horizontalHeader()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        group_layout.addWidget(self.table_pwv_groups)
+
+        group_buttons = QtWidgets.QHBoxLayout()
+        self.btn_pwv_group_add = QtWidgets.QPushButton("Add Group")
+        self.btn_pwv_group_remove = QtWidgets.QPushButton("Remove Selected")
+        self.btn_pwv_group_add.clicked.connect(self._add_pwv_group_row)
+        self.btn_pwv_group_remove.clicked.connect(self._remove_selected_pwv_group_rows)
+        group_buttons.addWidget(self.btn_pwv_group_add)
+        group_buttons.addWidget(self.btn_pwv_group_remove)
+        group_buttons.addStretch()
+        group_layout.addLayout(group_buttons)
+
+        hint = QtWidgets.QLabel(
+            "Labels accept ids or symbols from labels.json, separated by comma, semicolon, or +."
+        )
+        hint.setWordWrap(True)
+        group_layout.addWidget(hint)
+        layout.addWidget(group_box)
+        self.params_layout.addWidget(grp)
+
     def _build_derived_params(self):
         grp_wss = QtWidgets.QGroupBox("WSS Parameters")
         fl_wss = QtWidgets.QFormLayout(grp_wss)
@@ -430,16 +576,57 @@ class MainWindow(QtWidgets.QMainWindow):
         fl_tke = QtWidgets.QFormLayout(grp_tke)
         self.edit_dm_rho = QtWidgets.QLineEdit("1060.0")
         self.edit_dm_pg_smoothing_sigma = QtWidgets.QLineEdit("0.0")
-        self.edit_dm_stepsize = QtWidgets.QLineEdit("5")
-        self.edit_dm_tube = QtWidgets.QLineEdit("0.1")
         self.chk_dm_multithread = QtWidgets.QCheckBox()
         self.chk_dm_multithread.setChecked(False)
         fl_tke.addRow(u"Density \u03c1 (kg/m\u00b3)", self.edit_dm_rho)
         fl_tke.addRow("Pressure Gradient Gaussian Sigma (vox)", self.edit_dm_pg_smoothing_sigma)
-        fl_tke.addRow("Step Size", self.edit_dm_stepsize)
-        fl_tke.addRow("Tube Radius", self.edit_dm_tube)
         fl_tke.addRow("Multi-thread Metrics", self.chk_dm_multithread)
         self.params_layout.addWidget(grp_tke)
+
+    def _add_pwv_group_row(self, name="", labels=""):
+        row = self.table_pwv_groups.rowCount()
+        self.table_pwv_groups.insertRow(row)
+        self.table_pwv_groups.setItem(row, 0, QtWidgets.QTableWidgetItem(str(name or "")))
+        self.table_pwv_groups.setItem(row, 1, QtWidgets.QTableWidgetItem(str(labels or "")))
+        self.table_pwv_groups.setCurrentCell(row, 0)
+
+    def _remove_selected_pwv_group_rows(self):
+        rows = sorted({idx.row() for idx in self.table_pwv_groups.selectionModel().selectedRows()}, reverse=True)
+        if not rows and self.table_pwv_groups.rowCount() > 0:
+            rows = [self.table_pwv_groups.currentRow()]
+        for row in rows:
+            if row >= 0:
+                self.table_pwv_groups.removeRow(row)
+
+    def _split_pwv_group_labels_text(self, text):
+        tokens = re.split(r"[,;+\n\t]+", str(text or ""))
+        return [tok.strip() for tok in tokens if tok.strip()]
+
+    def _pwv_group_payload_from_ui(self):
+        groups = []
+        for row in range(self.table_pwv_groups.rowCount()):
+            name_item = self.table_pwv_groups.item(row, 0)
+            labels_item = self.table_pwv_groups.item(row, 1)
+            name = str(name_item.text()).strip() if name_item is not None else ""
+            labels_text = str(labels_item.text()).strip() if labels_item is not None else ""
+            groups.append({
+                "name": name,
+                "labels": self._split_pwv_group_labels_text(labels_text),
+            })
+        return groups
+
+    def _pwv_group_labels_for_ui(self, labels):
+        reverse_map = {}
+        for key, value in dict(self.workspace.label_params.label_map or {}).items():
+            reverse_map.setdefault(int(value), str(key))
+        display = []
+        for label_value in list(labels or []):
+            try:
+                label_id = int(label_value)
+            except Exception:
+                continue
+            display.append(reverse_map.get(label_id, str(label_id)))
+        return ", ".join(display)
 
     def _build_timeline(self, parent):
         grp = QtWidgets.QGroupBox("Timeline")
@@ -524,35 +711,84 @@ class MainWindow(QtWidgets.QMainWindow):
         self.segmentation_panel.btn_cancel.clicked.connect(self._cancel_segmentation_edits)
 
     def _build_pwv_dock(self):
-        self.pwv_dock = QtWidgets.QDockWidget("PWV", self)
+        self.pwv_dock = QtWidgets.QDockWidget("Analysis", self)
         self.pwv_dock.setObjectName("PWVDock")
         panel = QtWidgets.QWidget(self)
         layout = QtWidgets.QVBoxLayout(panel)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
-        header = QtWidgets.QHBoxLayout()
-        header.addWidget(QtWidgets.QLabel("Group"))
+        mode_row = QtWidgets.QHBoxLayout()
+        mode_row.addWidget(QtWidgets.QLabel("Display"))
+        self.combo_analysis_mode = QtWidgets.QComboBox()
+        for label, value in _ANALYSIS_MODE_ITEMS:
+            self.combo_analysis_mode.addItem(label, value)
+        self.combo_analysis_mode.currentIndexChanged.connect(self._on_analysis_mode_changed)
+        mode_row.addWidget(self.combo_analysis_mode, 1)
+        layout.addLayout(mode_row)
+
+        self.analysis_controls_stack = QtWidgets.QStackedWidget()
+
+        pwv_controls = QtWidgets.QWidget(self)
+        pwv_row = QtWidgets.QHBoxLayout(pwv_controls)
+        pwv_row.setContentsMargins(0, 0, 0, 0)
+        pwv_row.addWidget(QtWidgets.QLabel("PWV Group"))
         self.combo_pwv_group = QtWidgets.QComboBox()
         self.combo_pwv_group.currentIndexChanged.connect(self._on_pwv_group_changed)
-        header.addWidget(self.combo_pwv_group, 1)
-        layout.addLayout(header)
+        pwv_row.addWidget(self.combo_pwv_group, 1)
+        self.analysis_controls_stack.addWidget(pwv_controls)
 
-        self.label_pwv_status = QtWidgets.QLabel("No PWV results.")
+        curve_controls = QtWidgets.QWidget(self)
+        curve_row = QtWidgets.QHBoxLayout(curve_controls)
+        curve_row.setContentsMargins(0, 0, 0, 0)
+        curve_row.addWidget(QtWidgets.QLabel("Plane Metric"))
+        self.combo_plane_curve_metric = QtWidgets.QComboBox()
+        self.combo_plane_curve_metric.currentIndexChanged.connect(self._on_plane_curve_metric_changed)
+        curve_row.addWidget(self.combo_plane_curve_metric, 1)
+        self.analysis_controls_stack.addWidget(curve_controls)
+
+        ic_controls = QtWidgets.QWidget(self)
+        ic_row = QtWidgets.QHBoxLayout(ic_controls)
+        ic_row.setContentsMargins(0, 0, 0, 0)
+        self.label_ic_target = QtWidgets.QLabel("Target: none")
+        self.label_ic_target.setWordWrap(True)
+        ic_row.addWidget(self.label_ic_target, 1)
+        self.analysis_controls_stack.addWidget(ic_controls)
+
+        layout.addWidget(self.analysis_controls_stack)
+
+        self.label_pwv_status = QtWidgets.QLabel("No analysis available.")
         self.label_pwv_status.setWordWrap(True)
         layout.addWidget(self.label_pwv_status)
 
-        self.fig_pwv = Figure(figsize=(5.2, 3.6), dpi=90, facecolor="white")
+        self.fig_pwv = Figure(figsize=(5.6, 6.2), dpi=90, facecolor="white")
         self.canvas_pwv = FigureCanvas(self.fig_pwv)
-        self.ax_pwv = self.fig_pwv.add_subplot(111)
         layout.addWidget(self.canvas_pwv, 1)
 
         self.pwv_dock.setWidget(panel)
         self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self.pwv_dock)
         self.tabifyDockWidget(self.segmentation_dock, self.pwv_dock)
+        self._sync_analysis_controls()
+
+    def _analysis_mode(self):
+        value = self.combo_analysis_mode.currentData() if hasattr(self, "combo_analysis_mode") else "pwv"
+        return str(value or "pwv")
+
+    def _sync_analysis_controls(self):
+        if not hasattr(self, "analysis_controls_stack"):
+            return
+        index_map = {value: idx for idx, (_label, value) in enumerate(_ANALYSIS_MODE_ITEMS)}
+        self.analysis_controls_stack.setCurrentIndex(index_map.get(self._analysis_mode(), 0))
+
+    def _on_analysis_mode_changed(self, _index=None):
+        self._sync_analysis_controls()
+        self._refresh_analysis_panel()
 
     def _on_pwv_group_changed(self, _index=None):
-        self._plot_pwv_result(self._selected_pwv_result())
+        self._refresh_analysis_panel()
+
+    def _on_plane_curve_metric_changed(self, _index=None):
+        self._refresh_analysis_panel()
 
     def _selected_pwv_result(self):
         idx = self.combo_pwv_group.currentData()
@@ -567,53 +803,90 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         return results[idx]
 
-    def _clear_pwv_axes(self, message="No PWV results."):
-        self.ax_pwv.clear()
-        self.ax_pwv.set_title("PWV")
-        self.ax_pwv.set_xlabel("Slice Position (mm)")
-        self.ax_pwv.set_ylabel("Time-to-Foot (ms)")
-        self.ax_pwv.grid(True, alpha=0.25)
-        self.ax_pwv.text(0.5, 0.5, str(message), ha="center", va="center", transform=self.ax_pwv.transAxes)
+    def _selected_plane_metric(self):
+        plane_idx = int(getattr(self, "_selected_plane_index", -1))
+        if not (0 <= plane_idx < len(self.workspace.planes)):
+            return -1, None
+        plane = self.workspace.planes[plane_idx]
+        metric = getattr(plane, "metrics", {}) or {}
+        if not metric and plane_idx < len(self.workspace.derived.plane_metrics):
+            metric = self.workspace.derived.plane_metrics[plane_idx]
+        if not metric:
+            return plane_idx, None
+        return plane_idx, dict(metric)
+
+    def _selected_analysis_path_index(self):
+        path_idx = int(getattr(self.workspace, "selected_path_index", -1))
+        if 0 <= path_idx < len(self.workspace.path_info):
+            return path_idx
+        plane_idx, metric = self._selected_plane_metric()
+        if metric is None:
+            return -1
+        try:
+            path_idx = int(metric.get("path_index", getattr(self.workspace.planes[plane_idx], "path_index", -1)))
+        except Exception:
+            path_idx = -1
+        return path_idx if 0 <= path_idx < len(self.workspace.path_info) else -1
+
+    def _available_plane_curve_series(self, metric):
+        options = []
+        payload = dict(metric or {})
+        for key, label in _PLANE_CURVE_SERIES_OPTIONS:
+            values = payload.get(key)
+            if values is None:
+                continue
+            try:
+                arr = np.asarray(values, dtype=float).reshape(-1)
+            except Exception:
+                continue
+            if arr.size == 0:
+                continue
+            options.append((key, label))
+        return options
+
+    def _refresh_plane_curve_metric_options(self):
+        current_key = self.combo_plane_curve_metric.currentData() if hasattr(self, "combo_plane_curve_metric") else None
+        _plane_idx, metric = self._selected_plane_metric()
+        options = self._available_plane_curve_series(metric)
+        if not hasattr(self, "combo_plane_curve_metric"):
+            return options
+        self.combo_plane_curve_metric.blockSignals(True)
+        self.combo_plane_curve_metric.clear()
+        for key, label in options:
+            self.combo_plane_curve_metric.addItem(label, key)
+        self.combo_plane_curve_metric.setEnabled(bool(options))
+        if options:
+            target_idx = 0
+            for idx, (key, _label) in enumerate(options):
+                if key == current_key:
+                    target_idx = idx
+                    break
+            self.combo_plane_curve_metric.setCurrentIndex(target_idx)
+        self.combo_plane_curve_metric.blockSignals(False)
+        return options
+
+    def _clear_pwv_axes(self, message="No analysis available.", title="Analysis"):
+        self.fig_pwv.clear()
+        ax = self.fig_pwv.add_subplot(111)
+        ax.set_title(str(title))
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.text(0.5, 0.5, str(message), ha="center", va="center", transform=ax.transAxes)
         self.fig_pwv.tight_layout()
         self.canvas_pwv.draw_idle()
 
     def _plot_pwv_result(self, result):
         if result is None:
             self.label_pwv_status.setText("No PWV results.")
-            self._clear_pwv_axes()
+            self._clear_pwv_axes("Compute PWV to populate this view.", title="PWV")
             return
-        self.ax_pwv.clear()
-        self.ax_pwv.set_title(str(result.get("name", "PWV")))
-        self.ax_pwv.set_xlabel("Slice Position (mm)")
-        self.ax_pwv.set_ylabel("Time-to-Foot (ms)")
-        self.ax_pwv.grid(True, alpha=0.25)
-
-        positions = np.asarray(result.get("position_mm", []), dtype=float).reshape(-1)
-        foot_times = np.asarray(result.get("time_to_foot_ms", []), dtype=float).reshape(-1)
+        self.fig_pwv.clear()
+        self.ax_pwv = self.fig_pwv.add_subplot(211)
+        self.ax_pwv_flow = self.fig_pwv.add_subplot(212)
         plot_color = str(self.workspace.pwv_params.plot_color or "#2b8a3e")
         fit_color = str(self.workspace.pwv_params.fit_color or "#f08c00")
-        if positions.size > 0 and foot_times.size > 0:
-            self.ax_pwv.scatter(positions, foot_times, color=plot_color, label="Planes")
-            slope = result.get("fit_slope_ms_per_mm")
-            intercept = result.get("fit_intercept_ms")
-            pwv = result.get("pwv_m_s")
-            if slope is not None and intercept is not None:
-                xfit = np.linspace(float(np.min(positions)), float(np.max(positions)), 100)
-                yfit = float(intercept) + float(slope) * xfit
-                label = "Fit"
-                if pwv is not None:
-                    label = f"Fit PWV={float(pwv):.3g} m/s"
-                self.ax_pwv.plot(xfit, yfit, color=fit_color, linewidth=2.0, label=label)
-            self.ax_pwv.legend(loc="best")
-        else:
-            self.ax_pwv.text(
-                0.5,
-                0.5,
-                str(result.get("message", "No valid PWV points")),
-                ha="center",
-                va="center",
-                transform=self.ax_pwv.transAxes,
-            )
+        _plot_pwv_axes(self.ax_pwv, result, color=plot_color, fit_color=fit_color)
+        _plot_plane_flowrate_axes(self.ax_pwv_flow, result, color=plot_color)
 
         status = str(result.get("status", "") or "unknown")
         valid_count = int(result.get("valid_plane_count", 0) or 0)
@@ -621,10 +894,16 @@ class MainWindow(QtWidgets.QMainWindow):
         longest_path = result.get("longest_path_length_mm")
         pwv = result.get("pwv_m_s")
         fit_r2 = result.get("fit_r2")
+        tt_method = str(result.get("transit_time_method", "") or "")
+        foot_method = str(result.get("foot_method", "") or "")
         lines = [f"Status: {status}   Valid planes: {valid_count}/{plane_count}"]
         extras = []
         if pwv is not None:
             extras.append(f"PWV: {float(pwv):.4g} m/s")
+        if tt_method:
+            extras.append(f"TT: {tt_method}")
+        if foot_method and tt_method == "foot_to_foot":
+            extras.append(f"Foot: {foot_method}")
         if fit_r2 is not None:
             extras.append(f"R2: {float(fit_r2):.3f}")
         if longest_path is not None:
@@ -644,7 +923,136 @@ class MainWindow(QtWidgets.QMainWindow):
         self.fig_pwv.tight_layout()
         self.canvas_pwv.draw_idle()
 
-    def _refresh_pwv_plot(self):
+    def _plot_plane_curve(self):
+        plane_idx, metric = self._selected_plane_metric()
+        if metric is None:
+            self.label_pwv_status.setText("No plane selected.")
+            self._clear_pwv_axes("Select a plane to inspect a cardiac-phase curve.", title="Plane Curve")
+            return
+        options = self._refresh_plane_curve_metric_options()
+        if not options:
+            self.label_pwv_status.setText(f"Plane {int(plane_idx)} has no time-resolved metric series.")
+            self._clear_pwv_axes("Run plane metrics to populate plane curves.", title="Plane Curve")
+            return
+        series_key = self.combo_plane_curve_metric.currentData()
+        label_map = {key: label for key, label in _PLANE_CURVE_SERIES_OPTIONS}
+        series_label = label_map.get(str(series_key), str(series_key or "Metric"))
+        values = np.asarray(metric.get(series_key, []), dtype=float).reshape(-1)
+        if values.size == 0:
+            self.label_pwv_status.setText(f"Plane {int(plane_idx)} has no samples for {series_label}.")
+            self._clear_pwv_axes("Selected metric is not available for this plane.", title="Plane Curve")
+            return
+        self.fig_pwv.clear()
+        ax = self.fig_pwv.add_subplot(111)
+        phases = np.arange(values.size, dtype=float)
+        ax.plot(phases, values, color="#1f77b4", marker="o", linewidth=2.0, markersize=4)
+        current_t = int(np.clip(self.workspace.current_t, 0, max(0, values.size - 1)))
+        ax.axvline(current_t, color="#f08c00", linestyle="--", linewidth=1.2, alpha=0.8, label="Current Phase")
+        ax.scatter([current_t], [values[current_t]], color="#f08c00", zorder=4)
+        ax.set_title(f"Plane {int(plane_idx)}: {series_label}")
+        ax.set_xlabel("Cardiac Phase")
+        ax.set_ylabel(series_label)
+        ax.grid(True, alpha=0.25)
+        if values.size > 1:
+            ax.set_xlim(0.0, float(values.size - 1))
+        ax.legend(loc="best")
+        self.fig_pwv.tight_layout()
+        self.canvas_pwv.draw_idle()
+
+        plane = self.workspace.planes[int(plane_idx)]
+        path_idx = int(metric.get("path_index", getattr(plane, "path_index", -1)))
+        path_dir = str(metric.get("path_direction", "") or "")
+        header = f"Plane {int(plane_idx)}   Path {path_idx}"
+        if path_dir:
+            header += f"   {path_dir}"
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            finite = np.array([0.0], dtype=float)
+        lines = [
+            header,
+            f"Metric: {series_label}   Frames: {int(values.size)}   Current phase: {current_t}",
+            f"Current: {float(values[current_t]):.4g}   Min: {float(np.min(finite)):.4g}   Mean: {float(np.mean(finite)):.4g}   Max: {float(np.max(finite)):.4g}",
+            f"Path IC: {float(metric.get('path_ic', 1.0)):.3f}   Net Flow: {float(metric.get('netflow_mL_beat', 0.0)):.4g} mL/beat   Peak Velocity: {float(metric.get('peakv_cm_s', 0.0)):.4g} cm/s",
+        ]
+        related = []
+        for item in list(metric.get("fork_ic", []) or []):
+            try:
+                related.append(f"fork {int(item.get('fork_id', -1))} ({str(item.get('role', 'path'))}): {float(item.get('ic', 1.0)):.3f}")
+            except Exception:
+                continue
+        if related:
+            lines.append("Related branch IC: " + ", ".join(related))
+        self.label_pwv_status.setText("\n".join(lines))
+
+    def _plot_internal_consistency(self):
+        qc = dict(self.workspace.derived.plane_qc or {})
+        path_idx = self._selected_analysis_path_index()
+        if path_idx < 0:
+            self.label_ic_target.setText("Target: none")
+            self.label_pwv_status.setText("No path or plane selected.")
+            self._clear_pwv_axes("Select a path or plane to inspect path and branch internal consistency.", title="Internal Consistency")
+            return
+        if not qc:
+            self.label_ic_target.setText(f"Target: path {int(path_idx)}")
+            self.label_pwv_status.setText("No internal consistency results available.")
+            self._clear_pwv_axes("Run plane metrics to populate internal consistency.", title="Internal Consistency")
+            return
+        info = self.workspace.path_info[int(path_idx)]
+        self.label_ic_target.setText(f"Target: path {int(path_idx)}")
+        path_ic = float((qc.get("path_ic", {}) or {}).get(str(int(path_idx)), 1.0))
+        qc_forks = {int(item.get("fork_id", -1)): item for item in list(qc.get("forks", []) or [])}
+        related_fork_ids = []
+        for fork_id in list(info.get("fork_ids", []) or []):
+            try:
+                fork_id = int(fork_id)
+            except Exception:
+                continue
+            if fork_id in qc_forks:
+                related_fork_ids.append(fork_id)
+        if not related_fork_ids:
+            for fork_id, item in qc_forks.items():
+                members = [int(x) for x in item.get("left", [])] + [int(x) for x in item.get("right", [])]
+                if int(path_idx) in members:
+                    related_fork_ids.append(int(fork_id))
+        related_fork_ids = sorted(dict.fromkeys(related_fork_ids))
+        labels = [f"Path {int(path_idx)}"]
+        values = [path_ic]
+        colors = ["#1f77b4"]
+        for fork_id in related_fork_ids:
+            item = qc_forks.get(int(fork_id), {})
+            labels.append(f"Fork {int(fork_id)}")
+            values.append(float(item.get("ic", 1.0)))
+            colors.append("#d9480f")
+        self.fig_pwv.clear()
+        ax = self.fig_pwv.add_subplot(111)
+        xpos = np.arange(len(values), dtype=float)
+        bars = ax.bar(xpos, values, color=colors, alpha=0.88)
+        ax.set_title(f"Path / Branch Internal Consistency: Path {int(path_idx)}")
+        ax.set_ylabel("Internal Consistency")
+        ax.set_ylim(0.0, 1.05)
+        ax.set_xticks(xpos)
+        ax.set_xticklabels(labels, rotation=15, ha="right")
+        ax.grid(True, axis="y", alpha=0.25)
+        for bar, value in zip(bars, values):
+            ax.text(bar.get_x() + bar.get_width() * 0.5, min(1.03, value + 0.03), f"{float(value):.3f}", ha="center", va="bottom", fontsize=9)
+        self.fig_pwv.tight_layout()
+        self.canvas_pwv.draw_idle()
+
+        incoming = [int(x) for x in info.get("incoming_path_ids", [])]
+        outgoing = [int(x) for x in info.get("outgoing_path_ids", [])]
+        lines = [
+            f"Path {int(path_idx)}   dir={str(info.get('direction_text', '') or '')}",
+            f"Path IC: {path_ic:.3f}   Incoming: {incoming if incoming else 'none'}   Outgoing: {outgoing if outgoing else 'none'}",
+        ]
+        if related_fork_ids:
+            for fork_id in related_fork_ids:
+                item = qc_forks.get(int(fork_id), {})
+                lines.append(f"Branch/Fork {int(fork_id)}: IC={float(item.get('ic', 1.0)):.3f}   left={item.get('left', [])}   right={item.get('right', [])}")
+        else:
+            lines.append("No related branch junctions were found for the selected path.")
+        self.label_pwv_status.setText("\n".join(lines))
+
+    def _refresh_pwv_group_selector(self):
         results = list(self.workspace.derived.pwv_results or [])
         current_name = ""
         current = self._selected_pwv_result()
@@ -672,11 +1080,23 @@ class MainWindow(QtWidgets.QMainWindow):
                         break
             self.combo_pwv_group.setCurrentIndex(target_idx)
         self.combo_pwv_group.blockSignals(False)
-        if not results:
-            self.label_pwv_status.setText("No PWV results.")
-            self._clear_pwv_axes()
-            return
-        self._plot_pwv_result(self._selected_pwv_result())
+
+    def _refresh_analysis_panel(self):
+        self._sync_analysis_controls()
+        self._refresh_pwv_group_selector()
+        mode = self._analysis_mode()
+        if mode == "pwv":
+            self.label_ic_target.setText("Target: PWV group")
+            self._plot_pwv_result(self._selected_pwv_result())
+        elif mode == "plane_curve":
+            self.label_ic_target.setText("Target: selected plane")
+            self._plot_plane_curve()
+        else:
+            self._plot_internal_consistency()
+
+    def _refresh_pwv_plot(self):
+        self._refresh_plane_curve_metric_options()
+        self._refresh_analysis_panel()
 
     def _build_menu(self):
         mb = self.menuBar()
@@ -690,6 +1110,10 @@ class MainWindow(QtWidgets.QMainWindow):
             a = QtWidgets.QAction(label, self)
             a.triggered.connect(slot)
             mf.addAction(a)
+        me = mb.addMenu("Export")
+        a = QtWidgets.QAction("Export Videos...", self)
+        a.triggered.connect(self._on_export_videos)
+        me.addAction(a)
         mv = mb.addMenu("View")
         for label, slot in [("Reset Camera", lambda: self.scene.reset_camera()), ("Toggle Axes", lambda: self.scene.toggle_axes()),
             ("White BG", lambda: self.scene.set_background("white")), ("Dark BG", lambda: self.scene.set_background("#202124"))]:
@@ -1518,6 +1942,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._clear_browser_selection()
             self._set_plane_info_text("")
             self._set_path_info_text("")
+            self._refresh_analysis_panel()
             return
         self.workspace.selected_path_index = -1
         self._selected_plane_index = int(plane_idx)
@@ -1529,6 +1954,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._activate_plane_drag_widgets(int(plane_idx))
         self._set_path_info_text("")
         self._log_selected_plane_metric(int(plane_idx))
+        self._refresh_analysis_panel()
 
     def _on_3d_path_picked(self, uid, path_idx):
         if self._edit_mode is not None:
@@ -1544,6 +1970,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._clear_browser_selection()
             self._set_plane_info_text("")
             self._set_path_info_text("")
+            self._refresh_analysis_panel()
             return
         self.workspace.selected_path_index = int(path_idx)
         self._selected_plane_index = -1
@@ -1555,6 +1982,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._select_browser_item_by_uid(uid)
         self._set_plane_info_text("")
         self._log_selected_path_info(int(path_idx))
+        self._refresh_analysis_panel()
 
     def _find_uid_by_data_key(self, data_key):
         for uid, obj in self.workspace.scene_objects.items():
@@ -1584,6 +2012,130 @@ class MainWindow(QtWidgets.QMainWindow):
     def _browser_group_name(self, obj):
         group_name = str(getattr(obj, "group_name", "") or "")
         return group_name if group_name else "Global"
+
+    def _browser_type_name(self, obj):
+        data_key = str(getattr(obj, "data_key", "") or "")
+        if data_key == "segmask_raw_surface" or data_key.startswith("segmask_group_"):
+            return "Segmentation"
+        if data_key == "pwv_planes":
+            return "PWV"
+        if data_key.startswith("skeleton_") or obj.kind == ObjectKind.SKELETON:
+            return "Skeleton"
+        if data_key.startswith("graph_") or obj.kind == ObjectKind.GRAPH:
+            return "Graph"
+        if data_key.startswith("forks_"):
+            return "Forks"
+        if data_key.startswith("smooth_path_") or obj.kind == ObjectKind.BRANCH:
+            return "Paths"
+        if obj.kind == ObjectKind.PLANE:
+            return "Planes"
+        if data_key.startswith("pathline_"):
+            return "Pathlines"
+        if data_key == "streamlines_live":
+            return "Streamlines"
+        if data_key == "wss_surface_live":
+            return "WSS"
+        if data_key == "tke_volume":
+            return "TKE"
+        if data_key == "pressure_gradient_volume":
+            return "Pressure Gradient"
+        if obj.kind == ObjectKind.METRIC:
+            return "Metrics"
+        if obj.kind == ObjectKind.FLOW:
+            return "Flow"
+        if obj.kind == ObjectKind.AUX:
+            return "Aux"
+        return str(obj.kind.value)
+
+    def _browser_type_sort_key(self, type_name):
+        order = [
+            "Segmentation",
+            "Skeleton",
+            "Graph",
+            "Forks",
+            "Paths",
+            "Planes",
+            "Pathlines",
+            "Streamlines",
+            "PWV",
+            "WSS",
+            "TKE",
+            "Pressure Gradient",
+            "Metrics",
+            "Flow",
+            "Aux",
+        ]
+        try:
+            return (order.index(str(type_name)), str(type_name).lower())
+        except ValueError:
+            return (len(order), str(type_name).lower())
+
+    def _iter_browser_leaf_items(self, item):
+        if item is None:
+            return
+        uid = item.data(0, QtCore.Qt.UserRole)
+        if uid is not None:
+            yield item
+            return
+        for i in range(item.childCount()):
+            yield from self._iter_browser_leaf_items(item.child(i))
+
+    def _browser_check_state_for_item(self, item):
+        leaves = list(self._iter_browser_leaf_items(item))
+        if not leaves:
+            return QtCore.Qt.Unchecked
+        checked = sum(1 for leaf in leaves if leaf.checkState(0) == QtCore.Qt.Checked)
+        if checked == len(leaves):
+            return QtCore.Qt.Checked
+        if checked == 0:
+            return QtCore.Qt.Unchecked
+        return QtCore.Qt.PartiallyChecked
+
+    def _sync_browser_parent_states(self, item):
+        parent = item.parent()
+        while parent is not None:
+            parent.setCheckState(0, self._browser_check_state_for_item(parent))
+            parent = parent.parent()
+
+    def _set_browser_item_visibility(self, item, visible):
+        target_state = QtCore.Qt.Checked if visible else QtCore.Qt.Unchecked
+        refresh_segmentation = False
+        uid = item.data(0, QtCore.Qt.UserRole)
+        item.setCheckState(0, target_state)
+        if uid is not None:
+            obj = self.workspace.scene_objects.get(uid)
+            if obj is not None:
+                obj.visible = bool(visible)
+                if obj.data_key == "segmask_raw_surface":
+                    self.workspace.segmentation.visible = bool(visible)
+                    refresh_segmentation = True
+                self.scene.apply_object_properties(obj)
+            return refresh_segmentation
+        for i in range(item.childCount()):
+            refresh_segmentation = self._set_browser_item_visibility(item.child(i), visible) or refresh_segmentation
+        return refresh_segmentation
+
+    def _find_browser_item_by_uid(self, uid):
+        if uid is None:
+            return None
+
+        def _search(node):
+            if node.data(0, QtCore.Qt.UserRole) == uid:
+                return node
+            for idx in range(node.childCount()):
+                found = _search(node.child(idx))
+                if found is not None:
+                    return found
+            return None
+
+        for i in range(self.tree_objects.topLevelItemCount()):
+            found = _search(self.tree_objects.topLevelItem(i))
+            if found is not None:
+                return found
+        return None
+
+    def _collect_browser_uids(self, item):
+        return [leaf.data(0, QtCore.Qt.UserRole) for leaf in self._iter_browser_leaf_items(item) if leaf.data(0, QtCore.Qt.UserRole) is not None]
 
     def _plane_widget_distance(self):
         spacing = self._get_spacing_xyz_from_resolution()
@@ -1817,6 +2369,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ortho_viewer._selected_plane_idx = plane_idx
             self.ortho_viewer.refresh()
             self._log_selected_plane_metric(plane_idx)
+            self._refresh_analysis_panel()
             self._plane_drag_metrics_dirty = False
         except Exception as e:
             self.log(f"Plane metric update error: {type(e).__name__}: {e}")
@@ -1868,14 +2421,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _select_browser_item_by_uid(self, uid):
         self.tree_objects.blockSignals(True)
-        for i in range(self.tree_objects.topLevelItemCount()):
-            top = self.tree_objects.topLevelItem(i)
-            for j in range(top.childCount()):
-                child = top.child(j)
-                if child.data(0, QtCore.Qt.UserRole) == uid:
-                    self.tree_objects.setCurrentItem(child)
-                    self.tree_objects.blockSignals(False)
-                    return
+        item = self._find_browser_item_by_uid(uid)
+        if item is not None:
+            parent = item.parent()
+            while parent is not None:
+                parent.setExpanded(True)
+                parent = parent.parent()
+            self.tree_objects.setCurrentItem(item)
+            self.tree_objects.blockSignals(False)
+            return
         self.tree_objects.blockSignals(False)
 
     def _clear_browser_selection(self):
@@ -1909,6 +2463,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_path_info_text("")
         else:
             self._log_selected_path_info(path_idx)
+        self._refresh_analysis_panel()
 
     def log(self, text):
         self.console.append(str(text))
@@ -2050,6 +2605,32 @@ class MainWindow(QtWidgets.QMainWindow):
         ws.plane_gen_params.smoothing_window = self._int_from_text(self.edit_plane_smooth_win.text(), 15)
         ws.plane_gen_params.smoothing_polyorder = self._int_from_text(self.edit_plane_smooth_poly.text(), 3)
         ws.plane_gen_params.inter_time = self._int_from_text(self.edit_plane_inter_time.text(), 10)
+        pwv_payload = {
+            "enabled": self.chk_pwv_enabled.isChecked(),
+            "groups": self._pwv_group_payload_from_ui(),
+            "plane_interval_mm": max(self._float_from_text(self.edit_pwv_interval.text(), 10.0), 0.1),
+            "start_distance": self._float_from_text(self.edit_pwv_start.text(), 0.0),
+            "end_distance": self._float_from_text(self.edit_pwv_end.text(), 0.0),
+            "smoothing_window": max(self._int_from_text(self.edit_pwv_smooth_win.text(), 15), 1),
+            "smoothing_polyorder": max(self._int_from_text(self.edit_pwv_smooth_poly.text(), 2), 0),
+            "inter_time": max(self._int_from_text(self.edit_pwv_inter_time.text(), 10), 1),
+            "waveform_key": str(self.edit_pwv_waveform.text().strip() or "flowrate_mL_s"),
+            "transit_time_method": str(self.combo_pwv_tt_method.currentText().strip() or "foot_to_foot"),
+            "foot_method": str(self.combo_pwv_foot_method.currentText().strip() or "tangent"),
+            "foot_savgol_window": max(self._int_from_text(self.edit_pwv_foot_win.text(), 5), 1),
+            "foot_savgol_polyorder": max(self._int_from_text(self.edit_pwv_foot_poly.text(), 2), 0),
+            "foot_threshold_percent": min(max(self._float_from_text(self.edit_pwv_foot_threshold.text(), 10.0), 0.0), 100.0),
+            "xcorr_window": str(self.combo_pwv_xcorr_window.currentText().strip() or "full"),
+            "xcorr_interp_factor": max(self._int_from_text(self.edit_pwv_xcorr_interp.text(), 10), 1),
+            "allow_cycle_wrap": self.chk_pwv_allow_wrap.isChecked(),
+            "minimum_valid_planes": max(self._int_from_text(self.edit_pwv_min_planes.text(), 2), 2),
+            "scene_visible": self.chk_pwv_scene_visible.isChecked(),
+            "scene_color": str(self.edit_pwv_scene_color.text().strip() or "#ffd43b"),
+            "plot_color": str(self.edit_pwv_plot_color.text().strip() or "#2b8a3e"),
+            "fit_color": str(self.edit_pwv_fit_color.text().strip() or "#f08c00"),
+            "plot_dpi": max(self._int_from_text(self.edit_pwv_plot_dpi.text(), 160), 72),
+        }
+        ws.pwv_params = PwvParams.from_dict(pwv_payload, label_map=ws.label_params.label_map)
         ws.streamline_params.seed_ratio = min(max(self._float_from_text(self.edit_sl_ratio.text(), 0.02), 0.0001), 1.0)
         ws.streamline_params.max_steps = min(max(self._int_from_text(self.edit_sl_maxsteps.text(), 2000), 1), 200000)
         ws.streamline_params.terminal_speed = min(max(self._float_from_text(self.edit_sl_terminal.text(), 0.01), 0.0), 1e6)
@@ -2062,8 +2643,6 @@ class MainWindow(QtWidgets.QMainWindow):
         ws.derived_params.no_slip_condition = self.chk_dm_noslip.isChecked()
         ws.derived_params.rho = max(self._float_from_text(self.edit_dm_rho.text(), 1060.0), 1.0)
         ws.derived_params.pressure_gradient_smoothing_sigma = max(self._float_from_text(self.edit_dm_pg_smoothing_sigma.text(), 0.0), 0.0)
-        ws.derived_params.step_size = max(self._int_from_text(self.edit_dm_stepsize.text(), 5), 1)
-        ws.derived_params.tube_radius = max(self._float_from_text(self.edit_dm_tube.text(), 0.1), 0.0)
         ws.derived_params.use_multithread = self.chk_dm_multithread.isChecked()
 
     def _sync_params_to_ui(self):
@@ -2091,6 +2670,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.edit_plane_smooth_win.setText(str(ws.plane_gen_params.smoothing_window))
         self.edit_plane_smooth_poly.setText(str(ws.plane_gen_params.smoothing_polyorder))
         self.edit_plane_inter_time.setText(str(ws.plane_gen_params.inter_time))
+        self.chk_pwv_enabled.setChecked(bool(ws.pwv_params.enabled))
+        self.edit_pwv_interval.setText(str(ws.pwv_params.plane_interval_mm))
+        self.edit_pwv_start.setText(str(ws.pwv_params.start_distance))
+        self.edit_pwv_end.setText(str(ws.pwv_params.end_distance))
+        self.edit_pwv_smooth_win.setText(str(ws.pwv_params.smoothing_window))
+        self.edit_pwv_smooth_poly.setText(str(ws.pwv_params.smoothing_polyorder))
+        self.edit_pwv_inter_time.setText(str(ws.pwv_params.inter_time))
+        self.edit_pwv_waveform.setText(str(ws.pwv_params.waveform_key))
+        self.combo_pwv_tt_method.setCurrentText(str(ws.pwv_params.transit_time_method))
+        self.combo_pwv_foot_method.setCurrentText(str(ws.pwv_params.foot_method))
+        self.edit_pwv_foot_win.setText(str(ws.pwv_params.foot_savgol_window))
+        self.edit_pwv_foot_poly.setText(str(ws.pwv_params.foot_savgol_polyorder))
+        self.edit_pwv_foot_threshold.setText(str(ws.pwv_params.foot_threshold_percent))
+        self.combo_pwv_xcorr_window.setCurrentText(str(ws.pwv_params.xcorr_window))
+        self.edit_pwv_xcorr_interp.setText(str(ws.pwv_params.xcorr_interp_factor))
+        self.chk_pwv_allow_wrap.setChecked(bool(ws.pwv_params.allow_cycle_wrap))
+        self.edit_pwv_min_planes.setText(str(ws.pwv_params.minimum_valid_planes))
+        self.chk_pwv_scene_visible.setChecked(bool(ws.pwv_params.scene_visible))
+        self.edit_pwv_scene_color.setText(str(ws.pwv_params.scene_color))
+        self.edit_pwv_plot_color.setText(str(ws.pwv_params.plot_color))
+        self.edit_pwv_fit_color.setText(str(ws.pwv_params.fit_color))
+        self.edit_pwv_plot_dpi.setText(str(ws.pwv_params.plot_dpi))
+        self.table_pwv_groups.blockSignals(True)
+        self.table_pwv_groups.setRowCount(0)
+        for group in list(ws.pwv_params.groups or []):
+            self._add_pwv_group_row(name=str(group.name), labels=self._pwv_group_labels_for_ui(group.labels))
+        self.table_pwv_groups.clearSelection()
+        self.table_pwv_groups.blockSignals(False)
         self.edit_sl_ratio.setText(str(ws.streamline_params.seed_ratio))
         self.edit_sl_maxsteps.setText(str(ws.streamline_params.max_steps))
         self.edit_sl_terminal.setText(str(ws.streamline_params.terminal_speed))
@@ -2102,13 +2709,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_dm_noslip.setChecked(ws.derived_params.no_slip_condition)
         self.edit_dm_rho.setText(str(ws.derived_params.rho))
         self.edit_dm_pg_smoothing_sigma.setText(str(ws.derived_params.pressure_gradient_smoothing_sigma))
-        self.edit_dm_stepsize.setText(str(ws.derived_params.step_size))
-        self.edit_dm_tube.setText(str(ws.derived_params.tube_radius))
         self.chk_dm_multithread.setChecked(ws.derived_params.use_multithread)
 
     def _rebuild_plane_objects(self):
         self._clear_plane_drag_widgets()
         ws = self.workspace
+        plane_video_cfg = dict((getattr(ws, "render_settings", {}) or {}).get("plane_video_cfg", {}) or {})
+        default_cfg = plane_video_cfg.get("default", {}) if isinstance(plane_video_cfg.get("default"), dict) else {}
+        groups_cfg = plane_video_cfg.get("groups", {}) if isinstance(plane_video_cfg.get("groups"), dict) else {}
         ws.clear_pathlines()
         ws.pathline_colors = {}
         ws.remove_objects_by_prefix("plane_")
@@ -2120,6 +2728,17 @@ class MainWindow(QtWidgets.QMainWindow):
         for i in range(len(ws.planes)):
             plane = ws.planes[i]
             group_name = str(getattr(plane, "group_name", "") or "")
+            group_render_cfg = groups_cfg.get(group_name, {}) if group_name and isinstance(groups_cfg.get(group_name), dict) else {}
+            merged_render_cfg = dict(default_cfg)
+            merged_render_cfg.update(group_render_cfg)
+            plane_color = str(merged_render_cfg.get("plane_color", "") or "")
+            if not plane_color:
+                plane_color = ws.skeleton_params.scene_color_for_group(group_name, "plane") if group_name else "yellow"
+            try:
+                plane_opacity = float(merged_render_cfg.get("plane_opacity", 0.6))
+            except Exception:
+                plane_opacity = 0.6
+            plane_opacity = max(0.0, min(1.0, plane_opacity))
             if group_name in ws.multilabel_groups:
                 state = ws.multilabel_groups[group_name]
                 if group_name not in seen_groups:
@@ -2134,8 +2753,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 group_name=group_name,
                 browser_color=ws.skeleton_params.browser_color_for_group(group_name) if group_name else "",
                 visible=True,
-                opacity=0.6,
-                color=ws.skeleton_params.scene_color_for_group(group_name, "plane") if group_name else "yellow",
+                opacity=plane_opacity,
+                color=plane_color,
                 line_width=2,
             )
         self.scene.invalidate_cache("plane_")
@@ -2160,6 +2779,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if obj.data_key == "branch_surface":
                 continue
             group_name = self._browser_group_name(obj)
+            type_name = self._browser_type_name(obj)
             if group_name not in groups:
                 top = QtWidgets.QTreeWidgetItem([group_name, "Group", ""])
                 top.setFlags(top.flags() | QtCore.Qt.ItemIsUserCheckable)
@@ -2169,22 +2789,30 @@ class MainWindow(QtWidgets.QMainWindow):
                     color = QtGui.QColor(color_name)
                     if color.isValid():
                         top.setForeground(0, QtGui.QBrush(color))
-                groups[group_name] = top
+                groups[group_name] = {"item": top, "types": {}}
                 self.tree_objects.addTopLevelItem(top)
+            group_entry = groups[group_name]
+            type_map = group_entry["types"]
+            if type_name not in type_map:
+                type_item = QtWidgets.QTreeWidgetItem([type_name, "Type", ""])
+                type_item.setFlags(type_item.flags() | QtCore.Qt.ItemIsUserCheckable)
+                type_item.setCheckState(0, QtCore.Qt.Checked)
+                type_map[type_name] = type_item
+                group_entry["item"].addChild(type_item)
             it = QtWidgets.QTreeWidgetItem([obj.name, obj.kind.value, ""])
             it.setData(0, QtCore.Qt.UserRole, obj.uid)
             it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
             it.setCheckState(0, QtCore.Qt.Checked if obj.visible else QtCore.Qt.Unchecked)
-            groups[group_name].addChild(it)
-        for _group_name, top in groups.items():
-            vis_count = sum(1 for i in range(top.childCount()) if top.child(i).checkState(0) == QtCore.Qt.Checked)
-            total = top.childCount()
-            if vis_count == total:
-                top.setCheckState(0, QtCore.Qt.Checked)
-            elif vis_count == 0:
-                top.setCheckState(0, QtCore.Qt.Unchecked)
-            else:
-                top.setCheckState(0, QtCore.Qt.PartiallyChecked)
+            type_map[type_name].addChild(it)
+        for group_entry in groups.values():
+            top = group_entry["item"]
+            type_items = list(group_entry["types"].items())
+            type_items.sort(key=lambda pair: self._browser_type_sort_key(pair[0]))
+            for idx, (_type_name, type_item) in enumerate(type_items):
+                top.removeChild(type_item)
+                top.insertChild(idx, type_item)
+                type_item.setCheckState(0, self._browser_check_state_for_item(type_item))
+            top.setCheckState(0, self._browser_check_state_for_item(top))
         self.tree_objects.expandAll()
         self.tree_objects.blockSignals(False)
 
@@ -2263,30 +2891,25 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_selection_info()
 
     def _on_tree_item_changed(self, item, column):
+        _ = column
+        refresh_segmentation = False
         uid = item.data(0, QtCore.Qt.UserRole)
-        if uid:
+        self.tree_objects.blockSignals(True)
+        if uid is not None:
             obj = self.workspace.scene_objects.get(uid)
-            if obj:
+            if obj is not None:
                 obj.visible = item.checkState(0) == QtCore.Qt.Checked
                 if obj.data_key == "segmask_raw_surface":
                     self.workspace.segmentation.visible = bool(obj.visible)
-                    self._refresh_segmentation_ui()
+                    refresh_segmentation = True
                 self.scene.apply_object_properties(obj)
+            self._sync_browser_parent_states(item)
         else:
-            checked = item.checkState(0) != QtCore.Qt.Unchecked
-            self.tree_objects.blockSignals(True)
-            for i in range(item.childCount()):
-                child = item.child(i)
-                child.setCheckState(0, QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
-                cuid = child.data(0, QtCore.Qt.UserRole)
-                if cuid:
-                    obj = self.workspace.scene_objects.get(cuid)
-                    if obj:
-                        obj.visible = checked
-                        if obj.data_key == "segmask_raw_surface":
-                            self.workspace.segmentation.visible = bool(checked)
-                        self.scene.apply_object_properties(obj)
-            self.tree_objects.blockSignals(False)
+            checked = item.checkState(0) == QtCore.Qt.Checked
+            refresh_segmentation = self._set_browser_item_visibility(item, checked)
+            self._sync_browser_parent_states(item)
+        self.tree_objects.blockSignals(False)
+        if refresh_segmentation:
             self._refresh_segmentation_ui()
         self._refresh_scene()
 
@@ -2381,16 +3004,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_pathline_color(pathline_idx, color.name())
 
     def _set_group_vis(self, group_item, visible):
-        for i in range(group_item.childCount()):
-            uid = group_item.child(i).data(0, QtCore.Qt.UserRole)
-            if uid:
-                obj = self.workspace.scene_objects.get(uid)
-                if obj:
-                    obj.visible = visible
-                    if obj.data_key == "segmask_raw_surface":
-                        self.workspace.segmentation.visible = bool(visible)
-                    self.scene.apply_object_properties(obj)
-        self._refresh_segmentation_ui()
+        self.tree_objects.blockSignals(True)
+        refresh_segmentation = self._set_browser_item_visibility(group_item, visible)
+        self._sync_browser_parent_states(group_item)
+        self.tree_objects.blockSignals(False)
+        if refresh_segmentation:
+            self._refresh_segmentation_ui()
         self._refresh_browser()
         self._refresh_scene()
 
@@ -2403,9 +3022,19 @@ class MainWindow(QtWidgets.QMainWindow):
         plane_indices_removed = []
         pathline_indices_removed = []
         clear_streamlines = False
-        if uid:
+        if uid is not None:
             obj = self.workspace.scene_objects.get(uid)
             name = obj.name if obj else uid
+            uids = [uid]
+            log_message = f"Deleted: {name}"
+        else:
+            uids = list(dict.fromkeys(self._collect_browser_uids(item)))
+            if not uids:
+                return
+            section_name = item.text(0)
+            log_message = f"Deleted section: {section_name} ({len(uids)} objects)"
+        for current_uid in uids:
+            obj = self.workspace.scene_objects.get(current_uid)
             if obj and obj.kind == ObjectKind.PLANE:
                 pidx = _parse_plane_index(obj.data_key)
                 if pidx is not None:
@@ -2415,31 +3044,8 @@ class MainWindow(QtWidgets.QMainWindow):
             pidx = _parse_pathline_index(obj.data_key) if obj else None
             if pidx is not None:
                 pathline_indices_removed.append(pidx)
-            self.scene.remove_object(uid)
-            self.log(f"Deleted: {name}")
-        else:
-            count = item.childCount()
-            if count == 0:
-                return
-            kind_name = item.text(0)
-            uids = []
-            for i in range(count):
-                cuid = item.child(i).data(0, QtCore.Qt.UserRole)
-                if cuid:
-                    cobj = self.workspace.scene_objects.get(cuid)
-                    if cobj and cobj.kind == ObjectKind.PLANE:
-                        pidx = _parse_plane_index(cobj.data_key)
-                        if pidx is not None:
-                            plane_indices_removed.append(pidx)
-                    if cobj and cobj.data_key == "streamlines_live":
-                        clear_streamlines = True
-                    pidx = _parse_pathline_index(cobj.data_key) if cobj else None
-                    if pidx is not None:
-                        pathline_indices_removed.append(pidx)
-                    uids.append(cuid)
-            for u in uids:
-                self.scene.remove_object(u)
-            self.log(f"Deleted section: {kind_name} ({len(uids)} objects)")
+            self.scene.remove_object(current_uid)
+        self.log(log_message)
         if clear_streamlines:
             self.workspace.clear_streamlines()
         if pathline_indices_removed:
@@ -2643,6 +3249,329 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             progress_dialog.close()
 
+    def _rendering_kwargs(self):
+        rendering_cfg = bundle_to_autoflow_kwargs(self._config_bundle)
+        return {
+            "fps": int(rendering_cfg.get("fps", 12)),
+            "plane_rotation_frames": int(rendering_cfg.get("plane_rotation_frames", 180)),
+            "camera_view": str(rendering_cfg.get("camera_view", "right")),
+            "camera_distance_scale": float(rendering_cfg.get("camera_distance_scale", 1.5)),
+            "rotate_dynamic_video": bool(rendering_cfg.get("rotate_dynamic_video", True)),
+            "dynamic_rotation_frames": int(rendering_cfg.get("dynamic_rotation_frames", 180)),
+            "dynamic_rotation_elevation_deg": rendering_cfg.get("dynamic_rotation_elevation_deg", 10.0),
+            "dynamic_time_repeat": int(rendering_cfg.get("dynamic_time_repeat", 3)),
+            "add_plane_idx": bool(rendering_cfg.get("add_plane_idx", False)),
+            "add_path_idx": bool(rendering_cfg.get("add_path_idx", False)),
+            "plane_video_cfg": dict(rendering_cfg.get("plane_video_cfg", {})),
+            "window_size": tuple(rendering_cfg.get("window_size", (1600, 1200))),
+            "wss_clim": tuple(rendering_cfg.get("wss_clim", (0.0, 10.0))),
+            "wss_show_scalar_bar": bool(rendering_cfg.get("wss_show_scalar_bar", True)),
+            "wss_bar_cfg": dict(rendering_cfg.get("wss_bar_cfg", {})),
+            "tke_clim": tuple(rendering_cfg.get("tke_clim", (0.0, 100.0))),
+            "tke_show_scalar_bar": bool(rendering_cfg.get("tke_show_scalar_bar", True)),
+            "tke_bar_cfg": dict(rendering_cfg.get("tke_bar_cfg", {})),
+            "pressure_gradient_clim": None if rendering_cfg.get("pressure_gradient_clim", None) is None else tuple(rendering_cfg.get("pressure_gradient_clim", (0.0, 1.0))),
+            "pressure_gradient_show_scalar_bar": bool(rendering_cfg.get("pressure_gradient_show_scalar_bar", True)),
+            "pressure_gradient_bar_cfg": dict(rendering_cfg.get("pressure_gradient_bar_cfg", {})),
+            "streamline_clim": tuple(rendering_cfg.get("streamline_clim", (0.0, 1.0))),
+            "streamline_show_scalar_bar": bool(rendering_cfg.get("streamline_show_scalar_bar", True)),
+            "streamline_bar_cfg": dict(rendering_cfg.get("streamline_bar_cfg", {})),
+        }
+
+    def _update_video_export_summary(self, out_dir, requested_flags, video_outputs, video_times, total_time_sec):
+        summary_path = os.path.join(out_dir, "summary.json")
+        summary = {}
+        if os.path.exists(summary_path):
+            try:
+                with open(summary_path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                if isinstance(payload, dict):
+                    summary = payload
+            except Exception as e:
+                self.log(f"[Video Export] warning: failed to read existing summary.json: {type(e).__name__}: {e}")
+
+        existing_videos = summary.get("videos")
+        if not isinstance(existing_videos, dict):
+            existing_videos = {}
+        for name, path_value in video_outputs.items():
+            existing_videos[str(name)] = str(path_value or "")
+        summary["videos"] = existing_videos
+
+        existing_requested = summary.get("requested_videos")
+        if not isinstance(existing_requested, dict):
+            existing_requested = {}
+        merged_requested = {}
+        for name in sorted(set(existing_requested) | set(requested_flags)):
+            merged_requested[str(name)] = bool(existing_requested.get(name, False) or requested_flags.get(name, False))
+        summary["requested_videos"] = merged_requested
+
+        existing_video_times = summary.get("video_times_sec")
+        if not isinstance(existing_video_times, dict):
+            existing_video_times = {}
+        for name, elapsed in video_times.items():
+            existing_video_times[str(name)] = float(elapsed)
+        summary["video_times_sec"] = existing_video_times
+
+        summary.setdefault("output_dir", str(out_dir))
+        summary["gui_video_export"] = {
+            "output_dir": str(out_dir),
+            "requested_videos": {str(name): bool(enabled) for name, enabled in requested_flags.items()},
+            "videos": {str(name): str(path_value or "") for name, path_value in video_outputs.items()},
+            "video_times_sec": {str(name): float(elapsed) for name, elapsed in video_times.items()},
+            "total_time_sec": float(total_time_sec),
+        }
+
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        return summary_path
+
+    def _prompt_video_export_options(self):
+        default_dir = self.workspace.paths.output_dir or os.path.dirname(self.workspace.paths.flow_path or ".") or "."
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Export Videos")
+        layout = QtWidgets.QVBoxLayout(dialog)
+        form = QtWidgets.QFormLayout()
+
+        path_edit = QtWidgets.QLineEdit(str(default_dir))
+        browse_btn = QtWidgets.QPushButton("Browse...")
+        path_row = QtWidgets.QHBoxLayout()
+        path_row.addWidget(path_edit, 1)
+        path_row.addWidget(browse_btn)
+        path_widget = QtWidgets.QWidget()
+        path_widget.setLayout(path_row)
+        form.addRow("Output Directory", path_widget)
+
+        check_plane = QtWidgets.QCheckBox("Plane")
+        check_wss = QtWidgets.QCheckBox("WSS")
+        check_tke = QtWidgets.QCheckBox("TKE")
+        check_pg = QtWidgets.QCheckBox("Pressure Gradient")
+        check_streamlines = QtWidgets.QCheckBox("Streamlines")
+        check_plane.setChecked(True)
+
+        video_box = QtWidgets.QGroupBox("Export Items")
+        video_layout = QtWidgets.QVBoxLayout(video_box)
+        for widget in [check_plane, check_wss, check_tke, check_pg, check_streamlines]:
+            video_layout.addWidget(widget)
+        form.addRow(video_box)
+        layout.addLayout(form)
+
+        hint = QtWidgets.QLabel("WSS, TKE, and pressure-gradient videos require derived data. Streamlines require segmentation and flow.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+
+        def _browse_dir():
+            chosen = QtWidgets.QFileDialog.getExistingDirectory(dialog, "Choose Video Output Directory", path_edit.text().strip() or default_dir)
+            if chosen:
+                path_edit.setText(chosen)
+
+        browse_btn.clicked.connect(_browse_dir)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return None
+        out_dir = str(path_edit.text().strip() or default_dir)
+        if not any([check_plane.isChecked(), check_wss.isChecked(), check_tke.isChecked(), check_pg.isChecked(), check_streamlines.isChecked()]):
+            self.log("Video export cancelled: no video items selected.")
+            return None
+        return _VideoExportOptions(
+            out_dir=out_dir,
+            export_plane=check_plane.isChecked(),
+            export_wss=check_wss.isChecked(),
+            export_tke=check_tke.isChecked(),
+            export_pg=check_pg.isChecked(),
+            export_streamlines=check_streamlines.isChecked(),
+        )
+
+    def _on_export_videos(self):
+        if self._autoseg_running_guard("exporting videos"):
+            return
+        if not self.workspace.data_loaded:
+            self.log("No data loaded. Use File > Open H5 or Import DICOM Directory.")
+            return
+        options = self._prompt_video_export_options()
+        if options is None:
+            return
+        self._sync_params_to_ws()
+        os.makedirs(options.out_dir, exist_ok=True)
+        self.workspace.paths.output_dir = options.out_dir
+        progress = self._create_progress_dialog("Export Videos", "Preparing video export...")
+        requested_flags = {
+            "plane": bool(options.export_plane),
+            "wss": bool(options.export_wss),
+            "tke": bool(options.export_tke),
+            "pg": bool(options.export_pg),
+            "streamlines": bool(options.export_streamlines),
+        }
+        rendered = {}
+        video_outputs = {}
+        video_times = {}
+        export_started_at = time.perf_counter()
+        try:
+            if self.workspace.segmask_binary is None and self.workspace.segmask_raw is not None:
+                self.pipeline.preprocess(self.workspace)
+
+            need_wss = bool(options.export_wss)
+            need_tke = bool(options.export_tke)
+            need_pg = bool(options.export_pg)
+            if need_wss or need_tke or need_pg:
+                progress.setLabelText("Computing derived data for video export...")
+                QtWidgets.QApplication.processEvents()
+                if self.workspace.segmask_raw is None:
+                    raise ValueError("derived videos require segmentation")
+                self.pipeline._ensure_derived_metrics(
+                    self.workspace,
+                    save_pixelwise=False,
+                    refresh_scene_objects=False,
+                    compute_wss=need_wss,
+                    compute_tke=need_tke,
+                    compute_pressure_gradient=need_pg,
+                )
+
+            render_cfg = self._rendering_kwargs()
+
+            def _run(name, fn, enabled, available=True):
+                if not enabled:
+                    return
+                if not available:
+                    video_outputs[name] = ""
+                    self.log(f"[Video Export] skipped {name}: upstream data unavailable")
+                    return
+                progress.setLabelText(f"Rendering {name} video...")
+                QtWidgets.QApplication.processEvents()
+                t0 = time.perf_counter()
+                out = fn()
+                elapsed = time.perf_counter() - t0
+                video_times[name] = float(elapsed)
+                video_outputs[name] = str(out or "")
+                if out:
+                    rendered[name] = out
+                    self.log(f"[Video Export] {name} saved: {out} | time={elapsed:.2f}s")
+                else:
+                    self.log(f"[Video Export] {name} produced no output | time={elapsed:.2f}s")
+
+            _run(
+                "plane",
+                lambda: render_plane_rotation_video(
+                    self.workspace,
+                    options.out_dir,
+                    fps=render_cfg["fps"],
+                    n_frames=render_cfg["plane_rotation_frames"],
+                    smoothing_iteration=self.workspace.derived_params.smoothing_iteration,
+                    distance_scale=render_cfg["camera_distance_scale"],
+                    add_plane_idx=render_cfg["add_plane_idx"],
+                    add_path_idx=render_cfg["add_path_idx"],
+                    plane_video_cfg=render_cfg["plane_video_cfg"],
+                    window_size=render_cfg["window_size"],
+                ),
+                options.export_plane,
+                available=len(self.workspace.planes) > 0,
+            )
+            _run(
+                "wss",
+                lambda: render_wss_video(
+                    self.workspace,
+                    options.out_dir,
+                    fps=render_cfg["fps"],
+                    smoothing_iteration=self.workspace.derived_params.smoothing_iteration,
+                    view=render_cfg["camera_view"],
+                    distance_scale=render_cfg["camera_distance_scale"],
+                    wss_clim=render_cfg["wss_clim"],
+                    show_scalar_bar=render_cfg["wss_show_scalar_bar"],
+                    wss_bar_cfg=render_cfg["wss_bar_cfg"],
+                    rotate=render_cfg["rotate_dynamic_video"],
+                    rotation_frames=render_cfg["dynamic_rotation_frames"],
+                    elevation_deg=render_cfg["dynamic_rotation_elevation_deg"],
+                    time_repeat=render_cfg["dynamic_time_repeat"],
+                    window_size=render_cfg["window_size"],
+                ),
+                options.export_wss,
+                available=self.workspace.derived.wss_surfaces is not None and len(self.workspace.derived.wss_surfaces) > 0,
+            )
+            _run(
+                "tke",
+                lambda: render_tke_video(
+                    self.workspace,
+                    options.out_dir,
+                    fps=render_cfg["fps"],
+                    smoothing_iteration=self.workspace.derived_params.smoothing_iteration,
+                    view=render_cfg["camera_view"],
+                    distance_scale=render_cfg["camera_distance_scale"],
+                    tke_clim=render_cfg["tke_clim"],
+                    show_scalar_bar=render_cfg["tke_show_scalar_bar"],
+                    tke_bar_cfg=render_cfg["tke_bar_cfg"],
+                    rotate=render_cfg["rotate_dynamic_video"],
+                    rotation_frames=render_cfg["dynamic_rotation_frames"],
+                    elevation_deg=render_cfg["dynamic_rotation_elevation_deg"],
+                    time_repeat=render_cfg["dynamic_time_repeat"],
+                    window_size=render_cfg["window_size"],
+                ),
+                options.export_tke,
+                available=self.workspace.derived.tke_array is not None or self.workspace.derived.tke_volume is not None,
+            )
+            _run(
+                "pg",
+                lambda: render_pressure_gradient_video(
+                    self.workspace,
+                    options.out_dir,
+                    fps=render_cfg["fps"],
+                    smoothing_iteration=self.workspace.derived_params.smoothing_iteration,
+                    view=render_cfg["camera_view"],
+                    distance_scale=render_cfg["camera_distance_scale"],
+                    pressure_gradient_clim=render_cfg["pressure_gradient_clim"],
+                    show_scalar_bar=render_cfg["pressure_gradient_show_scalar_bar"],
+                    pressure_gradient_bar_cfg=render_cfg["pressure_gradient_bar_cfg"],
+                    rotate=render_cfg["rotate_dynamic_video"],
+                    rotation_frames=render_cfg["dynamic_rotation_frames"],
+                    elevation_deg=render_cfg["dynamic_rotation_elevation_deg"],
+                    time_repeat=render_cfg["dynamic_time_repeat"],
+                    window_size=render_cfg["window_size"],
+                ),
+                options.export_pg,
+                available=self.workspace.derived.pressure_gradient_magnitude is not None,
+            )
+            _run(
+                "streamlines",
+                lambda: render_streamlines_video(
+                    self.workspace,
+                    options.out_dir,
+                    fps=render_cfg["fps"],
+                    smoothing_iteration=self.workspace.derived_params.smoothing_iteration,
+                    view=render_cfg["camera_view"],
+                    distance_scale=render_cfg["camera_distance_scale"],
+                    streamline_clim=render_cfg["streamline_clim"],
+                    show_scalar_bar=render_cfg["streamline_show_scalar_bar"],
+                    streamline_bar_cfg=render_cfg["streamline_bar_cfg"],
+                    rotate=render_cfg["rotate_dynamic_video"],
+                    rotation_frames=render_cfg["dynamic_rotation_frames"],
+                    elevation_deg=render_cfg["dynamic_rotation_elevation_deg"],
+                    time_repeat=render_cfg["dynamic_time_repeat"],
+                    window_size=render_cfg["window_size"],
+                ),
+                options.export_streamlines,
+                available=self.workspace.flow_raw is not None and self.workspace.segmask_binary is not None and self.workspace.segmask_3d is not None,
+            )
+            if rendered:
+                self.log(f"[Video Export] completed: {', '.join(sorted(rendered))}")
+            else:
+                self.log("[Video Export] completed with no saved videos")
+            summary_path = self._update_video_export_summary(
+                options.out_dir,
+                requested_flags,
+                video_outputs,
+                video_times,
+                time.perf_counter() - export_started_at,
+            )
+            self.log(f"[Video Export] summary updated: {summary_path}")
+        except Exception as e:
+            self.log(f"VIDEO EXPORT ERROR: {type(e).__name__}: {e}")
+            self.log(traceback.format_exc())
+        finally:
+            self._close_progress_dialog(progress)
+
     def _on_close_workspace(self):
         if self._autoseg_thread is not None:
             self.log("Auto segmentation is running. Wait for it to finish before clearing the workspace.")
@@ -2730,6 +3659,7 @@ class MainWindow(QtWidgets.QMainWindow):
             StepId.GENERATE_GRAPH,
             StepId.GENERATE_PLANES,
             StepId.COMPUTE_PLANE_METRICS,
+            StepId.COMPUTE_PWV,
             StepId.COMPUTE_DERIVED_METRICS,
         ]
         try:

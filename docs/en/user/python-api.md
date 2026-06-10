@@ -30,7 +30,8 @@ from autoflow import AutoFlowConfig, run_batch
 config = AutoFlowConfig(
     inputs=["./data/demo_data.h5"],
     output_dir="./results/demo",
-    make_plane_video=False,
+    requested_metrics=["pwv", "wss"],
+    requested_videos=["plane", "wss"],
 )
 results, last_case_out = run_batch(config)
 ```
@@ -53,7 +54,17 @@ config = AutoFlowConfig.from_config_dir("./configs")
 summary = run_case("case.h5", config=config)
 ```
 
-PWV is currently controlled by `configs/pwv.json` rather than a dedicated `AutoFlowConfig` field. The workspace built from `config_dir` carries the PWV groups and plotting defaults.
+PWV group definitions, timing method selection, and plotting defaults still come from `configs/pwv.json`, while `AutoFlowConfig.requested_metrics=["pwv"]` decides whether the batch run executes PWV.
+
+For the other derived metrics, `AutoFlowConfig.from_config_dir()` now reads:
+
+- `configs/fluid.json` for shared fluid properties such as `rho` and `viscosity`
+- `configs/wss.json` for WSS compute parameters
+- `configs/tke.json` for TKE density
+- `configs/pressure_gradient.json` for pressure-gradient compute parameters
+- `configs/planes.json` for plane render styling
+- `configs/wss.json`, `configs/tke.json`, `configs/pressure_gradient.json`, and `configs/streamlines.json` for metric-specific render ranges and optional colorbars
+- `configs/rendering.json` for shared video controls such as `window_size`, camera behavior, and rotation
 
 ### Launch the GUI from Python
 
@@ -69,7 +80,8 @@ launch_gui(config_dir="./configs")
 | --- | --- | --- | --- | --- |
 | `inputs` | list of paths | empty | batch inputs for `run_batch()` | `autoflow/api.py` |
 | `output_dir` | path | `./results` | root output directory | `autoflow/api.py` |
-| `skip_derived` | bool | `False` | skip derived metrics export | `autoflow/processing.py` |
+| `requested_metrics` | list[str] | empty | opt in to `pwv`, `wss`, `tke`, and/or `pg` | `autoflow/processing.py` |
+| `skip_derived` | bool | `False` | remove requested WSS, TKE, and pressure-gradient work | `autoflow/processing.py` |
 | `skip_plane_metrics` | bool | `False` | skip plane metrics | `autoflow/processing.py` |
 | `background_phase_correction` | bool | `False` | enable loader correction | `autoflow/algorithms/data.py`, `autoflow/algorithms/dicom.py` |
 | `dual_venc_ratio1` | float | `0.0` | first dual-venc alias window ratio for legacy `Nv=7` H5 | `autoflow/algorithms/data.py` |
@@ -80,10 +92,10 @@ launch_gui(config_dir="./configs")
 | `seed_ratio` | float | `0.02` | streamline seed density | `autoflow/algorithms/streamlines.py` |
 | `autoseg` | bool | `False` | run auto segmentation if no segmentation exists | `autoflow/processing.py` |
 | `autoseg_model` | string | empty | choose explicit nnUNet model folder | `autoflow/algorithms/segmentation.py` |
-| `make_plane_video` | bool | `False` | export plane video | `autoflow/rendering/videos.py` |
-| `make_wss_video` | bool | `False` | export WSS video | `autoflow/rendering/videos.py` |
-| `make_streamlines_video` | bool | `False` | export streamline video | `autoflow/rendering/videos.py` |
-| `make_tke_video` | bool | `False` | export TKE video when available | `autoflow/rendering/videos.py` |
+| `requested_videos` | list[str] | empty | export any of `plane`, `wss`, `tke`, `pg`, `streamlines` | `autoflow/rendering/videos.py` |
+| `window_size` | tuple[int, int] | `(1600, 1200)` | output render size for exported videos | `autoflow/rendering/videos.py` |
+| `pressure_gradient_clim` | tuple[float, float] or `None` | `None` | explicit pressure-gradient video display range; `None` keeps the auto range | `autoflow/rendering/videos.py` |
+| `wss_show_scalar_bar`, `tke_show_scalar_bar`, `pressure_gradient_show_scalar_bar`, `streamline_show_scalar_bar` | bool | `True` | show or hide the matching GUI and video colorbar | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
 
 ## Config Directory Support
 
@@ -99,5 +111,5 @@ Main code:
 - batch processing flows through `run_case()` and `run_batch()`
 - interactive GUI editing is not exposed as a stable batch API
 - GUI pathlines are interactive behavior, not a public batch-processing API
-- offline videos are supported through config flags in `run_case()` and `run_batch()`
+- offline videos are supported through `requested_videos` in `run_case()` and `run_batch()`
 - PWV is available through the config bundle loaded by `AutoFlowConfig.from_config_dir()` and `build_workspace()`

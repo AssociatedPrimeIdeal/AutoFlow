@@ -173,24 +173,32 @@ class PipelineEngine:
     def _register_derived_scene_objects(self, ws):
         for dk in ["wss_surface_live", "tke_volume", "pressure_gradient_volume"]:
             ws.remove_object_by_data_key(dk)
+        render_cfg = dict(getattr(ws, "render_settings", {}) or {})
         wss_max = float(np.nanmax(ws.derived.wss_volume)) if ws.derived.wss_volume is not None and np.size(ws.derived.wss_volume) else 0.0
         tke_max = float(np.nanmax(ws.derived.tke_array)) if ws.derived.tke_array is not None and np.size(ws.derived.tke_array) else 0.0
-        pressure_gradient_clim = tuple(ws.derived.pressure_gradient_display_clim) if ws.derived.pressure_gradient_display_clim is not None else (0.0, 1.0)
+        wss_clim = render_cfg.get("wss_clim") or (0.0, wss_max if wss_max > 0 else 1.0)
+        tke_clim = render_cfg.get("tke_clim") or (0.0, tke_max if tke_max > 0 else 1.0)
+        pressure_gradient_clim = render_cfg.get("pressure_gradient_clim")
+        if pressure_gradient_clim is None:
+            pressure_gradient_clim = tuple(ws.derived.pressure_gradient_display_clim) if ws.derived.pressure_gradient_display_clim is not None else (0.0, 1.0)
         ws.add_object(name="wss_surface", kind=ObjectKind.METRIC,
                       data_key="wss_surface_live", visible=False, opacity=1.0,
-                      scalars="wss", cmap="jet", clim=(0.0, wss_max if wss_max > 0 else 1.0), dynamic=True,
-                      show_scalar_bar=True, scalar_bar_title="WSS (Pa)")
+                      scalars="wss", cmap="jet", clim=tuple(wss_clim), dynamic=True,
+                      show_scalar_bar=bool(render_cfg.get("wss_show_scalar_bar", True)), scalar_bar_title="WSS (Pa)",
+                      scalar_bar_cfg=dict(render_cfg.get("wss_bar_cfg", {}) or {}))
         has_tke_local = ws.derived.tke_array is not None or ws.derived.tke_volume is not None
         if has_tke_local:
             ws.add_object(name="tke_volume", kind=ObjectKind.METRIC,
                           data_key="tke_volume", visible=False, opacity=0.5,
-                          scalars="TKE", cmap="hot", clim=(0.0, tke_max if tke_max > 0 else 1.0), dynamic=True,
-                          show_scalar_bar=True, scalar_bar_title="TKE (J/m³)")
+                          scalars="TKE", cmap="hot", clim=tuple(tke_clim), dynamic=True,
+                          show_scalar_bar=bool(render_cfg.get("tke_show_scalar_bar", True)), scalar_bar_title="TKE (J/m³)",
+                          scalar_bar_cfg=dict(render_cfg.get("tke_bar_cfg", {}) or {}))
         if ws.derived.pressure_gradient_magnitude is not None:
             ws.add_object(name="pressure_gradient_volume", kind=ObjectKind.METRIC,
                           data_key="pressure_gradient_volume", visible=False, opacity=0.5,
                           scalars="PressureGradient", cmap="magma", clim=pressure_gradient_clim, dynamic=True,
-                          show_scalar_bar=True, scalar_bar_title="|Pressure Grad| (Pa/m)")
+                          show_scalar_bar=bool(render_cfg.get("pressure_gradient_show_scalar_bar", True)), scalar_bar_title="|Pressure Grad| (Pa/m)",
+                          scalar_bar_cfg=dict(render_cfg.get("pressure_gradient_bar_cfg", {}) or {}))
 
 
     def _missing_segmentation_message(self, ws, action):
@@ -401,6 +409,7 @@ class PipelineEngine:
             StepId.EDIT_GRAPH: self._step_edit_graph,
             StepId.GENERATE_PLANES: self._step_generate_planes,
             StepId.EDIT_PLANES: self._step_edit_planes,
+            StepId.COMPUTE_PWV: self._step_compute_pwv,
             StepId.GENERATE_STREAMLINES: self._step_generate_streamlines,
             StepId.PLANE_STREAMLINES: self._step_plane_streamlines,
             StepId.COMPUTE_PLANE_METRICS: self._step_compute_plane_metrics,
@@ -578,13 +587,29 @@ class PipelineEngine:
         return StepResult(StepId.EDIT_GRAPH, True, True, "Graph edit")
 
     
-    def _ensure_derived_metrics(self, ws, save_pixelwise=False, refresh_scene_objects=False):
+    def _ensure_derived_metrics(
+        self,
+        ws,
+        save_pixelwise=False,
+        refresh_scene_objects=False,
+        compute_wss=True,
+        compute_tke=True,
+        compute_pressure_gradient=True,
+    ):
         has_wss = ws.derived.wss_volume is not None and np.size(ws.derived.wss_volume) > 0
         has_pg = ws.derived.pressure_gradient_array is not None and np.size(ws.derived.pressure_gradient_array) > 0
         has_tke = ws.derived.tke_array is not None or ws.derived.tke_volume is not None
         source_tke = ws.source_tke_array
         source_sigma = ws.source_sigma if ws.input_state.capabilities.has_complex_source else None
-        if has_wss and has_pg and (has_tke or (source_tke is None and source_sigma is None)):
+        need_tke = bool(compute_tke and (source_tke is not None or source_sigma is not None))
+        has_requested = True
+        if compute_wss:
+            has_requested = has_requested and has_wss
+        if compute_pressure_gradient:
+            has_requested = has_requested and has_pg
+        if need_tke:
+            has_requested = has_requested and has_tke
+        if has_requested:
             if refresh_scene_objects:
                 self._register_derived_scene_objects(ws)
             return ws.derived
@@ -609,30 +634,45 @@ class PipelineEngine:
             rr=ws.rr,
             pressure_gradient_smoothing_sigma=dp.pressure_gradient_smoothing_sigma,
             pressure_gradient_use_convective_acceleration=dp.pressure_gradient_use_convective_acceleration,
+            compute_wss=bool(compute_wss),
+            compute_tke=bool(compute_tke),
+            compute_pressure_gradient=bool(compute_pressure_gradient),
+            wss_smoothing_iteration=dp.wss_smoothing_iteration,
+            wss_viscosity=dp.wss_viscosity,
+            wss_inward_distance=dp.wss_inward_distance,
+            wss_parabolic_fitting=dp.wss_parabolic_fitting,
+            wss_no_slip_condition=dp.wss_no_slip_condition,
+            tke_rho=dp.tke_rho,
+            pressure_gradient_rho=dp.pressure_gradient_rho,
+            pressure_gradient_viscosity=dp.pressure_gradient_viscosity,
         )
-        ws.derived.wss_surfaces = result["wss_surfaces"]
-        ws.derived.wss_volume = result.get("wss_volume")
-        ws.derived.tke_volume = result["tke_volume"]
-        ws.derived.tke_array = result.get("tke_array")
-        ws.derived.pressure_gradient_array = result.get("pressure_gradient_array")
-        ws.derived.pressure_gradient_magnitude = result.get("pressure_gradient_magnitude")
-        ws.derived.pressure_gradient_peak = result.get("pressure_gradient_peak")
-        ws.derived.pressure_gradient_support_mask = result.get("pressure_gradient_support_mask")
-        ws.derived.pressure_gradient_display_clim = result.get("pressure_gradient_display_clim")
+        if compute_wss:
+            ws.derived.wss_surfaces = result["wss_surfaces"]
+            ws.derived.wss_volume = result.get("wss_volume")
+        if compute_tke:
+            ws.derived.tke_volume = result["tke_volume"]
+            ws.derived.tke_array = result.get("tke_array")
+        if compute_pressure_gradient:
+            ws.derived.pressure_gradient_array = result.get("pressure_gradient_array")
+            ws.derived.pressure_gradient_magnitude = result.get("pressure_gradient_magnitude")
+            ws.derived.pressure_gradient_peak = result.get("pressure_gradient_peak")
+            ws.derived.pressure_gradient_support_mask = result.get("pressure_gradient_support_mask")
+            ws.derived.pressure_gradient_display_clim = result.get("pressure_gradient_display_clim")
         ws.derived.streamlines = []
         ws.derived.pixelwise_export = result.get("pixelwise_export", {})
         if refresh_scene_objects:
             self._register_derived_scene_objects(ws)
         return ws.derived
 
-    def _compute_plane_metrics_internal(self, ws, save=True, use_multithread=False):
+    def _compute_plane_metrics_internal(self, ws, save=True, use_multithread=False, include_derived=True):
         if not ws.has_flow():
             return [], {}, "Plane metrics skipped: no flow"
         if ws.segmask_raw is None:
             return [], {}, self._missing_segmentation_message(ws, "Plane metrics")
         if ws.segmask_binary is None:
             self.preprocess(ws)
-        self._ensure_derived_metrics(ws, save_pixelwise=False, refresh_scene_objects=False)
+        if include_derived:
+            self._ensure_derived_metrics(ws, save_pixelwise=False, refresh_scene_objects=False)
         # Prefer the smoothed centerlines (better local tangents) but fall back
         # to the raw ordered ones if the smoothing step hasn't been run yet.
         paths_for_tangent = ws.centerline_paths_smooth if len(ws.centerline_paths_smooth) > 0 else ws.centerline_paths
@@ -648,13 +688,28 @@ class PipelineEngine:
                 RR=ws.rr, branch_labels_3d=ws.branch_labels,
                 path_info=ws.path_info, forks=ws.forks, paths=paths_for_tangent,
                 return_qc=True)
-        metrics, plane_pixelwise = augment_plane_metrics_with_derived(
-            metrics, ws.planes, ws.segmask_binary, ws.resolution, ws.origin,
-            branch_labels_3d=ws.branch_labels,
-            tke_array=ws.derived.tke_array,
-            pressure_gradient_array=ws.derived.pressure_gradient_array,
-            wss_surfaces=ws.derived.wss_surfaces,
-        )
+        if include_derived:
+            metrics, plane_pixelwise = augment_plane_metrics_with_derived(
+                metrics, ws.planes, ws.segmask_binary, ws.resolution, ws.origin,
+                branch_labels_3d=ws.branch_labels,
+                tke_array=ws.derived.tke_array,
+                pressure_gradient_array=ws.derived.pressure_gradient_array,
+                wss_surfaces=ws.derived.wss_surfaces,
+            )
+        else:
+            metrics = [dict(metric) for metric in metrics]
+            plane_pixelwise = []
+            for idx, plane in enumerate(ws.planes):
+                plane_pixelwise.append(
+                    {
+                        "plane_index": int(idx),
+                        "center": np.asarray(plane.center, dtype=float).reshape(3).tolist(),
+                        "normal": np.asarray(plane.normal, dtype=float).reshape(3).tolist(),
+                        "label": int(getattr(plane, "label", 0) or 0),
+                        "path_index": int(getattr(plane, "path_index", -1)),
+                        "timepoints": [],
+                    }
+                )
         ws.derived.plane_metrics = metrics
         ws.derived.plane_qc = qc
         for i, metric in enumerate(metrics):
@@ -673,9 +728,6 @@ class PipelineEngine:
             save_plane_pixelwise_h5(plane_pixelwise_path, plane_pixelwise, rr_ms=ws.rr, source_format=ws.input_state.source_format)
             ws.derived.plane_pixelwise_file = plane_pixelwise_path
             msg += f" saved={plane_metric_path} qc={qc_path} pixelwise={plane_pixelwise_path}"
-            if not ws.derived.pwv_results or not ws.derived.pwv_file:
-                _pwv_results, pwv_msg = self._compute_pwv_internal(ws, save=True)
-                msg += f" | {pwv_msg}"
         return metrics, qc, msg
 
     def _save_planes_json(self, ws):
@@ -788,6 +840,19 @@ class PipelineEngine:
         ws.pipeline.mark_done(StepId.EDIT_PLANES, skipped=True)
         return StepResult(StepId.EDIT_PLANES, True, True, "Plane edit")
 
+    def _step_compute_pwv(self, ws):
+        if not ws.has_flow():
+            return StepResult(StepId.COMPUTE_PWV, True, True, "PWV skipped: no flow")
+        if ws.segmask_raw is None:
+            return StepResult(
+                StepId.COMPUTE_PWV, True, True,
+                self._missing_segmentation_message(ws, "PWV"),
+            )
+        results, msg = self._compute_pwv_internal(ws, save=True)
+        skipped = str(msg).startswith("PWV skipped:")
+        ws.pipeline.mark_done(StepId.COMPUTE_PWV, skipped=skipped)
+        return StepResult(StepId.COMPUTE_PWV, True, skipped, msg, outputs=list(results or []))
+
     def _step_generate_streamlines(self, ws):
         if ws.segmask_raw is None:
             return StepResult(
@@ -808,11 +873,13 @@ class PipelineEngine:
         ws.streamline_cache.clear()
         ws.streamline_active = True
         ws.remove_object_by_data_key("streamlines_live")
+        render_cfg = dict(getattr(ws, "render_settings", {}) or {})
         ws.add_object(
             name="streamlines", kind=ObjectKind.FLOW,
             data_key="streamlines_live", visible=True, opacity=1.0,
-            scalars="Velocity", cmap="turbo", dynamic=True,
-            show_scalar_bar=True, scalar_bar_title="Velocity (m/s)",
+            scalars="Velocity", cmap="turbo", clim=render_cfg.get("streamline_clim"), dynamic=True,
+            show_scalar_bar=bool(render_cfg.get("streamline_show_scalar_bar", True)), scalar_bar_title="Velocity (m/s)",
+            scalar_bar_cfg=dict(render_cfg.get("streamline_bar_cfg", {}) or {}),
             tube_radius=ws.streamline_params.tube_radius)
         ws.pipeline.mark_done(StepId.GENERATE_STREAMLINES)
         p = ws.streamline_params
@@ -865,7 +932,7 @@ class PipelineEngine:
             if plane_result.skipped or not plane_result.success:
                 return StepResult(StepId.COMPUTE_PLANE_METRICS, plane_result.success, True, plane_result.message)
         use_mt = getattr(ws.derived_params, "use_multithread", False)
-        _, _, msg = self._compute_plane_metrics_internal(ws, save=True, use_multithread=use_mt)
+        _, _, msg = self._compute_plane_metrics_internal(ws, save=True, use_multithread=use_mt, include_derived=True)
         self._save_planes_json(ws)
         ws.pipeline.mark_done(StepId.COMPUTE_PLANE_METRICS)
         return StepResult(StepId.COMPUTE_PLANE_METRICS, True, False, msg)
