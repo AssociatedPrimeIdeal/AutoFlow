@@ -11,6 +11,7 @@ from ..algorithms import (
     generate_streamlines_from_plane_at_t,
     generate_pathlines_from_plane_at_t,
     create_uniform_grid,
+    sample_volume_on_surface,
 )
 
 
@@ -535,7 +536,7 @@ class SceneController:
                     "fmt": "%.3g",
                 }
                 if isinstance(obj.scalar_bar_cfg, dict):
-                    scalar_bar_args.update(obj.scalar_bar_cfg)
+                    scalar_bar_args.update({k: v for k, v in obj.scalar_bar_cfg.items() if k != "stack_gap"})
                 kw["scalar_bar_args"] = scalar_bar_args
         else:
             kw["color"] = obj.color
@@ -577,63 +578,6 @@ class SceneController:
             if ws.segmask_3d is None:
                 return None
             return self._cached(data_key, 0, lambda: build_surface_from_mask3d(ws.segmask_3d, sp, org, smooth_iter=1000))
-
-        if isinstance(data_key, str) and data_key.startswith("segmask_group_"):
-            group_name = str(data_key[len("segmask_group_"):])
-            group_state = ws.multilabel_groups.get(group_name, {})
-            mask = group_state.get("segmask_3d")
-            if mask is None:
-                return None
-            return self._cached(
-                data_key,
-                0,
-                lambda: build_surface_from_mask3d(np.asarray(mask, dtype=bool), sp, org, smooth_iter=1000),
-            )
-
-        if data_key == "skeleton_points":
-            if ws.skeleton_points is None or len(ws.skeleton_points) == 0:
-                return None
-            return pv.PolyData(np.asarray(ws.skeleton_points, dtype=float) + np.asarray(org, dtype=float).reshape(1, 3))
-
-        if data_key == "skeleton_mask_surface":
-            if ws.skeleton_mask is None:
-                return None
-            return self._cached(data_key, 0, lambda: build_surface_from_mask3d(ws.skeleton_mask, sp, org, smooth_iter=1000))
-
-        if isinstance(data_key, str) and data_key.startswith("skeleton_"):
-            group_name = str(data_key[len("skeleton_"):])
-            if group_name and group_name != "points":
-                group_state = ws.multilabel_groups.get(group_name, {})
-                pts = group_state.get("skeleton_points")
-                if pts is None or len(pts) == 0:
-                    return None
-                return pv.PolyData(np.asarray(pts, dtype=float) + np.asarray(org, dtype=float).reshape(1, 3))
-
-        if data_key == "graph_lines":
-            if ws.graph is None or len(ws.graph.points) == 0:
-                return None
-            return graph_to_polydata(np.asarray(ws.graph.points) + np.asarray(org).reshape(1, 3), ws.graph.edges)
-
-        if isinstance(data_key, str) and data_key.startswith("graph_"):
-            group_name = str(data_key[len("graph_"):])
-            if group_name and group_name != "lines":
-                group_state = ws.multilabel_groups.get(group_name, {})
-                graph = group_state.get("graph")
-                if graph is None or len(getattr(graph, "points", [])) == 0:
-                    return None
-                return graph_to_polydata(np.asarray(graph.points) + np.asarray(org).reshape(1, 3), graph.edges)
-
-        if isinstance(data_key, str) and data_key.startswith("forks_"):
-            group_name = str(data_key[len("forks_"):])
-            group_state = ws.multilabel_groups.get(group_name, {})
-            forks = list(group_state.get("forks", []))
-            pts = [
-                np.asarray(f.get("crosspoint", [0.0, 0.0, 0.0]), dtype=float) + np.asarray(org, dtype=float).reshape(3)
-                for f in forks
-            ]
-            if not pts:
-                return None
-            return pv.PolyData(np.asarray(pts, dtype=float).reshape(-1, 3))
 
         if data_key == "streamlines_live":
             return self._get_streamline_mesh(t)
@@ -680,28 +624,68 @@ class SceneController:
                 return None
             def _build_pressure_gradient_t():
                 arr = np.asarray(ws.derived.pressure_gradient_magnitude, dtype=np.float32)
+                support = ws.derived.pressure_gradient_support_mask
                 if arr.ndim == 4:
-                    vol_t = arr[..., min(max(0, int(t)), arr.shape[3] - 1)]
+                    tidx = min(max(0, int(t)), arr.shape[3] - 1)
+                    vol_t = arr[..., tidx]
+                    support_t = np.asarray(support[..., tidx], dtype=bool) if support is not None and np.asarray(support).ndim == 4 else None
                 else:
                     vol_t = arr
-                if ws.segmask_binary is not None:
-                    if ws.segmask_binary.ndim == 4:
-                        mask_t = ws.segmask_binary[..., min(max(0, int(t)), ws.segmask_binary.shape[3] - 1)]
+                    support_t = np.asarray(support, dtype=bool) if support is not None else None
+                if support_t is None:
+                    if ws.segmask_binary is not None:
+                        if ws.segmask_binary.ndim == 4:
+                            support_t = np.asarray(ws.segmask_binary[..., min(max(0, int(t)), ws.segmask_binary.shape[3] - 1)], dtype=bool)
+                        else:
+                            support_t = np.asarray(ws.segmask_binary, dtype=bool)
+                    elif ws.segmask_3d is not None:
+                        support_t = np.asarray(ws.segmask_3d, dtype=bool)
                     else:
-                        mask_t = ws.segmask_binary
-                elif ws.segmask_3d is not None:
-                    mask_t = ws.segmask_3d
-                else:
-                    mask_t = np.ones(vol_t.shape, dtype=bool)
-                vol_t = vol_t * np.asarray(mask_t, dtype=np.float32)
-
-                grad_grid = create_uniform_grid(vol_t, sp, origin=org, name="PressureGradient")
-                mask_grid = create_uniform_grid(np.asarray(mask_t, dtype=np.float32), sp, origin=org, name="mask")
-                mask_mesh = mask_grid.threshold(0.1, scalars="mask")
-                if mask_mesh is None or mask_mesh.n_cells == 0:
-                    return None
-                return mask_mesh.sample(grad_grid)
+                        support_t = np.ones(vol_t.shape, dtype=bool)
+                vol_t = np.where(support_t, vol_t, 0.0)
+                return sample_volume_on_surface(
+                    vol_t,
+                    support_t,
+                    sp,
+                    origin=org,
+                    name="PressureGradient",
+                    smooth_iter=80,
+                )
             return self._cached(data_key, t, _build_pressure_gradient_t)
+
+        if data_key == "relative_pressure_volume":
+            if ws.derived.relative_pressure_array is None:
+                return None
+            def _build_relative_pressure_t():
+                arr = np.asarray(ws.derived.relative_pressure_array, dtype=np.float32)
+                support = ws.derived.pressure_gradient_support_mask
+                if arr.ndim == 4:
+                    tidx = min(max(0, int(t)), arr.shape[3] - 1)
+                    vol_t = arr[..., tidx]
+                    support_t = np.asarray(support[..., tidx], dtype=bool) if support is not None and np.asarray(support).ndim == 4 else None
+                else:
+                    vol_t = arr
+                    support_t = np.asarray(support, dtype=bool) if support is not None else None
+                if support_t is None:
+                    if ws.segmask_binary is not None:
+                        if ws.segmask_binary.ndim == 4:
+                            support_t = np.asarray(ws.segmask_binary[..., min(max(0, int(t)), ws.segmask_binary.shape[3] - 1)], dtype=bool)
+                        else:
+                            support_t = np.asarray(ws.segmask_binary, dtype=bool)
+                    elif ws.segmask_3d is not None:
+                        support_t = np.asarray(ws.segmask_3d, dtype=bool)
+                    else:
+                        support_t = np.ones(vol_t.shape, dtype=bool)
+                vol_t = np.where(support_t, vol_t, 0.0)
+                return sample_volume_on_surface(
+                    vol_t,
+                    support_t,
+                    sp,
+                    origin=org,
+                    name="RelativePressure",
+                    smooth_iter=80,
+                )
+            return self._cached(data_key, t, _build_relative_pressure_t)
 
         if data_key == "derived_streamlines_live":
             if not ws.derived.streamlines:

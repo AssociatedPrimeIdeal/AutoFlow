@@ -47,8 +47,8 @@
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
 | no planes generated | graph or segmentation is missing | generate segmentation, skeleton, and graph first |
-| pressure-gradient boundary looks trimmed | support mask excludes boundary voxels | expected behavior; check `pressure_gradient_support_mask` |
-| expected PWV, WSS, TKE, or pressure-gradient outputs are missing | the stage was not requested from CLI or API | rerun with `--with ...` or `requested_metrics=[...]` |
+| relative-pressure map looks trimmed | support mask excludes boundary voxels from the reconstruction support | expected behavior; check `pressure_gradient_support_mask` |
+| expected PWV, WSS, TKE, pressure-gradient, or relative-pressure outputs are missing | the stage was not requested from CLI or API | rerun with `--with ...` or `requested_metrics=[...]` |
 
 ## Where To Inspect Code
 

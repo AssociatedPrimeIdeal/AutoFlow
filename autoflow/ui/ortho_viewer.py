@@ -38,7 +38,8 @@ class OrthoViewer(QtWidgets.QWidget):
             "Flow X (cm/s)", "Flow Y (cm/s)", "Flow Z (cm/s)",
             "Magnitude", "PC-MRA", "Speed (cm/s)",
             "WSS (Pa)", "TKE (J/m³)",
-            "Pressure Grad X (Pa/m)", "Pressure Grad Y (Pa/m)", "Pressure Grad Z (Pa/m)", "|Pressure Grad| (Pa/m)"
+            "Pressure Grad X (Pa/m)", "Pressure Grad Y (Pa/m)", "Pressure Grad Z (Pa/m)", "|Pressure Grad| (Pa/m)",
+            "Relative Pressure (Pa)"
         ])
         self.combo_content.setCurrentIndex(4)
         self.combo_content.currentIndexChanged.connect(self._on_content_changed)
@@ -349,6 +350,26 @@ class OrthoViewer(QtWidgets.QWidget):
         vol = self._cached("tke_mesh_volume", key, _build)
         cmap, clim = self._scene_style("tke_volume", "hot", None)
         return vol, "TKE (J/m³)", {"cmap": cmap, "clim": clim}
+    def _get_relative_pressure_volume(self, t):
+        ws = self.workspace
+        if ws.derived.relative_pressure_array is None:
+            return None, "Relative Pressure (no data)", {"cmap": "RdBu_r", "clim": None}
+        arr = np.asarray(ws.derived.relative_pressure_array, dtype=float)
+        tidx = min(max(0, int(t)), arr.shape[3] - 1)
+        vol = np.asarray(arr[..., tidx], dtype=float)
+        if ws.segmask_binary is not None:
+            mask_t = ws.segmask_binary[..., tidx] if ws.segmask_binary.ndim == 4 else ws.segmask_binary
+            vol = np.where(np.asarray(mask_t, dtype=bool), vol, 0.0)
+        cmap, clim = self._scene_style("relative_pressure_volume", "RdBu_r", None)
+        if clim is None and ws.derived.relative_pressure_display_clim is not None:
+            clim = tuple(ws.derived.relative_pressure_display_clim)
+        if clim is None:
+            finite = vol[np.isfinite(vol)]
+            vmax = float(np.percentile(np.abs(finite), 99.0)) if finite.size else 1.0
+            vmax = max(vmax, 1.0)
+            clim = (-vmax, vmax)
+        return vol, "Relative Pressure (Pa)", {"cmap": cmap, "clim": clim}
+
     def _get_pressure_gradient_volume(self, t, component=None):
         ws = self.workspace
         if ws.derived.pressure_gradient_array is None:
@@ -422,6 +443,8 @@ class OrthoViewer(QtWidgets.QWidget):
             return self._get_pressure_gradient_volume(t, component=2)
         if content_idx == 11:
             return self._get_pressure_gradient_volume(t, component=None)
+        if content_idx == 12:
+            return self._get_relative_pressure_volume(t)
         return None, "", {"cmap": "gray", "clim": None}
 
     def _get_mask_3d(self):
@@ -568,7 +591,7 @@ class OrthoViewer(QtWidgets.QWidget):
             if labels_3d is not None and cx < labels_3d.shape[0]:
                 self._draw_segmentation_overlay(self.ax_sag, labels_3d[cx, :, :].T, float(res[2] / res[1]))
 
-            if self.combo_content.currentIndex() in (6, 7):
+            if self.combo_content.currentIndex() in (6, 7, 8, 9, 10, 11, 12):
                 self._scalar_cbar = self.fig.colorbar(im, ax=[self.ax_ax, self.ax_cor, self.ax_sag], fraction=0.025, pad=0.01)
                 self._scalar_cbar.ax.tick_params(labelsize=6, colors="white")
                 self._scalar_cbar.set_label(title, color="white", fontsize=7)

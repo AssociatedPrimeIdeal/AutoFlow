@@ -67,12 +67,38 @@ def test_phantom_p_plane_metrics_include_mean_velocity_error_and_valid_distance_
     case_dir, metrics = _run_phantom_p_case()
     plane_pixelwise_path = case_dir / "plane_metrics_pixelwise.h5"
     plane_positions_path = case_dir / "plane_positions.json"
+    summary_path = case_dir / "summary.json"
+    pixelwise_npz_path = case_dir / "derived_metrics_pixelwise.npz"
     assert plane_pixelwise_path.is_file()
     assert plane_positions_path.is_file()
+    assert summary_path.is_file()
+    assert pixelwise_npz_path.is_file()
 
     plane_positions = json.loads(plane_positions_path.read_text(encoding="utf-8"))["planes"]
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert len(plane_positions) == len(metrics)
     assert len(metrics) >= 1
+    assert summary["pressure_method"] == "least_squares"
+
+    centerline_profiles = list(summary.get("centerline_pressure_profiles", []) or [])
+    assert centerline_profiles
+    assert len(centerline_profiles) == int(summary.get("n_paths", len(centerline_profiles)))
+    assert any(float(item.get("pressure_drop_peak_Pa", 0.0)) > 0.0 for item in centerline_profiles)
+    assert any(len(item.get("pressure_drop_Pa_t", [])) > 1 for item in centerline_profiles)
+
+    with np.load(pixelwise_npz_path) as pixelwise_npz:
+        assert "relative_pressure" in pixelwise_npz.files
+        assert "relative_pressure_peak" in pixelwise_npz.files
+        assert "pressure_gradient" in pixelwise_npz.files
+        assert "pressure_gradient_mag" in pixelwise_npz.files
+        rel_pressure = np.asarray(pixelwise_npz["relative_pressure"], dtype=float)
+        rel_peak = np.asarray(pixelwise_npz["relative_pressure_peak"], dtype=float)
+        grad = np.asarray(pixelwise_npz["pressure_gradient"], dtype=float)
+        assert rel_pressure.ndim == 4
+        assert rel_peak.ndim == 3
+        assert grad.ndim == 5 and grad.shape[-1] == 3
+        assert np.isfinite(rel_pressure).any()
+        assert float(np.nanmax(np.abs(rel_peak))) > 0.0
 
     with h5py.File(DATA_DIR / "phantom_P.h5", "r") as handle:
         truth = handle["truth"]
@@ -114,6 +140,8 @@ def test_phantom_p_plane_metrics_include_mean_velocity_error_and_valid_distance_
         assert metric["meanv_cm_s"] > 0.0
         assert metric["peakv_cm_s"] > 0.0
         assert metric["peakv_cm_s"] >= metric["meanv_cm_s"]
+        assert "relative_pressure_mean_Pa" in metric
+        assert metric["relative_pressure_peak_Pa"] >= metric["relative_pressure_mean_Pa"]
         assert "pressure_gradient_mag_mean_Pa_m" in metric
         assert metric["pressure_gradient_mag_mean_Pa_m"] > 0.0
         assert metric["pressure_gradient_mag_peak_Pa_m"] >= metric["pressure_gradient_mag_mean_Pa_m"]

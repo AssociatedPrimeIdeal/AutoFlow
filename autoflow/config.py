@@ -51,6 +51,15 @@ DEFAULT_PRESSURE_GRADIENT_BAR_CFG = {
     "label_font_size": 32,
 }
 
+DEFAULT_RELATIVE_PRESSURE_BAR_CFG = {
+    "position_x": 0.75,
+    "position_y": 0.2,
+    "height": 0.22,
+    "width": 0.05,
+    "title_font_size": 40,
+    "label_font_size": 32,
+}
+
 DEFAULT_PLANE_VIDEO_CFG = {
     "show_skeleton": True,
     "skeleton_point_size": 10.0,
@@ -273,7 +282,11 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         },
     },
     "pressure_gradient": {
+        "method": "least_squares",
         "smoothing_sigma": 0.0,
+        "support_erosion_iters": 1,
+        "layer_opacity": 0.6,
+        "relative_pressure_opacity": 0.6,
         "use_convective_acceleration": True,
         "render": {
             "clim": None,
@@ -487,6 +500,9 @@ def resolve_render_settings(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[st
         "pressure_gradient_clim": _resolve_clim(pressure_gradient_render_cfg.get("clim", None), rendering_cfg.get("pressure_gradient_clim", None), None),
         "pressure_gradient_show_scalar_bar": bool(pressure_gradient_render_cfg.get("show_scalar_bar", rendering_cfg.get("pressure_gradient_show_scalar_bar", True))),
         "pressure_gradient_bar_cfg": _resolve_bar_cfg(pressure_gradient_render_cfg.get("bar_cfg", None), rendering_cfg.get("pressure_gradient_bar_cfg", None), DEFAULT_PRESSURE_GRADIENT_BAR_CFG),
+        "relative_pressure_clim": _resolve_clim(pressure_gradient_render_cfg.get("relative_pressure_clim", None), rendering_cfg.get("relative_pressure_clim", None), None),
+        "relative_pressure_show_scalar_bar": bool(pressure_gradient_render_cfg.get("relative_pressure_show_scalar_bar", rendering_cfg.get("show_relative_pressure_scalar_bar", rendering_cfg.get("pressure_gradient_show_scalar_bar", True)))),
+        "relative_pressure_bar_cfg": _resolve_bar_cfg(pressure_gradient_render_cfg.get("relative_pressure_bar_cfg", None), rendering_cfg.get("relative_pressure_bar_cfg", None), DEFAULT_RELATIVE_PRESSURE_BAR_CFG),
         "streamline_clim": _resolve_clim(streamline_render_cfg.get("clim", None), rendering_cfg.get("streamline_clim", None), (0.0, 1.0)),
         "streamline_show_scalar_bar": bool(streamline_render_cfg.get("show_scalar_bar", rendering_cfg.get("streamline_show_scalar_bar", True))),
         "streamline_bar_cfg": _resolve_bar_cfg(streamline_render_cfg.get("bar_cfg", None), rendering_cfg.get("streamline_bar_cfg", None), DEFAULT_STREAMLINE_BAR_CFG),
@@ -511,7 +527,11 @@ def _build_derived_metrics_config(config_bundle: Dict[str, Dict[str, Any]]) -> D
         "pressure_gradient_rho": float(pressure_gradient_cfg.get("rho", legacy_cfg.get("pressure_gradient_rho", shared_rho))),
         "pressure_gradient_viscosity": float(pressure_gradient_cfg.get("viscosity", legacy_cfg.get("pressure_gradient_viscosity", shared_viscosity))),
         "pressure_gradient_smoothing_sigma": float(pressure_gradient_cfg.get("smoothing_sigma", legacy_cfg.get("pressure_gradient_smoothing_sigma", 0.0))),
+        "pressure_gradient_support_erosion_iters": int(pressure_gradient_cfg.get("support_erosion_iters", legacy_cfg.get("pressure_gradient_support_erosion_iters", 1))),
+        "pressure_gradient_layer_opacity": float(pressure_gradient_cfg.get("layer_opacity", legacy_cfg.get("pressure_gradient_layer_opacity", 0.6))),
+        "relative_pressure_layer_opacity": float(pressure_gradient_cfg.get("relative_pressure_opacity", legacy_cfg.get("relative_pressure_layer_opacity", 0.6))),
         "pressure_gradient_use_convective_acceleration": bool(pressure_gradient_cfg.get("use_convective_acceleration", legacy_cfg.get("pressure_gradient_use_convective_acceleration", True))),
+        "pressure_method": str(pressure_gradient_cfg.get("method", legacy_cfg.get("pressure_method", legacy_cfg.get("pressure_gradient_method", "least_squares"))) or "least_squares"),
         "step_size": int(legacy_cfg.get("step_size", 5)),
         "tube_radius": float(legacy_cfg.get("tube_radius", 0.1)),
     }
@@ -557,6 +577,7 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
     skeleton_cfg = config_bundle.get("skeleton", {})
     streamline_cfg = config_bundle.get("streamlines", {})
     render_settings = resolve_render_settings(config_bundle)
+    derived_cfg = _build_derived_metrics_config(config_bundle)
     return {
         "output_dir": str(batch_cfg.get("output_dir", "./results")),
         "skip_derived": bool(batch_cfg.get("skip_derived", False)),
@@ -585,5 +606,6 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
         "rng_seed": int(streamline_cfg.get("rng_seed", 0)),
         "tube_radius": float(streamline_cfg.get("tube_radius", 0.05)),
         "pathline_color": str(streamline_cfg.get("pathline_color", streamline_cfg.get("plane_pathline_color", "deepskyblue")) or "deepskyblue"),
+        "pressure_method": str(derived_cfg.get("pressure_method", "least_squares") or "least_squares"),
         **copy.deepcopy(render_settings),
     }

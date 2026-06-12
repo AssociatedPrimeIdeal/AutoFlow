@@ -25,6 +25,7 @@ from .plane_io import (
 from .rendering import (
     render_plane_rotation_video,
     render_pressure_gradient_video,
+    render_relative_pressure_video,
     render_streamlines_video,
     render_tke_video,
     render_wss_video,
@@ -120,6 +121,8 @@ def _build_cached_pixelwise_export(ws):
         "pressure_gradient_mag": np.asarray(ws.derived.pressure_gradient_magnitude, dtype=np.float32),
         "pressure_gradient_peak": np.asarray(ws.derived.pressure_gradient_peak, dtype=np.float32),
         "pressure_gradient_support_mask": np.asarray(ws.derived.pressure_gradient_support_mask, dtype=np.uint8),
+        "relative_pressure": np.asarray(ws.derived.relative_pressure_array, dtype=np.float32),
+        "relative_pressure_peak": np.asarray(ws.derived.relative_pressure_peak, dtype=np.float32),
     }
     if ws.derived.tke_array is not None:
         tke_time = np.asarray(ws.derived.tke_array, dtype=np.float32)
@@ -241,6 +244,9 @@ def process_single(
     pressure_gradient_clim=None,
     pressure_gradient_show_scalar_bar=True,
     pressure_gradient_bar_cfg=None,
+    relative_pressure_clim=None,
+    relative_pressure_show_scalar_bar=True,
+    relative_pressure_bar_cfg=None,
     streamline_clim=None,
     streamline_show_scalar_bar=True,
     streamline_bar_cfg=None,
@@ -402,7 +408,7 @@ def process_single(
             if metric_flags["tke"]:
                 labels.append("TKE")
             if metric_flags["pg"]:
-                labels.append("Pressure Gradient")
+                labels.append("Relative Pressure")
             print(f"[8/8] Compute Derived Metrics ({'/'.join(labels)})...")
             t_step = _time.perf_counter()
             step_parts = []
@@ -543,7 +549,7 @@ def process_single(
         available=ws.derived.tke_array is not None or ws.derived.tke_volume is not None,
     )
     _run_video(
-        "pg",
+        "pressure_gradient",
         video_flags["pg"],
         lambda: render_pressure_gradient_video(
             ws,
@@ -562,6 +568,27 @@ def process_single(
             window_size=window_size,
         ),
         available=ws.derived.pressure_gradient_magnitude is not None,
+    )
+    _run_video(
+        "relative_pressure",
+        video_flags["pg"],
+        lambda: render_relative_pressure_video(
+            ws,
+            out_dir,
+            fps=fps,
+            smoothing_iteration=ws.derived_params.smoothing_iteration,
+            view=camera_view,
+            distance_scale=camera_distance_scale,
+            relative_pressure_clim=relative_pressure_clim,
+            show_scalar_bar=relative_pressure_show_scalar_bar,
+            relative_pressure_bar_cfg=relative_pressure_bar_cfg,
+            rotate=rotate_dynamic_video,
+            rotation_frames=dynamic_rotation_frames,
+            elevation_deg=dynamic_rotation_elevation_deg,
+            time_repeat=dynamic_time_repeat,
+            window_size=window_size,
+        ),
+        available=ws.derived.relative_pressure_array is not None,
     )
 
     table_rows, raw_metrics, qc_data = (None, None, None)
@@ -630,6 +657,8 @@ def process_single(
         "reused_planes_file": reuse_planes_path,
         "videos": video_paths,
         "pixelwise_export": {k: list(np.asarray(v).shape) for k, v in pixelwise_result.items()} if pixelwise_result else {},
+        "centerline_pressure_profiles": list(ws.derived.centerline_pressure_profiles or []),
+        "pressure_method": str(getattr(ws.derived_params, "pressure_method", "least_squares") or "least_squares"),
         "plane_pixelwise_file": ws.derived.plane_pixelwise_file,
     }
     summary_path = os.path.join(out_dir, "summary.json")

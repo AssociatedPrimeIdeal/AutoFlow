@@ -61,7 +61,7 @@ For the other derived metrics, `AutoFlowConfig.from_config_dir()` now reads:
 - `configs/fluid.json` for shared fluid properties such as `rho` and `viscosity`
 - `configs/wss.json` for WSS compute parameters
 - `configs/tke.json` for TKE density
-- `configs/pressure_gradient.json` for pressure-gradient compute parameters
+- `configs/pressure_gradient.json` for pressure-gradient estimation, relative-pressure reconstruction, and centerline-pressure outputs
 - `configs/planes.json` for plane render styling
 - `configs/wss.json`, `configs/tke.json`, `configs/pressure_gradient.json`, and `configs/streamlines.json` for metric-specific render ranges and optional colorbars
 - `configs/rendering.json` for shared video controls such as `window_size`, camera behavior, and rotation
@@ -81,7 +81,8 @@ launch_gui(config_dir="./configs")
 | `inputs` | list of paths | empty | batch inputs for `run_batch()` | `autoflow/api.py` |
 | `output_dir` | path | `./results` | root output directory | `autoflow/api.py` |
 | `requested_metrics` | list[str] | empty | opt in to `pwv`, `wss`, `tke`, and/or `pg` | `autoflow/processing.py` |
-| `skip_derived` | bool | `False` | remove requested WSS, TKE, and pressure-gradient work | `autoflow/processing.py` |
+| `skip_derived` | bool | `False` | remove requested WSS, TKE, pressure-gradient, relative-pressure, and centerline-pressure work | `autoflow/processing.py` |
+| `pressure_method` | string | `least_squares` | choose `least_squares` or `ppe` relative-pressure reconstruction; both use SciPy sparse solvers | `autoflow/algorithms/metrics.py` |
 | `skip_plane_metrics` | bool | `False` | skip plane metrics | `autoflow/processing.py` |
 | `background_phase_correction` | bool | `False` | enable loader correction | `autoflow/algorithms/data.py`, `autoflow/algorithms/dicom.py` |
 | `dual_venc_ratio1` | float | `0.0` | first dual-venc alias window ratio for legacy `Nv=7` H5 | `autoflow/algorithms/data.py` |
@@ -95,7 +96,8 @@ launch_gui(config_dir="./configs")
 | `requested_videos` | list[str] | empty | export any of `plane`, `wss`, `tke`, `pg`, `streamlines` | `autoflow/rendering/videos.py` |
 | `window_size` | tuple[int, int] | `(1600, 1200)` | output render size for exported videos | `autoflow/rendering/videos.py` |
 | `pressure_gradient_clim` | tuple[float, float] or `None` | `None` | explicit pressure-gradient video display range; `None` keeps the auto range | `autoflow/rendering/videos.py` |
-| `wss_show_scalar_bar`, `tke_show_scalar_bar`, `pressure_gradient_show_scalar_bar`, `streamline_show_scalar_bar` | bool | `True` | show or hide the matching GUI and video colorbar | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
+| `relative_pressure_clim` | tuple[float, float] or `None` | `None` | explicit relative-pressure video display range; `None` keeps the symmetric auto range | `autoflow/rendering/videos.py` |
+| `wss_show_scalar_bar`, `tke_show_scalar_bar`, `pressure_gradient_show_scalar_bar`, `relative_pressure_show_scalar_bar`, `streamline_show_scalar_bar` | bool | `True` | show or hide the matching GUI and video colorbar | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
 
 ## Config Directory Support
 

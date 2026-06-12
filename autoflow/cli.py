@@ -14,10 +14,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default=None, help="Root output directory. Overrides configs/batch.json.")
     parser.add_argument("--reuse-planes", default=None, help="Plane positions file or directory to reuse.")
 
-    parser.add_argument("--skip-derived", action="store_true", help="Skip all WSS/TKE/pressure-gradient derived metrics.")
+    parser.add_argument("--skip-derived", action="store_true", help="Skip all WSS/TKE/relative-pressure derived metrics.")
     parser.add_argument("--skip-wss", action="store_true", help="Skip WSS computation, export, and derived summaries.")
     parser.add_argument("--skip-tke", action="store_true", help="Skip TKE computation, export, and derived summaries.")
-    parser.add_argument("--skip-pressure-gradient", action="store_true", help="Skip pressure-gradient computation, export, and derived summaries.")
+    parser.add_argument("--skip-pressure-gradient", action="store_true", help="Skip relative-pressure reconstruction, centerline pressure-drop outputs, and pressure-gradient-derived summaries.")
     parser.add_argument("--skip-plane-metrics", action="store_true", help="Skip plane metric export.")
     parser.add_argument("--single-thread", dest="use_multithread", action="store_false", help="Disable multithreaded plane metric calculation.")
     parser.add_argument("--bgc", dest="background_phase_correction", action="store_true", help="Enable background phase offset correction during loading.")
@@ -64,6 +64,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--seed-ratio", type=float, default=None, help="Seed ratio for streamline rendering.")
     parser.add_argument("--tube-radius", type=float, default=None, help="Tube radius used in streamline rendering.")
+    parser.add_argument(
+        "--pressure-method",
+        choices=["least_squares", "ppe"],
+        default=None,
+        help="Relative-pressure reconstruction method used by the pg metric/video outputs.",
+    )
 
     parser.add_argument("--autoseg", action="store_true", help="If the loaded case has no segmentation, run auto segmentation before segmentation-dependent steps.")
     parser.add_argument("--autoseg-backend", default=None, help="Auto segmentation backend. Default comes from configs/segmentation.json or falls back to nnUNet.")
@@ -123,6 +129,7 @@ def main() -> None:
         "min_cc_volume": args.min_cc_volume,
         "seed_ratio": args.seed_ratio,
         "tube_radius": args.tube_radius,
+        "pressure_method": args.pressure_method,
         "autoseg_backend": args.autoseg_backend,
         "autoseg_model": args.autoseg_model,
         "autoseg_checkpoint": args.autoseg_checkpoint,

@@ -17,7 +17,7 @@ AutoFlow stores repo-level defaults in per-module JSON files and applies them to
 | `configs/fluid.json` | shared fluid properties such as `rho` and `viscosity` |
 | `configs/wss.json` | WSS compute defaults |
 | `configs/tke.json` | TKE density defaults |
-| `configs/pressure_gradient.json` | pressure-gradient compute defaults |
+| `configs/pressure_gradient.json` | pressure-gradient, relative-pressure, and centerline-pressure defaults |
 | `configs/pwv.json` | PWV groups, plane spacing, waveform selection, and plot styling |
 | `configs/segmentation.json` | segmentation dock and segmentation-run defaults |
 | `configs/rendering.json` | shared video and camera defaults |
@@ -111,15 +111,16 @@ AutoFlow stores repo-level defaults in per-module JSON files and applies them to
 
 | Parameter | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `rho` | float | `1060.0` | `configs/fluid.json` | shared fluid density used by TKE and pressure-gradient calculations unless a metric override is supplied | `autoflow/algorithms/metrics.py` |
-| `viscosity` | float | `4.0` | `configs/fluid.json` | shared fluid viscosity used by WSS and pressure-gradient calculations unless a metric override is supplied | `autoflow/algorithms/metrics.py` |
+| `rho` | float | `1060.0` | `configs/fluid.json` | shared fluid density used by TKE and relative-pressure calculations unless a metric override is supplied | `autoflow/algorithms/metrics.py` |
+| `viscosity` | float | `4.0` | `configs/fluid.json` | shared fluid viscosity used by WSS and relative-pressure calculations unless a metric override is supplied | `autoflow/algorithms/metrics.py` |
 | `smoothing_iteration` | int | `200` | `configs/wss.json` | surface smoothing iterations for WSS preparation | `autoflow/algorithms/metrics.py` |
 | `inward_distance` | float or `auto` | `auto` | `configs/wss.json` | near-wall sample distance for WSS | `autoflow/algorithms/metrics.py` |
 | `parabolic_fitting` | bool | `True` | `configs/wss.json` | enable parabolic fitting in WSS estimation | `autoflow/algorithms/metrics.py` |
 | `no_slip_condition` | bool | `False` | `configs/wss.json` | enable no-slip boundary handling for WSS | `autoflow/algorithms/metrics.py` |
 | `rho` | float | shared from `configs/fluid.json` | `configs/tke.json` | optional TKE-specific density override | `autoflow/algorithms/metrics.py` |
-| `rho` | float | shared from `configs/fluid.json` | `configs/pressure_gradient.json` | optional pressure-gradient-specific density override | `autoflow/algorithms/metrics.py` |
-| `viscosity` | float | shared from `configs/fluid.json` | `configs/pressure_gradient.json` | optional pressure-gradient-specific viscosity override | `autoflow/algorithms/metrics.py` |
+| `rho` | float | shared from `configs/fluid.json` | `configs/pressure_gradient.json` | optional pressure-analysis density override | `autoflow/algorithms/metrics.py` |
+| `viscosity` | float | shared from `configs/fluid.json` | `configs/pressure_gradient.json` | optional pressure-analysis viscosity override | `autoflow/algorithms/metrics.py` |
+| `method` | string | `least_squares` | `configs/pressure_gradient.json` | choose `least_squares` or `ppe` relative-pressure reconstruction; both use SciPy sparse solvers | `autoflow/algorithms/metrics.py` |
 | `smoothing_sigma` | float | `0.0` | `configs/pressure_gradient.json` | optional smoothing before pressure-gradient estimation | `autoflow/algorithms/metrics.py` |
 | `use_convective_acceleration` | bool | `True` | `configs/pressure_gradient.json` | include convective acceleration in pressure-gradient computation | `autoflow/algorithms/metrics.py` |
 
@@ -127,7 +128,7 @@ AutoFlow stores repo-level defaults in per-module JSON files and applies them to
 
 | Parameter | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `window_size` | list[int, int] | `[1600, 1200]` | `configs/rendering.json` | output render size for plane, WSS, TKE, pressure-gradient, and streamline videos | `autoflow/rendering/videos.py` |
+| `window_size` | list[int, int] | `[1600, 1200]` | `configs/rendering.json` | output render size for plane, WSS, TKE, pressure-gradient, relative-pressure, and streamline videos | `autoflow/rendering/videos.py` |
 | `planes.render.show_skeleton` | bool | `True` | `configs/planes.json` | show or hide skeleton points in plane videos | `autoflow/rendering/videos.py` |
 | `planes.render.skeleton_point_size` | float | `10.0` | `configs/planes.json` | skeleton point size in plane videos | `autoflow/rendering/videos.py` |
 | `planes.render.default.skeleton_color` | string | empty | `configs/planes.json` | fallback skeleton color for plane videos | `autoflow/rendering/videos.py` |
@@ -138,16 +139,19 @@ AutoFlow stores repo-level defaults in per-module JSON files and applies them to
 | `planes.render.groups.<group>.plane_size` | float or null | `null` | `configs/planes.json` | per-group plane size in plane videos | `autoflow/rendering/videos.py` |
 | `planes.render.groups.<group>.plane_color` | string | group fallback | `configs/planes.json` | per-group plane color in plane videos and GUI planes | `autoflow/rendering/videos.py`, `autoflow/ui/app.py` |
 | `planes.render.groups.<group>.plane_opacity` | float | `0.75` | `configs/planes.json` | per-group plane opacity in plane videos and GUI planes | `autoflow/rendering/videos.py`, `autoflow/ui/app.py` |
-| `rotate_dynamic_video` | bool | `True` | `configs/rendering.json` | rotate dynamic WSS, TKE, pressure-gradient, and streamline videos; set `False` for a fixed view | `autoflow/rendering/videos.py` |
+| `rotate_dynamic_video` | bool | `True` | `configs/rendering.json` | rotate dynamic WSS, TKE, pressure-gradient, relative-pressure, and streamline videos; set `False` for a fixed view | `autoflow/rendering/videos.py` |
 | `wss.render.clim` | list[float, float] | `[0.0, 10.0]` | `configs/wss.json` | WSS color range for GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
 | `wss.render.show_scalar_bar` | bool | `True` | `configs/wss.json` | show or hide the WSS colorbar in GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
 | `wss.render.bar_cfg` | object | built-in default | `configs/wss.json` | WSS scalar-bar placement and font settings | `autoflow/rendering/videos.py`, `autoflow/ui/viewer.py` |
 | `tke.render.clim` | list[float, float] | `[0.0, 100.0]` | `configs/tke.json` | TKE color range for GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
 | `tke.render.show_scalar_bar` | bool | `True` | `configs/tke.json` | show or hide the TKE colorbar in GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
 | `tke.render.bar_cfg` | object | built-in default | `configs/tke.json` | TKE scalar-bar placement and font settings | `autoflow/rendering/videos.py`, `autoflow/ui/viewer.py` |
-| `pressure_gradient.render.clim` | list[float, float] | `[0.0, 500.0]` | `configs/pressure_gradient.json` | pressure-gradient color range for GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
+| `pressure_gradient.render.clim` | list[float, float] or `null` | `null` | `configs/pressure_gradient.json` | pressure-gradient color range for GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
 | `pressure_gradient.render.show_scalar_bar` | bool | `True` | `configs/pressure_gradient.json` | show or hide the pressure-gradient colorbar in GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
 | `pressure_gradient.render.bar_cfg` | object | built-in default | `configs/pressure_gradient.json` | pressure-gradient scalar-bar placement and font settings | `autoflow/rendering/videos.py`, `autoflow/ui/viewer.py` |
+| `pressure_gradient.render.relative_pressure_clim` | list[float, float] or `null` | `null` | `configs/pressure_gradient.json` | relative-pressure color range for GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
+| `pressure_gradient.render.relative_pressure_show_scalar_bar` | bool | `True` | `configs/pressure_gradient.json` | show or hide the relative-pressure colorbar in GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
+| `pressure_gradient.render.relative_pressure_bar_cfg` | object | built-in default | `configs/pressure_gradient.json` | relative-pressure scalar-bar placement and font settings | `autoflow/rendering/videos.py`, `autoflow/ui/viewer.py` |
 | `streamlines.render.clim` | list[float, float] | `[0.0, 1.0]` | `configs/streamlines.json` | streamline velocity color range for GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
 | `streamlines.render.show_scalar_bar` | bool | `True` | `configs/streamlines.json` | show or hide the streamline colorbar in GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
 | `streamlines.render.bar_cfg` | object | built-in default | `configs/streamlines.json` | streamline scalar-bar placement and font settings | `autoflow/rendering/videos.py`, `autoflow/ui/viewer.py` |

@@ -39,6 +39,7 @@ from .segmentation import SegmentationConfigDialog, SegmentationDock, SOURCE_LAB
 from ..rendering import (
     render_plane_rotation_video,
     render_pressure_gradient_video,
+    render_relative_pressure_video,
     render_streamlines_video,
     render_tke_video,
     render_wss_video,
@@ -81,6 +82,7 @@ def _default_segmentation_color(label_id):
 _ANALYSIS_MODE_ITEMS = [
     ("PWV", "pwv"),
     ("Plane Curve", "plane_curve"),
+    ("Centerline Pressure", "centerline_pressure"),
     ("Internal Consistency", "internal_consistency"),
 ]
 
@@ -101,12 +103,24 @@ _PLANE_CURVE_SERIES_OPTIONS = [
     ("pressure_gradient_mag_mean_Pa_m_t", "Pressure Gradient Mean (Pa/m)"),
     ("pressure_gradient_mag_peak_Pa_m_t", "Pressure Gradient Peak (Pa/m)"),
     ("pressure_gradient_mag_p95_Pa_m_t", "Pressure Gradient P95 (Pa/m)"),
-    ("pressure_gradient_normal_mean_Pa_m_t", "Normal Pressure Gradient Mean (Pa/m)"),
-    ("pressure_gradient_normal_peak_Pa_m_t", "Normal Pressure Gradient Peak (Pa/m)"),
-    ("pressure_gradient_normal_p95_Pa_m_t", "Normal Pressure Gradient P95 (Pa/m)"),
+    ("pressure_gradient_normal_mean_Pa_m_t", "Pressure Gradient Normal Mean (Pa/m)"),
+    ("pressure_gradient_normal_peak_Pa_m_t", "Pressure Gradient Normal Peak (Pa/m)"),
+    ("pressure_gradient_normal_p95_Pa_m_t", "Pressure Gradient Normal P95 (Pa/m)"),
+    ("relative_pressure_mean_Pa_t", "Relative Pressure Mean (Pa)"),
+    ("relative_pressure_peak_Pa_t", "Relative Pressure Peak (Pa)"),
+    ("relative_pressure_p95_Pa_t", "Relative Pressure P95 (Pa)"),
     ("wss_wall_mean_Pa_t", "WSS Mean (Pa)"),
     ("wss_wall_peak_Pa_t", "WSS Peak (Pa)"),
     ("wss_wall_p95_Pa_t", "WSS P95 (Pa)"),
+]
+
+
+_RUNTIME_RENDER_METRICS = [
+    ("wss", "WSS"),
+    ("tke", "TKE"),
+    ("pressure_gradient", "Pressure Gradient"),
+    ("relative_pressure", "Relative Pressure"),
+    ("streamline", "Streamlines"),
 ]
 
 
@@ -570,18 +584,163 @@ class MainWindow(QtWidgets.QMainWindow):
         fl_wss.addRow("Inward Distance (mm or auto)", self.edit_dm_inward)
         fl_wss.addRow("Parabolic Fitting", self.chk_dm_parabolic)
         fl_wss.addRow("No-Slip Condition", self.chk_dm_noslip)
-        self.params_layout.addWidget(grp_wss)
 
-        grp_tke = QtWidgets.QGroupBox("Flow / TKE / Pressure Gradient Parameters")
+        render_group = QtWidgets.QGroupBox("Render / Colorbar")
+        render_layout = QtWidgets.QVBoxLayout(render_group)
+        render_layout.setContentsMargins(6, 6, 6, 6)
+        render_layout.setSpacing(6)
+
+        self.runtime_render_controls = {}
+        for key, label in _RUNTIME_RENDER_METRICS:
+            row = QtWidgets.QHBoxLayout()
+            row.addWidget(QtWidgets.QLabel(f"{label} clim"))
+            edit_min = QtWidgets.QLineEdit()
+            edit_min.setPlaceholderText("auto")
+            edit_max = QtWidgets.QLineEdit()
+            edit_max.setPlaceholderText("auto")
+            row.addWidget(edit_min)
+            row.addWidget(QtWidgets.QLabel("to"))
+            row.addWidget(edit_max)
+            row_widget = QtWidgets.QWidget()
+            row_widget.setLayout(row)
+            render_layout.addWidget(row_widget)
+            self.runtime_render_controls[key] = {"min": edit_min, "max": edit_max}
+
+        render_form = QtWidgets.QFormLayout()
+        self.edit_runtime_scalar_bar_width = QtWidgets.QLineEdit()
+        self.edit_runtime_scalar_bar_height = QtWidgets.QLineEdit()
+        self.edit_runtime_scalar_bar_gap = QtWidgets.QLineEdit()
+        self.edit_runtime_scalar_bar_pos_x = QtWidgets.QLineEdit()
+        self.edit_runtime_scalar_bar_pos_y = QtWidgets.QLineEdit()
+        render_form.addRow("Colorbar Width", self.edit_runtime_scalar_bar_width)
+        render_form.addRow("Colorbar Height", self.edit_runtime_scalar_bar_height)
+        render_form.addRow("Colorbar Gap", self.edit_runtime_scalar_bar_gap)
+        render_form.addRow("Colorbar X", self.edit_runtime_scalar_bar_pos_x)
+        render_form.addRow("Colorbar Y", self.edit_runtime_scalar_bar_pos_y)
+        render_layout.addLayout(render_form)
+
+        render_hint = QtWidgets.QLabel("These values default to config, update the live 3D scene immediately, and are reused by Export Videos in the current session.")
+        render_hint.setWordWrap(True)
+        render_layout.addWidget(render_hint)
+
+        for widgets in self.runtime_render_controls.values():
+            widgets["min"].editingFinished.connect(self._on_runtime_render_settings_changed)
+            widgets["max"].editingFinished.connect(self._on_runtime_render_settings_changed)
+        for widget in [
+            self.edit_runtime_scalar_bar_width,
+            self.edit_runtime_scalar_bar_height,
+            self.edit_runtime_scalar_bar_gap,
+            self.edit_runtime_scalar_bar_pos_x,
+            self.edit_runtime_scalar_bar_pos_y,
+        ]:
+            widget.editingFinished.connect(self._on_runtime_render_settings_changed)
+
+        self.params_layout.addWidget(grp_wss)
+        self.params_layout.addWidget(render_group)
+
+        grp_tke = QtWidgets.QGroupBox("Flow / TKE / Relative Pressure Parameters")
         fl_tke = QtWidgets.QFormLayout(grp_tke)
         self.edit_dm_rho = QtWidgets.QLineEdit("1060.0")
         self.edit_dm_pg_smoothing_sigma = QtWidgets.QLineEdit("0.0")
+        self.edit_dm_pg_support_erosion = QtWidgets.QLineEdit("1")
+        self.edit_dm_pg_opacity = QtWidgets.QLineEdit("0.6")
+        self.edit_dm_rp_opacity = QtWidgets.QLineEdit("0.6")
+        self.combo_dm_pressure_method = QtWidgets.QComboBox()
+        self.combo_dm_pressure_method.addItems(["least_squares", "ppe"])
         self.chk_dm_multithread = QtWidgets.QCheckBox()
         self.chk_dm_multithread.setChecked(False)
         fl_tke.addRow(u"Density \u03c1 (kg/m\u00b3)", self.edit_dm_rho)
-        fl_tke.addRow("Pressure Gradient Gaussian Sigma (vox)", self.edit_dm_pg_smoothing_sigma)
+        fl_tke.addRow("Relative Pressure Method", self.combo_dm_pressure_method)
+        fl_tke.addRow("Pressure-Gradient Gaussian Sigma (vox)", self.edit_dm_pg_smoothing_sigma)
+        fl_tke.addRow("Pressure Support Erosion (vox)", self.edit_dm_pg_support_erosion)
+        fl_tke.addRow("Pressure Gradient Opacity", self.edit_dm_pg_opacity)
+        fl_tke.addRow("Relative Pressure Opacity", self.edit_dm_rp_opacity)
         fl_tke.addRow("Multi-thread Metrics", self.chk_dm_multithread)
         self.params_layout.addWidget(grp_tke)
+
+    def _runtime_render_clim_keys(self):
+        return {
+            "wss": "wss_clim",
+            "tke": "tke_clim",
+            "pressure_gradient": "pressure_gradient_clim",
+            "relative_pressure": "relative_pressure_clim",
+            "streamline": "streamline_clim",
+        }
+
+    def _runtime_bar_cfg_keys(self):
+        return [
+            "wss_bar_cfg",
+            "tke_bar_cfg",
+            "pressure_gradient_bar_cfg",
+            "relative_pressure_bar_cfg",
+            "streamline_bar_cfg",
+        ]
+
+    def _parse_optional_clim_pair(self, min_text, max_text, fallback=None):
+        lo = self._optional_float_from_text(min_text, None)
+        hi = self._optional_float_from_text(max_text, None)
+        if lo is None or hi is None:
+            return fallback
+        if hi < lo:
+            lo, hi = hi, lo
+        return (float(lo), float(hi))
+
+    def _apply_render_settings_to_scene_objects(self):
+        ws = self.workspace
+        render_cfg = dict(getattr(ws, "render_settings", {}) or {})
+        mapping = {
+            "wss_surface_live": ("wss_clim", "wss_show_scalar_bar", "wss_bar_cfg"),
+            "tke_volume": ("tke_clim", "tke_show_scalar_bar", "tke_bar_cfg"),
+            "pressure_gradient_volume": ("pressure_gradient_clim", "pressure_gradient_show_scalar_bar", "pressure_gradient_bar_cfg"),
+            "relative_pressure_volume": ("relative_pressure_clim", "relative_pressure_show_scalar_bar", "relative_pressure_bar_cfg"),
+            "streamlines_live": ("streamline_clim", "streamline_show_scalar_bar", "streamline_bar_cfg"),
+        }
+        touched = False
+        for obj in ws.scene_objects.values():
+            keys = mapping.get(str(getattr(obj, "data_key", "") or ""))
+            if keys is None:
+                continue
+            clim_key, show_key, bar_key = keys
+            obj.clim = render_cfg.get(clim_key)
+            obj.show_scalar_bar = bool(render_cfg.get(show_key, True))
+            obj.scalar_bar_cfg = dict(render_cfg.get(bar_key, {}) or {})
+            self.scene.readd_object(obj)
+            touched = True
+        if touched:
+            self._refresh_browser()
+            self._refresh_scene()
+            self.ortho_viewer.refresh()
+
+    def _on_runtime_render_settings_changed(self):
+        if not hasattr(self, "runtime_render_controls"):
+            return
+        ws = self.workspace
+        render_cfg = dict(getattr(ws, "render_settings", {}) or {})
+        default_cfg = bundle_to_autoflow_kwargs(self._config_bundle)
+        for metric_key, cfg_key in self._runtime_render_clim_keys().items():
+            widgets = self.runtime_render_controls.get(metric_key, {})
+            clim_value = self._parse_optional_clim_pair(
+                widgets.get("min").text() if widgets.get("min") is not None else "",
+                widgets.get("max").text() if widgets.get("max") is not None else "",
+                fallback=default_cfg.get(cfg_key),
+            )
+            render_cfg[cfg_key] = clim_value
+
+        width = max(self._float_from_text(self.edit_runtime_scalar_bar_width.text(), 0.08), 0.01)
+        height = max(self._float_from_text(self.edit_runtime_scalar_bar_height.text(), 0.18), 0.05)
+        gap = max(self._float_from_text(self.edit_runtime_scalar_bar_gap.text(), 0.03), 0.0)
+        pos_x = min(max(self._float_from_text(self.edit_runtime_scalar_bar_pos_x.text(), 0.88), 0.0), 0.98)
+        pos_y = min(max(self._float_from_text(self.edit_runtime_scalar_bar_pos_y.text(), 0.06), 0.0), 0.95)
+        for bar_key in self._runtime_bar_cfg_keys():
+            bar_cfg = dict(render_cfg.get(bar_key, {}) or {})
+            bar_cfg["width"] = float(width)
+            bar_cfg["height"] = float(height)
+            bar_cfg["position_x"] = float(pos_x)
+            bar_cfg["position_y"] = float(pos_y)
+            bar_cfg["stack_gap"] = float(gap)
+            render_cfg[bar_key] = bar_cfg
+        ws.render_settings = render_cfg
+        self._apply_render_settings_to_scene_objects()
 
     def _add_pwv_group_row(self, name="", labels=""):
         row = self.table_pwv_groups.rowCount()
@@ -747,6 +906,15 @@ class MainWindow(QtWidgets.QMainWindow):
         curve_row.addWidget(self.combo_plane_curve_metric, 1)
         self.analysis_controls_stack.addWidget(curve_controls)
 
+        pressure_controls = QtWidgets.QWidget(self)
+        pressure_row = QtWidgets.QHBoxLayout(pressure_controls)
+        pressure_row.setContentsMargins(0, 0, 0, 0)
+        pressure_row.addWidget(QtWidgets.QLabel("Path"))
+        self.combo_centerline_pressure_path = QtWidgets.QComboBox()
+        self.combo_centerline_pressure_path.currentIndexChanged.connect(self._on_centerline_pressure_path_changed)
+        pressure_row.addWidget(self.combo_centerline_pressure_path, 1)
+        self.analysis_controls_stack.addWidget(pressure_controls)
+
         ic_controls = QtWidgets.QWidget(self)
         ic_row = QtWidgets.QHBoxLayout(ic_controls)
         ic_row.setContentsMargins(0, 0, 0, 0)
@@ -789,6 +957,87 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_plane_curve_metric_changed(self, _index=None):
         self._refresh_analysis_panel()
+
+    def _on_centerline_pressure_path_changed(self, _index=None):
+        self._refresh_analysis_panel()
+
+    def _refresh_centerline_pressure_path_selector(self):
+        if not hasattr(self, "combo_centerline_pressure_path"):
+            return
+        current = self.combo_centerline_pressure_path.currentData()
+        profiles = list(self.workspace.derived.centerline_pressure_profiles or [])
+        self.combo_centerline_pressure_path.blockSignals(True)
+        self.combo_centerline_pressure_path.clear()
+        for idx, item in enumerate(profiles):
+            path_index = int(item.get("path_index", idx))
+            peak = float(item.get("pressure_drop_peak_Pa", 0.0) or 0.0)
+            self.combo_centerline_pressure_path.addItem(f"Path {path_index} ({peak:.3g} Pa)", path_index)
+        self.combo_centerline_pressure_path.setEnabled(bool(profiles))
+        if profiles:
+            target = 0
+            for idx, item in enumerate(profiles):
+                if int(item.get("path_index", idx)) == int(current if current is not None else -1):
+                    target = idx
+                    break
+            self.combo_centerline_pressure_path.setCurrentIndex(target)
+        self.combo_centerline_pressure_path.blockSignals(False)
+
+    def _selected_centerline_pressure_profile(self):
+        path_index = self.combo_centerline_pressure_path.currentData() if hasattr(self, "combo_centerline_pressure_path") else None
+        profiles = list(self.workspace.derived.centerline_pressure_profiles or [])
+        if path_index is None and profiles:
+            return profiles[0]
+        for item in profiles:
+            if int(item.get("path_index", -1)) == int(path_index):
+                return item
+        return None
+
+    def _plot_centerline_pressure(self):
+        profile = self._selected_centerline_pressure_profile()
+        if profile is None:
+            self.label_ic_target.setText("Target: path")
+            self.label_pwv_status.setText("No centerline pressure profile available.")
+            self._clear_pwv_axes("Run relative pressure to populate centerline pressure drop.", title="Centerline Pressure")
+            return
+        distances = np.asarray(profile.get("distances_mm", []), dtype=float).reshape(-1)
+        pressure_t = list(profile.get("relative_pressure_Pa_t", []) or [])
+        drop_t = np.asarray(profile.get("pressure_drop_Pa_t", []), dtype=float).reshape(-1)
+        current_t = int(np.clip(self.workspace.current_t, 0, max(0, len(pressure_t) - 1)))
+        values = np.asarray(pressure_t[current_t] if current_t < len(pressure_t) else [], dtype=float).reshape(-1)
+        self.fig_pwv.clear()
+        ax = self.fig_pwv.add_subplot(211)
+        ax_drop = self.fig_pwv.add_subplot(212)
+        if distances.size and values.size == distances.size:
+            ax.plot(distances, values, color="#c92a2a", linewidth=2.0)
+            ax.scatter([distances[0], distances[-1]], [values[0], values[-1]], color="#f08c00", zorder=4)
+            ax.set_xlabel("Distance Along Centerline (mm)")
+            ax.set_ylabel("Relative Pressure (Pa)")
+            ax.set_title(f"Path {int(profile.get('path_index', -1))}: Relative Pressure at t={current_t}")
+            ax.grid(True, alpha=0.25)
+        else:
+            ax.text(0.5, 0.5, "No centerline samples", ha="center", va="center", transform=ax.transAxes)
+            ax.set_xticks([])
+            ax.set_yticks([])
+        phases = np.arange(drop_t.size, dtype=float)
+        if drop_t.size:
+            ax_drop.plot(phases, drop_t, color="#1f77b4", marker="o", linewidth=2.0, markersize=4)
+            ax_drop.axvline(current_t, color="#f08c00", linestyle="--", linewidth=1.2, alpha=0.8)
+            ax_drop.scatter([current_t], [drop_t[min(current_t, drop_t.size - 1)]], color="#f08c00", zorder=4)
+            ax_drop.set_xlabel("Cardiac Phase")
+            ax_drop.set_ylabel("Pressure Drop (Pa)")
+            ax_drop.set_title("Centerline Pressure Drop")
+            ax_drop.grid(True, alpha=0.25)
+        else:
+            ax_drop.text(0.5, 0.5, "No pressure-drop series", ha="center", va="center", transform=ax_drop.transAxes)
+            ax_drop.set_xticks([])
+            ax_drop.set_yticks([])
+        self.fig_pwv.tight_layout()
+        self.canvas_pwv.draw_idle()
+        lines = [
+            f"Path {int(profile.get('path_index', -1))}   Current phase: {current_t}",
+            f"Current drop: {float(drop_t[min(current_t, drop_t.size - 1)]) if drop_t.size else 0.0:.4g} Pa   Mean drop: {float(profile.get('pressure_drop_mean_Pa', 0.0)):.4g} Pa   Peak |drop|: {float(profile.get('pressure_drop_peak_Pa', 0.0)):.4g} Pa",
+        ]
+        self.label_pwv_status.setText("\n".join(lines))
 
     def _selected_pwv_result(self):
         idx = self.combo_pwv_group.currentData()
@@ -1084,6 +1333,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _refresh_analysis_panel(self):
         self._sync_analysis_controls()
         self._refresh_pwv_group_selector()
+        self._refresh_centerline_pressure_path_selector()
         mode = self._analysis_mode()
         if mode == "pwv":
             self.label_ic_target.setText("Target: PWV group")
@@ -1091,6 +1341,9 @@ class MainWindow(QtWidgets.QMainWindow):
         elif mode == "plane_curve":
             self.label_ic_target.setText("Target: selected plane")
             self._plot_plane_curve()
+        elif mode == "centerline_pressure":
+            self.label_ic_target.setText("Target: selected path")
+            self._plot_centerline_pressure()
         else:
             self._plot_internal_consistency()
 
@@ -2039,6 +2292,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return "TKE"
         if data_key == "pressure_gradient_volume":
             return "Pressure Gradient"
+        if data_key == "relative_pressure_volume":
+            return "Relative Pressure"
         if obj.kind == ObjectKind.METRIC:
             return "Metrics"
         if obj.kind == ObjectKind.FLOW:
@@ -2061,6 +2316,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "WSS",
             "TKE",
             "Pressure Gradient",
+            "Relative Pressure",
             "Metrics",
             "Flow",
             "Aux",
@@ -2228,6 +2484,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     branch_labels_3d=self.workspace.branch_labels,
                     tke_array=self.workspace.derived.tke_array,
                     pressure_gradient_array=self.workspace.derived.pressure_gradient_array,
+                    relative_pressure_array=self.workspace.derived.relative_pressure_array,
                     wss_surfaces=self.workspace.derived.wss_surfaces,
                 )
                 save_plane_pixelwise_h5(plane_pixelwise_path, plane_pixelwise, rr_ms=self.workspace.rr, source_format=self.workspace.input_state.source_format)
@@ -2642,8 +2899,39 @@ class MainWindow(QtWidgets.QMainWindow):
         ws.derived_params.parabolic_fitting = self.chk_dm_parabolic.isChecked()
         ws.derived_params.no_slip_condition = self.chk_dm_noslip.isChecked()
         ws.derived_params.rho = max(self._float_from_text(self.edit_dm_rho.text(), 1060.0), 1.0)
+        pressure_method = str(self.combo_dm_pressure_method.currentText().strip() or "least_squares").lower()
+        if pressure_method not in {"least_squares", "ppe"}:
+            pressure_method = "least_squares"
+        ws.derived_params.pressure_method = pressure_method
         ws.derived_params.pressure_gradient_smoothing_sigma = max(self._float_from_text(self.edit_dm_pg_smoothing_sigma.text(), 0.0), 0.0)
+        ws.derived_params.pressure_gradient_support_erosion_iters = max(self._int_from_text(self.edit_dm_pg_support_erosion.text(), 1), 0)
+        ws.derived_params.pressure_gradient_layer_opacity = min(max(self._float_from_text(self.edit_dm_pg_opacity.text(), 0.6), 0.0), 1.0)
+        ws.derived_params.relative_pressure_layer_opacity = min(max(self._float_from_text(self.edit_dm_rp_opacity.text(), 0.6), 0.0), 1.0)
         ws.derived_params.use_multithread = self.chk_dm_multithread.isChecked()
+        if hasattr(self, "runtime_render_controls"):
+            default_cfg = bundle_to_autoflow_kwargs(self._config_bundle)
+            render_cfg = dict(getattr(ws, "render_settings", {}) or default_cfg)
+            for metric_key, cfg_key in self._runtime_render_clim_keys().items():
+                widgets = self.runtime_render_controls.get(metric_key, {})
+                render_cfg[cfg_key] = self._parse_optional_clim_pair(
+                    widgets.get("min").text() if widgets.get("min") is not None else "",
+                    widgets.get("max").text() if widgets.get("max") is not None else "",
+                    fallback=default_cfg.get(cfg_key),
+                )
+            width = max(self._float_from_text(self.edit_runtime_scalar_bar_width.text(), 0.08), 0.01)
+            height = max(self._float_from_text(self.edit_runtime_scalar_bar_height.text(), 0.18), 0.05)
+            gap = max(self._float_from_text(self.edit_runtime_scalar_bar_gap.text(), 0.03), 0.0)
+            pos_x = min(max(self._float_from_text(self.edit_runtime_scalar_bar_pos_x.text(), 0.88), 0.0), 0.98)
+            pos_y = min(max(self._float_from_text(self.edit_runtime_scalar_bar_pos_y.text(), 0.06), 0.0), 0.95)
+            for bar_key in self._runtime_bar_cfg_keys():
+                bar_cfg = dict(render_cfg.get(bar_key, {}) or {})
+                bar_cfg["width"] = float(width)
+                bar_cfg["height"] = float(height)
+                bar_cfg["position_x"] = float(pos_x)
+                bar_cfg["position_y"] = float(pos_y)
+                bar_cfg["stack_gap"] = float(gap)
+                render_cfg[bar_key] = bar_cfg
+            ws.render_settings = render_cfg
 
     def _sync_params_to_ui(self):
         ws = self.workspace
@@ -2708,8 +2996,41 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_dm_parabolic.setChecked(ws.derived_params.parabolic_fitting)
         self.chk_dm_noslip.setChecked(ws.derived_params.no_slip_condition)
         self.edit_dm_rho.setText(str(ws.derived_params.rho))
+        self.combo_dm_pressure_method.setCurrentText(str(ws.derived_params.pressure_method))
         self.edit_dm_pg_smoothing_sigma.setText(str(ws.derived_params.pressure_gradient_smoothing_sigma))
+        self.edit_dm_pg_support_erosion.setText(str(ws.derived_params.pressure_gradient_support_erosion_iters))
+        self.edit_dm_pg_opacity.setText(str(ws.derived_params.pressure_gradient_layer_opacity))
+        self.edit_dm_rp_opacity.setText(str(ws.derived_params.relative_pressure_layer_opacity))
         self.chk_dm_multithread.setChecked(ws.derived_params.use_multithread)
+        render_cfg = dict((getattr(ws, "render_settings", {}) or {}) or self._rendering_kwargs())
+        for metric_key, cfg_key in self._runtime_render_clim_keys().items():
+            widgets = getattr(self, "runtime_render_controls", {}).get(metric_key, {})
+            value = render_cfg.get(cfg_key)
+            min_widget = widgets.get("min")
+            max_widget = widgets.get("max")
+            if min_widget is None or max_widget is None:
+                continue
+            min_widget.blockSignals(True)
+            max_widget.blockSignals(True)
+            if value is None:
+                min_widget.setText("auto")
+                max_widget.setText("auto")
+            else:
+                min_widget.setText(f"{float(value[0]):.6g}")
+                max_widget.setText(f"{float(value[1]):.6g}")
+            min_widget.blockSignals(False)
+            max_widget.blockSignals(False)
+        shared_bar_cfg = dict(render_cfg.get("wss_bar_cfg", {}) or {})
+        for widget, key, default in [
+            (self.edit_runtime_scalar_bar_width, "width", 0.08),
+            (self.edit_runtime_scalar_bar_height, "height", 0.18),
+            (self.edit_runtime_scalar_bar_gap, "stack_gap", 0.03),
+            (self.edit_runtime_scalar_bar_pos_x, "position_x", 0.88),
+            (self.edit_runtime_scalar_bar_pos_y, "position_y", 0.06),
+        ]:
+            widget.blockSignals(True)
+            widget.setText(f"{float(shared_bar_cfg.get(key, default)):.6g}")
+            widget.blockSignals(False)
 
     def _rebuild_plane_objects(self):
         self._clear_plane_drag_widgets()
@@ -3251,6 +3572,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _rendering_kwargs(self):
         rendering_cfg = bundle_to_autoflow_kwargs(self._config_bundle)
+        runtime_cfg = dict(getattr(self.workspace, "render_settings", {}) or {})
+        rendering_cfg.update(copy.deepcopy(runtime_cfg))
         return {
             "fps": int(rendering_cfg.get("fps", 12)),
             "plane_rotation_frames": int(rendering_cfg.get("plane_rotation_frames", 180)),
@@ -3270,9 +3593,12 @@ class MainWindow(QtWidgets.QMainWindow):
             "tke_clim": tuple(rendering_cfg.get("tke_clim", (0.0, 100.0))),
             "tke_show_scalar_bar": bool(rendering_cfg.get("tke_show_scalar_bar", True)),
             "tke_bar_cfg": dict(rendering_cfg.get("tke_bar_cfg", {})),
-            "pressure_gradient_clim": None if rendering_cfg.get("pressure_gradient_clim", None) is None else tuple(rendering_cfg.get("pressure_gradient_clim", (0.0, 1.0))),
+            "pressure_gradient_clim": None if rendering_cfg.get("pressure_gradient_clim", None) is None else tuple(rendering_cfg.get("pressure_gradient_clim", (-1.0, 1.0))),
             "pressure_gradient_show_scalar_bar": bool(rendering_cfg.get("pressure_gradient_show_scalar_bar", True)),
             "pressure_gradient_bar_cfg": dict(rendering_cfg.get("pressure_gradient_bar_cfg", {})),
+            "relative_pressure_clim": None if rendering_cfg.get("relative_pressure_clim", None) is None else tuple(rendering_cfg.get("relative_pressure_clim", (-1.0, 1.0))),
+            "relative_pressure_show_scalar_bar": bool(rendering_cfg.get("relative_pressure_show_scalar_bar", True)),
+            "relative_pressure_bar_cfg": dict(rendering_cfg.get("relative_pressure_bar_cfg", {})),
             "streamline_clim": tuple(rendering_cfg.get("streamline_clim", (0.0, 1.0))),
             "streamline_show_scalar_bar": bool(rendering_cfg.get("streamline_show_scalar_bar", True)),
             "streamline_bar_cfg": dict(rendering_cfg.get("streamline_bar_cfg", {})),
@@ -3344,7 +3670,7 @@ class MainWindow(QtWidgets.QMainWindow):
         check_plane = QtWidgets.QCheckBox("Plane")
         check_wss = QtWidgets.QCheckBox("WSS")
         check_tke = QtWidgets.QCheckBox("TKE")
-        check_pg = QtWidgets.QCheckBox("Pressure Gradient")
+        check_pg = QtWidgets.QCheckBox("Relative Pressure")
         check_streamlines = QtWidgets.QCheckBox("Streamlines")
         check_plane.setChecked(True)
 
@@ -3355,7 +3681,7 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow(video_box)
         layout.addLayout(form)
 
-        hint = QtWidgets.QLabel("WSS, TKE, and pressure-gradient videos require derived data. Streamlines require segmentation and flow.")
+        hint = QtWidgets.QLabel("WSS, TKE, and relative-pressure videos require derived data. Streamlines require segmentation and flow.")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
@@ -3513,7 +3839,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 available=self.workspace.derived.tke_array is not None or self.workspace.derived.tke_volume is not None,
             )
             _run(
-                "pg",
+                "pressure_gradient",
                 lambda: render_pressure_gradient_video(
                     self.workspace,
                     options.out_dir,
@@ -3532,6 +3858,27 @@ class MainWindow(QtWidgets.QMainWindow):
                 ),
                 options.export_pg,
                 available=self.workspace.derived.pressure_gradient_magnitude is not None,
+            )
+            _run(
+                "relative_pressure",
+                lambda: render_relative_pressure_video(
+                    self.workspace,
+                    options.out_dir,
+                    fps=render_cfg["fps"],
+                    smoothing_iteration=self.workspace.derived_params.smoothing_iteration,
+                    view=render_cfg["camera_view"],
+                    distance_scale=render_cfg["camera_distance_scale"],
+                    relative_pressure_clim=render_cfg["relative_pressure_clim"],
+                    show_scalar_bar=render_cfg["relative_pressure_show_scalar_bar"],
+                    relative_pressure_bar_cfg=render_cfg["relative_pressure_bar_cfg"],
+                    rotate=render_cfg["rotate_dynamic_video"],
+                    rotation_frames=render_cfg["dynamic_rotation_frames"],
+                    elevation_deg=render_cfg["dynamic_rotation_elevation_deg"],
+                    time_repeat=render_cfg["dynamic_time_repeat"],
+                    window_size=render_cfg["window_size"],
+                ),
+                options.export_pg,
+                available=self.workspace.derived.relative_pressure_array is not None,
             )
             _run(
                 "streamlines",

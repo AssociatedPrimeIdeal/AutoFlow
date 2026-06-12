@@ -14,7 +14,7 @@ It currently supports:
 - segmentation from embedded masks, imported masks, thresholding, and nnUNet auto segmentation
 - grouped multi-label segmentation with config-driven label maps, per-group preprocessing, and grouped visualization
 - skeleton, graph, branch, path, and plane generation
-- plane metrics, config-driven PWV, WSS, optional TKE, pressure-gradient, streamlines, and GUI pathlines
+- plane metrics, config-driven PWV, WSS, optional TKE, pressure-gradient fields, relative-pressure maps, centerline pressure-drop analysis, streamlines, and GUI pathlines
 - offline result export to JSON, NPZ, H5, PNG, and video
 
 ![Demo](https://github.com/user-attachments/assets/e2c17a9e-6a47-4f85-ba0d-c35b622802b1)
@@ -71,7 +71,7 @@ This runs the standard batch order:
 3. generate graph
 4. generate planes
 5. calculate plane metrics
-6. optionally calculate PWV, WSS, TKE, or pressure gradient when requested
+6. optionally calculate PWV, WSS, TKE, pressure gradient, relative pressure, and centerline pressure drop when requested
 7. optionally export requested videos
 
 Typical outputs under `./results/demo/<case_name>/`:
@@ -132,8 +132,8 @@ Metric config split:
 - `wss.json -> render` owns WSS display range and optional colorbar settings for GUI and offline videos.
 - `tke.json` only needs metric-specific overrides when you want to override the shared fluid density.
 - `tke.json -> render` owns TKE display range and optional colorbar settings for GUI and offline videos.
-- `pressure_gradient.json` owns pressure-gradient compute parameters.
-- `pressure_gradient.json -> render` owns pressure-gradient display range and optional colorbar settings for GUI and offline videos.
+- `pressure_gradient.json` owns pressure-analysis parameters: pressure-gradient estimation, relative-pressure reconstruction, and centerline pressure-drop sampling inputs.
+- `pressure_gradient.json -> render` owns pressure-gradient display settings, plus optional `relative_pressure_*` overrides for the reconstructed relative-pressure map.
 - `planes.json -> render` owns plane skeleton and plane styling for GUI display and plane videos.
 - `streamlines.json -> render` owns streamline display range and optional colorbar settings for GUI and offline videos.
 - `derived.json` is now just a legacy compatibility placeholder.
@@ -193,7 +193,7 @@ Detailed documentation now lives under `docs/en/`.
 - [Planes](docs/en/features/planes.md)
 - [Plane Metrics](docs/en/features/metrics.md)
 - [PWV](docs/en/features/pwv.md)
-- [WSS, TKE, Pressure Gradient](docs/en/features/wss-tke-pressure.md)
+- [WSS, TKE, Pressure Gradient, and Relative Pressure](docs/en/features/wss-tke-pressure.md)
 - [Streamlines and Pathlines](docs/en/features/streamlines.md)
 - [Videos](docs/en/features/videos.md)
 
@@ -214,7 +214,7 @@ Detailed documentation now lives under `docs/en/`.
 - auto segmentation is currently executable in both CLI and GUI when the nnUNet backend and model folder are available
 - the GUI Browser can show and hide a whole segmentation group at once, and group title colors come from `configs/labels.json`
 - when PWV is enabled, the GUI uses one `Analysis` dock for PWV, plane cardiac-phase curves, and path/branch internal consistency, and still exposes PWV planes as one `PWV planes` browser item
-- `Run All` in the GUI runs `Generate Skeleton -> Generate Graph -> Generate Planes -> Calculate && Save Metrics -> Compute PWV -> WSS / TKE / Pressure Gradient`
+- `Run All` in the GUI runs `Generate Skeleton -> Generate Graph -> Generate Planes -> Calculate && Save Metrics -> Compute PWV -> WSS / TKE / Pressure`
 - offline videos can be exported from CLI, Python batch, or GUI `Export > Export Videos...`; CLI and Python remain the repeatable batch path
 
 ## Documentation Checklist For PRs

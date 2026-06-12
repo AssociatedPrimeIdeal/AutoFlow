@@ -42,6 +42,36 @@ def build_surface_from_mask3d(mask_xyz, spacing, origin=(0, 0, 0), smooth_iter=1
     return surf
 
 
+
+def sample_volume_on_surface(field_xyz, mask_xyz, spacing, origin=(0, 0, 0), *, name="field", smooth_iter=80):
+    field_xyz = np.asarray(field_xyz, dtype=np.float32)
+    mask_xyz = np.asarray(mask_xyz, dtype=bool)
+    if field_xyz.ndim != 3:
+        raise ValueError(f"{name} must be XYZ, got {field_xyz.shape}")
+    if field_xyz.shape != mask_xyz.shape:
+        raise ValueError(f"{name} shape {field_xyz.shape} does not match mask {mask_xyz.shape}")
+    if not np.any(mask_xyz):
+        return None
+
+    mask_grid = create_uniform_grid(mask_xyz.astype(np.uint8), spacing, origin=origin, name="mask")
+    support = mask_grid.threshold(0.1, scalars="mask")
+    if support is None or support.n_cells == 0:
+        return None
+
+    surface = support.extract_surface()
+    if surface is None or surface.n_points == 0:
+        return None
+    if int(smooth_iter) > 0:
+        surface = surface.triangulate().smooth(n_iter=int(smooth_iter))
+
+    scalar_grid = create_uniform_grid(field_xyz, spacing, origin=origin, name=name)
+    scalar_grid = scalar_grid.cell_data_to_point_data(pass_cell_data=False)
+    sampled = surface.sample(scalar_grid)
+    if sampled is None or sampled.n_points == 0:
+        return None
+    return sampled
+
+
 def _build_branch_grid(branch_labels_3d, spacing, origin):
     if branch_labels_3d is None:
         return None

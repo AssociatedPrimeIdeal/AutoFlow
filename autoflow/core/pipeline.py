@@ -171,7 +171,7 @@ class PipelineEngine:
         return specs
 
     def _register_derived_scene_objects(self, ws):
-        for dk in ["wss_surface_live", "tke_volume", "pressure_gradient_volume"]:
+        for dk in ["wss_surface_live", "tke_volume", "pressure_gradient_volume", "relative_pressure_volume"]:
             ws.remove_object_by_data_key(dk)
         render_cfg = dict(getattr(ws, "render_settings", {}) or {})
         wss_max = float(np.nanmax(ws.derived.wss_volume)) if ws.derived.wss_volume is not None and np.size(ws.derived.wss_volume) else 0.0
@@ -181,6 +181,9 @@ class PipelineEngine:
         pressure_gradient_clim = render_cfg.get("pressure_gradient_clim")
         if pressure_gradient_clim is None:
             pressure_gradient_clim = tuple(ws.derived.pressure_gradient_display_clim) if ws.derived.pressure_gradient_display_clim is not None else (0.0, 1.0)
+        relative_pressure_clim = render_cfg.get("relative_pressure_clim")
+        if relative_pressure_clim is None:
+            relative_pressure_clim = tuple(ws.derived.relative_pressure_display_clim) if ws.derived.relative_pressure_display_clim is not None else (-1.0, 1.0)
         ws.add_object(name="wss_surface", kind=ObjectKind.METRIC,
                       data_key="wss_surface_live", visible=False, opacity=1.0,
                       scalars="wss", cmap="jet", clim=tuple(wss_clim), dynamic=True,
@@ -195,10 +198,16 @@ class PipelineEngine:
                           scalar_bar_cfg=dict(render_cfg.get("tke_bar_cfg", {}) or {}))
         if ws.derived.pressure_gradient_magnitude is not None:
             ws.add_object(name="pressure_gradient_volume", kind=ObjectKind.METRIC,
-                          data_key="pressure_gradient_volume", visible=False, opacity=0.5,
+                          data_key="pressure_gradient_volume", visible=False, opacity=float(np.clip(ws.derived_params.pressure_gradient_layer_opacity, 0.0, 1.0)),
                           scalars="PressureGradient", cmap="magma", clim=pressure_gradient_clim, dynamic=True,
                           show_scalar_bar=bool(render_cfg.get("pressure_gradient_show_scalar_bar", True)), scalar_bar_title="|Pressure Grad| (Pa/m)",
                           scalar_bar_cfg=dict(render_cfg.get("pressure_gradient_bar_cfg", {}) or {}))
+        if ws.derived.relative_pressure_array is not None:
+            ws.add_object(name="relative_pressure_volume", kind=ObjectKind.METRIC,
+                          data_key="relative_pressure_volume", visible=False, opacity=float(np.clip(ws.derived_params.relative_pressure_layer_opacity, 0.0, 1.0)),
+                          scalars="RelativePressure", cmap="RdBu_r", clim=relative_pressure_clim, dynamic=True,
+                          show_scalar_bar=bool(render_cfg.get("relative_pressure_show_scalar_bar", render_cfg.get("pressure_gradient_show_scalar_bar", True))), scalar_bar_title="Relative Pressure (Pa)",
+                          scalar_bar_cfg=dict(render_cfg.get("relative_pressure_bar_cfg", render_cfg.get("pressure_gradient_bar_cfg", {}) or {}) or {}))
 
 
     def _missing_segmentation_message(self, ws, action):
@@ -291,6 +300,10 @@ class PipelineEngine:
         ws.derived.pressure_gradient_peak = None
         ws.derived.pressure_gradient_support_mask = None
         ws.derived.pressure_gradient_display_clim = None
+        ws.derived.relative_pressure_array = None
+        ws.derived.relative_pressure_peak = None
+        ws.derived.relative_pressure_display_clim = None
+        ws.derived.centerline_pressure_profiles = []
         ws.derived.wss_surfaces = []
         ws.derived.wss_volume = None
         ws.derived.pixelwise_export = {}
@@ -300,7 +313,7 @@ class PipelineEngine:
         ws.derived.pwv_file = ""
         ws.data_loaded = True
 
-        for data_key in ["segmask_raw_surface", "segmask_pre_surface", "wss_surface_live", "tke_volume", "pressure_gradient_volume"]:
+        for data_key in ["segmask_raw_surface", "segmask_pre_surface", "wss_surface_live", "tke_volume", "pressure_gradient_volume", "relative_pressure_volume"]:
             ws.remove_object_by_data_key(data_key)
         ws.remove_object_by_data_key("pwv_planes")
         if ws.segmask_raw is not None:
@@ -609,6 +622,8 @@ class PipelineEngine:
             has_requested = has_requested and has_pg
         if need_tke:
             has_requested = has_requested and has_tke
+        if save_pixelwise and not ws.derived.pixelwise_export:
+            has_requested = False
         if has_requested:
             if refresh_scene_objects:
                 self._register_derived_scene_objects(ws)
@@ -633,7 +648,10 @@ class PipelineEngine:
             sigma=source_sigma,
             rr=ws.rr,
             pressure_gradient_smoothing_sigma=dp.pressure_gradient_smoothing_sigma,
+            pressure_gradient_support_erosion_iters=dp.pressure_gradient_support_erosion_iters,
             pressure_gradient_use_convective_acceleration=dp.pressure_gradient_use_convective_acceleration,
+            pressure_method=dp.pressure_method,
+            centerline_paths=ws.centerline_paths_smooth if len(ws.centerline_paths_smooth) > 0 else ws.centerline_paths,
             compute_wss=bool(compute_wss),
             compute_tke=bool(compute_tke),
             compute_pressure_gradient=bool(compute_pressure_gradient),
@@ -658,6 +676,10 @@ class PipelineEngine:
             ws.derived.pressure_gradient_peak = result.get("pressure_gradient_peak")
             ws.derived.pressure_gradient_support_mask = result.get("pressure_gradient_support_mask")
             ws.derived.pressure_gradient_display_clim = result.get("pressure_gradient_display_clim")
+            ws.derived.relative_pressure_array = result.get("relative_pressure_array")
+            ws.derived.relative_pressure_peak = result.get("relative_pressure_peak")
+            ws.derived.relative_pressure_display_clim = result.get("relative_pressure_display_clim")
+            ws.derived.centerline_pressure_profiles = list(result.get("centerline_pressure_profiles", []) or [])
         ws.derived.streamlines = []
         ws.derived.pixelwise_export = result.get("pixelwise_export", {})
         if refresh_scene_objects:
@@ -694,6 +716,7 @@ class PipelineEngine:
                 branch_labels_3d=ws.branch_labels,
                 tke_array=ws.derived.tke_array,
                 pressure_gradient_array=ws.derived.pressure_gradient_array,
+                relative_pressure_array=ws.derived.relative_pressure_array,
                 wss_surfaces=ws.derived.wss_surfaces,
             )
         else:

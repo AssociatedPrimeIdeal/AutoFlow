@@ -52,7 +52,7 @@ The left browser is group-aware. When the loaded segmentation produces multiple 
 
 | Menu item | What it does | Main code |
 | --- | --- | --- |
-| `Export Videos...` | choose an output directory and export selected plane, WSS, TKE, pressure-gradient, or streamline videos | `autoflow/ui/app.py`, `autoflow/rendering/videos.py` |
+| `Export Videos...` | choose an output directory and export selected plane, WSS, TKE, pressure-analysis, or streamline videos | `autoflow/ui/app.py`, `autoflow/rendering/videos.py` |
 
 ## Standard Workflow
 
@@ -76,7 +76,7 @@ The left browser is group-aware. When the loaded segmentation produces multiple 
 | `Generate Graph` | build graph, branches, and paths | depends on skeleton and preserves group names |
 | `Generate Planes` | create center or distance-based planes | depends on graph and keeps grouped path ownership |
 | `Calculate && Save Metrics` | compute plane metrics and save outputs | requires segmentation and flow |
-| `WSS / TKE / Pressure Gradient` | compute derived volumes and refresh scene objects | TKE stays optional |
+| `WSS / TKE / Pressure` | compute pressure-gradient fields, reconstructed relative pressure, centerline pressure drop, and refresh scene objects | TKE stays optional |
 | `Generate Streamlines` | enable live streamlines from the combined segmentation | requires segmentation |
 | `Pathlines` | launch time-resolved pathlines from planes | grouped plane names are preserved |
 | `Edit Skeleton` | interactive skeleton correction | available only when exactly one segmentation group is active |
@@ -90,7 +90,7 @@ Current `Run All` order:
 3. `Generate Planes`
 4. `Calculate && Save Metrics`
 5. `Compute PWV`
-6. `WSS / TKE / Pressure Gradient`
+6. `WSS / TKE / Pressure`
 
 ## Parameter Panels
 
@@ -101,8 +101,8 @@ Current `Run All` order:
 | `Generate Planes Parameters` | center-plane or distance-plane generation | `autoflow/ui/app.py` |
 | `PWV Parameters` | enable PWV, edit groups, waveform selection, spacing, and plot styling | `autoflow/ui/app.py` |
 | `Streamline Parameters` | seed density, steps, terminal speed, colors | `autoflow/ui/app.py` |
-| `WSS Parameters` | WSS-specific controls | `autoflow/ui/app.py` |
-| `Flow / TKE / Pressure Gradient Parameters` | derived metrics controls | `autoflow/ui/app.py` |
+| `WSS Parameters` | WSS-specific controls plus runtime render and colorbar controls for live metric layers | `autoflow/ui/app.py` |
+| `Flow / TKE / Relative Pressure Parameters` | derived metrics controls, including pressure reconstruction method, support erosion, and pressure-layer opacities | `autoflow/ui/app.py` |
 
 ## Segmentation Workflow
 
@@ -137,7 +137,7 @@ PWV behavior:
 - when `Allow Cycle Wrap` is enabled, foot detection can follow an upstroke that starts at the end of the cardiac cycle and peaks in the first frames instead of pinning those planes to `0 ms`
 - group labels can be entered as symbolic names from `configs/labels.json` such as `AAO, ARCH, DAO` or as integer ids
 - step buttons use the current GUI PWV values immediately after `Load`, `Clear Workspace`, or manual edits; the values do not write back to `configs/pwv.json` automatically
-- the GUI shows one `Analysis` dock with a `Display` selector. `PWV` keeps the group selector and two-panel PWV plot. `Plane Curve` shows the selected plane's chosen metric across cardiac phase. `Internal Consistency` shows the selected path or plane's path-level and branch-level internal consistency
+- the GUI shows one `Analysis` dock with a `Display` selector. `PWV` keeps the group selector and two-panel PWV plot. `Plane Curve` shows the selected plane's chosen metric across cardiac phase, including pressure-gradient and relative-pressure series when available. `Centerline Pressure` shows the selected path's current relative-pressure profile plus its per-phase pressure drop. `Internal Consistency` shows the selected path or plane's path-level and branch-level internal consistency
 - PWV planes appear in the browser as one grouped item named `PWV planes`; the GUI does not list every PWV plane separately
 
 
@@ -148,10 +148,12 @@ Use `Export > Export Videos...` for interactive offline export.
 - choose an output directory
 - select any combination of `plane`, `wss`, `tke`, `pg`, and `streamlines`
 - `plane` is checked by default
-- WSS, TKE, and pressure-gradient exports compute missing derived data before rendering
+- WSS, TKE, pressure-gradient, and relative-pressure exports compute missing derived data before rendering
 - GUI video export reads shared camera and sizing defaults from `configs/rendering.json`
 - GUI live planes read `configs/planes.json -> render`
-- GUI live WSS, TKE, pressure-gradient, and streamline objects read the corresponding `*.json -> render` block, including optional colorbar visibility
+- GUI live WSS, TKE, pressure-gradient, relative-pressure, and streamline objects read the corresponding `*.json -> render` block as startup defaults, then use any runtime `clim` or colorbar edits you make in the GUI for both the scene and later video export in the same session
+- pressure-gradient and relative-pressure 3D layers are rendered on a smoothed pressure support surface
+- each visible 3D metric layer uses the standard PyVista colorbar behavior driven by its own render config or current GUI runtime overrides
 - if `summary.json` already exists in the output directory, the GUI updates `videos`, `video_times_sec`, and adds `gui_video_export`
 
 `Run All` does not export videos automatically. Video export is a separate top-level menu action.
@@ -178,7 +180,8 @@ The ortho viewer supports:
 - speed
 - WSS
 - TKE
-- pressure-gradient components and magnitude
+- pressure gradient
+- relative pressure
 - segmentation painting while editing is enabled
 - jump-to-plane-center behavior
 

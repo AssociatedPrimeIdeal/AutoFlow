@@ -6,7 +6,7 @@ import numpy as np
 import pyvista as pv
 from PIL import Image
 
-from ..algorithms import create_uniform_grid, generate_seed_points, generate_streamlines_at_t
+from ..algorithms import create_uniform_grid, generate_seed_points, generate_streamlines_at_t, sample_volume_on_surface
 from ..config import DEFAULT_PLANE_VIDEO_CFG
 
 WINDOW_SIZE = (1600, 1200)
@@ -97,7 +97,7 @@ def _scalar_bar_args(title, bar_cfg=None):
         "fmt": "%.3g",
     }
     if bar_cfg:
-        cfg.update(bar_cfg)
+        cfg.update({k: v for k, v in bar_cfg.items() if k != "stack_gap"})
     return cfg
 
 
@@ -847,7 +847,23 @@ def _pressure_gradient_max(ws):
     arr = np.asarray(arr, dtype=float)
     if arr.size == 0:
         return 1e-6
-    return max(float(np.nanmax(arr)), 1e-6)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return 1e-6
+    return max(float(np.nanmax(finite)), 1e-6)
+
+
+def _relative_pressure_max(ws):
+    arr = ws.derived.relative_pressure_array
+    if arr is None:
+        return 1e-6
+    arr = np.asarray(arr, dtype=float)
+    if arr.size == 0:
+        return 1e-6
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return 1e-6
+    return max(float(np.nanmax(np.abs(finite))), 1e-6)
 
 
 def render_pressure_gradient_video(
@@ -913,22 +929,24 @@ def render_pressure_gradient_video(
         plotter.set_background("white")
         plotter.add_mesh(surf, opacity=0.08, color="white")
 
-        vol_t = pg_arr if pg_arr.ndim == 3 else pg_arr[..., min(max(0, t), pg_arr.shape[3] - 1)]
-        pg_mesh = create_uniform_grid(vol_t, ws.resolution, origin=ws.origin, name="PressureGradient")
-        mesh_union = create_uniform_grid(
-            np.max(ws.segmask_binary > 0, axis=-1),
-            ws.resolution,
-            origin=ws.origin,
-        )
-        mesh_union = mesh_union.threshold(0.1)
-        pg_mesh = mesh_union.sample(pg_mesh)
-        plotter.add_mesh(
-            pg_mesh,
-            scalars="PressureGradient",
-            cmap="magma",
-            clim=clim,
-            **_scalar_bar_mesh_kwargs(show_scalar_bar, "|Pressure Grad| (Pa/m)", pressure_gradient_bar_cfg),
-        )
+        tidx = min(max(0, t), pg_arr.shape[3] - 1) if pg_arr.ndim == 4 else 0
+        vol_t = pg_arr if pg_arr.ndim == 3 else pg_arr[..., tidx]
+        support = ws.derived.pressure_gradient_support_mask
+        if support is not None:
+            support_arr = np.asarray(support, dtype=bool)
+            support_t = support_arr if support_arr.ndim == 3 else support_arr[..., tidx]
+        else:
+            support_t = np.asarray(ws.segmask_3d if ws.segmask_3d is not None else np.max(ws.segmask_binary > 0, axis=-1), dtype=bool)
+        vol_t = np.where(support_t, vol_t, 0.0)
+        pg_mesh = sample_volume_on_surface(vol_t, support_t, ws.resolution, origin=ws.origin, name="PressureGradient", smooth_iter=80)
+        if pg_mesh is not None and pg_mesh.n_points > 0:
+            plotter.add_mesh(
+                pg_mesh,
+                scalars="PressureGradient",
+                cmap="magma",
+                clim=clim,
+                **_scalar_bar_mesh_kwargs(show_scalar_bar, "|Pressure Grad| (Pa/m)", pressure_gradient_bar_cfg),
+            )
 
         txt = f"t={t} | rot {frame_idx + 1}/{total_frames}" if rotate else f"t={t}"
         plotter.add_text(txt, position="upper_left", font_size=14, color="black")
@@ -939,6 +957,99 @@ def render_pressure_gradient_video(
     plotter.close()
     suffix = "rotate" if rotate else "video"
     return _write_video(frames, os.path.join(out_dir, f"pressure_gradient_{suffix}.mp4"), fps=fps)
+
+
+def render_relative_pressure_video(
+    ws,
+    out_dir,
+    fps=24,
+    smoothing_iteration=200,
+    view="iso",
+    distance_scale=1.0,
+    relative_pressure_clim=None,
+    relative_pressure_bar_cfg=None,
+    show_scalar_bar=True,
+    rotate=False,
+    rotation_frames=None,
+    elevation_deg=None,
+    time_repeat=1,
+    window_size=None,
+):
+    if ws.derived.relative_pressure_array is None:
+        return None
+
+    _, surf = _build_union_surface(ws, smoothing_iteration=smoothing_iteration)
+    if surf is None or surf.n_points == 0:
+        return None
+
+    rp_arr = np.asarray(ws.derived.relative_pressure_array, dtype=np.float32)
+    if rp_arr.ndim not in (3, 4):
+        return None
+
+    rp_max = _relative_pressure_max(ws)
+    if relative_pressure_clim is None:
+        relative_pressure_clim = tuple(ws.derived.relative_pressure_display_clim) if ws.derived.relative_pressure_display_clim is not None else (-rp_max, rp_max)
+    clim = relative_pressure_clim
+
+    _, default_elevation_deg = _resolve_view(view)
+    if elevation_deg is None:
+        elevation_deg = default_elevation_deg
+
+    n_time = int(max(ws.time_count(), 1 if rp_arr.ndim == 3 else rp_arr.shape[3]))
+    if rotate:
+        base_frames = n_time * int(max(time_repeat, 1))
+        total_frames = max(int(rotation_frames), base_frames) if rotation_frames is not None else base_frames
+    else:
+        total_frames = n_time * int(max(time_repeat, 1))
+
+    plotter = _make_plotter(window_size=_resolve_window_size(window_size))
+    frames = []
+
+    for frame_idx in range(total_frames):
+        if rotate:
+            t, azimuth_deg = _time_and_azimuth(
+                frame_idx,
+                rotation_frames=rotation_frames if rotation_frames is not None else total_frames,
+                n_time=n_time,
+                time_repeat=time_repeat,
+            )
+            camera_position = _orbit_camera(surf, azimuth_deg, elevation_deg, distance_scale)
+        else:
+            t = min(frame_idx, n_time - 1)
+            camera_position = _camera_from_view(surf, view, distance_scale)
+
+        plotter.clear()
+        plotter.set_background("white")
+        plotter.add_mesh(surf, opacity=0.08, color="white")
+
+        tidx = min(max(0, t), rp_arr.shape[3] - 1) if rp_arr.ndim == 4 else 0
+        vol_t = rp_arr if rp_arr.ndim == 3 else rp_arr[..., tidx]
+        support = ws.derived.pressure_gradient_support_mask
+        if support is not None:
+            support_arr = np.asarray(support, dtype=bool)
+            support_t = support_arr if support_arr.ndim == 3 else support_arr[..., tidx]
+        else:
+            support_t = np.asarray(ws.segmask_3d if ws.segmask_3d is not None else np.max(ws.segmask_binary > 0, axis=-1), dtype=bool)
+        vol_t = np.where(support_t, vol_t, 0.0)
+        rp_mesh = sample_volume_on_surface(vol_t, support_t, ws.resolution, origin=ws.origin, name="RelativePressure", smooth_iter=80)
+        if rp_mesh is not None and rp_mesh.n_points > 0:
+            plotter.add_mesh(
+                rp_mesh,
+                scalars="RelativePressure",
+                cmap="RdBu_r",
+                clim=clim,
+                **_scalar_bar_mesh_kwargs(show_scalar_bar, "Relative Pressure (Pa)", relative_pressure_bar_cfg),
+            )
+
+        txt = f"t={t} | rot {frame_idx + 1}/{total_frames}" if rotate else f"t={t}"
+        plotter.add_text(txt, position="upper_left", font_size=14, color="black")
+        plotter.camera_position = camera_position
+        plotter.render()
+        frames.append(np.asarray(plotter.screenshot(return_img=True)))
+
+    plotter.close()
+    suffix = "rotate" if rotate else "video"
+    return _write_video(frames, os.path.join(out_dir, f"relative_pressure_{suffix}.mp4"), fps=fps)
 
 
 def extract_frame(mp4_path, frame_index, out_png):

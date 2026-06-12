@@ -44,7 +44,7 @@ class StepId(Enum):
             StepId.GENERATE_STREAMLINES: "Generate Streamlines",
             StepId.PLANE_STREAMLINES: "Pathlines",
             StepId.COMPUTE_PLANE_METRICS: "Calculate && Save Metrics",
-            StepId.COMPUTE_DERIVED_METRICS: "WSS / TKE / Pressure Gradient",
+            StepId.COMPUTE_DERIVED_METRICS: "WSS / TKE / Relative Pressure",
         }[self]
 
     @staticmethod
@@ -307,7 +307,11 @@ class DerivedMetricsParams:
     pressure_gradient_rho: float = 1060.0
     pressure_gradient_viscosity: float = 4.0
     pressure_gradient_smoothing_sigma: float = 0.0
+    pressure_gradient_support_erosion_iters: int = 1
+    pressure_gradient_layer_opacity: float = 0.6
+    relative_pressure_layer_opacity: float = 0.6
     pressure_gradient_use_convective_acceleration: bool = True
+    pressure_method: str = "least_squares"
     step_size: int = 5
     tube_radius: float = 0.1
     use_multithread: bool = False
@@ -323,7 +327,11 @@ class DerivedMetricsParams:
             "pressure_gradient_rho": self.pressure_gradient_rho,
             "pressure_gradient_viscosity": self.pressure_gradient_viscosity,
             "pressure_gradient_smoothing_sigma": self.pressure_gradient_smoothing_sigma,
+            "pressure_gradient_support_erosion_iters": self.pressure_gradient_support_erosion_iters,
+            "pressure_gradient_layer_opacity": self.pressure_gradient_layer_opacity,
+            "relative_pressure_layer_opacity": self.relative_pressure_layer_opacity,
             "pressure_gradient_use_convective_acceleration": self.pressure_gradient_use_convective_acceleration,
+            "pressure_method": str(self.pressure_method),
             "step_size": self.step_size,
             "tube_radius": self.tube_radius,
             "use_multithread": self.use_multithread,
@@ -340,6 +348,9 @@ class DerivedMetricsParams:
             inward_distance = float(inward_distance)
         legacy_viscosity = float(payload.get("viscosity", 4.0))
         legacy_rho = float(payload.get("rho", 1060.0))
+        pressure_method = str(payload.get("pressure_method", payload.get("pressure_gradient_method", "least_squares")) or "least_squares").strip().lower()
+        if pressure_method not in {"least_squares", "ppe"}:
+            pressure_method = "least_squares"
         return DerivedMetricsParams(
             wss_smoothing_iteration=int(payload.get("wss_smoothing_iteration", payload.get("smoothing_iteration", 200))),
             wss_viscosity=float(payload.get("wss_viscosity", legacy_viscosity)),
@@ -350,7 +361,11 @@ class DerivedMetricsParams:
             pressure_gradient_rho=float(payload.get("pressure_gradient_rho", legacy_rho)),
             pressure_gradient_viscosity=float(payload.get("pressure_gradient_viscosity", legacy_viscosity)),
             pressure_gradient_smoothing_sigma=float(payload.get("pressure_gradient_smoothing_sigma", 0.0)),
+            pressure_gradient_support_erosion_iters=int(payload.get("pressure_gradient_support_erosion_iters", 1)),
+            pressure_gradient_layer_opacity=float(payload.get("pressure_gradient_layer_opacity", 0.6)),
+            relative_pressure_layer_opacity=float(payload.get("relative_pressure_layer_opacity", 0.6)),
             pressure_gradient_use_convective_acceleration=bool(payload.get("pressure_gradient_use_convective_acceleration", True)),
+            pressure_method=pressure_method,
             step_size=int(payload.get("step_size", 5)),
             tube_radius=float(payload.get("tube_radius", 0.1)),
             use_multithread=bool(payload.get("use_multithread", False)),
@@ -795,6 +810,10 @@ class DerivedResults:
     pressure_gradient_peak: Optional[np.ndarray] = None
     pressure_gradient_support_mask: Optional[np.ndarray] = None
     pressure_gradient_display_clim: Optional[Tuple[float, float]] = None
+    relative_pressure_array: Optional[np.ndarray] = None
+    relative_pressure_peak: Optional[np.ndarray] = None
+    relative_pressure_display_clim: Optional[Tuple[float, float]] = None
+    centerline_pressure_profiles: List[Dict[str, Any]] = field(default_factory=list)
     streamlines: List[Any] = field(default_factory=list)
     pixelwise_export: Dict[str, Any] = field(default_factory=dict)
     plane_pixelwise_file: str = ""
@@ -1207,6 +1226,7 @@ class Workspace:
         self.remove_object_by_data_key("wss_surface_live")
         self.remove_object_by_data_key("tke_volume")
         self.remove_object_by_data_key("pressure_gradient_volume")
+        self.remove_object_by_data_key("relative_pressure_volume")
         self.remove_object_by_data_key("pwv_planes")
         self.remove_object_by_data_key("derived_streamlines_live")
         self.remove_objects_by_prefix("plane_")
@@ -1340,6 +1360,7 @@ class Workspace:
                 "plane_metrics": copy.deepcopy(self.derived.plane_metrics),
                 "plane_qc": copy.deepcopy(self.derived.plane_qc),
                 "plane_pixelwise_file": str(self.derived.plane_pixelwise_file or ""),
+                "centerline_pressure_profiles": copy.deepcopy(self.derived.centerline_pressure_profiles),
                 "pwv_results": copy.deepcopy(self.derived.pwv_results),
                 "pwv_planes": copy.deepcopy(self.derived.pwv_planes),
                 "pwv_file": str(self.derived.pwv_file or ""),
@@ -1463,6 +1484,7 @@ class Workspace:
             plane_metrics=copy.deepcopy(derived_state.get("plane_metrics", [])),
             plane_qc=copy.deepcopy(derived_state.get("plane_qc", {})),
             plane_pixelwise_file=str(derived_state.get("plane_pixelwise_file", "") or ""),
+            centerline_pressure_profiles=copy.deepcopy(derived_state.get("centerline_pressure_profiles", [])),
             pwv_results=copy.deepcopy(derived_state.get("pwv_results", [])),
             pwv_planes=copy.deepcopy(derived_state.get("pwv_planes", [])),
             pwv_file=str(derived_state.get("pwv_file", "") or ""),

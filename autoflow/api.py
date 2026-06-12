@@ -11,6 +11,7 @@ from .case_types import InputCase
 from .config import (
     DEFAULT_PRESSURE_GRADIENT_BAR_CFG,
     DEFAULT_PLANE_VIDEO_CFG,
+    DEFAULT_RELATIVE_PRESSURE_BAR_CFG,
     DEFAULT_STREAMLINE_BAR_CFG,
     DEFAULT_TKE_BAR_CFG,
     DEFAULT_WSS_BAR_CFG,
@@ -59,6 +60,7 @@ class AutoFlowConfig:
     tube_radius: float = 0.05
     pathline_color: Optional[str] = None
     plane_pathline_color: Optional[str] = None
+    pressure_method: str = "least_squares"
 
     autoseg: bool = False
     autoseg_backend: str = "nnUNet"
@@ -99,6 +101,9 @@ class AutoFlowConfig:
     pressure_gradient_clim: Optional[Tuple[float, float]] = None
     pressure_gradient_show_scalar_bar: bool = True
     pressure_gradient_bar_cfg: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_PRESSURE_GRADIENT_BAR_CFG))
+    relative_pressure_clim: Optional[Tuple[float, float]] = None
+    relative_pressure_show_scalar_bar: bool = True
+    relative_pressure_bar_cfg: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_RELATIVE_PRESSURE_BAR_CFG))
     streamline_clim: Tuple[float, float] = (0.0, 1.0)
     streamline_show_scalar_bar: bool = True
     streamline_bar_cfg: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_STREAMLINE_BAR_CFG))
@@ -141,6 +146,10 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
     ws.streamline_params.rng_seed = int(cfg.rng_seed)
     ws.streamline_params.tube_radius = float(cfg.tube_radius)
     ws.streamline_params.pathline_color = str(cfg.pathline_color or cfg.plane_pathline_color or "deepskyblue")
+    pressure_method = str(getattr(cfg, "pressure_method", "least_squares") or "least_squares").strip().lower()
+    if pressure_method not in {"least_squares", "ppe"}:
+        pressure_method = "least_squares"
+    ws.derived_params.pressure_method = pressure_method
     ws.derived_params.use_multithread = bool(cfg.use_multithread)
     return ws
 
@@ -271,6 +280,7 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 tube_radius=config.tube_radius,
                 pathline_color=config.pathline_color,
                 plane_pathline_color=config.plane_pathline_color,
+                pressure_method=config.pressure_method,
                 autoseg=config.autoseg,
                 autoseg_backend=config.autoseg_backend,
                 autoseg_model=config.autoseg_model,

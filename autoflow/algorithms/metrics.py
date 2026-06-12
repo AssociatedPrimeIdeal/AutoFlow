@@ -2,11 +2,13 @@ import h5py
 import numpy as np
 import pyvista as pv
 from scipy.ndimage import binary_erosion, gaussian_filter
+from scipy.sparse import csc_matrix, csr_matrix, diags
+from scipy.sparse.linalg import cg, factorized
 
 from .paths import _determine_plane_forward, _vector_orientation_text
 from .surfaces import (
     _build_branch_grid,
-    _extract_plane_flow_region,
+    _select_connected_region,
     create_uniform_field_grid,
     create_uniform_grid,
     create_uniform_vector,
@@ -154,7 +156,8 @@ def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes
         raise ValueError(f"mask time dimension {mask.shape[3]} does not match flow {flow.shape[3]}")
     Nt = int(flow.shape[3])
     branch_grid = _build_branch_grid(branch_labels_3d, spacing, origin)
-    mask_static = all(np.array_equal(mask[..., 0], mask[..., t]) for t in range(1, Nt))
+    mask_phase_lookup = _build_mask_phase_lookup(mask)
+    mask_static = all(int(rep_t) == 0 for rep_t in mask_phase_lookup)
     mask_template = mask[..., 0] if mask_static else None
 
     paths_lookup = None
@@ -183,7 +186,7 @@ def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes
                 pp = paths_lookup[pi]
         results.append(_compute_single_plane_metric(
             (flow, mask, spacing, origin, plane, Nt, RR,
-             branch_grid, target_label, path_info, pp, mask_template)
+             branch_grid, target_label, path_info, pp, mask_template, mask_phase_lookup)
         ))
 
     results, qc = apply_internal_consistency_to_metrics(results, path_info=path_info, forks=forks)
@@ -217,6 +220,93 @@ def _target_label_for_plane(plane, branch_labels_3d, spacing, origin):
     ijk = np.rint((np.asarray(plane.center, dtype=float).reshape(3) - origin) / (spacing + 1e-12)).astype(int)
     ijk = np.clip(ijk, 0, np.array(np.asarray(branch_labels_3d).shape) - 1)
     return int(np.asarray(branch_labels_3d)[ijk[0], ijk[1], ijk[2]])
+
+
+def _build_mask_phase_lookup(mask4d):
+    mask4d = _ensure_mask4d(mask4d)
+    representatives = {}
+    lookup = []
+    for tidx in range(int(mask4d.shape[3])):
+        mask_t = mask4d[..., tidx]
+        rep_t = representatives.get(mask_t.tobytes())
+        if rep_t is None:
+            rep_t = int(tidx)
+            representatives[mask_t.tobytes()] = rep_t
+        lookup.append(rep_t)
+    return lookup
+
+
+def _build_plane_slice_spec(mask_xyz, plane, spacing, origin, branch_grid=None, target_label=None, *, select_connected=False):
+    mask_xyz = np.asarray(mask_xyz, dtype=bool)
+    if not np.any(mask_xyz):
+        return None
+    grid = create_uniform_field_grid(mask_xyz.astype(np.uint8), spacing, origin=origin, name="mask")
+    grid.cell_data["_cell_id"] = np.arange(mask_xyz.size, dtype=np.int32)
+    mesh = grid.threshold(0.1, scalars="mask")
+    if mesh is None or mesh.n_cells == 0:
+        return None
+    pg = mesh.slice(normal=np.asarray(plane.normal, dtype=float), origin=np.asarray(plane.center, dtype=float))
+    if pg is None or pg.n_cells == 0:
+        return None
+    pg = pg.compute_cell_sizes(area=True)
+    if branch_grid is not None and target_label is not None and int(target_label) > 0:
+        centers = pg.cell_centers().sample(branch_grid)
+        bid = np.asarray(centers.point_data.get("branch_id", []))
+        if len(bid) == 0:
+            return None
+        keep = np.where(bid == int(target_label))[0]
+        if len(keep) == 0:
+            return None
+        pg = pg.extract_cells(keep)
+        if pg is None or pg.n_cells == 0:
+            return None
+        pg = pg.compute_cell_sizes(area=True)
+    if select_connected:
+        pg = _select_connected_region(pg, ref_point=np.asarray(plane.center, dtype=float))
+        if pg is None or pg.n_cells == 0:
+            return None
+    cell_ids = np.asarray(pg.cell_data.get("_cell_id", []), dtype=np.int64).reshape(-1)
+    if cell_ids.size != int(pg.n_cells):
+        return None
+    areas = np.asarray(pg.cell_data.get("Area", np.ones(pg.n_cells, dtype=float)), dtype=float).reshape(-1)
+    if areas.size != int(pg.n_cells):
+        areas = np.ones(int(pg.n_cells), dtype=float)
+    return {
+        "cell_ids": cell_ids,
+        "areas": areas,
+    }
+
+
+def _get_cached_plane_slice_spec(slice_cache, cache_key, mask_xyz, plane, spacing, origin,
+                                 branch_grid=None, target_label=None, *, select_connected=False):
+    if cache_key not in slice_cache:
+        slice_cache[cache_key] = _build_plane_slice_spec(
+            mask_xyz,
+            plane,
+            spacing,
+            origin,
+            branch_grid=branch_grid,
+            target_label=target_label,
+            select_connected=select_connected,
+        )
+    return slice_cache[cache_key]
+
+
+def _sample_field_from_slice_spec(field_t, mask_shape, field_name, slice_spec):
+    if slice_spec is None:
+        return None
+    field_arr = np.asarray(field_t)
+    if tuple(field_arr.shape[:3]) != tuple(mask_shape):
+        raise ValueError(f"{field_name} spatial shape {field_arr.shape[:3]} does not match mask {mask_shape}")
+    cell_ids = np.asarray(slice_spec["cell_ids"], dtype=np.int64).reshape(-1)
+    if field_arr.ndim == 3:
+        return field_arr.reshape(-1, order="F")[cell_ids]
+    if field_arr.ndim == 4 and field_arr.shape[-1] in (1, 3):
+        payload = field_arr if field_arr.shape[-1] != 1 else field_arr[..., 0]
+        if payload.ndim == 3:
+            return payload.reshape(-1, order="F")[cell_ids]
+        return payload.reshape(-1, payload.shape[-1], order="F")[cell_ids]
+    raise ValueError(f"{field_name} must be XYZ, XYZT-slice scalar, or XYZV, got {field_arr.shape}")
 
 
 def _extract_plane_field_region(mask_xyz, field_t, plane, spacing, origin, field_name, branch_grid=None, target_label=None):
@@ -292,12 +382,14 @@ def _append_summary(metric, prefix, series):
 
 
 def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_labels_3d=None,
-                                    tke_array=None, pressure_gradient_array=None, wss_surfaces=None):
+                                    tke_array=None, pressure_gradient_array=None,
+                                    relative_pressure_array=None, wss_surfaces=None,
+                                    branch_grid=None, mask_phase_lookup=None):
     mask4d = _ensure_mask4d(mask4d)
     spacing = np.asarray(spacing, dtype=float).reshape(3)
     origin = np.asarray(origin, dtype=float).reshape(3)
     Nt = int(mask4d.shape[3])
-    branch_grid = _build_branch_grid(branch_labels_3d, spacing, origin)
+    branch_grid = branch_grid if branch_grid is not None else _build_branch_grid(branch_labels_3d, spacing, origin)
     target_label = _target_label_for_plane(plane, branch_labels_3d, spacing, origin)
     normal = np.asarray(plane.normal, dtype=float).reshape(3)
     normal = normal / (np.linalg.norm(normal) + 1e-12)
@@ -307,7 +399,9 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
 
     has_tke = tke_array is not None
     has_pressure_gradient = pressure_gradient_array is not None
+    has_relative_pressure = relative_pressure_array is not None
     has_wss = wss_surfaces is not None
+    needs_volume_slice = has_tke or has_pressure_gradient or has_relative_pressure
 
     if has_tke:
         tke_array = _prepare_tke_array(mask4d, tke_array=tke_array, sigma=None)
@@ -315,6 +409,13 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
         pressure_gradient_array = np.asarray(pressure_gradient_array, dtype=np.float32)
         if pressure_gradient_array.ndim != 5 or pressure_gradient_array.shape[-1] != 3:
             raise ValueError(f"pressure_gradient_array must be XYZTV, got {pressure_gradient_array.shape}")
+    if has_relative_pressure:
+        relative_pressure_array = np.asarray(relative_pressure_array, dtype=np.float32)
+        if relative_pressure_array.ndim != 4:
+            raise ValueError(f"relative_pressure_array must be XYZT, got {relative_pressure_array.shape}")
+    if mask_phase_lookup is None:
+        mask_phase_lookup = _build_mask_phase_lookup(mask4d) if needs_volume_slice else []
+    slice_cache = {}
 
     tke_mean_t = []
     tke_peak_t = []
@@ -325,52 +426,85 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
     pg_normal_mean_t = []
     pg_normal_peak_t = []
     pg_normal_p95_t = []
+    rp_mean_t = []
+    rp_peak_t = []
+    rp_p95_t = []
     wss_mean_t = []
     wss_peak_t = []
     wss_p95_t = []
 
     for tidx in range(Nt):
-        mask_t = mask4d[..., tidx]
         entry = {"time_index": int(tidx)}
 
         tke_series_vals = np.array([], dtype=float)
         pg_mag_vals = np.array([], dtype=float)
         pg_normal_vals = np.array([], dtype=float)
+        rp_vals = np.array([], dtype=float)
         areas = np.array([], dtype=float)
-
-        if has_tke:
-            pg_tke = _extract_plane_field_region(
-                mask_t, tke_array[..., tidx], plane, spacing, origin, "tke",
-                branch_grid=branch_grid, target_label=target_label,
+        slice_spec = None
+        if needs_volume_slice:
+            rep_t = int(mask_phase_lookup[tidx])
+            slice_spec = _get_cached_plane_slice_spec(
+                slice_cache,
+                rep_t,
+                mask4d[..., rep_t],
+                plane,
+                spacing,
+                origin,
+                branch_grid=branch_grid,
+                target_label=target_label,
+                select_connected=False,
             )
-            if pg_tke is not None and pg_tke.n_cells > 0:
-                if "tke" not in pg_tke.cell_data and "tke" in pg_tke.point_data:
-                    pg_tke = pg_tke.point_data_to_cell_data(pass_point_data=True)
-                tke_series_vals = np.asarray(pg_tke.cell_data.get("tke", []), dtype=float).reshape(-1)
-                areas = np.asarray(pg_tke.cell_data.get("Area", np.ones(pg_tke.n_cells, dtype=float)), dtype=float).reshape(-1)
+
+        if has_tke and slice_spec is not None:
+            tke_series_vals = np.asarray(
+                _sample_field_from_slice_spec(tke_array[..., tidx], mask4d.shape[:3], "tke", slice_spec),
+                dtype=float,
+            ).reshape(-1)
+            if tke_series_vals.size:
+                areas = np.asarray(slice_spec["areas"], dtype=float).reshape(-1)
                 entry["cell_area_mm2"] = areas.astype(np.float32)
                 entry["tke_J_m3"] = tke_series_vals.astype(np.float32)
                 entry["lumen_mask"] = np.ones_like(tke_series_vals, dtype=np.uint8)
 
-        if has_pressure_gradient:
-            pg_pg = _extract_plane_field_region(
-                mask_t, pressure_gradient_array[..., tidx, :], plane, spacing, origin, "pressure_gradient",
-                branch_grid=branch_grid, target_label=target_label,
+        if has_pressure_gradient and slice_spec is not None:
+            vec = np.asarray(
+                _sample_field_from_slice_spec(
+                    pressure_gradient_array[..., tidx, :],
+                    mask4d.shape[:3],
+                    "pressure_gradient",
+                    slice_spec,
+                ),
+                dtype=float,
             )
-            if pg_pg is not None and pg_pg.n_cells > 0:
-                if "pressure_gradient" not in pg_pg.cell_data and "pressure_gradient" in pg_pg.point_data:
-                    pg_pg = pg_pg.point_data_to_cell_data(pass_point_data=True)
-                vec = np.asarray(pg_pg.cell_data.get("pressure_gradient", []), dtype=float)
-                if vec.ndim == 2 and vec.shape[1] == 3 and len(vec) == pg_pg.n_cells:
-                    if areas.size == 0:
-                        areas = np.asarray(pg_pg.cell_data.get("Area", np.ones(pg_pg.n_cells, dtype=float)), dtype=float).reshape(-1)
-                        entry.setdefault("cell_area_mm2", areas.astype(np.float32))
-                        entry.setdefault("lumen_mask", np.ones(len(areas), dtype=np.uint8))
-                    pg_mag_vals = np.linalg.norm(vec, axis=1)
-                    pg_normal_vals = np.dot(vec, normal)
-                    entry["pressure_gradient_mag_Pa_m"] = pg_mag_vals.astype(np.float32)
-                    entry["pressure_gradient_normal_Pa_m"] = pg_normal_vals.astype(np.float32)
-                    entry["pressure_gradient_vec_Pa_m"] = vec.astype(np.float32)
+            if vec.ndim == 2 and vec.shape[1] == 3:
+                if areas.size == 0:
+                    areas = np.asarray(slice_spec["areas"], dtype=float).reshape(-1)
+                    entry.setdefault("cell_area_mm2", areas.astype(np.float32))
+                    entry.setdefault("lumen_mask", np.ones(len(areas), dtype=np.uint8))
+                pg_mag_vals = np.linalg.norm(vec, axis=1)
+                pg_normal_vals = np.dot(vec, normal)
+                entry["pressure_gradient_mag_Pa_m"] = pg_mag_vals.astype(np.float32)
+                entry["pressure_gradient_normal_Pa_m"] = pg_normal_vals.astype(np.float32)
+                entry["pressure_gradient_vec_Pa_m"] = vec.astype(np.float32)
+
+        if has_relative_pressure and slice_spec is not None:
+            vals = np.asarray(
+                _sample_field_from_slice_spec(
+                    relative_pressure_array[..., tidx],
+                    mask4d.shape[:3],
+                    "relative_pressure",
+                    slice_spec,
+                ),
+                dtype=float,
+            ).reshape(-1)
+            if vals.size:
+                if areas.size == 0:
+                    areas = np.asarray(slice_spec["areas"], dtype=float).reshape(-1)
+                    entry.setdefault("cell_area_mm2", areas.astype(np.float32))
+                    entry.setdefault("lumen_mask", np.ones(len(areas), dtype=np.uint8))
+                rp_vals = vals
+                entry["relative_pressure_Pa"] = rp_vals.astype(np.float32)
 
         if tke_series_vals.size:
             tke_mean_t.append(_weighted_mean(tke_series_vals, areas))
@@ -395,6 +529,15 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
             pg_normal_mean_t.append(0.0)
             pg_normal_peak_t.append(0.0)
             pg_normal_p95_t.append(0.0)
+
+        if rp_vals.size:
+            rp_mean_t.append(_weighted_mean(rp_vals, areas))
+            rp_peak_t.append(float(np.max(np.abs(rp_vals))))
+            rp_p95_t.append(_nanpercentile_safe(np.abs(rp_vals), 95.0))
+        else:
+            rp_mean_t.append(0.0)
+            rp_peak_t.append(0.0)
+            rp_p95_t.append(0.0)
 
         wss_vals = np.array([], dtype=float)
         surf = None if not has_wss or tidx >= len(wss_surfaces) else wss_surfaces[tidx]
@@ -431,6 +574,10 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
         _append_summary(summary, "pressure_gradient_normal_mean_Pa_m", pg_normal_mean_t)
         _append_summary(summary, "pressure_gradient_normal_peak_Pa_m", pg_normal_peak_t)
         _append_summary(summary, "pressure_gradient_normal_p95_Pa_m", pg_normal_p95_t)
+    if has_relative_pressure:
+        _append_summary(summary, "relative_pressure_mean_Pa", rp_mean_t)
+        _append_summary(summary, "relative_pressure_peak_Pa", rp_peak_t)
+        _append_summary(summary, "relative_pressure_p95_Pa", rp_p95_t)
     if has_wss:
         _append_summary(summary, "wss_wall_mean_Pa", wss_mean_t)
         _append_summary(summary, "wss_wall_peak_Pa", wss_peak_t)
@@ -439,7 +586,11 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
 
 
 def augment_plane_metrics_with_derived(plane_metrics, planes, mask4d, spacing, origin, branch_labels_3d=None,
-                                       tke_array=None, pressure_gradient_array=None, wss_surfaces=None):
+                                       tke_array=None, pressure_gradient_array=None,
+                                       relative_pressure_array=None, wss_surfaces=None):
+    mask4d = _ensure_mask4d(mask4d)
+    shared_branch_grid = _build_branch_grid(branch_labels_3d, spacing, origin)
+    mask_phase_lookup = _build_mask_phase_lookup(mask4d)
     metrics = [dict(m) for m in plane_metrics]
     pixelwise = []
     for idx, metric in enumerate(metrics):
@@ -449,7 +600,10 @@ def augment_plane_metrics_with_derived(plane_metrics, planes, mask4d, spacing, o
         summary, payload = summarize_plane_derived_metrics(
             planes[idx], mask4d, spacing, origin, branch_labels_3d=branch_labels_3d,
             tke_array=tke_array, pressure_gradient_array=pressure_gradient_array,
+            relative_pressure_array=relative_pressure_array,
             wss_surfaces=wss_surfaces,
+            branch_grid=shared_branch_grid,
+            mask_phase_lookup=mask_phase_lookup,
         )
         metric.update(summary)
         payload["plane_index"] = int(idx)
@@ -582,8 +736,414 @@ def compute_wss_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
     }
 
 
+def _finite_percentile_abs(values, q, default=0.0):
+    arr = np.asarray(values, dtype=float)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return float(default)
+    return float(np.percentile(np.abs(finite), float(q)))
+
+
+def _normalize_pressure_method(method):
+    token = str(method or "least_squares").strip().lower()
+    if token in {"ls", "least_squares", "least-squares", "least squares"}:
+        return "least_squares"
+    if token in {"ppe", "poisson", "poisson_pressure_equation"}:
+        return "ppe"
+    raise ValueError(f"unsupported pressure reconstruction method: {method}")
+
+
+def _neighbor_shifts():
+    return (
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    )
+
+
+def _solve_reconstruction_system(system, rhs, *, tol=1e-5, max_iter=2000):
+    matrix = system["matrix"]
+    n = int(matrix.shape[0])
+    if n <= 0:
+        return np.zeros(0, dtype=np.float32)
+    rhs = np.asarray(rhs, dtype=np.float64).reshape(n)
+    if n == 1:
+        return np.zeros(1, dtype=np.float32)
+
+    if "preconditioner" not in system:
+        diag = np.asarray(matrix.diagonal(), dtype=np.float64)
+        inv_diag = np.zeros_like(diag)
+        nz = np.abs(diag) > 1e-12
+        inv_diag[nz] = 1.0 / diag[nz]
+        system["preconditioner"] = diags(inv_diag, 0, format="csr")
+
+    x0 = system.get("last_solution")
+    sol, info = cg(
+        matrix,
+        rhs,
+        x0=x0,
+        M=system["preconditioner"],
+        maxiter=int(max_iter),
+        rtol=float(tol),
+        atol=0.0,
+    )
+    if info != 0:
+        try:
+            solver = system.get("factorized_solver")
+            if solver is None:
+                solver = factorized(csc_matrix(matrix))
+                system["factorized_solver"] = solver
+            sol = np.asarray(solver(rhs), dtype=np.float64).reshape(n)
+        except Exception:
+            raise RuntimeError(f"sparse pressure solve failed to converge: info={info}")
+    else:
+        sol = np.asarray(sol, dtype=np.float64).reshape(n)
+    system["last_solution"] = sol
+
+    anchor_index = int(system.get("anchor_index", 0))
+    if 0 <= anchor_index < n:
+        sol -= float(sol[anchor_index])
+    else:
+        sol -= float(np.mean(sol))
+    return sol.astype(np.float32)
+
+
+def _build_least_squares_system(mask_t, spacing_m):
+    coords = np.argwhere(mask_t)
+    n = int(len(coords))
+    if n == 0:
+        return {
+            "coords": coords,
+            "index_map": -np.ones(mask_t.shape, dtype=np.int32),
+            "matrix": csr_matrix((0, 0), dtype=np.float64),
+            "edge_pairs": np.zeros((0, 2), dtype=np.int32),
+            "edge_axes": np.zeros(0, dtype=np.int8),
+            "edge_scales": np.zeros(0, dtype=np.float64),
+            "anchor_index": 0,
+        }
+
+    index_map = -np.ones(mask_t.shape, dtype=np.int32)
+    index_map[mask_t] = np.arange(n, dtype=np.int32)
+    rows = []
+    cols = []
+    data = []
+    edge_pairs = []
+    edge_axes = []
+    edge_scales = []
+    rhs_rows = []
+    rhs_cols = []
+    rhs_data = []
+    row_idx = 0
+    dx, dy, dz = [float(v) for v in spacing_m]
+    for voxel_idx, (ix, iy, iz) in enumerate(coords):
+        if voxel_idx == 0:
+            rows.append(row_idx)
+            cols.append(voxel_idx)
+            data.append(1.0)
+            rhs_rows.append(voxel_idx)
+            rhs_cols.append(row_idx)
+            rhs_data.append(1.0)
+            row_idx += 1
+        if ix + 1 < mask_t.shape[0] and mask_t[ix + 1, iy, iz]:
+            nbr = int(index_map[ix + 1, iy, iz])
+            scale = 1.0 / dx
+            rows.extend((row_idx, row_idx))
+            cols.extend((voxel_idx, nbr))
+            data.extend((-scale, scale))
+            edge_pairs.append((voxel_idx, nbr))
+            edge_axes.append(0)
+            edge_scales.append(scale)
+            rhs_rows.extend((voxel_idx, nbr))
+            rhs_cols.extend((row_idx, row_idx))
+            rhs_data.extend((-scale, scale))
+            row_idx += 1
+        if iy + 1 < mask_t.shape[1] and mask_t[ix, iy + 1, iz]:
+            nbr = int(index_map[ix, iy + 1, iz])
+            scale = 1.0 / dy
+            rows.extend((row_idx, row_idx))
+            cols.extend((voxel_idx, nbr))
+            data.extend((-scale, scale))
+            edge_pairs.append((voxel_idx, nbr))
+            edge_axes.append(1)
+            edge_scales.append(scale)
+            rhs_rows.extend((voxel_idx, nbr))
+            rhs_cols.extend((row_idx, row_idx))
+            rhs_data.extend((-scale, scale))
+            row_idx += 1
+        if iz + 1 < mask_t.shape[2] and mask_t[ix, iy, iz + 1]:
+            nbr = int(index_map[ix, iy, iz + 1])
+            scale = 1.0 / dz
+            rows.extend((row_idx, row_idx))
+            cols.extend((voxel_idx, nbr))
+            data.extend((-scale, scale))
+            edge_pairs.append((voxel_idx, nbr))
+            edge_axes.append(2)
+            edge_scales.append(scale)
+            rhs_rows.extend((voxel_idx, nbr))
+            rhs_cols.extend((row_idx, row_idx))
+            rhs_data.extend((-scale, scale))
+            row_idx += 1
+
+    if row_idx == 0:
+        matrix = diags([1.0], [0], shape=(n, n), dtype=np.float64).tocsr()
+    else:
+        incidence = csr_matrix((np.asarray(data, dtype=np.float64), (np.asarray(rows, dtype=np.int32), np.asarray(cols, dtype=np.int32))), shape=(row_idx, n), dtype=np.float64)
+        matrix = (incidence.T @ incidence).tocsr()
+    matrix = matrix + diags([1e-6], [0], shape=(n, n), dtype=np.float64)
+    return {
+        "coords": coords,
+        "index_map": index_map,
+        "matrix": matrix.tocsr(),
+        "rhs_operator": csr_matrix((np.asarray(rhs_data, dtype=np.float64), (np.asarray(rhs_rows, dtype=np.int32), np.asarray(rhs_cols, dtype=np.int32))), shape=(n, row_idx), dtype=np.float64),
+        "edge_pairs": np.asarray(edge_pairs, dtype=np.int32).reshape(-1, 2),
+        "edge_axes": np.asarray(edge_axes, dtype=np.int8),
+        "edge_scales": np.asarray(edge_scales, dtype=np.float64),
+        "anchor_index": 0,
+    }
+
+
+def _build_ppe_system(mask_t, spacing_m):
+    coords = np.argwhere(mask_t)
+    n = int(len(coords))
+    if n == 0:
+        return {
+            "coords": coords,
+            "index_map": -np.ones(mask_t.shape, dtype=np.int32),
+            "matrix": csr_matrix((0, 0), dtype=np.float64),
+            "anchor_index": 0,
+        }
+
+    index_map = -np.ones(mask_t.shape, dtype=np.int32)
+    index_map[mask_t] = np.arange(n, dtype=np.int32)
+    rows = []
+    cols = []
+    data = []
+    dx, dy, dz = [float(v) for v in spacing_m]
+    for voxel_idx, (ix, iy, iz) in enumerate(coords):
+        if voxel_idx == 0:
+            rows.append(voxel_idx)
+            cols.append(voxel_idx)
+            data.append(1.0)
+            continue
+        diag = 0.0
+        for sx, sy, sz in _neighbor_shifts():
+            jx, jy, jz = ix + sx, iy + sy, iz + sz
+            if not (0 <= jx < mask_t.shape[0] and 0 <= jy < mask_t.shape[1] and 0 <= jz < mask_t.shape[2]):
+                continue
+            if not mask_t[jx, jy, jz]:
+                continue
+            step = dx if sx != 0 else dy if sy != 0 else dz
+            weight = 1.0 / (step * step)
+            rows.append(voxel_idx)
+            cols.append(int(index_map[jx, jy, jz]))
+            data.append(-weight)
+            diag += weight
+        rows.append(voxel_idx)
+        cols.append(voxel_idx)
+        data.append(diag if diag > 0.0 else 1.0)
+
+    matrix = csr_matrix((np.asarray(data, dtype=np.float64), (np.asarray(rows, dtype=np.int32), np.asarray(cols, dtype=np.int32))), shape=(n, n), dtype=np.float64)
+    return {
+        "coords": coords,
+        "index_map": index_map,
+        "matrix": matrix.tocsr(),
+        "anchor_index": 0,
+    }
+
+
+def _least_squares_rhs(grad_t, system):
+    edge_pairs = system["edge_pairs"]
+    if edge_pairs.size == 0:
+        rhs = np.zeros(system["matrix"].shape[0], dtype=np.float64)
+        if rhs.size:
+            rhs[0] = 0.0
+        return rhs
+    edge_axes = system["edge_axes"]
+    coords = system["coords"]
+    edge_scales = system["edge_scales"]
+    rhs_rows = np.zeros(int(edge_pairs.shape[0]) + 1, dtype=np.float64)
+    rhs_rows[1:] = -np.asarray(grad_t[coords[edge_pairs[:, 0], 0], coords[edge_pairs[:, 0], 1], coords[edge_pairs[:, 0], 2], edge_axes], dtype=np.float64) * edge_scales
+    return rhs_rows
+
+
+def _ppe_rhs(grad_t, mask_t, spacing_m, system):
+    dx, dy, dz = [float(v) for v in spacing_m]
+    divergence = np.zeros(mask_t.shape, dtype=np.float64)
+    gx_field = np.asarray(grad_t[..., 0], dtype=np.float64)
+    gy_field = np.asarray(grad_t[..., 1], dtype=np.float64)
+    gz_field = np.asarray(grad_t[..., 2], dtype=np.float64)
+    divergence[1:-1, :, :] += (gx_field[2:, :, :] - gx_field[:-2, :, :]) / (2.0 * dx)
+    divergence[:, 1:-1, :] += (gy_field[:, 2:, :] - gy_field[:, :-2, :]) / (2.0 * dy)
+    divergence[:, :, 1:-1] += (gz_field[:, :, 2:] - gz_field[:, :, :-2]) / (2.0 * dz)
+    rhs = np.zeros(system["matrix"].shape[0], dtype=np.float64)
+    coords = system["coords"]
+    if len(coords):
+        rhs[:] = divergence[coords[:, 0], coords[:, 1], coords[:, 2]]
+        rhs[0] = 0.0
+    return rhs
+
+
+def reconstruct_relative_pressure_map(pressure_gradient_array, support_mask, spacing, *, method="least_squares"):
+    method = _normalize_pressure_method(method)
+    grad = np.asarray(pressure_gradient_array, dtype=np.float32)
+    if grad.ndim != 5 or grad.shape[-1] != 3:
+        raise ValueError(f"pressure_gradient_array must be XYZTV, got {grad.shape}")
+    support = np.asarray(support_mask, dtype=bool)
+    if support.shape != grad.shape[:4]:
+        raise ValueError(f"support_mask shape {support.shape} does not match {grad.shape[:4]}")
+
+    spacing_m = np.asarray(spacing, dtype=float).reshape(3) / 1000.0
+    dx, dy, dz = [float(max(v, 1e-12)) for v in spacing_m]
+    nt = grad.shape[3]
+    pressure = np.zeros(grad.shape[:4], dtype=np.float32)
+
+    system_cache = {}
+    for tidx in range(nt):
+        mask_t = support[..., tidx]
+        if not np.any(mask_t):
+            continue
+        cache_key = mask_t.tobytes()
+        if method == "least_squares":
+            system = system_cache.get(cache_key)
+            if system is None:
+                system = _build_least_squares_system(mask_t, (dx, dy, dz))
+                system_cache[cache_key] = system
+            rhs_rows = _least_squares_rhs(grad[..., tidx, :], system)
+            rhs = system["rhs_operator"] @ rhs_rows
+            sol = _solve_reconstruction_system(system, rhs)
+        else:
+            system = system_cache.get(cache_key)
+            if system is None:
+                system = _build_ppe_system(mask_t, (dx, dy, dz))
+                system_cache[cache_key] = system
+            rhs = _ppe_rhs(grad[..., tidx, :], mask_t, (dx, dy, dz), system)
+            sol = _solve_reconstruction_system(system, rhs)
+
+        pressure_t = np.zeros(mask_t.shape, dtype=np.float32)
+        coords = system["coords"]
+        if len(coords):
+            pressure_t[coords[:, 0], coords[:, 1], coords[:, 2]] = sol
+        pressure[..., tidx] = pressure_t
+
+    peak = np.max(np.abs(pressure), axis=3).astype(np.float32) if pressure.shape[3] > 0 else np.zeros(pressure.shape[:3], dtype=np.float32)
+    finite = pressure[support & np.isfinite(pressure)]
+    upper = _finite_percentile_abs(finite, 99.0, default=1.0)
+    upper = upper if upper > 0.0 else 1.0
+    return {
+        "relative_pressure_array": pressure,
+        "relative_pressure_peak": peak,
+        "relative_pressure_display_clim": (-upper, upper),
+        "pressure_method": method,
+    }
+
+
+def _points_as_voxels(points_xyz, spacing, origin, shape):
+    pts = np.asarray(points_xyz, dtype=float).reshape(-1, 3)
+    spacing = np.asarray(spacing, dtype=float).reshape(3)
+    origin = np.asarray(origin, dtype=float).reshape(3)
+    shape = np.asarray(shape, dtype=int).reshape(3)
+    if len(pts) == 0:
+        return pts, False
+    looks_like_voxels = (
+        np.all(np.isfinite(pts))
+        and np.all(pts >= -0.5)
+        and np.all(pts <= (shape.reshape(1, 3) - 0.5))
+    )
+    if looks_like_voxels:
+        return pts, True
+    vox = (pts - origin.reshape(1, 3)) / (spacing.reshape(1, 3) + 1e-12)
+    return vox, False
+
+
+def _sample_volume_at_points(volume_xyz, points_xyz, spacing, origin):
+    vol = np.asarray(volume_xyz, dtype=np.float32)
+    pts = np.asarray(points_xyz, dtype=float).reshape(-1, 3)
+    if vol.ndim != 3 or len(pts) == 0:
+        return np.zeros(len(pts), dtype=np.float32)
+    spacing = np.asarray(spacing, dtype=float).reshape(3)
+    origin = np.asarray(origin, dtype=float).reshape(3)
+    shape = np.array(vol.shape, dtype=int)
+    vox, _ = _points_as_voxels(pts, spacing, origin, shape)
+    out = np.zeros(len(pts), dtype=np.float32)
+    for idx, coord in enumerate(vox):
+        if np.any(coord < 0.0) or np.any(coord > (shape - 1)):
+            continue
+        base = np.floor(coord).astype(int)
+        frac = coord - base
+        upper = np.minimum(base + 1, shape - 1)
+        x0, y0, z0 = base.tolist()
+        x1, y1, z1 = upper.tolist()
+        c000 = float(vol[x0, y0, z0])
+        c100 = float(vol[x1, y0, z0])
+        c010 = float(vol[x0, y1, z0])
+        c110 = float(vol[x1, y1, z0])
+        c001 = float(vol[x0, y0, z1])
+        c101 = float(vol[x1, y0, z1])
+        c011 = float(vol[x0, y1, z1])
+        c111 = float(vol[x1, y1, z1])
+        xd, yd, zd = frac.tolist()
+        c00 = c000 * (1.0 - xd) + c100 * xd
+        c10 = c010 * (1.0 - xd) + c110 * xd
+        c01 = c001 * (1.0 - xd) + c101 * xd
+        c11 = c011 * (1.0 - xd) + c111 * xd
+        c0 = c00 * (1.0 - yd) + c10 * yd
+        c1 = c01 * (1.0 - yd) + c11 * yd
+        out[idx] = c0 * (1.0 - zd) + c1 * zd
+    return out
+
+
+def compute_centerline_pressure_profiles(relative_pressure_array, centerline_paths, spacing, origin):
+    pressure = np.asarray(relative_pressure_array, dtype=np.float32)
+    if pressure.ndim != 4:
+        raise ValueError(f"relative_pressure_array must be XYZT, got {pressure.shape}")
+    spacing = np.asarray(spacing, dtype=float).reshape(3)
+    origin = np.asarray(origin, dtype=float).reshape(3)
+    profiles = []
+    nt = pressure.shape[3]
+    for path_idx, path in enumerate(list(centerline_paths or [])):
+        pts = np.asarray(path, dtype=float).reshape(-1, 3)
+        if len(pts) == 0:
+            profiles.append({
+                "path_index": int(path_idx),
+                "distances_mm": [],
+                "relative_pressure_Pa_t": [],
+                "pressure_drop_Pa_t": [],
+                "pressure_drop_mean_Pa": 0.0,
+                "pressure_drop_peak_Pa": 0.0,
+            })
+            continue
+        pts_vox, are_voxels = _points_as_voxels(pts, spacing, origin, pressure.shape[:3])
+        if len(pts_vox) > 1:
+            diffs = np.diff(pts_vox, axis=0)
+            seg = np.linalg.norm(diffs * spacing.reshape(1, 3), axis=1)
+        else:
+            seg = np.zeros(0, dtype=float)
+        dist = np.concatenate([[0.0], np.cumsum(seg)]) if len(pts) > 0 else np.zeros(0, dtype=float)
+        sample_pts = pts_vox if are_voxels else pts
+        samples_t = []
+        drop_t = []
+        for tidx in range(nt):
+            vals = _sample_volume_at_points(pressure[..., tidx], sample_pts, spacing, origin)
+            samples_t.append(vals.astype(np.float32).tolist())
+            drop_t.append(float(vals[0] - vals[-1]) if len(vals) else 0.0)
+        profiles.append({
+            "path_index": int(path_idx),
+            "distances_mm": dist.astype(np.float32).tolist(),
+            "relative_pressure_Pa_t": samples_t,
+            "pressure_drop_Pa_t": [float(x) for x in drop_t],
+            "pressure_drop_mean_Pa": float(np.mean(drop_t)) if drop_t else 0.0,
+            "pressure_drop_peak_Pa": float(np.max(np.abs(drop_t))) if drop_t else 0.0,
+        })
+    return profiles
+
+
 def compute_pressure_gradient_metrics(mask4d, flow, spacing, rr, rho=1060.0, viscosity=4.0,
-                                      smoothing_sigma=0.0, use_convective_acceleration=True):
+                                      smoothing_sigma=0.0, support_erosion_iters=1, use_convective_acceleration=True,
+                                      pressure_method="least_squares", centerline_paths=None,
+                                      origin=(0, 0, 0)):
     mask4d = _ensure_mask4d(mask4d)
     flow = np.asarray(flow, dtype=np.float32)
     if flow.ndim != 5 or flow.shape[-1] != 3:
@@ -652,9 +1212,12 @@ def compute_pressure_gradient_metrics(mask4d, flow, spacing, rr, rho=1060.0, vis
         lap[..., comp] = d2u_dx2 + d2u_dy2 + d2u_dz2
 
     grad_inner = -rho * (du_dt + conv) + mu_pa_s * lap
-    support_mask = np.zeros(mask4d.shape, dtype=bool)
-    for tidx in range(mask4d.shape[3]):
-        support_mask[..., tidx] = binary_erosion(mask4d[..., tidx], structure=np.ones((3, 3, 3), dtype=bool), border_value=0)
+    support_mask = np.asarray(mask4d, dtype=bool).copy()
+    erosion_iters = max(int(support_erosion_iters), 0)
+    if erosion_iters > 0:
+        structure = np.ones((3, 3, 3), dtype=bool)
+        for tidx in range(mask4d.shape[3]):
+            support_mask[..., tidx] = binary_erosion(mask4d[..., tidx], structure=structure, iterations=erosion_iters, border_value=0)
     support_inner = support_mask[1:-1, 1:-1, 1:-1, 1:-1]
 
     grad = np.zeros(flow.shape, dtype=np.float32)
@@ -664,7 +1227,21 @@ def compute_pressure_gradient_metrics(mask4d, flow, spacing, rr, rho=1060.0, vis
     grad_peak = np.max(grad_mag, axis=3).astype(np.float32)
 
     finite_inner = grad_inner[np.isfinite(grad_inner) & support_inner[..., None]]
-    display_upper = float(np.percentile(np.abs(finite_inner), 99.0)) if finite_inner.size else 0.0
+    display_upper = _finite_percentile_abs(finite_inner, 99.0, default=1.0)
+    display_upper = display_upper if display_upper > 0 else 1.0
+
+    pressure_result = reconstruct_relative_pressure_map(
+        grad,
+        support_mask.astype(bool),
+        spacing_mm,
+        method=pressure_method,
+    )
+    centerline_profiles = compute_centerline_pressure_profiles(
+        pressure_result["relative_pressure_array"],
+        centerline_paths or [],
+        spacing_mm,
+        origin,
+    )
 
     return {
         'pressure_gradient_array': grad,
@@ -672,7 +1249,12 @@ def compute_pressure_gradient_metrics(mask4d, flow, spacing, rr, rho=1060.0, vis
         'pressure_gradient_peak': grad_peak,
         'pressure_gradient_dt_s': float(dt_s),
         'pressure_gradient_support_mask': support_mask.astype(np.uint8),
-        'pressure_gradient_display_clim': (0.0, display_upper if display_upper > 0 else 1.0),
+        'pressure_gradient_display_clim': (0.0, display_upper),
+        'relative_pressure_array': pressure_result['relative_pressure_array'],
+        'relative_pressure_peak': pressure_result['relative_pressure_peak'],
+        'relative_pressure_display_clim': pressure_result['relative_pressure_display_clim'],
+        'pressure_method': pressure_result['pressure_method'],
+        'centerline_pressure_profiles': centerline_profiles,
     }
 
 
@@ -683,6 +1265,7 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
                             tube_radius=0.1, rho=1060.0,
                             save_pixelwise=False, tke_array=None, sigma=None,
                             rr=1000.0, pressure_gradient_smoothing_sigma=0.0,
+                            pressure_gradient_support_erosion_iters=1,
                             pressure_gradient_use_convective_acceleration=True,
                             compute_wss=True, compute_tke=True,
                             compute_pressure_gradient=True,
@@ -693,7 +1276,9 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
                             wss_no_slip_condition=None,
                             tke_rho=None,
                             pressure_gradient_rho=None,
-                            pressure_gradient_viscosity=None):
+                            pressure_gradient_viscosity=None,
+                            pressure_method="least_squares",
+                            centerline_paths=None):
     mask4d = _ensure_mask4d(mask4d)
     wss_smoothing_iteration = smoothing_iteration if wss_smoothing_iteration is None else wss_smoothing_iteration
     wss_viscosity = viscosity if wss_viscosity is None else wss_viscosity
@@ -728,7 +1313,11 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
             rho=pressure_gradient_rho,
             viscosity=pressure_gradient_viscosity,
             smoothing_sigma=pressure_gradient_smoothing_sigma,
+            support_erosion_iters=pressure_gradient_support_erosion_iters,
             use_convective_acceleration=pressure_gradient_use_convective_acceleration,
+            pressure_method=pressure_method,
+            centerline_paths=centerline_paths,
+            origin=origin,
         )
 
     spacing = np.asarray(spacing, dtype=float).reshape(3)
@@ -745,6 +1334,11 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
         "pressure_gradient_dt_s": None if pressure_gradient is None else pressure_gradient["pressure_gradient_dt_s"],
         "pressure_gradient_support_mask": None if pressure_gradient is None else pressure_gradient["pressure_gradient_support_mask"],
         "pressure_gradient_display_clim": None if pressure_gradient is None else pressure_gradient["pressure_gradient_display_clim"],
+        "relative_pressure_array": None if pressure_gradient is None else pressure_gradient["relative_pressure_array"],
+        "relative_pressure_peak": None if pressure_gradient is None else pressure_gradient["relative_pressure_peak"],
+        "relative_pressure_display_clim": None if pressure_gradient is None else pressure_gradient["relative_pressure_display_clim"],
+        "centerline_pressure_profiles": [] if pressure_gradient is None else pressure_gradient["centerline_pressure_profiles"],
+        "pressure_method": None if pressure_gradient is None else pressure_gradient["pressure_method"],
         "streamlines": [],
         "tube_radius": float(tube_radius),
     }
@@ -760,6 +1354,8 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
             pixelwise_export["pressure_gradient_mag"] = np.asarray(pressure_gradient["pressure_gradient_magnitude"], dtype=np.float32)
             pixelwise_export["pressure_gradient_peak"] = np.asarray(pressure_gradient["pressure_gradient_peak"], dtype=np.float32)
             pixelwise_export["pressure_gradient_support_mask"] = np.asarray(pressure_gradient["pressure_gradient_support_mask"], dtype=np.uint8)
+            pixelwise_export["relative_pressure"] = np.asarray(pressure_gradient["relative_pressure_array"], dtype=np.float32)
+            pixelwise_export["relative_pressure_peak"] = np.asarray(pressure_gradient["relative_pressure_peak"], dtype=np.float32)
         if tke is not None:
             pixelwise_export["tke"] = np.asarray(tke["tke_peak"], dtype=np.float32)
             pixelwise_export["tke_time"] = np.asarray(tke["tke_array"], dtype=np.float32)
@@ -771,7 +1367,7 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
 
 def _compute_single_plane_metric(args):
     (flow, mask, spacing, origin, plane, Nt, RR, branch_grid, target_label,
-     path_info, path_points, mask_template) = args
+     path_info, path_points, mask_template, mask_phase_lookup) = args
     normal = np.asarray(plane.normal, dtype=float).reshape(3)
     normal = normal / (np.linalg.norm(normal) + 1e-12)
 
@@ -789,30 +1385,37 @@ def _compute_single_plane_metric(args):
     meanv_t = []         
     meanv_fwd_t = []     
     meanv_rev_t = []     
+    slice_cache = {}
 
     for t in range(Nt):
-        mask_t = mask_template if mask_template is not None else mask[..., t]
-        pg = _extract_plane_flow_region(
-            mask_t, flow[..., t, :], plane, spacing, origin,
-            branch_grid=branch_grid, target_label=target_label,
+        rep_t = int(mask_phase_lookup[t]) if mask_phase_lookup else int(t)
+        mask_t = mask_template if mask_template is not None else mask[..., rep_t]
+        slice_spec = _get_cached_plane_slice_spec(
+            slice_cache,
+            rep_t,
+            mask_t,
+            plane,
+            spacing,
+            origin,
+            branch_grid=branch_grid,
+            target_label=target_label,
+            select_connected=True,
         )
-        if pg is None or pg.n_cells == 0:
+        if slice_spec is None:
             flowrate.append(0.0); flowrate_fwd.append(0.0); flowrate_rev.append(0.0)
             meanv_t.append(0.0); meanv_fwd_t.append(0.0); meanv_rev_t.append(0.0)
             area.append(0.0)
             continue
-        if "flow" not in pg.cell_data and "flow" in pg.point_data:
-            pg = pg.point_data_to_cell_data(pass_point_data=True)
-        vec = np.asarray(pg.cell_data.get("flow", []), dtype=float)
-        if vec.ndim != 2 or vec.shape[1] != 3 or len(vec) != pg.n_cells:
-            ca0 = np.asarray(pg.cell_data.get("Area", []), dtype=float)
+        vec = np.asarray(
+            _sample_field_from_slice_spec(flow[..., t, :], mask.shape[:3], "flow", slice_spec),
+            dtype=float,
+        )
+        ca = np.asarray(slice_spec["areas"], dtype=float).reshape(-1)
+        if vec.ndim != 2 or vec.shape[1] != 3 or len(vec) != len(ca):
             flowrate.append(0.0); flowrate_fwd.append(0.0); flowrate_rev.append(0.0)
             meanv_t.append(0.0); meanv_fwd_t.append(0.0); meanv_rev_t.append(0.0)
-            area.append(float(np.sum(ca0)) if len(ca0) else 0.0)
+            area.append(float(np.sum(ca)) if len(ca) else 0.0)
             continue
-        ca = np.asarray(pg.cell_data.get("Area", np.ones(pg.n_cells, dtype=float)), dtype=float).reshape(-1)
-        if len(ca) != len(vec):
-            ca = np.ones(len(vec), dtype=float)
 
         proj = np.dot(vec, normal)
         proj_fwd = proj * float(forward_sign)
@@ -920,7 +1523,8 @@ def compute_plane_metrics_multithread(flow_xyzt3, segmask_binary_4d, spacing, or
     elif mask.ndim == 4 and mask.shape[3] == 1 and flow.shape[3] > 1:
         mask = np.repeat(mask, flow.shape[3], axis=3)
     Nt = int(flow.shape[3])
-    mask_static = all(np.array_equal(mask[..., 0], mask[..., t]) for t in range(1, Nt))
+    mask_phase_lookup = _build_mask_phase_lookup(mask)
+    mask_static = all(int(rep_t) == 0 for rep_t in mask_phase_lookup)
     mask_template = mask[..., 0] if mask_static else None
 
     branch_grid = _build_branch_grid(branch_labels_3d, spacing, origin)
@@ -949,7 +1553,7 @@ def compute_plane_metrics_multithread(flow_xyzt3, segmask_binary_4d, spacing, or
             if 0 <= pi < len(paths_lookup):
                 pp = paths_lookup[pi]
         args_list.append((flow, mask, spacing, origin, plane, Nt, RR,
-                          branch_grid, target_label, path_info, pp, mask_template))
+                          branch_grid, target_label, path_info, pp, mask_template, mask_phase_lookup))
     if max_workers is None:
         import os as _os
         max_workers = min(len(planes), max(1, _os.cpu_count() or 4))
@@ -979,6 +1583,7 @@ def load_metrics_as_table(metrics_json_path, qc_json_path=None):
         "tke_mean_J_m3", "tke_peak_J_m3", "tke_p95_J_m3",
         "pressure_gradient_mag_mean_Pa_m", "pressure_gradient_mag_peak_Pa_m", "pressure_gradient_mag_p95_Pa_m",
         "pressure_gradient_normal_mean_Pa_m", "pressure_gradient_normal_peak_Pa_m", "pressure_gradient_normal_p95_Pa_m",
+        "relative_pressure_mean_Pa", "relative_pressure_peak_Pa", "relative_pressure_p95_Pa",
         "wss_wall_mean_Pa", "wss_wall_peak_Pa", "wss_wall_p95_Pa",
     ]
     table_rows = []

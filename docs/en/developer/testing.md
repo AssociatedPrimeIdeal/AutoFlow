@@ -12,7 +12,7 @@ Use:
 | Area | Main tests |
 | --- | --- |
 | smoke regression | `tests/test_smoke_phantoms.py` |
-| pressure-gradient phantom regression | `tests/test_pressure_gradient_phantom.py` |
+| relative-pressure phantom regression | `tests/test_pressure_gradient_phantom.py` |
 
 ## Expectations
 - keep the automated suite limited to smoke and phantom regression coverage

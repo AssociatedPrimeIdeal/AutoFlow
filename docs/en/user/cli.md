@@ -106,7 +106,7 @@ Behavior details:
 | CLI flag | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
 | `--with` | csv | empty | command line | opt in to `pwv`, `wss`, `tke`, and/or `pg` | `autoflow/cli.py`, `autoflow/processing.py` |
-| `--skip-derived` | bool | `False` | `configs/batch.json` | remove WSS, TKE, and pressure-gradient from the requested set | `autoflow/processing.py` |
+| `--skip-derived` | bool | `False` | `configs/batch.json` | remove WSS, TKE, and relative-pressure work from the requested set | `autoflow/processing.py` |
 | `--skip-plane-metrics` | bool | `False` | `configs/batch.json` | skip plane metric export | `autoflow/processing.py` |
 | `--single-thread` | bool | multithread on | `configs/batch.json` | disable multithreaded plane metrics | `autoflow/core/pipeline.py` |
 
@@ -138,12 +138,12 @@ PWV is opt-in from the CLI and still uses `configs/pwv.json` for PWV group defin
 - enable it in `configs/pwv.json`
 - define one or more PWV groups in `configs/pwv.json -> groups`
 
-WSS, TKE, and pressure-gradient compute defaults are now split by metric:
+WSS, TKE, and pressure-analysis compute defaults are now split by metric:
 
 - `configs/fluid.json` for shared fluid properties such as `rho` and `viscosity`
 - `configs/wss.json` for WSS computation
 - `configs/tke.json` for TKE density
-- `configs/pressure_gradient.json` for pressure-gradient computation
+- `configs/pressure_gradient.json` for pressure-gradient estimation, relative-pressure reconstruction, and centerline-pressure settings
 - `configs/planes.json` for plane render styling
 - `configs/wss.json`, `configs/tke.json`, `configs/pressure_gradient.json`, and `configs/streamlines.json` for metric-specific render ranges and optional colorbars
 - `configs/rendering.json` for shared video controls such as `window_size`, `rotate_dynamic_video`, and camera behavior
@@ -161,6 +161,7 @@ WSS, TKE, and pressure-gradient compute defaults are now split by metric:
 | --- | --- | --- | --- | --- | --- |
 | `--seed-ratio` | float | `0.02` | `configs/streamlines.json` | streamline seed density | `autoflow/algorithms/streamlines.py` |
 | `--tube-radius` | float | `0.05` | `configs/streamlines.json` | streamline tube radius | `autoflow/rendering/videos.py` |
+| `--pressure-method` | string | `least_squares` | `configs/pressure_gradient.json` | choose `least_squares` or `ppe` relative-pressure reconstruction; both use SciPy sparse solvers | `autoflow/algorithms/metrics.py` |
 
 ### Auto segmentation
 
@@ -197,8 +198,10 @@ Note:
 | `planes.render.default.plane_color` | string | `yellow` | `configs/planes.json` | default plane color in GUI and plane video | `autoflow/ui/app.py`, `autoflow/rendering/videos.py` |
 | `wss.render.show_scalar_bar` | bool | `True` | `configs/wss.json` | show or hide the WSS colorbar in GUI and exported videos | `autoflow/rendering/videos.py` |
 | `tke.render.show_scalar_bar` | bool | `True` | `configs/tke.json` | show or hide the TKE colorbar in GUI and exported videos | `autoflow/rendering/videos.py` |
-| `pressure_gradient.render.clim` | list[float, float] | `[0.0, 500.0]` | `configs/pressure_gradient.json` | explicit pressure-gradient display range | `autoflow/rendering/videos.py` |
+| `pressure_gradient.render.clim` | list[float, float] or `null` | `null` | `configs/pressure_gradient.json` | explicit pressure-gradient display range; `null` keeps the auto range | `autoflow/rendering/videos.py` |
 | `pressure_gradient.render.show_scalar_bar` | bool | `True` | `configs/pressure_gradient.json` | show or hide the pressure-gradient colorbar in GUI and exported videos | `autoflow/rendering/videos.py` |
+| `pressure_gradient.render.relative_pressure_clim` | list[float, float] or `null` | `null` | `configs/pressure_gradient.json` | explicit relative-pressure display range; `null` keeps the symmetric auto range | `autoflow/rendering/videos.py` |
+| `pressure_gradient.render.relative_pressure_show_scalar_bar` | bool | `True` | `configs/pressure_gradient.json` | show or hide the relative-pressure colorbar in GUI and exported videos | `autoflow/rendering/videos.py` |
 | `streamlines.render.show_scalar_bar` | bool | `True` | `configs/streamlines.json` | show or hide the streamline colorbar in GUI and exported videos | `autoflow/rendering/videos.py` |
 
 ## Outputs
