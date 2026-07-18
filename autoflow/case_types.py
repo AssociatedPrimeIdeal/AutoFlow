@@ -40,6 +40,7 @@ class BackgroundPhaseCorrectionConfig:
     threshold: float = 0.1
     dual_venc_ratio1: float = 0.0
     dual_venc_ratio2: float = 0.0
+    force_recompute: bool = False
 
     def to_dict(self):
         return {
@@ -48,6 +49,7 @@ class BackgroundPhaseCorrectionConfig:
             "threshold": float(self.threshold),
             "dual_venc_ratio1": float(self.dual_venc_ratio1),
             "dual_venc_ratio2": float(self.dual_venc_ratio2),
+            "force_recompute": bool(self.force_recompute),
         }
 
     @staticmethod
@@ -59,6 +61,7 @@ class BackgroundPhaseCorrectionConfig:
             threshold=float(payload.get("threshold", 0.1)),
             dual_venc_ratio1=float(payload.get("dual_venc_ratio1", 0.0)),
             dual_venc_ratio2=float(payload.get("dual_venc_ratio2", 0.0)),
+            force_recompute=bool(payload.get("force_recompute", False)),
         )
 
 

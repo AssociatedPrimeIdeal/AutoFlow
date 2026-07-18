@@ -4,7 +4,8 @@
     "corr_fit_order": 3,
     "threshold": 0.1,
     "dual_venc_ratio1": 0.0,
-    "dual_venc_ratio2": 0.0
+    "dual_venc_ratio2": 0.0,
+    "force_recompute": false
   },
   "dicom_parameter_overrides": {},
   "dicom_read_workers": 1

@@ -20,7 +20,8 @@ AutoFlow stores repo-level defaults in per-module JSON files and applies them to
 | `configs/pressure_gradient.json` | pressure-gradient, relative-pressure, and centerline-pressure defaults |
 | `configs/pwv.json` | PWV groups, plane spacing, waveform selection, and plot styling |
 | `configs/segmentation.json` | segmentation dock and segmentation-run defaults |
-| `configs/rendering.json` | shared video and camera defaults |
+| `configs/colorbar.json` | shared GUI colorbar defaults |
+| `configs/video_exporting.json` | shared video and camera defaults |
 
 ## Main Code
 
@@ -52,6 +53,8 @@ AutoFlow stores repo-level defaults in per-module JSON files and applies them to
 | --- | --- | --- | --- | --- | --- |
 | `remove_small_cc` | bool | `True` | `configs/skeleton.json` | remove small connected components before grouped preprocessing | `autoflow/core/models.py` |
 | `min_cc_volume_mm3` | float | `50.0` | `configs/skeleton.json` | component-volume threshold | `autoflow/core/models.py` |
+| `cc_filter_mode` | string | `hybrid` | `configs/skeleton.json` | choose `absolute`, `relative`, `hybrid`, or `largest` component filtering | `autoflow/core/models.py` |
+| `cc_rel_min_ratio` | float | `0.01` | `configs/skeleton.json` | relative threshold against the largest component for `relative` and `hybrid` filtering | `autoflow/core/models.py` |
 | `do_closing` | bool | `True` | `configs/skeleton.json` | morphological closing before skeletonization | `autoflow/algorithms/preprocess.py` |
 | `do_opening` | bool | `False` | `configs/skeleton.json` | morphological opening before skeletonization | `autoflow/algorithms/preprocess.py` |
 | `gaussian_sigma` | float | `0.5` | `configs/skeleton.json` | smoothing strength | `autoflow/algorithms/preprocess.py` |
@@ -128,18 +131,24 @@ AutoFlow stores repo-level defaults in per-module JSON files and applies them to
 
 | Parameter | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `window_size` | list[int, int] | `[1600, 1200]` | `configs/rendering.json` | output render size for plane, WSS, TKE, pressure-gradient, relative-pressure, and streamline videos | `autoflow/rendering/videos.py` |
-| `planes.render.show_skeleton` | bool | `True` | `configs/planes.json` | show or hide skeleton points in plane videos | `autoflow/rendering/videos.py` |
-| `planes.render.skeleton_point_size` | float | `10.0` | `configs/planes.json` | skeleton point size in plane videos | `autoflow/rendering/videos.py` |
-| `planes.render.default.skeleton_color` | string | empty | `configs/planes.json` | fallback skeleton color for plane videos | `autoflow/rendering/videos.py` |
-| `planes.render.default.plane_size` | float or null | `null` | `configs/planes.json` | fallback plane size; `null` uses the automatic size from the vessel surface extent | `autoflow/rendering/videos.py` |
-| `planes.render.default.plane_color` | string | `yellow` | `configs/planes.json` | fallback plane color for plane videos and GUI planes | `autoflow/rendering/videos.py`, `autoflow/ui/app.py` |
-| `planes.render.default.plane_opacity` | float | `0.75` | `configs/planes.json` | fallback plane opacity for plane videos and GUI planes | `autoflow/rendering/videos.py`, `autoflow/ui/app.py` |
-| `planes.render.groups.<group>.skeleton_color` | string | group fallback | `configs/planes.json` | per-group skeleton color in plane videos | `autoflow/rendering/videos.py` |
-| `planes.render.groups.<group>.plane_size` | float or null | `null` | `configs/planes.json` | per-group plane size in plane videos | `autoflow/rendering/videos.py` |
-| `planes.render.groups.<group>.plane_color` | string | group fallback | `configs/planes.json` | per-group plane color in plane videos and GUI planes | `autoflow/rendering/videos.py`, `autoflow/ui/app.py` |
-| `planes.render.groups.<group>.plane_opacity` | float | `0.75` | `configs/planes.json` | per-group plane opacity in plane videos and GUI planes | `autoflow/rendering/videos.py`, `autoflow/ui/app.py` |
-| `rotate_dynamic_video` | bool | `True` | `configs/rendering.json` | rotate dynamic WSS, TKE, pressure-gradient, relative-pressure, and streamline videos; set `False` for a fixed view | `autoflow/rendering/videos.py` |
+| `window_size` | list[int, int] | `[1600, 1200]` | `configs/video_exporting.json` | output render size for plane, WSS, TKE, pressure-gradient, relative-pressure, and streamline videos | `autoflow/rendering/videos.py` |
+| `plane_video.show_skeleton` | bool | `True` | `configs/video_exporting.json` | show or hide skeleton points in plane videos | `autoflow/rendering/videos.py` |
+| `plane_video.skeleton_point_size` | float | `10.0` | `configs/video_exporting.json` | skeleton point size in plane videos | `autoflow/rendering/videos.py` |
+| `plane_video.default.skeleton_color` | string | empty | `configs/video_exporting.json` | fallback skeleton color for plane videos | `autoflow/rendering/videos.py` |
+| `plane_video.default.plane_size` | float or null | `null` | `configs/video_exporting.json` | fallback plane size; `null` uses the automatic size from the vessel surface extent | `autoflow/rendering/videos.py` |
+| `plane_video.default.plane_color` | string | `yellow` | `configs/video_exporting.json` | fallback plane color for plane videos | `autoflow/rendering/videos.py` |
+| `plane_video.default.plane_opacity` | float | `0.75` | `configs/video_exporting.json` | fallback plane opacity for plane videos | `autoflow/rendering/videos.py` |
+| `plane_video.label.prefix` | string | `planeidx=` | `configs/video_exporting.json` | plane-video index label prefix before the plane number | `autoflow/rendering/videos.py` |
+| `plane_video.label.font_size` | int | `28` | `configs/video_exporting.json` | plane-video index label font size | `autoflow/rendering/videos.py` |
+| `plane_video.label.text_color` | string | `black` | `configs/video_exporting.json` | plane-video index label text color | `autoflow/rendering/videos.py` |
+| `plane_video.label.shape_color` | string | `yellow` | `configs/video_exporting.json` | plane-video index label background color | `autoflow/rendering/videos.py` |
+| `plane_video.label.shape_opacity` | float | `0.85` | `configs/video_exporting.json` | plane-video index label background opacity | `autoflow/rendering/videos.py` |
+| `plane_video.groups.<group>.skeleton_color` | string | group fallback | `configs/video_exporting.json` | per-group skeleton color in plane videos | `autoflow/rendering/videos.py` |
+| `plane_video.groups.<group>.plane_size` | float or null | `null` | `configs/video_exporting.json` | per-group plane size in plane videos | `autoflow/rendering/videos.py` |
+| `plane_video.groups.<group>.plane_color` | string | group fallback | `configs/video_exporting.json` | per-group plane color in plane videos | `autoflow/rendering/videos.py` |
+| `plane_video.groups.<group>.plane_opacity` | float | `0.75` | `configs/video_exporting.json` | per-group plane opacity in plane videos | `autoflow/rendering/videos.py` |
+| `rotate_dynamic_video` | bool | `True` | `configs/video_exporting.json` | rotate dynamic WSS, TKE, pressure-gradient, relative-pressure, and streamline videos; set `False` for a fixed view | `autoflow/rendering/videos.py` |
+| `add_plane_idx` | bool | `True` | `configs/video_exporting.json` | show or hide plane index labels in the plane video | `autoflow/rendering/videos.py` |
 | `wss.render.clim` | list[float, float] | `[0.0, 10.0]` | `configs/wss.json` | WSS color range for GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
 | `wss.render.show_scalar_bar` | bool | `True` | `configs/wss.json` | show or hide the WSS colorbar in GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
 | `wss.render.bar_cfg` | object | built-in default | `configs/wss.json` | WSS scalar-bar placement and font settings | `autoflow/rendering/videos.py`, `autoflow/ui/viewer.py` |
@@ -154,13 +163,15 @@ AutoFlow stores repo-level defaults in per-module JSON files and applies them to
 | `pressure_gradient.render.relative_pressure_bar_cfg` | object | built-in default | `configs/pressure_gradient.json` | relative-pressure scalar-bar placement and font settings | `autoflow/rendering/videos.py`, `autoflow/ui/viewer.py` |
 | `streamlines.render.clim` | list[float, float] | `[0.0, 1.0]` | `configs/streamlines.json` | streamline velocity color range for GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
 | `streamlines.render.show_scalar_bar` | bool | `True` | `configs/streamlines.json` | show or hide the streamline colorbar in GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
-| `streamlines.render.bar_cfg` | object | built-in default | `configs/streamlines.json` | streamline scalar-bar placement and font settings | `autoflow/rendering/videos.py`, `autoflow/ui/viewer.py` |
+| `streamlines.render.bar_cfg` | object | built-in default | `configs/streamlines.json` | streamline scalar-bar placement and font settings for offline videos and optional per-layer GUI overrides | `autoflow/rendering/videos.py`, `autoflow/ui/viewer.py` |
+| `colorbar.show` | bool | `True` | `configs/colorbar.json` | show or hide the shared GUI colorbar slot | `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
+| `colorbar.bar_cfg` | object | built-in default | `configs/colorbar.json` | shared GUI colorbar placement and font settings used by segmentation labels and as the fallback for other GUI scalar layers | `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
 
 ## Runtime Notes
 
 - 4D label masks are collapsed to 3D labels by majority vote along time before grouping.
 - connected-component cleanup runs per label value before groups are merged.
-- each grouped vessel mask is reduced to its largest connected component before skeletonization.
+- each grouped vessel mask now keeps every connected component that passes the active skeleton cleanup rule; the default `hybrid` rule uses `max(min_cc_volume_mm3, cc_rel_min_ratio * largest_component_volume_mm3)`.
 - grouped scene objects keep stable internal data keys such as `smooth_path_<group>_<idx>`, `plane_<group>_<idx>`, and `pathline_<group>_<idx>`.
 - GUI-visible names are intentionally shorter: `path 3`, `plane 5`, and `pathline 5`.
 - PWV planes are exposed as one grouped scene object with data key `pwv_planes` and browser name `PWV planes`.

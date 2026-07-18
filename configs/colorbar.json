@@ -1,0 +1,11 @@
+{
+  "show": true,
+  "bar_cfg": {
+    "position_x": 0.75,
+    "position_y": 0.1,
+    "height": 0.6,
+    "width": 0.2,
+    "title_font_size": 20,
+    "label_font_size": 16
+  }
+}

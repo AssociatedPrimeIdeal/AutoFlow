@@ -20,8 +20,9 @@
   "threshold_closing": true,
   "threshold_opening": false,
   "auto_backend": "nnUNet",
-  "auto_model": "autoflow/segmodel/nnUNetTrainer_500epochs__nnUNetPlans__3d_fullres_iso1mm",
+  "auto_model": "autoflow/segmodel/nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm",
   "auto_checkpoint": "checkpoint_final.pth",
   "auto_device": "auto",
-  "auto_label_map": ""
+  "auto_label_map": "",
+  "force_recompute_auto_cache": false
 }

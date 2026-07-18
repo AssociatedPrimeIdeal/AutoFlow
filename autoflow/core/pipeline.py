@@ -14,11 +14,11 @@ from ..algorithms import (
     compute_plane_metrics_multithread,
     augment_plane_metrics_with_derived, save_plane_pixelwise_h5,
     generate_seed_points,
-    largest_connected_component,
     compute_pwv_groups,
     save_pwv_results,
     segmentation_timestamp,
 )
+from ..plane_io import build_plane_records, save_planes_h5, save_planes_json, save_pwv_h5
 
 
 class StepResult:
@@ -74,6 +74,8 @@ class PipelineEngine:
         ws.derived.pwv_results = []
         ws.derived.pwv_planes = []
         ws.derived.pwv_file = ""
+        ws.derived.pwv_json_file = ""
+        ws.derived.pwv_h5_file = ""
         ws.remove_object_by_data_key("pwv_planes")
 
     def _register_pwv_scene_object(self, ws):
@@ -117,13 +119,27 @@ class PipelineEngine:
         ws.derived.pwv_results = list(results or [])
         ws.derived.pwv_planes = list(scene_planes or [])
         if save:
-            ws.derived.pwv_file = save_pwv_results(ws.derived.pwv_results, os.path.join(out_dir, "pwv.json"))
+            source_path = str(ws.paths.flow_path or ws.paths.segmask_path or "")
+            ws.derived.pwv_json_file = save_pwv_results(ws.derived.pwv_results, os.path.join(out_dir, "pwv.json"))
+            ws.derived.pwv_h5_file = save_pwv_h5(
+                ws.derived.pwv_results,
+                os.path.join(out_dir, "pwv.h5"),
+                source_path=source_path,
+                source_format=ws.input_state.source_format,
+                source_group=ws.input_state.source_group,
+            )
+            ws.derived.pwv_file = ws.derived.pwv_json_file
         self._register_pwv_scene_object(ws)
         ok_count = sum(1 for item in ws.derived.pwv_results if str(item.get("status", "")) == "ok")
         total = len(ws.derived.pwv_results)
         msg = f"PWV: {ok_count}/{total} groups"
-        if ws.derived.pwv_file:
-            msg += f" saved={ws.derived.pwv_file}"
+        saved_parts = []
+        if ws.derived.pwv_json_file:
+            saved_parts.append(f"json={ws.derived.pwv_json_file}")
+        if ws.derived.pwv_h5_file:
+            saved_parts.append(f"h5={ws.derived.pwv_h5_file}")
+        if saved_parts:
+            msg += " saved=" + " ".join(saved_parts)
         return ws.derived.pwv_results, msg
 
     def _label_name_for_value(self, ws, label_value):
@@ -246,6 +262,7 @@ class PipelineEngine:
         load_target = path if input_source is None else input_source
         load_kwargs = {
             "correction_config": ws.loader_params.background_phase_correction,
+            "force_recompute_seg": bool(getattr(ws.segmentation, "force_recompute_auto_cache", False)),
         }
         dicom_overrides = ws.loader_params.dicom_parameter_overrides.to_loader_kwargs()
         if dicom_overrides:
@@ -311,6 +328,8 @@ class PipelineEngine:
         ws.derived.pwv_results = []
         ws.derived.pwv_planes = []
         ws.derived.pwv_file = ""
+        ws.derived.pwv_json_file = ""
+        ws.derived.pwv_h5_file = ""
         ws.data_loaded = True
 
         for data_key in ["segmask_raw_surface", "segmask_pre_surface", "wss_surface_live", "tke_volume", "pressure_gradient_volume", "relative_pressure_volume"]:
@@ -346,16 +365,18 @@ class PipelineEngine:
     def preprocess(self, ws):
         if ws.segmask_raw is None:
             raise ValueError("segmask_raw is None")
-        from ..algorithms.preprocess import majority_vote_labels_3d, remove_small_cc_from_labeled_mask
+        from ..algorithms.preprocess import majority_vote_labels_3d, filter_connected_components, filter_labeled_components
 
         previous_groups = dict(ws.multilabel_groups or {})
         ws.segmask_labels = filter_segmask_labels(ws.segmask_raw)
         voted_labels_3d = majority_vote_labels_3d(ws.segmask_labels)
         if ws.skeleton_params.remove_small_cc:
-            voted_labels_3d = remove_small_cc_from_labeled_mask(
+            voted_labels_3d = filter_labeled_components(
                 voted_labels_3d,
                 ws.resolution,
-                ws.skeleton_params.min_cc_volume_mm3,
+                mode=ws.skeleton_params.cc_filter_mode,
+                min_volume_mm3=ws.skeleton_params.min_cc_volume_mm3,
+                rel_min_ratio=ws.skeleton_params.cc_rel_min_ratio,
             )
         specs = self._build_group_specs(ws, voted_labels_3d)
         ws.group_order = [str(spec["name"]) for spec in specs]
@@ -368,11 +389,17 @@ class PipelineEngine:
             group_name = str(spec["name"])
             labels = [int(x) for x in spec["labels"]]
             group_mask_3d = np.isin(voted_labels_3d, labels)
-            group_mask_3d = largest_connected_component(group_mask_3d)
-            group_binary = self._repeat_mask_to_time(group_mask_3d, time_count)
             group_params = ws.skeleton_params.params_for_group(group_name)
+            if group_params.remove_small_cc:
+                group_mask_3d = filter_connected_components(
+                    group_mask_3d,
+                    ws.resolution,
+                    mode=group_params.cc_filter_mode,
+                    min_volume_mm3=group_params.min_cc_volume_mm3,
+                    rel_min_ratio=group_params.cc_rel_min_ratio,
+                )
+            group_binary = self._repeat_mask_to_time(group_mask_3d, time_count)
             processed_mask_3d = preprocess_mask_for_skeleton(group_mask_3d, group_params, resolution=ws.resolution)
-            processed_mask_3d = largest_connected_component(processed_mask_3d)
             previous_state = dict(previous_groups.get(group_name, {})) if isinstance(previous_groups.get(group_name, {}), dict) else {}
             global_binary |= np.asarray(group_binary, dtype=bool)
             global_mask_3d |= np.asarray(processed_mask_3d, dtype=bool)
@@ -755,27 +782,11 @@ class PipelineEngine:
 
     def _save_planes_json(self, ws):
         out_dir = self._output_dir(ws)
+        source_path = str(ws.paths.flow_path or ws.paths.segmask_path or "")
         out_path = os.path.join(out_dir, "planes.json")
-        payload = []
-        origin = np.asarray(ws.origin, dtype=float).reshape(3)
-        for i, p in enumerate(ws.planes):
-            center_local = np.asarray(p.center, dtype=float).reshape(3)
-            item = {
-                "plane_index": int(i),
-                "center": center_local.tolist(),
-                "center_world": (center_local + origin).tolist(),
-                "normal": np.asarray(p.normal).tolist(),
-                "label": int(p.label),
-                "path_index": int(p.path_index),
-                "distance": float(p.distance),
-            }
-            if p.metrics:
-                item.update(json.loads(json.dumps(p.metrics, ensure_ascii=False)))
-            if 0 <= int(p.path_index) < len(ws.path_info):
-                item["path_info"] = ws.path_info[int(p.path_index)]
-            payload.append(item)
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+        payload = build_plane_records(ws)
+        save_planes_json(ws, out_path, source_path=source_path, payload=payload)
+        save_planes_h5(ws, os.path.join(out_dir, "planes.h5"), source_path=source_path, payload=payload)
         return out_path
 
     def _step_generate_planes(self, ws):
@@ -809,7 +820,10 @@ class PipelineEngine:
                 smoothing_window=pgp.smoothing_window * pgp.inter_time,
                 smoothing_polyorder=pgp.smoothing_polyorder,
                 inter_time=pgp.inter_time,
-                use_center_plane=pgp.use_center_plane,
+                plane_mode=pgp.plane_mode,
+                plane_count=pgp.plane_count,
+                anchor=pgp.anchor,
+                anchor_offset_mm=pgp.anchor_offset_mm,
             )
             path_offset = int(group_state.get("path_index_offset", 0))
             plane_offset = len(planes)

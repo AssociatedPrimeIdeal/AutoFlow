@@ -14,7 +14,7 @@ PWV computes pulse-wave velocity from one or more configured label groups.
 For each PWV group, AutoFlow:
 
 1. merges the configured labels into one mask
-2. keeps only the largest connected component
+2. applies the active skeleton connected-component cleanup rule to that grouped mask
 3. skeletonizes that grouped mask
 4. builds a graph and finds the longest endpoint-to-endpoint path across all degree-1 nodes in the PWV group graph
 5. places planes along that path at the configured spacing in mm

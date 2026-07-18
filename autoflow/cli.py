@@ -49,11 +49,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Dual-venc alias threshold ratio2 used when loading legacy Nv=7 complex H5 inputs.",
     )
+    parser.add_argument(
+        "--force-recompute-corr",
+        action="store_true",
+        help="Ignore reusable H5 background phase correction caches and recompute them before optionally overwriting the cache.",
+    )
     parser.add_argument("--dicom-read-workers", type=int, default=None, help="Worker count for direct DICOM loading; use 0 to pick an automatic thread count.")
     parser.set_defaults(use_multithread=None)
     parser.set_defaults(background_phase_correction=None)
 
-    parser.add_argument("--plane-by-distance", dest="use_center_plane", action="store_false", help="Generate evenly spaced planes instead of a single center plane.")
+    parser.add_argument("--plane-mode", choices=["count", "distance", "anchored_offset"], default=None, help="Plane placement mode.")
+    parser.add_argument("--plane-count", type=int, default=None, help="Number of evenly spaced planes when using count mode. count=1 is the center-plane default.")
+    parser.add_argument("--plane-anchor", choices=["start", "end"], default=None, help="Anchor used by anchored_offset mode.")
+    parser.add_argument("--plane-offset-mm", type=float, default=None, help="Offset in mm from the selected anchor when using anchored_offset mode.")
+    parser.add_argument("--plane-by-distance", dest="use_center_plane", action="store_false", help="Deprecated compatibility flag. Equivalent to --plane-mode distance.")
     parser.add_argument("--cross-section-dist", type=float, default=None, help="Plane spacing in mm when using distance mode.")
     parser.add_argument("--start-dist", type=float, default=None, help="Distance from path start before the first plane.")
     parser.add_argument("--end-dist", type=float, default=None, help="Distance from path end to stop placing planes.")
@@ -61,6 +70,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--remove-small-cc", action="store_true", help="Remove small connected components before skeletonization.")
     parser.add_argument("--min-cc-volume", type=float, default=None, help="Minimum component volume in mm^3 when removal is enabled.")
+    parser.add_argument("--cc-filter-mode", choices=["absolute", "relative", "hybrid", "largest"], default=None, help="Connected-component filtering mode used during skeleton preprocessing.")
+    parser.add_argument("--cc-rel-min-ratio", type=float, default=None, help="Relative component threshold ratio against the largest connected component when using relative or hybrid filtering.")
 
     parser.add_argument("--seed-ratio", type=float, default=None, help="Seed ratio for streamline rendering.")
     parser.add_argument("--tube-radius", type=float, default=None, help="Tube radius used in streamline rendering.")
@@ -77,6 +88,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--autoseg-checkpoint", default=None, help="Auto segmentation checkpoint name.")
     parser.add_argument("--autoseg-device", default=None, help="Auto segmentation device: auto, cpu, or cuda.")
     parser.add_argument("--autoseg-label-map", default=None, help="Optional JSON label remap passed to auto segmentation.")
+    parser.add_argument(
+        "--force-recompute-seg",
+        action="store_true",
+        help="Ignore H5 auto-segmentation caches tagged as AutoFlow-generated and rerun auto segmentation. Original or imported segmentations are not bypassed.",
+    )
+    parser.add_argument(
+        "--segmentation-only",
+        action="store_true",
+        help="Stop after loading or generating segmentation; skip skeleton, planes, metrics, and videos.",
+    )
 
     parser.add_argument(
         "--with",
@@ -121,12 +142,19 @@ def main() -> None:
         "background_phase_threshold": args.background_phase_threshold,
         "dual_venc_ratio1": args.dual_venc_ratio1,
         "dual_venc_ratio2": args.dual_venc_ratio2,
+        "force_recompute_corr": args.force_recompute_corr,
         "dicom_read_workers": args.dicom_read_workers,
+        "plane_mode": args.plane_mode,
+        "plane_count": args.plane_count,
         "use_center_plane": args.use_center_plane,
         "cross_section_dist": args.cross_section_dist,
         "start_dist": args.start_dist,
         "end_dist": args.end_dist,
+        "plane_anchor": args.plane_anchor,
+        "plane_offset_mm": args.plane_offset_mm,
         "min_cc_volume": args.min_cc_volume,
+        "cc_filter_mode": args.cc_filter_mode,
+        "cc_rel_min_ratio": args.cc_rel_min_ratio,
         "seed_ratio": args.seed_ratio,
         "tube_radius": args.tube_radius,
         "pressure_method": args.pressure_method,
@@ -135,6 +163,8 @@ def main() -> None:
         "autoseg_checkpoint": args.autoseg_checkpoint,
         "autoseg_device": args.autoseg_device,
         "autoseg_label_map": args.autoseg_label_map,
+        "force_recompute_seg": args.force_recompute_seg,
+        "segmentation_only": args.segmentation_only,
         "requested_metrics": [] if args.requested_metrics is None else [args.requested_metrics],
         "requested_videos": [] if args.requested_videos is None else [args.requested_videos],
         "fps": args.fps,

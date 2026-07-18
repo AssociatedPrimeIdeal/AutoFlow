@@ -92,6 +92,7 @@ class SceneController:
         self._plane_pick_callback = None
         self._path_pick_callback = None
         self._shared_pick_obs_id = None
+        self._active_scalar_bar_uid = None
 
     def initialize(self):
         self.plotter.set_background("white")
@@ -111,6 +112,7 @@ class SceneController:
             obj.label_actor = None
         self._tracked_actors.clear()
         self._mesh_cache.clear()
+        self._active_scalar_bar_uid = None
         self._remove_plane_highlight()
         self._remove_path_highlight()
         self.initialize()
@@ -190,10 +192,16 @@ class SceneController:
             self._remove_plane_highlight()
         if self._highlight_path_uid == uid:
             self._remove_path_highlight()
+        self._refresh_shared_scalar_bar(render=False)
+        try:
+            self.plotter.render()
+        except Exception:
+            pass
 
     def render_all(self):
         for obj in self.workspace.scene_objects.values():
-            self._render_object(obj)
+            self._render_object(obj, refresh_scalar_bar=False)
+        self._refresh_shared_scalar_bar(render=False)
         try:
             self.plotter.render()
         except Exception:
@@ -209,7 +217,8 @@ class SceneController:
                 cam_before = None
         for obj in self.workspace.scene_objects.values():
             if obj.dynamic:
-                self.readd_object(obj)
+                self.readd_object(obj, refresh_scalar_bar=False)
+        self._refresh_shared_scalar_bar(preferred_uid=self._active_scalar_bar_uid, render=False)
         if self._playback_active and cam_before is not None:
             try:
                 self.plotter.camera_position = cam_before
@@ -223,15 +232,16 @@ class SceneController:
     def rebuild_dynamic(self):
         for obj in self.workspace.scene_objects.values():
             if obj.dynamic:
-                self.readd_object(obj)
+                self.readd_object(obj, refresh_scalar_bar=False)
+        self._refresh_shared_scalar_bar(preferred_uid=self._active_scalar_bar_uid, render=False)
 
-    def readd_object(self, obj):
+    def readd_object(self, obj, refresh_scalar_bar=True):
         self._remove_actor(obj)
-        self._render_object(obj)
+        self._render_object(obj, refresh_scalar_bar=refresh_scalar_bar)
 
     def apply_object_properties(self, obj):
         if obj.actor is None:
-            self._render_object(obj)
+            self._render_object(obj, refresh_scalar_bar=True)
             return
         try:
             obj.actor.SetVisibility(1 if obj.visible else 0)
@@ -247,6 +257,7 @@ class SceneController:
         if obj.visible:
             self.readd_object(obj)
             return
+        self._refresh_shared_scalar_bar(render=False)
         try:
             self.plotter.render()
         except Exception:
@@ -474,17 +485,21 @@ class SceneController:
         obj.actor = None
         obj.label_actor = None
 
-    def _render_object(self, obj):
+    def _render_object(self, obj, refresh_scalar_bar=True):
         if not obj.visible:
             if obj.actor is not None:
                 try:
                     obj.actor.SetVisibility(0)
                 except Exception:
                     pass
+            if refresh_scalar_bar:
+                self._refresh_shared_scalar_bar(render=False)
             return
         data = self._build_dataset(obj.data_key)
         if data is None:
             self._remove_actor(obj)
+            if refresh_scalar_bar:
+                self._refresh_shared_scalar_bar(render=False)
             return
         if obj.actor is not None:
             self._remove_actor(obj)
@@ -499,6 +514,8 @@ class SceneController:
             self._apply_basic_properties_only(obj)
         except Exception as e:
             self.logger(f"Render failed: {obj.name}: {type(e).__name__}: {e}")
+        if refresh_scalar_bar:
+            self._refresh_shared_scalar_bar(preferred_uid=obj.uid if obj.visible else None, render=False)
 
     def _apply_basic_properties_only(self, obj):
         try:
@@ -514,7 +531,7 @@ class SceneController:
             pass
 
     def _mesh_kwargs(self, obj, data):
-        kw = {"opacity": float(obj.opacity), "show_scalar_bar": bool(obj.show_scalar_bar)}
+        kw = {"opacity": float(obj.opacity), "show_scalar_bar": False}
         use_scalars = False
         if obj.scalars:
             if hasattr(data, "point_data") and obj.scalars in data.point_data:
@@ -526,18 +543,6 @@ class SceneController:
             kw["cmap"] = obj.cmap
             if obj.clim:
                 kw["clim"] = obj.clim
-            if obj.scalar_bar_title:
-                scalar_bar_args = {
-                    "title": obj.scalar_bar_title,
-                    "vertical": True,
-                    "title_font_size": 14,
-                    "label_font_size": 12,
-                    "n_labels": 5,
-                    "fmt": "%.3g",
-                }
-                if isinstance(obj.scalar_bar_cfg, dict):
-                    scalar_bar_args.update({k: v for k, v in obj.scalar_bar_cfg.items() if k != "stack_gap"})
-                kw["scalar_bar_args"] = scalar_bar_args
         else:
             kw["color"] = obj.color
         if obj.data_key == "pwv_planes":
@@ -556,6 +561,99 @@ class SceneController:
             kw["edge_color"] = "black"
             kw["line_width"] = max(float(obj.line_width), 2.0)
         return kw
+
+    def _scalar_bar_args_for_object(self, obj):
+        scalar_bar_args = {
+            "title": str(obj.scalar_bar_title or ""),
+            "vertical": True,
+            "title_font_size": 14,
+            "label_font_size": 12,
+            "n_labels": 5,
+            "fmt": "%.3g",
+        }
+        shared_cfg = dict(getattr(self.workspace, "render_settings", {}).get("shared_colorbar_bar_cfg", {}) or {})
+        if shared_cfg:
+            scalar_bar_args.update({k: v for k, v in shared_cfg.items() if k != "stack_gap"})
+        if isinstance(obj.scalar_bar_cfg, dict):
+            scalar_bar_args.update({k: v for k, v in obj.scalar_bar_cfg.items() if k != "stack_gap"})
+        return scalar_bar_args
+
+    def _object_can_drive_scalar_bar(self, obj):
+        if obj is None or not bool(obj.visible) or not bool(obj.show_scalar_bar) or not obj.scalars:
+            return False
+        actor = getattr(obj, "actor", None)
+        if actor is None:
+            return False
+        try:
+            return actor.GetMapper() is not None
+        except Exception:
+            return False
+
+    def _clear_shared_scalar_bar(self, render=False):
+        try:
+            scalar_bars = getattr(self.plotter, "scalar_bars", None)
+            titles = list(scalar_bars.keys()) if scalar_bars is not None else []
+        except Exception:
+            titles = []
+        removed = False
+        for title in titles:
+            try:
+                self.plotter.remove_scalar_bar(title=title, render=False)
+                removed = True
+            except Exception:
+                pass
+        if not titles:
+            try:
+                self.plotter.remove_scalar_bar(render=False)
+                removed = True
+            except Exception:
+                pass
+        if removed:
+            self._active_scalar_bar_uid = None
+        if render:
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
+
+    def _select_scalar_bar_object(self, preferred_uid=None):
+        if preferred_uid is not None:
+            preferred = self.workspace.scene_objects.get(preferred_uid)
+            if self._object_can_drive_scalar_bar(preferred):
+                return preferred
+        if self._active_scalar_bar_uid is not None:
+            active = self.workspace.scene_objects.get(self._active_scalar_bar_uid)
+            if self._object_can_drive_scalar_bar(active):
+                return active
+        candidates = [obj for obj in self.workspace.scene_objects.values() if self._object_can_drive_scalar_bar(obj)]
+        if not candidates:
+            return None
+        return candidates[-1]
+
+    def _refresh_shared_scalar_bar(self, preferred_uid=None, render=False):
+        obj = self._select_scalar_bar_object(preferred_uid=preferred_uid)
+        if obj is None:
+            self._clear_shared_scalar_bar(render=render)
+            return
+        try:
+            mapper = obj.actor.GetMapper()
+        except Exception:
+            mapper = None
+        if mapper is None:
+            self._clear_shared_scalar_bar(render=render)
+            return
+        self._clear_shared_scalar_bar(render=False)
+        try:
+            self.plotter.add_scalar_bar(mapper=mapper, render=False, **self._scalar_bar_args_for_object(obj))
+            self._active_scalar_bar_uid = obj.uid
+        except Exception as e:
+            self._active_scalar_bar_uid = None
+            self.logger(f"Scalar bar refresh failed: {obj.name}: {type(e).__name__}: {e}")
+        if render:
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
 
     def _build_dataset(self, data_key):
         ws = self.workspace

@@ -10,6 +10,7 @@ It currently supports:
 
 - legacy complex H5 input
 - normalized H5 input
+- nested-group H5 input when one case payload lives below the root and loader keys vary by case
 - direct DICOM directory input
 - segmentation from embedded masks, imported masks, thresholding, and nnUNet auto segmentation
 - grouped multi-label segmentation with config-driven label maps, per-group preprocessing, and grouped visualization
@@ -64,6 +65,8 @@ autoflow-run ./data/demo_data.h5 \
   --video plane,wss,pg
 ```
 
+Directory inputs scan only top-level H5/HDF5 files. Nested output folders such as `autoflow_out/` are not recursed into for H5 batch discovery. Multi-group H5 files create one case output per H5 data-group path.
+
 This runs the standard batch order:
 
 1. load data
@@ -77,12 +80,14 @@ This runs the standard batch order:
 Typical outputs under `./results/demo/<case_name>/`:
 
 - `planes.json`
+- `planes.h5`
 - `plane_positions.json`
 - `plane_metrics.json`
 - `plane_qc.json`
 - `pwv.json` when PWV is enabled
 - `pwv_<group>.png` when PWV plotting succeeds
 - `summary.json` with `stage_times_sec`, `video_times_sec`, and request flags
+- source H5 `segmask` is updated in place for reuse, plus `*_auto_segmentation.nii.gz` and `*_auto_segmentation_feature_*.nii.gz` when `--autoseg` runs on an H5 input
 
 GUI:
 
@@ -122,7 +127,8 @@ AutoFlow keeps default hyperparameters in per-module JSON files under `configs/`
 - `pressure_gradient.json`
 - `pwv.json`
 - `segmentation.json`
-- `rendering.json`
+- `colorbar.json`
+- `video_exporting.json`
   includes only shared video and camera defaults such as `window_size`, `rotate_dynamic_video`, `dynamic_rotation_frames`, `camera_view`, and `make_*_video`
 
 Metric config split:
@@ -134,10 +140,11 @@ Metric config split:
 - `tke.json -> render` owns TKE display range and optional colorbar settings for GUI and offline videos.
 - `pressure_gradient.json` owns pressure-analysis parameters: pressure-gradient estimation, relative-pressure reconstruction, and centerline pressure-drop sampling inputs.
 - `pressure_gradient.json -> render` owns pressure-gradient display settings, plus optional `relative_pressure_*` overrides for the reconstructed relative-pressure map.
-- `planes.json -> render` owns plane skeleton and plane styling for GUI display and plane videos.
-- `streamlines.json -> render` owns streamline display range and optional colorbar settings for GUI and offline videos.
+- `planes.json -> render` owns GUI plane color and opacity. `video_exporting.json -> plane_video` owns plane-video skeleton, plane size, plane color, plane opacity, and label styling.
+- `streamlines.json -> render` owns streamline display range; metric-specific `bar_cfg` values can still override the shared GUI colorbar defaults and are also used by offline videos.
+- `colorbar.json` owns the shared GUI colorbar visibility, size, position, and font defaults.
 - `derived.json` is now just a legacy compatibility placeholder.
-- `rendering.json` stays the central place for shared video sizing, rotation, camera, and output toggles.
+- `video_exporting.json` stays the central place for shared video sizing, rotation, camera, and output toggles.
 
 Important grouped-mask note:
 
@@ -207,9 +214,10 @@ Detailed documentation now lives under `docs/en/`.
 
 ## Current Status Highlights
 
-- input loading supports legacy complex H5, normalized H5, and direct DICOM directories
+- input loading supports legacy complex H5, normalized H5, real-valued `img[..., 0:4]` as `mag + flow_xyz`, complex-valued `img[..., 0:4]` as legacy complex input, and direct DICOM directories
+- H5 loader keys are matched case-insensitively and can be resolved from a single nested case group instead of only the file root
 - loader output is normalized around `LoadedCase` with required `mag`, `flow`, `resolution`, `origin`, `venc`, and `rr`
-- grouped multi-label segmentations can be reduced from 4D labels to 3D by time majority vote, cleaned per label, reduced to the largest connected component per group before skeletonization, and rendered back as grouped skeleton, graph, path, plane, and pathline objects
+- grouped multi-label segmentations can be reduced from 4D labels to 3D by time majority vote, cleaned per label, filtered per group with the skeleton connected-component rule before skeletonization, and rendered back as grouped skeleton, graph, path, plane, and pathline objects
 - TKE is optional; mag/flow-only inputs must not synthesize fake TKE
 - auto segmentation is currently executable in both CLI and GUI when the nnUNet backend and model folder are available
 - the GUI Browser can show and hide a whole segmentation group at once, and group title colors come from `configs/labels.json`

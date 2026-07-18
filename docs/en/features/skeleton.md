@@ -16,7 +16,7 @@ For grouped multi-label segmentations, AutoFlow now:
 1. reduces 4D labels to 3D by majority vote along time
 2. removes small connected components per label when enabled
 3. merges labels into configured groups from `configs/labels.json`
-4. keeps only the largest connected component for each group mask
+4. filters grouped components with the configured connected-component rule, which defaults to `hybrid = max(min_cc_volume_mm3, cc_rel_min_ratio * largest_component_volume_mm3)`
 5. applies per-group preprocessing
 6. skeletonizes each group separately
 
@@ -61,6 +61,8 @@ summary = run_case("case.h5", config=AutoFlowConfig(output_dir="./results/case")
 | --- | --- | --- | --- | --- | --- |
 | `remove_small_cc` | bool | `True` | `configs/skeleton.json` | remove small connected components before grouped preprocessing | `autoflow/core/models.py` |
 | `min_cc_volume_mm3` | float | `50.0` | `configs/skeleton.json` | component-volume threshold | `autoflow/core/models.py` |
+| `cc_filter_mode` | string | `hybrid` | `configs/skeleton.json` | choose `absolute`, `relative`, `hybrid`, or `largest` connected-component filtering | `autoflow/core/models.py` |
+| `cc_rel_min_ratio` | float | `0.01` | `configs/skeleton.json` | relative threshold against the largest connected component for `relative` and `hybrid` filtering | `autoflow/core/models.py` |
 | `do_closing` | bool | `True` | `configs/skeleton.json` | global closing before skeletonization | `autoflow/algorithms/preprocess.py` |
 | `do_opening` | bool | `False` | `configs/skeleton.json` | global opening before skeletonization | `autoflow/algorithms/preprocess.py` |
 | `gaussian_sigma` | float | `0.5` | `configs/skeleton.json` | global smoothing strength | `autoflow/algorithms/preprocess.py` |
@@ -99,5 +101,5 @@ summary = run_case("case.h5", config=AutoFlowConfig(output_dir="./results/case")
 | --- | --- | --- |
 | skeleton step is skipped | no segmentation | create or load segmentation first |
 | skeleton contains many small branches | noisy segmentation | raise cleanup thresholds or improve segmentation |
-| one grouped vessel disappears | only a tiny disconnected component existed after grouping | review the segmentation or adjust grouping so the desired vessel is in the largest connected component |
+| one grouped vessel disappears | every component in that group fell below the active cleanup threshold | lower `min_cc_volume_mm3` or `cc_rel_min_ratio`, or improve the segmentation |
 | `Edit Skeleton` is unavailable | more than one segmentation group is active | use a single-group case or simplify `configs/labels.json` |

@@ -144,15 +144,31 @@ def _write_video(frames, out_path, fps=24):
         return None
     out_path = os.path.splitext(out_path)[0] + ".mp4"
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    attempts = [
+        {"codec": "libx264", "macro_block_size": None},
+        {"codec": "mpeg4", "macro_block_size": None},
+        {"macro_block_size": None},
+    ]
+    last_error = None
+    for writer_kwargs in attempts:
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except Exception:
+            pass
+        try:
+            with imageio.get_writer(out_path, format="ffmpeg", fps=fps, **writer_kwargs) as writer:
+                for frame in frames:
+                    writer.append_data(np.asarray(frame))
+            return out_path
+        except Exception as exc:
+            last_error = exc
     try:
-        with imageio.get_writer(out_path, fps=fps, codec="libx264", macro_block_size=None) as writer:
-            for frame in frames:
-                writer.append_data(np.asarray(frame))
-        return out_path
+        if os.path.exists(out_path):
+            os.remove(out_path)
     except Exception:
-        gif_path = os.path.splitext(out_path)[0] + ".gif"
-        imageio.mimsave(gif_path, [np.asarray(frame) for frame in frames], duration=1.0 / max(int(fps), 1))
-        return gif_path
+        pass
+    raise RuntimeError(f"failed to write MP4 video: {out_path}") from last_error
 
 
 def _surface_center_radius(poly):
@@ -224,7 +240,13 @@ def _build_union_surface(ws, smoothing_iteration=200):
     mesh = mesh.threshold(0.1)
     if mesh is None or mesh.n_cells == 0:
         return None, None
-    surf = mesh.extract_surface()
+    try:
+        surf = mesh.extract_surface(algorithm="dataset_surface")
+    except TypeError as exc:
+        # Older PyVista releases do not expose the ``algorithm`` kwarg.
+        if "algorithm" not in str(exc):
+            raise
+        surf = mesh.extract_surface()
     if surf is not None and surf.n_points > 0 and int(smoothing_iteration) > 0:
         surf = surf.smooth(n_iter=int(smoothing_iteration))
     return mesh, surf
@@ -322,6 +344,39 @@ def _plane_video_style(ws, group_name, plane_video_cfg, default_plane_size):
     }
 
 
+def _plane_label_style(plane_video_cfg):
+    cfg = plane_video_cfg if isinstance(plane_video_cfg, dict) else {}
+    default_cfg = DEFAULT_PLANE_VIDEO_CFG.get("label", {})
+    label_cfg = cfg.get("label", {}) if isinstance(cfg.get("label"), dict) else {}
+    merged = dict(default_cfg)
+    merged.update(label_cfg)
+
+    prefix_value = merged.get("prefix", "planeidx=")
+    prefix = "" if prefix_value is None else str(prefix_value)
+
+    try:
+        font_size = int(merged.get("font_size", 28))
+    except Exception:
+        font_size = 28
+    font_size = max(1, font_size)
+
+    text_color = str(merged.get("text_color", "black") or "black")
+    shape_color = str(merged.get("shape_color", "yellow") or "yellow")
+    try:
+        shape_opacity = float(merged.get("shape_opacity", 0.85))
+    except Exception:
+        shape_opacity = 0.85
+    shape_opacity = max(0.0, min(1.0, shape_opacity))
+
+    return {
+        "prefix": prefix,
+        "font_size": font_size,
+        "text_color": text_color,
+        "shape_color": shape_color,
+        "shape_opacity": shape_opacity,
+    }
+
+
 def render_plane_rotation_video(
     ws,
     out_dir,
@@ -330,7 +385,7 @@ def render_plane_rotation_video(
     smoothing_iteration=200,
     elevation_deg=0.0,
     distance_scale=1.0,
-    add_plane_idx=False,
+    add_plane_idx=True,
     add_path_idx=False,
     plane_video_cfg=None,
     window_size=None,
@@ -343,17 +398,22 @@ def render_plane_rotation_video(
     base_cfg = {
         "show_skeleton": bool(cfg.get("show_skeleton", DEFAULT_PLANE_VIDEO_CFG.get("show_skeleton", True))),
         "skeleton_point_size": cfg.get("skeleton_point_size", DEFAULT_PLANE_VIDEO_CFG.get("skeleton_point_size", 10.0)),
+        "label": dict(DEFAULT_PLANE_VIDEO_CFG.get("label", {})),
         "default": dict(DEFAULT_PLANE_VIDEO_CFG.get("default", {})),
         "groups": dict(cfg.get("groups", {})) if isinstance(cfg.get("groups"), dict) else {},
     }
     if isinstance(cfg.get("default"), dict):
         base_cfg["default"].update(cfg.get("default", {}))
+    if isinstance(cfg.get("label"), dict):
+        base_cfg["label"].update(cfg.get("label", {}))
 
     try:
         skeleton_point_size = float(base_cfg.get("skeleton_point_size", 10.0))
     except Exception:
         skeleton_point_size = 10.0
     skeleton_point_size = max(1.0, skeleton_point_size)
+
+    label_style = _plane_label_style(base_cfg)
 
     default_plane_size = _plane_size_from_surface(surf)
     origin = np.asarray(ws.origin, dtype=float).reshape(3)
@@ -411,19 +471,19 @@ def render_plane_rotation_video(
             line_width=2,
         )
         centers.append(center_world)
-        plane_labels.append(f"Plane {i}")
+        plane_labels.append(f'{label_style["prefix"]}{i}')
 
     if add_plane_idx and centers:
         plotter.add_point_labels(
             np.asarray(centers, dtype=float),
             plane_labels,
-            font_size=28,
+            font_size=label_style["font_size"],
             bold=True,
-            text_color="black",
+            text_color=label_style["text_color"],
             fill_shape=True,
             shape="rounded_rect",
-            shape_color="yellow",
-            shape_opacity=0.85,
+            shape_color=label_style["shape_color"],
+            shape_opacity=label_style["shape_opacity"],
             margin=5,
             always_visible=True,
         )

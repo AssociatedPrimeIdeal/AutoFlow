@@ -22,6 +22,7 @@
 | `nnUNet model folder not configured` | explicit model folder missing and bundled default not found | set `--autoseg-model` or configure the GUI model path |
 | `unsupported auto segmentation backend` | backend is not `nnUNet` | use `nnUNet` |
 | nnUNet subprocess fails | missing `nnUNetv2_predict_from_modelfolder`, bad model folder, or invalid checkpoint | verify nnUNet install, model folder, and checkpoint name |
+| bundled auto-seg model is not the expected one | AutoFlow defaults to `autoflow/segmodel/nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm` | override with `--autoseg-model` or change the GUI auto model path if you need another trainer |
 
 ## TKE Is Missing
 
@@ -40,7 +41,9 @@
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
+| `extract_surface()` got an unexpected keyword argument `algorithm` during plane, WSS, pressure-gradient, relative-pressure, or streamline video export | the installed `PyVista` release does not support the newer `extract_surface(algorithm=...)` keyword | use the updated build, which falls back to the older `extract_surface()` call automatically |
 | repeated `vtkEGLRenderWindow ... Unable to eglMakeCurrent: 12290` lines during GUI export | off-screen export tried to create a second local render context while a display-backed GUI VTK context was already active | rerun with the updated build; if the host still prefers display-backed export, launch `autoflow-gui` with `AUTOFLOW_OFFSCREEN_MODE=display` |
+| `TiffWriter.write() got an unexpected keyword argument \`fps\`` during MP4 export | ImageIO selected a still-image plugin instead of FFmpeg for an `.mp4` output | use the updated build, which forces MP4 export through the FFmpeg writer path |
 
 ## Plane Metrics Or Derived Metrics Look Incomplete
 

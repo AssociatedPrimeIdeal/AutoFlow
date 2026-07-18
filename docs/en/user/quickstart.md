@@ -41,11 +41,14 @@ What this does:
 
 Typical outputs under `./results/demo/<case_name>/`:
 
+- multi-group H5 files create one output folder per H5 data-group path, for example `stem__StudyA_Series1`
 - `planes.json`
+- `planes.h5`
 - `plane_positions.json`
 - `plane_metrics.json`
 - `plane_qc.json`
 - `summary.json`
+- source H5 `segmask` is updated in place for reuse, plus `*_auto_segmentation.nii.gz` and `*_auto_segmentation_feature_*.nii.gz` when auto segmentation runs on an H5 input
 
 ## Run One DICOM Root From The CLI
 
@@ -86,7 +89,7 @@ results, last_case_out = run_batch(config)
 ```bash
 autoflow-run ./data/demo_data.h5 \
   --output-dir ./results/demo \
-  --plane-by-distance \
+  --plane-mode distance \
   --cross-section-dist 15 \
   --start-dist 5 \
   --end-dist 0

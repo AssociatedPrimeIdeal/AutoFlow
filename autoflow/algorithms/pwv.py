@@ -12,7 +12,7 @@ from .graph import build_graph_from_points, graph_to_networkx
 from .metrics import compute_plane_metrics
 from .paths import _vector_orientation_text
 from .planes import generate_planes_from_paths
-from .preprocess import largest_connected_component, majority_vote_labels_3d, preprocess_mask_for_skeleton
+from .preprocess import filter_connected_components, majority_vote_labels_3d, preprocess_mask_for_skeleton
 from .skeleton import generate_skeleton_from_mask3d
 
 
@@ -372,8 +372,12 @@ def save_pwv_plot(result, out_path, color="#2b8a3e", fit_color="#f08c00", dpi=16
     return out_path
 
 
+def build_pwv_results_payload(results):
+    return {"results": list(results or [])}
+
+
 def save_pwv_results(results, out_path):
-    payload = {"results": results}
+    payload = build_pwv_results_payload(results)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     return out_path
@@ -658,13 +662,19 @@ def compute_pwv_groups(
             result.update({"status": "skipped", "message": "group mask is empty"})
             results.append(result)
             continue
-        group_mask = largest_connected_component(group_mask)
+        if getattr(skeleton_params, "remove_small_cc", False):
+            group_mask = filter_connected_components(
+                group_mask,
+                resolution,
+                mode=getattr(skeleton_params, "cc_filter_mode", "hybrid"),
+                min_volume_mm3=getattr(skeleton_params, "min_cc_volume_mm3", 50.0),
+                rel_min_ratio=getattr(skeleton_params, "cc_rel_min_ratio", 0.01),
+            )
         if not np.any(group_mask):
-            result.update({"status": "skipped", "message": "largest connected component is empty"})
+            result.update({"status": "skipped", "message": "filtered group mask is empty"})
             results.append(result)
             continue
         processed = preprocess_mask_for_skeleton(group_mask, skeleton_params, resolution=resolution)
-        processed = largest_connected_component(processed)
         if not np.any(processed):
             result.update({"status": "skipped", "message": "preprocessed group mask is empty"})
             results.append(result)
@@ -720,7 +730,7 @@ def compute_pwv_groups(
             smoothing_window=int(getattr(pwv_params, "smoothing_window", 15) or 15) * int(getattr(pwv_params, "inter_time", 10) or 10),
             smoothing_polyorder=int(getattr(pwv_params, "smoothing_polyorder", 2) or 2),
             inter_time=int(getattr(pwv_params, "inter_time", 10) or 10),
-            use_center_plane=False,
+            plane_mode="distance",
         )
         if not pwv_planes:
             result.update({"status": "skipped", "message": "no PWV planes generated"})

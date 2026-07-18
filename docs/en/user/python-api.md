@@ -62,9 +62,9 @@ For the other derived metrics, `AutoFlowConfig.from_config_dir()` now reads:
 - `configs/wss.json` for WSS compute parameters
 - `configs/tke.json` for TKE density
 - `configs/pressure_gradient.json` for pressure-gradient estimation, relative-pressure reconstruction, and centerline-pressure outputs
-- `configs/planes.json` for plane render styling
+- `configs/planes.json` for GUI plane styling, plus `configs/video_exporting.json` for plane-video styling
 - `configs/wss.json`, `configs/tke.json`, `configs/pressure_gradient.json`, and `configs/streamlines.json` for metric-specific render ranges and optional colorbars
-- `configs/rendering.json` for shared video controls such as `window_size`, camera behavior, and rotation
+- `configs/video_exporting.json` for shared video controls such as `window_size`, camera behavior, and rotation
 
 ### Launch the GUI from Python
 
@@ -84,16 +84,30 @@ launch_gui(config_dir="./configs")
 | `skip_derived` | bool | `False` | remove requested WSS, TKE, pressure-gradient, relative-pressure, and centerline-pressure work | `autoflow/processing.py` |
 | `pressure_method` | string | `least_squares` | choose `least_squares` or `ppe` relative-pressure reconstruction; both use SciPy sparse solvers | `autoflow/algorithms/metrics.py` |
 | `skip_plane_metrics` | bool | `False` | skip plane metrics | `autoflow/processing.py` |
-| `background_phase_correction` | bool | `False` | enable loader correction | `autoflow/algorithms/data.py`, `autoflow/algorithms/dicom.py` |
+| `background_phase_correction` | bool | `False` | enable loader correction; H5 inputs reuse or write a compatible `corr` cache | `autoflow/algorithms/data.py`, `autoflow/algorithms/dicom.py` |
 | `dual_venc_ratio1` | float | `0.0` | first dual-venc alias window ratio for legacy `Nv=7` H5 | `autoflow/algorithms/data.py` |
 | `dual_venc_ratio2` | float | `0.0` | second dual-venc alias window ratio for legacy `Nv=7` H5 | `autoflow/algorithms/data.py` |
-| `use_center_plane` | bool | `True` | use one center plane per path | `autoflow/algorithms/planes.py` |
+| `plane_mode` | string | `count` | choose `count`, `distance`, or `anchored_offset` plane placement | `autoflow/algorithms/planes.py` |
+| `plane_count` | int | `1` | evenly spaced plane count in count mode; `1` gives the center-style default | `autoflow/algorithms/planes.py` |
 | `cross_section_dist` | float | `5.0` | distance-plane spacing | `autoflow/algorithms/planes.py` |
+| `start_dist` | float | `5.0` | trim from path start before count or distance placement | `autoflow/algorithms/planes.py` |
+| `end_dist` | float | `0.0` | trim from path end | `autoflow/algorithms/planes.py` |
+| `plane_anchor` | string | `end` | choose `start` or `end` anchor in anchored-offset mode | `autoflow/algorithms/planes.py` |
+| `plane_offset_mm` | float | `5.0` | offset from the chosen anchor in anchored-offset mode | `autoflow/algorithms/planes.py` |
 | `remove_small_cc` | bool | `True` | drop small components before skeletonization | `autoflow/algorithms/preprocess.py` |
+| `min_cc_volume` | float | `50.0` | absolute component threshold in mm^3 | `autoflow/algorithms/preprocess.py` |
+| `cc_filter_mode` | string | `hybrid` | choose `absolute`, `relative`, `hybrid`, or `largest` component filtering | `autoflow/algorithms/preprocess.py` |
+| `cc_rel_min_ratio` | float | `0.01` | relative threshold against the largest component for `relative` and `hybrid` filtering | `autoflow/algorithms/preprocess.py` |
 | `seed_ratio` | float | `0.02` | streamline seed density | `autoflow/algorithms/streamlines.py` |
 | `autoseg` | bool | `False` | run auto segmentation if no segmentation exists | `autoflow/processing.py` |
-| `autoseg_model` | string | empty | choose explicit nnUNet model folder | `autoflow/algorithms/segmentation.py` |
+| `autoseg_model` | string | empty, then resolved to bundled `autoflow/segmodel/nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm` if present | choose explicit nnUNet model folder | `autoflow/algorithms/segmentation.py` |
 | `requested_videos` | list[str] | empty | export any of `plane`, `wss`, `tke`, `pg`, `streamlines` | `autoflow/rendering/videos.py` |
+| `add_plane_idx` | bool | `True` | show or hide plane index labels in the plane video | `autoflow/rendering/videos.py` |
+| `plane_video_cfg["default"]["plane_color"]` | string | `yellow` | fallback plane color for plane videos | `autoflow/rendering/videos.py`, `autoflow/ui/app.py` |
+| `plane_video_cfg["default"]["plane_opacity"]` | float | `0.75` | fallback plane opacity for plane videos | `autoflow/rendering/videos.py`, `autoflow/ui/app.py` |
+| `plane_video_cfg["label"]["prefix"]` | string | `planeidx=` | plane-video index label prefix before the plane number | `autoflow/rendering/videos.py` |
+| `plane_video_cfg["label"]["font_size"]` | int | `28` | plane-video index label font size | `autoflow/rendering/videos.py` |
+| `plane_video_cfg["label"]["text_color"]` | string | `black` | plane-video index label text color | `autoflow/rendering/videos.py` |
 | `window_size` | tuple[int, int] | `(1600, 1200)` | output render size for exported videos | `autoflow/rendering/videos.py` |
 | `pressure_gradient_clim` | tuple[float, float] or `None` | `None` | explicit pressure-gradient video display range; `None` keeps the auto range | `autoflow/rendering/videos.py` |
 | `relative_pressure_clim` | tuple[float, float] or `None` | `None` | explicit relative-pressure video display range; `None` keeps the symmetric auto range | `autoflow/rendering/videos.py` |

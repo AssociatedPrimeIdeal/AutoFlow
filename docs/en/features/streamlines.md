@@ -65,7 +65,7 @@ summary = run_case("case.h5", config=config)
 | `pathline_color` | string | `deepskyblue` | `configs/streamlines.json` or GUI | default color for newly generated pathlines; each pathline can later be recolored individually in the browser | `autoflow/ui/app.py` |
 | `streamlines.render.clim` | list[float, float] | `[0.0, 1.0]` | `configs/streamlines.json` | streamline display range in GUI and videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
 | `streamlines.render.show_scalar_bar` | bool | `True` | `configs/streamlines.json` | show or hide the streamline colorbar in GUI and videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
-| GUI runtime streamline `clim` and colorbar layout | floats or `auto` | config default | GUI `Render / Colorbar` panel | update live streamline display immediately and reuse the same values for video export in the current session | `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
+| GUI runtime streamline `clim` and colorbar layout | floats or `auto` | config default | GUI `Render / Colorbar` panel | update live streamline display immediately and reuse the same values for video export in the current session; the live GUI scene reuses the same shared colorbar slot as other scalar layers, with shared defaults from `configs/colorbar.json` | `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
 
 ## Outputs
 

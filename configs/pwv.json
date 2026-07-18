@@ -1,16 +1,13 @@
 {
   "enabled": true,
   "groups": [
-    {
-      "name": "Aorta",
-      "labels": ["AAO", "ARCH", "DAO"]
-    },
+
     {
       "name": "Portal Vein",
       "labels": ["PV"]
     }
   ],
-  "plane_interval_mm": 10.0,
+  "plane_interval_mm": 5.0,
   "start_distance": 0.0,
   "end_distance": 0.0,
   "smoothing_window": 15,

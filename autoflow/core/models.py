@@ -87,6 +87,8 @@ class PreprocessParams:
 class SkeletonParams:
     remove_small_cc: bool = False
     min_cc_volume_mm3: float = 50.0
+    cc_filter_mode: str = "hybrid"
+    cc_rel_min_ratio: float = 0.01
     do_closing: bool = True
     do_opening: bool = False
     gaussian_sigma: float = 0.5
@@ -105,6 +107,8 @@ class SkeletonParams:
         return {
             "remove_small_cc": self.remove_small_cc,
             "min_cc_volume_mm3": self.min_cc_volume_mm3,
+            "cc_filter_mode": str(self.cc_filter_mode),
+            "cc_rel_min_ratio": float(self.cc_rel_min_ratio),
             "do_closing": self.do_closing,
             "do_opening": self.do_opening,
             "gaussian_sigma": self.gaussian_sigma,
@@ -158,6 +162,8 @@ class SkeletonParams:
         return SkeletonParams(
             remove_small_cc=bool(payload.get("remove_small_cc", False)),
             min_cc_volume_mm3=float(payload.get("min_cc_volume_mm3", 50.0)),
+            cc_filter_mode=str(payload.get("cc_filter_mode", "hybrid") or "hybrid"),
+            cc_rel_min_ratio=float(payload.get("cc_rel_min_ratio", 0.01)),
             do_closing=bool(payload.get("do_closing", True)),
             do_opening=bool(payload.get("do_opening", False)),
             gaussian_sigma=float(payload.get("gaussian_sigma", 0.5)),
@@ -202,6 +208,8 @@ class SkeletonParams:
         params = SkeletonParams(
             remove_small_cc=self.remove_small_cc,
             min_cc_volume_mm3=self.min_cc_volume_mm3,
+            cc_filter_mode=self.cc_filter_mode,
+            cc_rel_min_ratio=self.cc_rel_min_ratio,
             do_closing=self.do_closing,
             do_opening=self.do_opening,
             gaussian_sigma=self.gaussian_sigma,
@@ -214,6 +222,8 @@ class SkeletonParams:
         for key in [
             "remove_small_cc",
             "min_cc_volume_mm3",
+            "cc_filter_mode",
+            "cc_rel_min_ratio",
             "do_closing",
             "do_opening",
             "gaussian_sigma",
@@ -230,20 +240,26 @@ class SkeletonParams:
 
 @dataclass
 class PlaneGenerationParams:
-    use_center_plane: bool = True
-    cross_section_distance: float = 20.0
+    plane_mode: str = "count"
+    plane_count: int = 1
+    cross_section_distance: float = 5.0
     start_distance: float = 5.0
     end_distance: float = 0.0
+    anchor: str = "end"
+    anchor_offset_mm: float = 5.0
     smoothing_window: int = 15
     smoothing_polyorder: int = 2
     inter_time: int = 10
 
     def to_dict(self):
         return {
-            "use_center_plane": bool(self.use_center_plane),
-            "cross_section_distance": self.cross_section_distance,
-            "start_distance": self.start_distance,
-            "end_distance": self.end_distance,
+            "plane_mode": str(self.plane_mode or "count"),
+            "plane_count": int(self.plane_count),
+            "cross_section_distance": float(self.cross_section_distance),
+            "start_distance": float(self.start_distance),
+            "end_distance": float(self.end_distance),
+            "anchor": str(self.anchor or "end"),
+            "anchor_offset_mm": float(self.anchor_offset_mm),
             "smoothing_window": int(self.smoothing_window),
             "smoothing_polyorder": int(self.smoothing_polyorder),
             "inter_time": int(self.inter_time),
@@ -251,14 +267,26 @@ class PlaneGenerationParams:
 
     @staticmethod
     def from_dict(d):
+        payload = dict(d or {})
+        plane_mode = str(payload.get("plane_mode", "") or "").strip().lower()
+        if plane_mode not in {"count", "distance", "anchored_offset"}:
+            use_center_plane = payload.get("use_center_plane", None)
+            plane_mode = "count" if bool(True if use_center_plane is None else use_center_plane) else "distance"
+        plane_count = max(1, int(payload.get("plane_count", 1) or 1))
+        anchor = str(payload.get("anchor", "end") or "end").strip().lower()
+        if anchor not in {"start", "end"}:
+            anchor = "end"
         return PlaneGenerationParams(
-            use_center_plane=bool(d.get("use_center_plane", True)),
-            cross_section_distance=float(d.get("cross_section_distance", 20.0)),
-            start_distance=float(d.get("start_distance", 5.0)),
-            end_distance=float(d.get("end_distance", 0.0)),
-            smoothing_window=int(d.get("smoothing_window", 15)),
-            smoothing_polyorder=int(d.get("smoothing_polyorder", 3)),
-            inter_time=int(d.get("inter_time", 10)),
+            plane_mode=plane_mode,
+            plane_count=plane_count,
+            cross_section_distance=float(payload.get("cross_section_distance", 5.0)),
+            start_distance=float(payload.get("start_distance", 5.0)),
+            end_distance=float(payload.get("end_distance", 0.0)),
+            anchor=anchor,
+            anchor_offset_mm=float(payload.get("anchor_offset_mm", 5.0)),
+            smoothing_window=int(payload.get("smoothing_window", 15)),
+            smoothing_polyorder=int(payload.get("smoothing_polyorder", 2)),
+            inter_time=int(payload.get("inter_time", 10)),
         )
 
 
@@ -820,6 +848,8 @@ class DerivedResults:
     pwv_results: List[Dict[str, Any]] = field(default_factory=list)
     pwv_planes: List[Dict[str, Any]] = field(default_factory=list)
     pwv_file: str = ""
+    pwv_json_file: str = ""
+    pwv_h5_file: str = ""
 
 
 @dataclass
@@ -873,10 +903,11 @@ class SegmentationState:
     threshold_closing: bool = True
     threshold_opening: bool = False
     auto_backend: str = "nnUNet"
-    auto_model: str = "autoflow/segmodel/nnUNetTrainer_500epochs__nnUNetPlans__3d_fullres_iso1mm"
+    auto_model: str = "autoflow/segmodel/nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm"
     auto_checkpoint: str = "checkpoint_final.pth"
     auto_device: str = "auto"
     auto_label_map: str = ""
+    force_recompute_auto_cache: bool = False
 
     @staticmethod
     def _coerce_threshold_value(value):
@@ -932,6 +963,7 @@ class SegmentationState:
             "auto_checkpoint": self.auto_checkpoint,
             "auto_device": self.auto_device,
             "auto_label_map": self.auto_label_map,
+            "force_recompute_auto_cache": bool(self.force_recompute_auto_cache),
         }
 
     @staticmethod
@@ -969,10 +1001,11 @@ class SegmentationState:
             threshold_closing=bool(payload.get("threshold_closing", True)),
             threshold_opening=bool(payload.get("threshold_opening", False)),
             auto_backend=str(payload.get("auto_backend", "nnUNet")),
-            auto_model=str(payload.get("auto_model", "autoflow/segmodel/nnUNetTrainer_500epochs__nnUNetPlans__3d_fullres_iso1mm")),
+            auto_model=str(payload.get("auto_model", "autoflow/segmodel/nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm")),
             auto_checkpoint=str(payload.get("auto_checkpoint", "checkpoint_final.pth")),
             auto_device=str(payload.get("auto_device", "auto")),
             auto_label_map=str(payload.get("auto_label_map", "")),
+            force_recompute_auto_cache=bool(payload.get("force_recompute_auto_cache", False)),
         )
 
 
@@ -1364,6 +1397,8 @@ class Workspace:
                 "pwv_results": copy.deepcopy(self.derived.pwv_results),
                 "pwv_planes": copy.deepcopy(self.derived.pwv_planes),
                 "pwv_file": str(self.derived.pwv_file or ""),
+                "pwv_json_file": str(self.derived.pwv_json_file or ""),
+                "pwv_h5_file": str(self.derived.pwv_h5_file or ""),
             },
             "render_settings": copy.deepcopy(self.render_settings),
             "scene_objects": [
@@ -1488,6 +1523,8 @@ class Workspace:
             pwv_results=copy.deepcopy(derived_state.get("pwv_results", [])),
             pwv_planes=copy.deepcopy(derived_state.get("pwv_planes", [])),
             pwv_file=str(derived_state.get("pwv_file", "") or ""),
+            pwv_json_file=str(derived_state.get("pwv_json_file", "") or ""),
+            pwv_h5_file=str(derived_state.get("pwv_h5_file", "") or ""),
         )
         self.render_settings = copy.deepcopy(d.get("render_settings", {}))
         self.scene_objects = {}

@@ -8,6 +8,7 @@ import numpy as np
 from ..case_types import InputCase, LoadedCase, LoaderCapabilities
 from .data import (
     _axis_pair,
+    discover_h5_input_cases,
     load_h5_data,
     normalize_loaded_case,
     reorient,
@@ -547,11 +548,19 @@ def _iter_candidate_dicom_files(root):
 
 def _collect_h5_files_from_dir(root):
     matches = []
-    for dirpath, _, filenames in os.walk(root):
-        for filename in filenames:
-            lower = filename.lower()
-            if lower.endswith(_H5_SUFFIXES):
-                matches.append(os.path.join(dirpath, filename))
+    for filename in sorted(os.listdir(root)):
+        path = os.path.join(root, filename)
+        if not os.path.isfile(path):
+            continue
+        lower = filename.lower()
+        if lower.endswith(_H5_SUFFIXES):
+            try:
+                import h5py
+
+                if h5py.is_hdf5(path):
+                    matches.append(path)
+            except Exception:
+                continue
     return sorted(matches)
 
 
@@ -644,15 +653,14 @@ def resolve_input_case(input_source):
 
     path = os.path.abspath(str(input_source))
     if _is_h5_path(path):
-        stem = os.path.splitext(os.path.basename(path))[0]
-        return InputCase(
-            input_path=path,
-            input_kind="h5",
-            display_name=stem,
-            output_name=stem,
-            source_group=None,
-            metadata={},
-        )
+        cases = discover_h5_input_cases(path)
+        if not cases:
+            raise ValueError(f"no supported H5 cases found: {path}")
+        if len(cases) > 1:
+            labels = ", ".join(case.display_name for case in cases[:3])
+            suffix = "" if len(cases) <= 3 else f", ... ({len(cases)} total)"
+            raise ValueError(f"multiple H5 cases found in {path}: {labels}{suffix}")
+        return cases[0]
 
     root = path if os.path.isdir(path) else os.path.dirname(path)
     if not root:
@@ -687,11 +695,13 @@ def collect_input_cases(inputs):
     for item in inputs:
         path = os.path.abspath(str(item))
         if _is_h5_path(path):
-            _append(resolve_input_case(path))
+            for case in discover_h5_input_cases(path):
+                _append(case)
             continue
         if os.path.isdir(path):
             for h5_path in _collect_h5_files_from_dir(path):
-                _append(resolve_input_case(h5_path))
+                for case in discover_h5_input_cases(h5_path):
+                    _append(case)
             for case in scan_dicom_cases(path):
                 _append(case)
             continue
@@ -1566,10 +1576,17 @@ def load_input_data(
     progress_callback=None,
     parameter_overrides=None,
     dicom_read_workers=1,
+    force_recompute_seg=False,
 ):
     case = resolve_input_case(input_source)
     if case.input_kind == "h5":
-        return load_h5_data(case.input_path, correction_config=correction_config, progress_callback=progress_callback)
+        return load_h5_data(
+            case.input_path,
+            correction_config=correction_config,
+            progress_callback=progress_callback,
+            source_group=case.source_group,
+            force_recompute_seg=force_recompute_seg,
+        )
     return load_dicom_case(
         case,
         correction_config=correction_config,

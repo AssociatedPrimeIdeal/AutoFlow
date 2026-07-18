@@ -1,6 +1,8 @@
 {
   "remove_small_cc": true,
   "min_cc_volume_mm3": 50.0,
+  "cc_filter_mode": "hybrid",
+  "cc_rel_min_ratio": 0.01,
   "do_closing": true,
   "do_opening": false,
   "gaussian_sigma": 0.5,

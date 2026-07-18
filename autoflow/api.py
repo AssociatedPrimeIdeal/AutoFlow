@@ -12,6 +12,7 @@ from .config import (
     DEFAULT_PRESSURE_GRADIENT_BAR_CFG,
     DEFAULT_PLANE_VIDEO_CFG,
     DEFAULT_RELATIVE_PRESSURE_BAR_CFG,
+    DEFAULT_SHARED_COLORBAR_CFG,
     DEFAULT_STREAMLINE_BAR_CFG,
     DEFAULT_TKE_BAR_CFG,
     DEFAULT_WSS_BAR_CFG,
@@ -42,15 +43,22 @@ class AutoFlowConfig:
     background_phase_threshold: float = 0.1
     dual_venc_ratio1: float = 0.0
     dual_venc_ratio2: float = 0.0
+    force_recompute_corr: bool = False
     dicom_read_workers: int = 1
 
-    use_center_plane: bool = True
+    plane_mode: str = "count"
+    plane_count: int = 1
     cross_section_dist: float = 5.0
     start_dist: float = 5.0
     end_dist: float = 0.0
+    plane_anchor: str = "end"
+    plane_offset_mm: float = 5.0
+    use_center_plane: Optional[bool] = None
 
     remove_small_cc: bool = True
     min_cc_volume: float = 50.0
+    cc_filter_mode: str = "hybrid"
+    cc_rel_min_ratio: float = 0.01
 
     seed_ratio: float = 0.02
     max_steps: int = 2000
@@ -68,6 +76,8 @@ class AutoFlowConfig:
     autoseg_checkpoint: str = "checkpoint_final.pth"
     autoseg_device: str = "auto"
     autoseg_label_map: str = ""
+    force_recompute_seg: bool = False
+    segmentation_only: bool = False
 
     requested_metrics: Sequence[str] = field(default_factory=list)
     requested_videos: Sequence[str] = field(default_factory=list)
@@ -87,10 +97,12 @@ class AutoFlowConfig:
     dynamic_rotation_elevation_deg: Optional[float] = 10.0
     dynamic_time_repeat: int = 3
 
-    add_plane_idx: bool = False
+    add_plane_idx: bool = True
     add_path_idx: bool = False
     plane_video_cfg: Dict[str, Any] = field(default_factory=lambda: copy.deepcopy(DEFAULT_PLANE_VIDEO_CFG))
     window_size: Tuple[int, int] = (1600, 1200)
+    shared_colorbar_show: bool = True
+    shared_colorbar_bar_cfg: Dict[str, Any] = field(default_factory=lambda: copy.deepcopy(DEFAULT_SHARED_COLORBAR_CFG["bar_cfg"]))
 
     wss_clim: Tuple[float, float] = (0.0, 10.0)
     wss_show_scalar_bar: bool = True
@@ -132,13 +144,26 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
     ws.loader_params.background_phase_correction.threshold = float(cfg.background_phase_threshold)
     ws.loader_params.background_phase_correction.dual_venc_ratio1 = float(cfg.dual_venc_ratio1)
     ws.loader_params.background_phase_correction.dual_venc_ratio2 = float(cfg.dual_venc_ratio2)
+    ws.loader_params.background_phase_correction.force_recompute = bool(cfg.force_recompute_corr)
     ws.loader_params.dicom_read_workers = int(cfg.dicom_read_workers)
-    ws.plane_gen_params.use_center_plane = bool(cfg.use_center_plane)
+    ws.segmentation.force_recompute_auto_cache = bool(cfg.force_recompute_seg)
+    ws.plane_gen_params.plane_mode = str(getattr(cfg, "plane_mode", "count") or "count")
+    ws.plane_gen_params.plane_count = max(1, int(getattr(cfg, "plane_count", 1) or 1))
     ws.plane_gen_params.cross_section_distance = float(cfg.cross_section_dist)
     ws.plane_gen_params.start_distance = float(cfg.start_dist)
     ws.plane_gen_params.end_distance = float(cfg.end_dist)
+    ws.plane_gen_params.anchor = str(getattr(cfg, "plane_anchor", "end") or "end")
+    ws.plane_gen_params.anchor_offset_mm = float(getattr(cfg, "plane_offset_mm", 5.0))
+    if getattr(cfg, "use_center_plane", None) is not None:
+        if bool(cfg.use_center_plane):
+            ws.plane_gen_params.plane_mode = "count"
+            ws.plane_gen_params.plane_count = 1
+        elif str(getattr(cfg, "plane_mode", "") or "").strip() == "":
+            ws.plane_gen_params.plane_mode = "distance"
     ws.skeleton_params.remove_small_cc = bool(cfg.remove_small_cc)
     ws.skeleton_params.min_cc_volume_mm3 = float(cfg.min_cc_volume)
+    ws.skeleton_params.cc_filter_mode = str(cfg.cc_filter_mode or "hybrid")
+    ws.skeleton_params.cc_rel_min_ratio = float(cfg.cc_rel_min_ratio)
     ws.streamline_params.seed_ratio = float(cfg.seed_ratio)
     ws.streamline_params.max_steps = int(cfg.max_steps)
     ws.streamline_params.min_seeds = int(cfg.min_seeds)
@@ -189,6 +214,7 @@ def run_case(
         autoseg_checkpoint=cfg.autoseg_checkpoint,
         autoseg_device=cfg.autoseg_device,
         autoseg_label_map=cfg.autoseg_label_map,
+        segmentation_only=cfg.segmentation_only,
         requested_metrics=list(cfg.requested_metrics),
         requested_videos=list(cfg.requested_videos),
         fps=cfg.fps,
@@ -207,6 +233,8 @@ def run_case(
         add_path_idx=cfg.add_path_idx,
         plane_video_cfg=copy.deepcopy(cfg.plane_video_cfg),
         window_size=cfg.window_size,
+        shared_colorbar_show=cfg.shared_colorbar_show,
+        shared_colorbar_bar_cfg=copy.deepcopy(cfg.shared_colorbar_bar_cfg),
         wss_clim=cfg.wss_clim,
         wss_show_scalar_bar=cfg.wss_show_scalar_bar,
         wss_bar_cfg=dict(cfg.wss_bar_cfg),
@@ -216,6 +244,9 @@ def run_case(
         pressure_gradient_clim=cfg.pressure_gradient_clim,
         pressure_gradient_show_scalar_bar=cfg.pressure_gradient_show_scalar_bar,
         pressure_gradient_bar_cfg=dict(cfg.pressure_gradient_bar_cfg),
+        relative_pressure_clim=cfg.relative_pressure_clim,
+        relative_pressure_show_scalar_bar=cfg.relative_pressure_show_scalar_bar,
+        relative_pressure_bar_cfg=dict(cfg.relative_pressure_bar_cfg),
         streamline_clim=cfg.streamline_clim,
         streamline_show_scalar_bar=cfg.streamline_show_scalar_bar,
         streamline_bar_cfg=dict(cfg.streamline_bar_cfg),
@@ -266,12 +297,18 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 dual_venc_ratio1=config.dual_venc_ratio1,
                 dual_venc_ratio2=config.dual_venc_ratio2,
                 dicom_read_workers=config.dicom_read_workers,
-                use_center_plane=config.use_center_plane,
+                plane_mode=config.plane_mode,
+                plane_count=config.plane_count,
                 cross_section_dist=config.cross_section_dist,
                 start_dist=config.start_dist,
                 end_dist=config.end_dist,
+                plane_anchor=config.plane_anchor,
+                plane_offset_mm=config.plane_offset_mm,
+                use_center_plane=config.use_center_plane,
                 remove_small_cc=config.remove_small_cc,
                 min_cc_volume=config.min_cc_volume,
+                cc_filter_mode=config.cc_filter_mode,
+                cc_rel_min_ratio=config.cc_rel_min_ratio,
                 seed_ratio=config.seed_ratio,
                 max_steps=config.max_steps,
                 min_seeds=config.min_seeds,
@@ -287,6 +324,7 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 autoseg_checkpoint=config.autoseg_checkpoint,
                 autoseg_device=config.autoseg_device,
                 autoseg_label_map=config.autoseg_label_map,
+                segmentation_only=config.segmentation_only,
                 requested_metrics=list(config.requested_metrics),
                 requested_videos=list(config.requested_videos),
                 fps=config.fps,
@@ -306,6 +344,8 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 add_path_idx=config.add_path_idx,
                 plane_video_cfg=copy.deepcopy(config.plane_video_cfg),
                 window_size=config.window_size,
+                shared_colorbar_show=config.shared_colorbar_show,
+                shared_colorbar_bar_cfg=copy.deepcopy(config.shared_colorbar_bar_cfg),
                 wss_clim=config.wss_clim,
                 wss_show_scalar_bar=config.wss_show_scalar_bar,
                 wss_bar_cfg=dict(config.wss_bar_cfg),
@@ -315,6 +355,9 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 pressure_gradient_clim=config.pressure_gradient_clim,
                 pressure_gradient_show_scalar_bar=config.pressure_gradient_show_scalar_bar,
                 pressure_gradient_bar_cfg=dict(config.pressure_gradient_bar_cfg),
+                relative_pressure_clim=config.relative_pressure_clim,
+                relative_pressure_show_scalar_bar=config.relative_pressure_show_scalar_bar,
+                relative_pressure_bar_cfg=dict(config.relative_pressure_bar_cfg),
                 streamline_clim=config.streamline_clim,
                 streamline_show_scalar_bar=config.streamline_show_scalar_bar,
                 streamline_bar_cfg=dict(config.streamline_bar_cfg),

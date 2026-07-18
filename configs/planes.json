@@ -1,72 +1,53 @@
 {
-  "use_center_plane": true,
+  "plane_mode": "count",
+  "plane_count": 1,
   "cross_section_distance": 5.0,
   "start_distance": 5.0,
   "end_distance": 0.0,
+  "anchor": "end",
+  "anchor_offset_mm": 5.0,
   "smoothing_window": 15,
   "smoothing_polyorder": 2,
   "inter_time": 10,
   "render": {
-    "show_skeleton": true,
-    "skeleton_point_size": 10.0,
     "default": {
-      "skeleton_color": "",
-      "plane_size": null,
       "plane_color": "yellow",
       "plane_opacity": 0.75
     },
     "groups": {
       "aorta_systemic_branches": {
-        "skeleton_color": "#c92a2a",
-        "plane_size": null,
         "plane_color": "#ffd43b",
         "plane_opacity": 0.75
       },
       "pulmonary_arteries": {
-        "skeleton_color": "#1971c2",
-        "plane_size": null,
         "plane_color": "#a5d8ff",
         "plane_opacity": 0.75
       },
       "portal_splenic_venous": {
-        "skeleton_color": "#2b8a3e",
-        "plane_size": null,
         "plane_color": "#b2f2bb",
         "plane_opacity": 0.75
       },
       "carotid_arteries": {
-        "skeleton_color": "#862e9c",
-        "plane_size": null,
         "plane_color": "#e599f7",
         "plane_opacity": 0.75
       },
       "vertebral_arteries": {
-        "skeleton_color": "#5f3dc4",
-        "plane_size": null,
         "plane_color": "#d0bfff",
         "plane_opacity": 0.75
       },
       "basilar_artery": {
-        "skeleton_color": "#364fc7",
-        "plane_size": null,
         "plane_color": "#bac8ff",
         "plane_opacity": 0.75
       },
       "dural_sinuses": {
-        "skeleton_color": "#0b7285",
-        "plane_size": null,
         "plane_color": "#99e9f2",
         "plane_opacity": 0.75
       },
       "jugular_veins": {
-        "skeleton_color": "#495057",
-        "plane_size": null,
         "plane_color": "#dee2e6",
         "plane_opacity": 0.75
       },
       "intracranial_arterial_branches": {
-        "skeleton_color": "#e67700",
-        "plane_size": null,
         "plane_color": "#ffec99",
         "plane_opacity": 0.75
       }

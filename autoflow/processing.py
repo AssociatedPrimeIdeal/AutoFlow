@@ -1,5 +1,4 @@
 import copy
-import glob
 import json
 import os
 import traceback
@@ -15,6 +14,7 @@ from .algorithms.segmentation import (
     resolve_auto_segmentation_device,
     resolve_nnunet_model_folder,
     save_segmentation_file,
+    save_segmentation_to_source_h5,
 )
 from .plane_io import (
     load_plane_positions,
@@ -100,31 +100,45 @@ def _timing_payload(mapping):
     return {str(name): float(seconds) for name, seconds in mapping.items()}
 
 
-def _has_cached_derived_metrics(ws):
+def _has_cached_derived_metrics(ws, *, compute_wss=False, compute_tke=False, compute_pressure_gradient=False):
     has_wss = ws.derived.wss_volume is not None and np.size(ws.derived.wss_volume) > 0
     has_pg = ws.derived.pressure_gradient_array is not None and np.size(ws.derived.pressure_gradient_array) > 0
     has_tke = ws.derived.tke_array is not None or ws.derived.tke_volume is not None
     source_tke = ws.source_tke_array
     source_sigma = ws.source_sigma if ws.input_state.capabilities.has_complex_source else None
-    return has_wss and has_pg and (has_tke or (source_tke is None and source_sigma is None))
+    need_tke = bool(compute_tke and (source_tke is not None or source_sigma is not None))
+    if compute_wss and not has_wss:
+        return False
+    if compute_pressure_gradient and not has_pg:
+        return False
+    if need_tke and not has_tke:
+        return False
+    return bool(compute_wss or compute_pressure_gradient or need_tke)
 
 
-def _build_cached_pixelwise_export(ws):
-    if not _has_cached_derived_metrics(ws):
+def _build_cached_pixelwise_export(ws, *, compute_wss=False, compute_tke=False, compute_pressure_gradient=False):
+    if not _has_cached_derived_metrics(
+        ws,
+        compute_wss=compute_wss,
+        compute_tke=compute_tke,
+        compute_pressure_gradient=compute_pressure_gradient,
+    ):
         return {}
 
     pixelwise = {
-        "wss": np.asarray(ws.derived.wss_volume, dtype=np.float32),
         "spacing": np.asarray(ws.resolution, dtype=np.float32),
         "origin": np.asarray(ws.origin, dtype=np.float32),
-        "pressure_gradient": np.asarray(ws.derived.pressure_gradient_array, dtype=np.float32),
-        "pressure_gradient_mag": np.asarray(ws.derived.pressure_gradient_magnitude, dtype=np.float32),
-        "pressure_gradient_peak": np.asarray(ws.derived.pressure_gradient_peak, dtype=np.float32),
-        "pressure_gradient_support_mask": np.asarray(ws.derived.pressure_gradient_support_mask, dtype=np.uint8),
-        "relative_pressure": np.asarray(ws.derived.relative_pressure_array, dtype=np.float32),
-        "relative_pressure_peak": np.asarray(ws.derived.relative_pressure_peak, dtype=np.float32),
     }
-    if ws.derived.tke_array is not None:
+    if compute_wss:
+        pixelwise["wss"] = np.asarray(ws.derived.wss_volume, dtype=np.float32)
+    if compute_pressure_gradient:
+        pixelwise["pressure_gradient"] = np.asarray(ws.derived.pressure_gradient_array, dtype=np.float32)
+        pixelwise["pressure_gradient_mag"] = np.asarray(ws.derived.pressure_gradient_magnitude, dtype=np.float32)
+        pixelwise["pressure_gradient_peak"] = np.asarray(ws.derived.pressure_gradient_peak, dtype=np.float32)
+        pixelwise["pressure_gradient_support_mask"] = np.asarray(ws.derived.pressure_gradient_support_mask, dtype=np.uint8)
+        pixelwise["relative_pressure"] = np.asarray(ws.derived.relative_pressure_array, dtype=np.float32)
+        pixelwise["relative_pressure_peak"] = np.asarray(ws.derived.relative_pressure_peak, dtype=np.float32)
+    if compute_tke and ws.derived.tke_array is not None:
         tke_time = np.asarray(ws.derived.tke_array, dtype=np.float32)
         pixelwise["tke"] = np.asarray(np.max(tke_time, axis=3), dtype=np.float32)
         pixelwise["tke_time"] = tke_time
@@ -169,6 +183,7 @@ def _run_cli_auto_segmentation(ws, out_dir, *, backend, model_folder, checkpoint
         raise ValueError("auto segmentation requires loaded mag and flow data")
     resolved_model = resolve_nnunet_model_folder(model_folder)
     resolved_device = resolve_auto_segmentation_device(device)
+    artifact_prefix = os.path.splitext(_default_segmentation_sidecar_path(ws, out_dir, source="auto"))[0]
     print(f"  [autoseg] backend={backend} model={resolved_model} checkpoint={checkpoint_name} device={resolved_device}")
     t_start = time.perf_counter()
     seg, provenance = generate_nnunet_auto_segmentation(
@@ -181,23 +196,41 @@ def _run_cli_auto_segmentation(ws, out_dir, *, backend, model_folder, checkpoint
         checkpoint_name=checkpoint_name,
         device=resolved_device,
         auto_label_map=auto_label_map,
+        artifact_prefix=artifact_prefix,
         progress_callback=_make_cli_autoseg_progress_handler(),
     )
     infer_elapsed = time.perf_counter() - t_start
+    provenance = dict(provenance or {})
+    provenance["force_recompute_seg"] = bool(getattr(ws.segmentation, "force_recompute_auto_cache", False))
     ws.set_segmentation_source("auto", seg, provenance=provenance)
     ws.activate_segmentation_source("auto")
-    sidecar = _default_segmentation_sidecar_path(ws, out_dir, source="auto")
+    cache_target = ""
     t_save = time.perf_counter()
-    save_segmentation_file(
-        sidecar,
-        ws.get_active_segmentation(),
-        resolution=ws.resolution,
-        origin=ws.origin,
-        provenance=ws.get_active_segmentation_provenance(),
-    )
+    if str(ws.input_state.source_format or "").lower().endswith("h5") and str(ws.paths.flow_path or "").lower().endswith((".h5", ".hdf5")):
+        save_segmentation_to_source_h5(
+            ws.paths.flow_path,
+            ws.get_active_segmentation(),
+            resolution=ws.resolution,
+            origin=ws.origin,
+            provenance=ws.get_active_segmentation_provenance(),
+            source_spatial_order=tuple(str(x).upper() for x in (ws.input_state.metadata.get("spatial_order_raw") or [])),
+            source_group=ws.input_state.source_group,
+        )
+        cache_target = ws.paths.flow_path
     save_elapsed = time.perf_counter() - t_save
-    print(f"  [autoseg] sidecar saved: {sidecar} | save={save_elapsed:.2f}s total={infer_elapsed + save_elapsed:.2f}s")
-    return sidecar
+    feature_files = [str(path) for path in provenance.get("feature_files") or [] if str(path).strip()]
+    seg_nifti = str(provenance.get("segmentation_nifti") or provenance.get("prediction_file") or "").strip()
+    if feature_files:
+        print(
+            f"  [autoseg] feature NIfTI saved: {len(feature_files)} file(s) under {os.path.dirname(feature_files[0])}"
+        )
+    if seg_nifti:
+        print(f"  [autoseg] segmentation NIfTI saved: {seg_nifti}")
+    if cache_target:
+        print(f"  [autoseg] segmentation cached in source h5: {cache_target} | save={save_elapsed:.2f}s total={infer_elapsed + save_elapsed:.2f}s")
+    else:
+        print(f"  [autoseg] segmentation cache skipped for source format={ws.input_state.source_format or 'unknown'} | total={infer_elapsed + save_elapsed:.2f}s")
+    return cache_target
 
 
 def process_single(
@@ -217,6 +250,7 @@ def process_single(
     autoseg_checkpoint="checkpoint_final.pth",
     autoseg_device="auto",
     autoseg_label_map="",
+    segmentation_only=False,
     requested_metrics=None,
     requested_videos=None,
     fps=24,
@@ -231,7 +265,7 @@ def process_single(
     make_tke_video=False,
     camera_view="iso",
     camera_distance_scale=1.0,
-    add_plane_idx=False,
+    add_plane_idx=True,
     add_path_idx=False,
     plane_video_cfg=None,
     window_size=None,
@@ -251,6 +285,8 @@ def process_single(
     streamline_show_scalar_bar=True,
     streamline_bar_cfg=None,
     dynamic_time_repeat=1,
+    shared_colorbar_show=True,
+    shared_colorbar_bar_cfg=None,
 ):
     case = resolve_input_case(input_source)
     input_label = case.display_name or case.input_path
@@ -300,10 +336,12 @@ def process_single(
     _record_timing(stage_times, "load", elapsed)
     print(f"  -> load={elapsed:.2f}s")
 
+    auto_seg_cache_bypassed = bool(getattr(ws.segmentation, "force_recompute_auto_cache", False) and ws.segmask_raw is None)
+    segmentation_output = ""
     if ws.segmask_raw is None and autoseg:
         print("[1.5/7] Auto segmentation...")
         t_stage = _time.perf_counter()
-        sidecar = _run_cli_auto_segmentation(
+        segmentation_output = _run_cli_auto_segmentation(
             ws,
             out_dir,
             backend=autoseg_backend,
@@ -314,7 +352,43 @@ def process_single(
         )
         elapsed = _time.perf_counter() - t_stage
         _record_timing(stage_times, "autoseg", elapsed)
-        print(f"  -> auto segmentation ready: {sidecar} | time={elapsed:.2f}s")
+        print(f"  -> auto segmentation ready: {segmentation_output} | time={elapsed:.2f}s")
+
+    if segmentation_only:
+        if ws.segmask_raw is None:
+            raise RuntimeError("segmentation-only run finished without an available segmentation")
+        total_time_sec = _time.perf_counter() - t_total_start
+        provenance = dict(ws.get_active_segmentation_provenance() or {})
+        summary = {
+            "input": case.input_path,
+            "input_kind": case.input_kind,
+            "input_display_name": case.display_name,
+            "output_dir": out_dir,
+            "resolution": ws.resolution.tolist(),
+            "origin": np.asarray(ws.origin, dtype=float).reshape(3).tolist(),
+            "rr": ws.rr,
+            "source_format": ws.input_state.source_format,
+            "source_group": ws.input_state.source_group,
+            "capabilities": ws.input_state.capabilities.to_dict(),
+            "segmentation_only": True,
+            "segmentation_source": str(ws.segmentation.active_source or ""),
+            "segmentation_output": str(segmentation_output or ""),
+            "segmentation_nifti": str(
+                provenance.get("segmentation_nifti") or provenance.get("prediction_file") or ""
+            ),
+            "total_time_sec": float(total_time_sec),
+            "stage_times_sec": _timing_payload(stage_times),
+            "force_recompute_corr": bool(
+                getattr(ws.loader_params.background_phase_correction, "force_recompute", False)
+            ),
+            "force_recompute_seg": bool(getattr(ws.segmentation, "force_recompute_auto_cache", False)),
+            "force_recompute_seg_cache_bypassed": bool(auto_seg_cache_bypassed),
+        }
+        summary_path = os.path.join(out_dir, "summary.json")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        print(f"\nSegmentation-only run complete. Summary saved: {summary_path}")
+        return summary
 
     print("[2/7] Generate Skeleton...")
     t_stage = _time.perf_counter()
@@ -412,17 +486,27 @@ def process_single(
             print(f"[8/8] Compute Derived Metrics ({'/'.join(labels)})...")
             t_step = _time.perf_counter()
             step_parts = []
-            t_part = _time.perf_counter()
-            engine._ensure_derived_metrics(
+            pixelwise_result = _build_cached_pixelwise_export(
                 ws,
-                save_pixelwise=True,
-                refresh_scene_objects=False,
                 compute_wss=metric_flags["wss"],
                 compute_tke=metric_flags["tke"],
                 compute_pressure_gradient=metric_flags["pg"],
             )
-            step_parts.append(("derived_compute", _time.perf_counter() - t_part))
-            pixelwise_result = dict(ws.derived.pixelwise_export or {})
+            if pixelwise_result:
+                ws.derived.pixelwise_export = dict(pixelwise_result)
+                step_parts.append(("derived_reuse", 0.0))
+            else:
+                t_part = _time.perf_counter()
+                engine._ensure_derived_metrics(
+                    ws,
+                    save_pixelwise=True,
+                    refresh_scene_objects=False,
+                    compute_wss=metric_flags["wss"],
+                    compute_tke=metric_flags["tke"],
+                    compute_pressure_gradient=metric_flags["pg"],
+                )
+                step_parts.append(("derived_compute", _time.perf_counter() - t_part))
+                pixelwise_result = dict(ws.derived.pixelwise_export or {})
             pixel_path = os.path.join(out_dir, "derived_metrics_pixelwise.npz")
             if pixelwise_result:
                 t_part = _time.perf_counter()
@@ -652,9 +736,14 @@ def process_single(
         "plane_qc": ws.derived.plane_qc,
         "pwv_results": ws.derived.pwv_results,
         "pwv_file": ws.derived.pwv_file,
+        "pwv_json_file": ws.derived.pwv_json_file,
+        "pwv_h5_file": ws.derived.pwv_h5_file,
         "pwv_plot_files": pwv_plot_files,
         "plane_positions_file": plane_positions_path,
         "reused_planes_file": reuse_planes_path,
+        "force_recompute_corr": bool(getattr(ws.loader_params.background_phase_correction, "force_recompute", False)),
+        "force_recompute_seg": bool(getattr(ws.segmentation, "force_recompute_auto_cache", False)),
+        "force_recompute_seg_cache_bypassed": bool(auto_seg_cache_bypassed),
         "videos": video_paths,
         "pixelwise_export": {k: list(np.asarray(v).shape) for k, v in pixelwise_result.items()} if pixelwise_result else {},
         "centerline_pressure_profiles": list(ws.derived.centerline_pressure_profiles or []),
@@ -685,12 +774,22 @@ def collect_input_items(inputs):
 
 def build_base_workspace():
     ws = Workspace()
-    ws.plane_gen_params.use_center_plane = globals().get("USE_CENTER_PLANE", True)
+    ws.plane_gen_params.plane_mode = globals().get("PLANE_MODE", "count")
+    ws.plane_gen_params.plane_count = globals().get("PLANE_COUNT", 1)
     ws.plane_gen_params.cross_section_distance = globals().get("CROSS_SECTION_DIST", 5.0)
-    ws.plane_gen_params.start_distance = globals().get("START_DIST", 5.0)
+    ws.plane_gen_params.start_distance = globals().get("START_DIST", 0.0)
     ws.plane_gen_params.end_distance = globals().get("END_DIST", 0.0)
+    ws.plane_gen_params.anchor = globals().get("PLANE_ANCHOR", "end")
+    ws.plane_gen_params.anchor_offset_mm = globals().get("PLANE_OFFSET_MM", 5.0)
+    if globals().get("USE_CENTER_PLANE", None) is False:
+        ws.plane_gen_params.plane_mode = "distance"
+    elif globals().get("USE_CENTER_PLANE", None) is True:
+        ws.plane_gen_params.plane_mode = "count"
+        ws.plane_gen_params.plane_count = 1
     ws.skeleton_params.remove_small_cc = globals().get("REMOVE_SMALL_CC", True)
     ws.skeleton_params.min_cc_volume_mm3 = globals().get("MIN_CC_VOLUME", 50.0)
+    ws.skeleton_params.cc_filter_mode = globals().get("CC_FILTER_MODE", "hybrid")
+    ws.skeleton_params.cc_rel_min_ratio = globals().get("CC_REL_MIN_RATIO", 0.01)
     ws.streamline_params.max_steps = globals().get("MAX_STEPS", 2000)
     ws.streamline_params.min_seeds = globals().get("MIN_SEEDS", 50)
     ws.streamline_params.seed_ratio = globals().get("SEED_RATIO", 0.02)
@@ -725,7 +824,7 @@ def run_batch():
     rotate_dynamic_video = globals().get("ROTATE_DYNAMIC_VIDEO", False)
     dynamic_rotation_frames = globals().get("DYNAMIC_ROTATION_FRAMES", 180)
     dynamic_rotation_elevation_deg = globals().get("DYNAMIC_ROTATION_ELEVATION_DEG", None)
-    add_plane_idx = globals().get("ADD_PLANE_IDX", False)
+    add_plane_idx = globals().get("ADD_PLANE_IDX", True)
     add_path_idx = globals().get("ADD_PATH_IDX", False)
     plane_video_cfg = globals().get("PLANE_VIDEO_CFG", None)
     window_size = globals().get("WINDOW_SIZE", None)

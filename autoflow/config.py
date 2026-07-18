@@ -60,9 +60,38 @@ DEFAULT_RELATIVE_PRESSURE_BAR_CFG = {
     "label_font_size": 32,
 }
 
+DEFAULT_SHARED_COLORBAR_CFG = {
+    "show": True,
+    "bar_cfg": {
+        "position_x": 0.75,
+        "position_y": 0.2,
+        "height": 0.22,
+        "width": 0.05,
+        "title_font_size": 40,
+        "label_font_size": 32,
+    },
+}
+
+DEFAULT_PLANE_LABEL_CFG = {
+    "prefix": "planeidx=",
+    "font_size": 28,
+    "text_color": "black",
+    "shape_color": "yellow",
+    "shape_opacity": 0.85,
+}
+
+DEFAULT_PLANE_RENDER_CFG = {
+    "default": {
+        "plane_color": "yellow",
+        "plane_opacity": 0.75,
+    },
+    "groups": {},
+}
+
 DEFAULT_PLANE_VIDEO_CFG = {
     "show_skeleton": True,
     "skeleton_point_size": 10.0,
+    "label": copy.deepcopy(DEFAULT_PLANE_LABEL_CFG),
     "default": {
         "skeleton_color": "",
         "plane_size": None,
@@ -210,6 +239,7 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
             "threshold": 0.1,
             "dual_venc_ratio1": 0.0,
             "dual_venc_ratio2": 0.0,
+            "force_recompute": False,
         },
         "dicom_parameter_overrides": {},
         "dicom_read_workers": 1,
@@ -217,6 +247,8 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
     "skeleton": {
         "remove_small_cc": True,
         "min_cc_volume_mm3": 50.0,
+        "cc_filter_mode": "hybrid",
+        "cc_rel_min_ratio": 0.01,
         "do_closing": True,
         "do_opening": False,
         "gaussian_sigma": 0.5,
@@ -234,14 +266,17 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "label_groups": copy.deepcopy(DEFAULT_SKELETON_LABEL_GROUPS),
     },
     "planes": {
-        "use_center_plane": True,
+        "plane_mode": "count",
+        "plane_count": 1,
         "cross_section_distance": 5.0,
         "start_distance": 5.0,
         "end_distance": 0.0,
+        "anchor": "end",
+        "anchor_offset_mm": 5.0,
         "smoothing_window": 15,
         "smoothing_polyorder": 2,
         "inter_time": 10,
-        "render": copy.deepcopy(DEFAULT_PLANE_VIDEO_CFG),
+        "render": copy.deepcopy(DEFAULT_PLANE_RENDER_CFG),
     },
     "streamlines": {
         "seed_ratio": 0.02,
@@ -341,12 +376,13 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "threshold_closing": True,
         "threshold_opening": False,
         "auto_backend": "nnUNet",
-        "auto_model": "autoflow/segmodel/nnUNetTrainer_500epochs__nnUNetPlans__3d_fullres_iso1mm",
+        "auto_model": "autoflow/segmodel/nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm",
         "auto_checkpoint": "checkpoint_final.pth",
         "auto_device": "auto",
         "auto_label_map": "",
     },
-    "rendering": {
+    "colorbar": copy.deepcopy(DEFAULT_SHARED_COLORBAR_CFG),
+    "video_exporting": {
         "fps": 12,
         "plane_rotation_frames": 180,
         "make_plane_video": False,
@@ -360,9 +396,10 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "dynamic_rotation_frames": 180,
         "dynamic_rotation_elevation_deg": 10.0,
         "dynamic_time_repeat": 3,
-        "add_plane_idx": False,
+        "add_plane_idx": True,
         "add_path_idx": False,
         "window_size": [1600, 1200],
+        "plane_video": copy.deepcopy(DEFAULT_PLANE_VIDEO_CFG),
     },
 }
 
@@ -397,10 +434,18 @@ def _deep_merge(base: Any, override: Any) -> Any:
 def load_config_module(module_name: str, config_dir: Optional[str] = None) -> Dict[str, Any]:
     if module_name not in DEFAULT_CONFIG_BUNDLE:
         raise KeyError(f"unknown config module: {module_name}")
-    config_path = resolve_config_dir(config_dir, require_exists=bool(config_dir)) / f"{module_name}.json"
+    config_root = resolve_config_dir(config_dir, require_exists=bool(config_dir))
+    config_path = config_root / f"{module_name}.json"
     defaults = copy.deepcopy(DEFAULT_CONFIG_BUNDLE[module_name])
     if not config_path.exists():
-        return defaults
+        if module_name == "video_exporting":
+            legacy_path = config_root / "rendering.json"
+            if legacy_path.exists():
+                config_path = legacy_path
+            else:
+                return defaults
+        else:
+            return defaults
     with config_path.open("r", encoding="utf-8") as f:
         payload = json.load(f)
     if not isinstance(payload, dict):
@@ -433,6 +478,59 @@ def _feature_render_cfg(module_cfg: Dict[str, Any]) -> Dict[str, Any]:
     return dict(render_cfg) if isinstance(render_cfg, dict) else {}
 
 
+def _plane_render_cfg(render_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    resolved = copy.deepcopy(DEFAULT_PLANE_RENDER_CFG)
+    cfg = render_cfg if isinstance(render_cfg, dict) else {}
+    default_cfg = cfg.get("default", {}) if isinstance(cfg.get("default"), dict) else {}
+    group_cfgs = cfg.get("groups", {}) if isinstance(cfg.get("groups"), dict) else {}
+
+    for key in ("plane_color", "plane_opacity"):
+        if key in default_cfg:
+            resolved["default"][key] = copy.deepcopy(default_cfg[key])
+    for group_name, raw_group_cfg in group_cfgs.items():
+        if not isinstance(raw_group_cfg, dict):
+            continue
+        group_cfg = {}
+        for key in ("plane_color", "plane_opacity"):
+            if key in raw_group_cfg:
+                group_cfg[key] = copy.deepcopy(raw_group_cfg[key])
+        if group_cfg:
+            resolved["groups"][str(group_name)] = group_cfg
+    return resolved
+
+
+def _legacy_plane_video_cfg(render_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = render_cfg if isinstance(render_cfg, dict) else {}
+    legacy = {}
+    if "show_skeleton" in cfg:
+        legacy["show_skeleton"] = copy.deepcopy(cfg.get("show_skeleton"))
+    if "skeleton_point_size" in cfg:
+        legacy["skeleton_point_size"] = copy.deepcopy(cfg.get("skeleton_point_size"))
+    if isinstance(cfg.get("label"), dict):
+        legacy["label"] = copy.deepcopy(cfg.get("label"))
+    default_cfg = cfg.get("default", {}) if isinstance(cfg.get("default"), dict) else {}
+    legacy_default = {}
+    for key in ("skeleton_color", "plane_size", "plane_color", "plane_opacity"):
+        if key in default_cfg:
+            legacy_default[key] = copy.deepcopy(default_cfg[key])
+    if legacy_default:
+        legacy["default"] = legacy_default
+    group_cfgs = cfg.get("groups", {}) if isinstance(cfg.get("groups"), dict) else {}
+    legacy_groups = {}
+    for group_name, raw_group_cfg in group_cfgs.items():
+        if not isinstance(raw_group_cfg, dict):
+            continue
+        group_cfg = {}
+        for key in ("skeleton_color", "plane_size", "plane_color", "plane_opacity"):
+            if key in raw_group_cfg:
+                group_cfg[key] = copy.deepcopy(raw_group_cfg[key])
+        if group_cfg:
+            legacy_groups[str(group_name)] = group_cfg
+    if legacy_groups:
+        legacy["groups"] = legacy_groups
+    return legacy
+
+
 def _resolve_clim(primary: Any, fallback: Any, default: Optional[tuple[float, float]]) -> Optional[tuple[float, float]]:
     value = _coerce_render_clim(primary)
     if value is not None:
@@ -453,59 +551,68 @@ def _resolve_bar_cfg(primary: Any, fallback: Any, default: Dict[str, Any]) -> Di
 
 
 def resolve_render_settings(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    rendering_cfg = dict(config_bundle.get("rendering", {}))
+    video_exporting_cfg = dict(config_bundle.get("video_exporting", config_bundle.get("rendering", {})))
     plane_cfg = dict(config_bundle.get("planes", {}))
     wss_cfg = dict(config_bundle.get("wss", {}))
     tke_cfg = dict(config_bundle.get("tke", {}))
     pressure_gradient_cfg = dict(config_bundle.get("pressure_gradient", {}))
     streamline_cfg = dict(config_bundle.get("streamlines", {}))
+    colorbar_cfg = dict(config_bundle.get("colorbar", {}))
 
-    plane_render_cfg = _feature_render_cfg(plane_cfg)
+    raw_plane_render_cfg = _feature_render_cfg(plane_cfg)
+    plane_render_cfg = _plane_render_cfg(raw_plane_render_cfg)
     wss_render_cfg = _feature_render_cfg(wss_cfg)
     tke_render_cfg = _feature_render_cfg(tke_cfg)
     pressure_gradient_render_cfg = _feature_render_cfg(pressure_gradient_cfg)
     streamline_render_cfg = _feature_render_cfg(streamline_cfg)
+    shared_colorbar_bar_cfg = _resolve_bar_cfg(colorbar_cfg.get("bar_cfg", None), video_exporting_cfg.get("shared_colorbar_bar_cfg", None), DEFAULT_SHARED_COLORBAR_CFG["bar_cfg"])
+    shared_colorbar_show = bool(colorbar_cfg.get("show", video_exporting_cfg.get("shared_colorbar_show", True)))
 
     plane_video_cfg = copy.deepcopy(DEFAULT_PLANE_VIDEO_CFG)
-    legacy_plane_cfg = rendering_cfg.get("plane_video", {})
-    if isinstance(legacy_plane_cfg, dict):
-        plane_video_cfg = _deep_merge(plane_video_cfg, legacy_plane_cfg)
-    if plane_render_cfg:
-        plane_video_cfg = _deep_merge(plane_video_cfg, plane_render_cfg)
+    configured_plane_video_cfg = video_exporting_cfg.get("plane_video", {})
+    if isinstance(configured_plane_video_cfg, dict) and configured_plane_video_cfg:
+        plane_video_cfg = _deep_merge(plane_video_cfg, configured_plane_video_cfg)
+    else:
+        legacy_plane_video_cfg = _legacy_plane_video_cfg(raw_plane_render_cfg)
+        if legacy_plane_video_cfg:
+            plane_video_cfg = _deep_merge(plane_video_cfg, legacy_plane_video_cfg)
 
     return {
-        "fps": int(rendering_cfg.get("fps", 12)),
-        "plane_rotation_frames": int(rendering_cfg.get("plane_rotation_frames", 180)),
-        "make_plane_video": bool(rendering_cfg.get("make_plane_video", False)),
-        "make_wss_video": bool(rendering_cfg.get("make_wss_video", False)),
-        "make_pressure_gradient_video": bool(rendering_cfg.get("make_pressure_gradient_video", False)),
-        "make_streamlines_video": bool(rendering_cfg.get("make_streamlines_video", False)),
-        "make_tke_video": bool(rendering_cfg.get("make_tke_video", False)),
-        "camera_view": str(rendering_cfg.get("camera_view", "right")),
-        "camera_distance_scale": float(rendering_cfg.get("camera_distance_scale", 1.5)),
-        "rotate_dynamic_video": bool(rendering_cfg.get("rotate_dynamic_video", True)),
-        "dynamic_rotation_frames": int(rendering_cfg.get("dynamic_rotation_frames", 180)),
-        "dynamic_rotation_elevation_deg": rendering_cfg.get("dynamic_rotation_elevation_deg", 10.0),
-        "dynamic_time_repeat": int(rendering_cfg.get("dynamic_time_repeat", 3)),
-        "add_plane_idx": bool(rendering_cfg.get("add_plane_idx", False)),
-        "add_path_idx": bool(rendering_cfg.get("add_path_idx", False)),
+        "fps": int(video_exporting_cfg.get("fps", 12)),
+        "plane_rotation_frames": int(video_exporting_cfg.get("plane_rotation_frames", 180)),
+        "make_plane_video": bool(video_exporting_cfg.get("make_plane_video", False)),
+        "make_wss_video": bool(video_exporting_cfg.get("make_wss_video", False)),
+        "make_pressure_gradient_video": bool(video_exporting_cfg.get("make_pressure_gradient_video", False)),
+        "make_streamlines_video": bool(video_exporting_cfg.get("make_streamlines_video", False)),
+        "make_tke_video": bool(video_exporting_cfg.get("make_tke_video", False)),
+        "camera_view": str(video_exporting_cfg.get("camera_view", "right")),
+        "camera_distance_scale": float(video_exporting_cfg.get("camera_distance_scale", 1.5)),
+        "rotate_dynamic_video": bool(video_exporting_cfg.get("rotate_dynamic_video", True)),
+        "dynamic_rotation_frames": int(video_exporting_cfg.get("dynamic_rotation_frames", 180)),
+        "dynamic_rotation_elevation_deg": video_exporting_cfg.get("dynamic_rotation_elevation_deg", 10.0),
+        "dynamic_time_repeat": int(video_exporting_cfg.get("dynamic_time_repeat", 3)),
+        "add_plane_idx": bool(video_exporting_cfg.get("add_plane_idx", True)),
+        "add_path_idx": bool(video_exporting_cfg.get("add_path_idx", False)),
+        "plane_render_cfg": plane_render_cfg,
         "plane_video_cfg": plane_video_cfg,
-        "window_size": _coerce_window_size(rendering_cfg.get("window_size", rendering_cfg.get("figsize", [1600, 1200]))),
-        "wss_clim": _resolve_clim(wss_render_cfg.get("clim", None), rendering_cfg.get("wss_clim", None), (0.0, 10.0)),
-        "wss_show_scalar_bar": bool(wss_render_cfg.get("show_scalar_bar", rendering_cfg.get("wss_show_scalar_bar", True))),
-        "wss_bar_cfg": _resolve_bar_cfg(wss_render_cfg.get("bar_cfg", None), rendering_cfg.get("wss_bar_cfg", None), DEFAULT_WSS_BAR_CFG),
-        "tke_clim": _resolve_clim(tke_render_cfg.get("clim", None), rendering_cfg.get("tke_clim", None), (0.0, 100.0)),
-        "tke_show_scalar_bar": bool(tke_render_cfg.get("show_scalar_bar", rendering_cfg.get("tke_show_scalar_bar", True))),
-        "tke_bar_cfg": _resolve_bar_cfg(tke_render_cfg.get("bar_cfg", None), rendering_cfg.get("tke_bar_cfg", None), DEFAULT_TKE_BAR_CFG),
-        "pressure_gradient_clim": _resolve_clim(pressure_gradient_render_cfg.get("clim", None), rendering_cfg.get("pressure_gradient_clim", None), None),
-        "pressure_gradient_show_scalar_bar": bool(pressure_gradient_render_cfg.get("show_scalar_bar", rendering_cfg.get("pressure_gradient_show_scalar_bar", True))),
-        "pressure_gradient_bar_cfg": _resolve_bar_cfg(pressure_gradient_render_cfg.get("bar_cfg", None), rendering_cfg.get("pressure_gradient_bar_cfg", None), DEFAULT_PRESSURE_GRADIENT_BAR_CFG),
-        "relative_pressure_clim": _resolve_clim(pressure_gradient_render_cfg.get("relative_pressure_clim", None), rendering_cfg.get("relative_pressure_clim", None), None),
-        "relative_pressure_show_scalar_bar": bool(pressure_gradient_render_cfg.get("relative_pressure_show_scalar_bar", rendering_cfg.get("show_relative_pressure_scalar_bar", rendering_cfg.get("pressure_gradient_show_scalar_bar", True)))),
-        "relative_pressure_bar_cfg": _resolve_bar_cfg(pressure_gradient_render_cfg.get("relative_pressure_bar_cfg", None), rendering_cfg.get("relative_pressure_bar_cfg", None), DEFAULT_RELATIVE_PRESSURE_BAR_CFG),
-        "streamline_clim": _resolve_clim(streamline_render_cfg.get("clim", None), rendering_cfg.get("streamline_clim", None), (0.0, 1.0)),
-        "streamline_show_scalar_bar": bool(streamline_render_cfg.get("show_scalar_bar", rendering_cfg.get("streamline_show_scalar_bar", True))),
-        "streamline_bar_cfg": _resolve_bar_cfg(streamline_render_cfg.get("bar_cfg", None), rendering_cfg.get("streamline_bar_cfg", None), DEFAULT_STREAMLINE_BAR_CFG),
+        "window_size": _coerce_window_size(video_exporting_cfg.get("window_size", video_exporting_cfg.get("figsize", [1600, 1200]))),
+        "shared_colorbar_show": shared_colorbar_show,
+        "shared_colorbar_bar_cfg": shared_colorbar_bar_cfg,
+        "wss_clim": _resolve_clim(wss_render_cfg.get("clim", None), video_exporting_cfg.get("wss_clim", None), (0.0, 10.0)),
+        "wss_show_scalar_bar": bool(wss_render_cfg.get("show_scalar_bar", video_exporting_cfg.get("wss_show_scalar_bar", True))),
+        "wss_bar_cfg": _resolve_bar_cfg(wss_render_cfg.get("bar_cfg", None), video_exporting_cfg.get("wss_bar_cfg", None), DEFAULT_WSS_BAR_CFG),
+        "tke_clim": _resolve_clim(tke_render_cfg.get("clim", None), video_exporting_cfg.get("tke_clim", None), (0.0, 100.0)),
+        "tke_show_scalar_bar": bool(tke_render_cfg.get("show_scalar_bar", video_exporting_cfg.get("tke_show_scalar_bar", True))),
+        "tke_bar_cfg": _resolve_bar_cfg(tke_render_cfg.get("bar_cfg", None), video_exporting_cfg.get("tke_bar_cfg", None), DEFAULT_TKE_BAR_CFG),
+        "pressure_gradient_clim": _resolve_clim(pressure_gradient_render_cfg.get("clim", None), video_exporting_cfg.get("pressure_gradient_clim", None), None),
+        "pressure_gradient_show_scalar_bar": bool(pressure_gradient_render_cfg.get("show_scalar_bar", video_exporting_cfg.get("pressure_gradient_show_scalar_bar", True))),
+        "pressure_gradient_bar_cfg": _resolve_bar_cfg(pressure_gradient_render_cfg.get("bar_cfg", None), video_exporting_cfg.get("pressure_gradient_bar_cfg", None), DEFAULT_PRESSURE_GRADIENT_BAR_CFG),
+        "relative_pressure_clim": _resolve_clim(pressure_gradient_render_cfg.get("relative_pressure_clim", None), video_exporting_cfg.get("relative_pressure_clim", None), None),
+        "relative_pressure_show_scalar_bar": bool(pressure_gradient_render_cfg.get("relative_pressure_show_scalar_bar", video_exporting_cfg.get("show_relative_pressure_scalar_bar", video_exporting_cfg.get("pressure_gradient_show_scalar_bar", True)))),
+        "relative_pressure_bar_cfg": _resolve_bar_cfg(pressure_gradient_render_cfg.get("relative_pressure_bar_cfg", None), video_exporting_cfg.get("relative_pressure_bar_cfg", None), DEFAULT_RELATIVE_PRESSURE_BAR_CFG),
+        "streamline_clim": _resolve_clim(streamline_render_cfg.get("clim", None), video_exporting_cfg.get("streamline_clim", None), (0.0, 1.0)),
+        "streamline_show_scalar_bar": bool(streamline_render_cfg.get("show_scalar_bar", video_exporting_cfg.get("streamline_show_scalar_bar", True))),
+        "streamline_bar_cfg": _resolve_bar_cfg(streamline_render_cfg.get("bar_cfg", None), video_exporting_cfg.get("streamline_bar_cfg", None), DEFAULT_STREAMLINE_BAR_CFG),
     }
 
 
@@ -576,7 +683,8 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
     plane_cfg = config_bundle.get("planes", {})
     skeleton_cfg = config_bundle.get("skeleton", {})
     streamline_cfg = config_bundle.get("streamlines", {})
-    render_settings = resolve_render_settings(config_bundle)
+    render_settings = copy.deepcopy(resolve_render_settings(config_bundle))
+    render_settings.pop("plane_render_cfg", None)
     derived_cfg = _build_derived_metrics_config(config_bundle)
     return {
         "output_dir": str(batch_cfg.get("output_dir", "./results")),
@@ -592,13 +700,20 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
         "background_phase_threshold": float(bpc_cfg.get("threshold", 0.1)),
         "dual_venc_ratio1": float(bpc_cfg.get("dual_venc_ratio1", 0.0)),
         "dual_venc_ratio2": float(bpc_cfg.get("dual_venc_ratio2", 0.0)),
+        "force_recompute_corr": bool(bpc_cfg.get("force_recompute", False)),
         "dicom_read_workers": int(loader_cfg.get("dicom_read_workers", 1)),
-        "use_center_plane": bool(plane_cfg.get("use_center_plane", True)),
+        "plane_mode": str(plane_cfg.get("plane_mode", "count") or "count"),
+        "plane_count": int(plane_cfg.get("plane_count", 1) or 1),
         "cross_section_dist": float(plane_cfg.get("cross_section_distance", 5.0)),
         "start_dist": float(plane_cfg.get("start_distance", 5.0)),
         "end_dist": float(plane_cfg.get("end_distance", 0.0)),
+        "plane_anchor": str(plane_cfg.get("anchor", "end") or "end"),
+        "plane_offset_mm": float(plane_cfg.get("anchor_offset_mm", 5.0)),
+        "use_center_plane": bool(plane_cfg.get("use_center_plane", True)),
         "remove_small_cc": bool(skeleton_cfg.get("remove_small_cc", True)),
         "min_cc_volume": float(skeleton_cfg.get("min_cc_volume_mm3", 50.0)),
+        "cc_filter_mode": str(skeleton_cfg.get("cc_filter_mode", "hybrid") or "hybrid"),
+        "cc_rel_min_ratio": float(skeleton_cfg.get("cc_rel_min_ratio", 0.01)),
         "seed_ratio": float(streamline_cfg.get("seed_ratio", 0.02)),
         "max_steps": int(streamline_cfg.get("max_steps", 2000)),
         "min_seeds": int(streamline_cfg.get("min_seeds", 50)),
@@ -607,5 +722,6 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
         "tube_radius": float(streamline_cfg.get("tube_radius", 0.05)),
         "pathline_color": str(streamline_cfg.get("pathline_color", streamline_cfg.get("plane_pathline_color", "deepskyblue")) or "deepskyblue"),
         "pressure_method": str(derived_cfg.get("pressure_method", "least_squares") or "least_squares"),
+        "force_recompute_seg": bool(config_bundle.get("segmentation", {}).get("force_recompute_auto_cache", False)),
         **copy.deepcopy(render_settings),
     }

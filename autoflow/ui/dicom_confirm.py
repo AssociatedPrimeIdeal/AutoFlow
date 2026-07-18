@@ -1,6 +1,82 @@
 from PyQt5 import QtCore, QtWidgets
 
 
+class H5CaseSelectDialog(QtWidgets.QDialog):
+    def __init__(self, cases, parent=None):
+        super().__init__(parent)
+        self._cases = list(cases or [])
+        self._selected_case = None
+        self.setWindowTitle("Select H5 Case")
+        self.resize(860, 360)
+        self._build_ui()
+        self._populate_cases()
+
+    def _build_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+
+        intro = QtWidgets.QLabel(
+            "Select the H5 data-group path to load when one file contains multiple supported cases."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        layout.addWidget(splitter, 1)
+
+        case_group = QtWidgets.QGroupBox("Cases")
+        case_layout = QtWidgets.QVBoxLayout(case_group)
+        self.list_cases = QtWidgets.QListWidget()
+        self.list_cases.currentRowChanged.connect(self._on_case_changed)
+        case_layout.addWidget(self.list_cases)
+        splitter.addWidget(case_group)
+
+        info_group = QtWidgets.QGroupBox("Selected Case")
+        form = QtWidgets.QFormLayout(info_group)
+        self.label_case_info = QtWidgets.QLabel("-")
+        self.label_case_info.setWordWrap(True)
+        self.label_case_group = QtWidgets.QLabel("-")
+        self.label_case_output = QtWidgets.QLabel("-")
+        form.addRow("Case", self.label_case_info)
+        form.addRow("Data Group", self.label_case_group)
+        form.addRow("Output Name", self.label_case_output)
+        splitter.addWidget(info_group)
+        splitter.setSizes([380, 480])
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _populate_cases(self):
+        self.list_cases.clear()
+        for case in self._cases:
+            self.list_cases.addItem(case.display_name or case.output_name or case.input_path)
+        if self._cases:
+            self.list_cases.setCurrentRow(0)
+
+    def _on_case_changed(self, row):
+        if row < 0 or row >= len(self._cases):
+            self._selected_case = None
+            self.label_case_info.setText("-")
+            self.label_case_group.setText("-")
+            self.label_case_output.setText("-")
+            return
+        case = self._cases[row]
+        self._selected_case = case
+        self.label_case_info.setText(case.display_name or case.input_path)
+        self.label_case_group.setText(str(case.source_group or "<root>"))
+        self.label_case_output.setText(case.output_name or case.input_path)
+
+    def selected_case(self):
+        return self._selected_case
+
+    def accept(self):
+        if self._selected_case is None:
+            QtWidgets.QMessageBox.warning(self, "No Case Selected", "Select an H5 case before continuing.")
+            return
+        super().accept()
+
+
 class DicomImportDialog(QtWidgets.QDialog):
     def __init__(self, cases, preview_loader, parent=None):
         super().__init__(parent)

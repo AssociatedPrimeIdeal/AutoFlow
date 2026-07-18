@@ -12,7 +12,7 @@
 ## What It Does
 This feature computes wall shear stress, pressure-gradient fields, reconstructed relative-pressure maps, centerline pressure-drop profiles, and optional TKE outputs from the loaded velocity data and segmentation.
 
-Rendering controls are now split by metric: `configs/wss.json -> render`, `configs/tke.json -> render`, and `configs/pressure_gradient.json -> render`. These values load as GUI defaults, and the GUI can override `clim` plus colorbar layout at runtime for the live scene and later offline video export in the same session.
+Rendering controls are now split by metric: `configs/wss.json -> render`, `configs/tke.json -> render`, and `configs/pressure_gradient.json -> render`. These values load as GUI defaults, and the GUI can override `clim` plus colorbar layout at runtime for the live scene and later offline video export in the same session. In the live GUI scene, WSS, TKE, pressure-gradient, and relative-pressure layers share one colorbar slot; `configs/colorbar.json` owns the shared GUI colorbar geometry and font defaults, while metric `bar_cfg` values can still override a specific layer when needed.
 
 For pressure-gradient and relative-pressure 3D views, the GUI and exported videos now color a smoothed pressure-support surface derived from `pressure_gradient_support_mask`. This keeps the 3D pressure view aligned with the valid pressure solve region.
 

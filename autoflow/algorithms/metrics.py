@@ -190,6 +190,9 @@ def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes
         ))
 
     results, qc = apply_internal_consistency_to_metrics(results, path_info=path_info, forks=forks)
+    for plane_index, metric in enumerate(results):
+        if isinstance(metric, dict):
+            metric["plane_index"] = int(plane_index)
     if return_qc:
         return results, qc
     return results
@@ -1560,6 +1563,9 @@ def compute_plane_metrics_multithread(flow_xyzt3, segmask_binary_4d, spacing, or
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         results = list(pool.map(_compute_single_plane_metric, args_list))
     results, qc = apply_internal_consistency_to_metrics(results, path_info=path_info, forks=forks)
+    for plane_index, metric in enumerate(results):
+        if isinstance(metric, dict):
+            metric["plane_index"] = int(plane_index)
     if return_qc:
         return results, qc
     return results
@@ -1588,7 +1594,7 @@ def load_metrics_as_table(metrics_json_path, qc_json_path=None):
     ]
     table_rows = []
     for i, m in enumerate(metrics):
-        row = {"plane_index": i}
+        row = {"plane_index": int(m.get("plane_index", i))}
         for k in scalar_keys:
             if k in m:
                 row[k] = m[k]

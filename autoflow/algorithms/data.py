@@ -5,7 +5,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import h5py
 import numpy as np
 
-from ..case_types import BackgroundPhaseCorrectionConfig, LoadedCase, LoaderCapabilities
+from ..case_types import BackgroundPhaseCorrectionConfig, InputCase, LoadedCase, LoaderCapabilities
 from .phase_correction import (
     apply_background_phase_correction_to_complex,
     apply_background_phase_correction_to_mag_flow,
@@ -53,7 +53,7 @@ def _flip_axes(arr, axes_to_flip):
 
 
 def reorient(mag, flow, segmask, venc, resolution, spatial_order, venc_order,
-             target_spatial_order, target_venc_order, return_velocity=False):
+             target_spatial_order, target_venc_order, return_velocity=False, normalize_mag=True):
     spatial_order = [s.upper() for s in spatial_order]
     venc_order = [v.upper() for v in venc_order]
     target_spatial_order = [s.upper() for s in target_spatial_order]
@@ -88,16 +88,50 @@ def reorient(mag, flow, segmask, venc, resolution, spatial_order, venc_order,
 
     sign3 = np.array([(-1.0 if _need_flip(venc_order[comp_perm[i]], target_venc_order[i]) else 1.0)
                       for i in range(3)], dtype=np.float32)
-    flow_r = flow_r * sign3.reshape((1, 1, 1, 1, -1))
+    sign_shape = (1,) * (flow_r.ndim - 1) + (int(sign3.shape[0]),)
+    flow_r = flow_r * sign3.reshape(sign_shape)
 
     if return_velocity:
-        flow_r = (flow_r / np.pi) * venc_r.reshape((1, 1, 1, 1, -1))
+        venc_shape = (1,) * (flow_r.ndim - 1) + (int(venc_r.shape[0]),)
+        flow_r = (flow_r / np.pi) * venc_r.reshape(venc_shape)
 
-    mag_max = np.max(np.abs(mag_r))
-    if mag_max > 0:
-        mag_r = mag_r / mag_max
+    if normalize_mag:
+        mag_max = np.max(np.abs(mag_r))
+        if mag_max > 0:
+            mag_r = mag_r / mag_max
 
     return flow_r, mag_r, seg_r, venc_r, resolution_r
+
+
+def _flow_looks_like_phase_radians(flow, venc):
+    flow = np.asarray(flow, dtype=np.float32)
+    if flow.size == 0:
+        return False
+    finite = np.isfinite(flow)
+    if not np.any(finite):
+        return False
+
+    venc = np.asarray(venc, dtype=np.float32)
+    if venc.ndim == 0:
+        venc = np.full(3, float(venc), dtype=np.float32)
+    venc_abs = np.abs(venc[np.isfinite(venc)])
+    if venc_abs.size == 0:
+        return False
+    if float(np.max(venc_abs)) <= float(np.pi) * 1.25:
+        return False
+
+    peak_abs = float(np.max(np.abs(flow[finite])))
+    return float(np.pi) * 0.75 <= peak_abs <= float(np.pi) * 1.25
+
+
+def _normalize_real_img_layout(img):
+    img = np.asarray(img)
+    if img.ndim in (4, 5) and int(img.shape[-1]) == 4:
+        return np.ascontiguousarray(img), False
+    if img.ndim in (4, 5) and int(img.shape[0]) == 4:
+        axes = tuple(range(img.ndim - 1, 0, -1)) + (0,)
+        return np.ascontiguousarray(np.transpose(img, axes)), True
+    raise ValueError(f"real-valued img layout must be XYZT4, XYZ4, 4TZYX, or 4ZYX, got {img.shape}")
 
 
 def _ensure_flow_mag_time_and_segmask(flow, mag, segmask):
@@ -329,6 +363,54 @@ def _reorient_component_abs(arr, spatial_order, target_spatial_order, venc_order
     return arr_r[..., comp_perm]
 
 
+def _reorient_real_valued_fields(
+    *,
+    mag,
+    flow,
+    segmask,
+    sigma,
+    tke_array,
+    venc,
+    resolution,
+    spatial_order,
+    venc_order,
+    target_spatial_order,
+    target_venc_order,
+    return_velocity=False,
+):
+    segmask_for_reorient = segmask if segmask is not None else np.zeros(np.asarray(mag).shape, dtype=np.int16)
+    flow_r, mag_r, seg_r, venc_r, resolution_r = reorient(
+        mag,
+        flow,
+        segmask_for_reorient,
+        venc=venc,
+        resolution=resolution,
+        spatial_order=spatial_order,
+        venc_order=venc_order,
+        target_spatial_order=target_spatial_order,
+        target_venc_order=target_venc_order,
+        return_velocity=return_velocity,
+        normalize_mag=False,
+    )
+    sigma_r = None
+    if sigma is not None:
+        sigma_r = _reorient_component_abs(
+            sigma,
+            spatial_order=spatial_order,
+            target_spatial_order=target_spatial_order,
+            venc_order=venc_order,
+            target_venc_order=target_venc_order,
+        ).astype(np.float32)
+    tke_r = None
+    if tke_array is not None:
+        tke_r = _reorient_spatial_only(
+            tke_array,
+            spatial_order=spatial_order,
+            target_spatial_order=target_spatial_order,
+        ).astype(np.float32)
+    return flow_r, mag_r, (seg_r if segmask is not None else None), venc_r, resolution_r, sigma_r, tke_r
+
+
 def _progress_prefix(progress_callback, prefix):
     if progress_callback is None:
         return None
@@ -347,12 +429,396 @@ def _loader_correction_config(correction_config):
         return coerce_background_phase_correction_config({"enabled": False})
     return coerce_background_phase_correction_config(correction_config)
 
+def _background_phase_corr_attr_scalar(attrs, name, default=None):
+    if attrs is None:
+        return default
+    value = None
+    try:
+        value = attrs.get(name)
+    except Exception:
+        value = None
+    if value is None:
+        return default
+    arr = np.asarray(value).reshape(-1)
+    if arr.size == 0:
+        return default
+    item = arr[0]
+    if isinstance(item, (bytes, np.bytes_)):
+        return item.decode("utf-8", errors="ignore")
+    if isinstance(default, (bool, np.bool_)):
+        return bool(item)
+    if isinstance(default, (int, np.integer)) and not isinstance(default, bool):
+        return int(item)
+    if isinstance(default, (float, np.floating)):
+        return float(item)
+    return item
+
+
+def _read_background_phase_corr_cache(scope, cache_name, expected_shape, cfg, expected_source_group=None, allow_untagged_root=True):
+    report = {
+        "cache_hit": False,
+        "cache_name": str(cache_name),
+        "cache_reason": "missing",
+    }
+    ds = _find_h5_dataset(scope, cache_name)
+    if ds is None:
+        return None, report
+
+    corr = np.asarray(ds[:], dtype=np.float32)
+    if corr.ndim == len(expected_shape) - 1 and corr.shape[-1] == 3 and len(expected_shape) == corr.ndim + 1:
+        corr = corr[..., np.newaxis, :]
+    corr_shape = tuple(corr.shape)
+    expected_shape = tuple(expected_shape)
+    singleton_time_match = (
+        len(corr_shape) == 5
+        and len(expected_shape) == 5
+        and corr_shape[:3] == expected_shape[:3]
+        and corr_shape[3] == 1
+        and corr_shape[4] == expected_shape[4]
+    )
+    if corr_shape != expected_shape and not singleton_time_match:
+        report["cache_reason"] = f"shape_mismatch:{tuple(corr.shape)}"
+        return None, report
+
+    stored_group = _background_phase_corr_attr_scalar(ds.attrs, "corr_source_group", None)
+    if expected_source_group is not None and stored_group is not None:
+        if str(stored_group).strip("/") != str(expected_source_group).strip("/"):
+            report["cache_reason"] = f"group_mismatch:{stored_group}"
+            return None, report
+    if expected_source_group is not None and stored_group is None:
+        scope_group = _h5_group_source_name(scope)
+        if scope_group is None and not allow_untagged_root:
+            report["cache_reason"] = "missing_group_tag"
+            return None, report
+
+    algorithm = _background_phase_corr_attr_scalar(ds.attrs, "corr_algorithm", "")
+    if algorithm not in ("", None) and str(algorithm).lower() != "msac":
+        report["cache_reason"] = f"algorithm_mismatch:{algorithm}"
+        return None, report
+
+    version = _background_phase_corr_attr_scalar(ds.attrs, "corr_version", 1)
+    if version is not None and int(version) != 1:
+        report["cache_reason"] = f"version_mismatch:{version}"
+        return None, report
+
+    fit_order = _background_phase_corr_attr_scalar(ds.attrs, "corr_fit_order", None)
+    if fit_order is not None and int(fit_order) != int(cfg.corr_fit_order):
+        report["cache_reason"] = f"fit_order_mismatch:{fit_order}"
+        return None, report
+
+    threshold = _background_phase_corr_attr_scalar(ds.attrs, "corr_threshold", None)
+    if threshold is not None and not np.isclose(float(threshold), float(cfg.threshold)):
+        report["cache_reason"] = f"threshold_mismatch:{float(threshold)}"
+        return None, report
+
+    report.update({
+        "cache_hit": True,
+        "cache_reason": "hit",
+        "corr_algorithm": str(algorithm or "msac"),
+        "corr_version": int(version) if version is not None else 1,
+        "corr_fit_order": int(fit_order) if fit_order is not None else int(cfg.corr_fit_order),
+        "corr_threshold": float(threshold) if threshold is not None else float(cfg.threshold),
+        "corr_components": int(corr.shape[-1]),
+    })
+    if stored_group is not None:
+        report["corr_source_group"] = str(stored_group)
+    source_mode = _background_phase_corr_attr_scalar(ds.attrs, "corr_source_mode", None)
+    if source_mode is not None:
+        report["corr_source_mode"] = str(source_mode)
+    stationary_voxels = _background_phase_corr_attr_scalar(ds.attrs, "corr_stationary_voxels", None)
+    if stationary_voxels is not None:
+        report["stationary_voxels"] = int(stationary_voxels)
+    return corr, report
+
+
+def _read_background_phase_corr_cache_from_scopes(scopes, cache_name, expected_shape, cfg, expected_source_group=None, allow_untagged_root=True):
+    if bool(getattr(cfg, "force_recompute", False)):
+        return None, {"cache_hit": False, "cache_reason": "force_recompute", "cache_name": str(cache_name)}
+    last_report = None
+    for scope in scopes:
+        corr, report = _read_background_phase_corr_cache(
+            scope,
+            cache_name,
+            expected_shape,
+            cfg,
+            expected_source_group=expected_source_group,
+            allow_untagged_root=allow_untagged_root,
+        )
+        if (
+            last_report is not None
+            and report.get("cache_reason") == "missing"
+            and last_report.get("cache_reason") not in (None, "missing")
+        ):
+            report = dict(report)
+            report["cache_reason"] = last_report.get("cache_reason")
+        last_report = report
+        if bool(report.get("cache_hit", False)):
+            return corr, report
+    return None, last_report or {"cache_hit": False, "cache_reason": "missing", "cache_name": str(cache_name)}
+
+
+def _write_background_phase_corr_cache(scope, cache_name, report, expected_source_group=None):
+    corr = report.get("corr") if isinstance(report, dict) else None
+    if corr is None:
+        return False
+    corr_arr = np.asarray(corr, dtype=np.float32)
+    if corr_arr.ndim == 4 and corr_arr.shape[-1] == 3:
+        corr_arr = corr_arr[..., np.newaxis, :]
+    if corr_arr.ndim != 5 or corr_arr.shape[-1] != 3:
+        return False
+    try:
+        existing_name = _h5_member_name_map(scope).get(_canonical_h5_key(cache_name))
+        if existing_name is not None:
+            del scope[existing_name]
+        ds = scope.create_dataset(str(cache_name), data=corr_arr, compression="gzip")
+        ds.attrs["corr_algorithm"] = str(report.get("corr_algorithm", "msac"))
+        ds.attrs["corr_version"] = int(report.get("corr_version", 1))
+        ds.attrs["corr_fit_order"] = int(report.get("corr_fit_order", 3))
+        ds.attrs["corr_threshold"] = float(report.get("threshold", 0.1))
+        ds.attrs["corr_components"] = int(report.get("corr_components", corr_arr.shape[-1]))
+        ds.attrs["corr_source_mode"] = str(report.get("source_mode", ""))
+        ds.attrs["corr_cache_hit"] = int(bool(report.get("cache_hit", False)))
+        if expected_source_group is None:
+            expected_source_group = _h5_group_source_name(scope)
+        if expected_source_group is not None:
+            ds.attrs["corr_source_group"] = str(expected_source_group)
+        if report.get("stationary_voxels") is not None:
+            ds.attrs["corr_stationary_voxels"] = int(report.get("stationary_voxels"))
+    except Exception:
+        return False
+    return True
+
+
+def _canonical_h5_key(name):
+    return re.sub(r"[^a-z0-9]+", "", str(name or "").strip().lower())
+
+
+def _h5_member_name_map(group):
+    mapping = {}
+    for name in group.keys():
+        mapping.setdefault(_canonical_h5_key(name), str(name))
+    return mapping
+
+
+def _h5_attr_name_map(group):
+    mapping = {}
+    for name in group.attrs.keys():
+        mapping.setdefault(_canonical_h5_key(name), str(name))
+    return mapping
+
+
+def _find_h5_dataset(group, *aliases):
+    name_map = _h5_member_name_map(group)
+    for alias in aliases:
+        actual = name_map.get(_canonical_h5_key(alias))
+        if actual is None:
+            continue
+        obj = group[actual]
+        if isinstance(obj, h5py.Dataset):
+            return obj
+    return None
+
+
+def _find_h5_dataset_from_scopes(scopes, *aliases):
+    for group in scopes:
+        ds = _find_h5_dataset(group, *aliases)
+        if ds is not None:
+            return ds
+    return None
+
+
+def _find_h5_attr(group, *aliases):
+    name_map = _h5_attr_name_map(group)
+    for alias in aliases:
+        actual = name_map.get(_canonical_h5_key(alias))
+        if actual is not None:
+            return group.attrs[actual]
+    return None
+
+
+def _read_h5_value(group, *aliases, default=None):
+    ds = _find_h5_dataset(group, *aliases)
+    if ds is not None:
+        return ds[()]
+    attr = _find_h5_attr(group, *aliases)
+    if attr is not None:
+        return attr
+    return default
+
+
+def _read_h5_value_from_scopes(scopes, *aliases, default=None):
+    for group in scopes:
+        value = _read_h5_value(group, *aliases, default=None)
+        if value is not None:
+            return value
+    return default
+
+
+def _decode_h5_string(value):
+    if isinstance(value, (bytes, np.bytes_)):
+        return value.decode("utf-8", errors="ignore")
+    return str(value)
+
+
+def _coerce_h5_text_array(value, default):
+    if value is None:
+        return np.asarray(default, dtype=str)
+    arr = np.asarray(value)
+    if arr.ndim == 0:
+        arr = np.asarray([arr.item()])
+    tokens = []
+    for item in arr.reshape(-1).tolist():
+        decoded = _decode_h5_string(item).strip()
+        if not decoded:
+            continue
+        parts = [part.strip() for part in re.split(r"[\s,;]+", decoded) if str(part).strip()]
+        tokens.extend(parts or [decoded])
+    return np.asarray(tokens or list(default), dtype=str)
+
+
+def _coerce_h5_scalar_float(value, default):
+    if value is None:
+        return float(default)
+    arr = np.asarray(value, dtype=float).reshape(-1)
+    if arr.size == 0:
+        return float(default)
+    return float(arr[0])
+
+
+def _coerce_h5_numeric_array(value, default):
+    if value is None:
+        return np.asarray(default, dtype=float).reshape(-1)
+    arr = np.asarray(value, dtype=float).reshape(-1)
+    if arr.size == 0:
+        return np.asarray(default, dtype=float).reshape(-1)
+    return arr.astype(float, copy=False)
+
+
+def _coerce_h5_triplet(value, default, name, repeat_scalar=False):
+    arr = _coerce_h5_numeric_array(value, default)
+    if arr.size == 1 and repeat_scalar:
+        return np.full(3, float(arr[0]), dtype=float)
+    if arr.size != 3:
+        raise ValueError(f"{name} must contain 3 values, got shape {arr.shape}")
+    return np.asarray(arr, dtype=float)
+
+
+def _h5_group_source_name(group):
+    name = str(getattr(group, "name", "") or "").strip("/")
+    return name or None
+
+
+def _is_h5_data_group_candidate(group):
+    if _find_h5_dataset(group, "img_complex") is not None:
+        return True
+    if _find_h5_dataset(group, "mag") is not None and _find_h5_dataset(group, "flow") is not None:
+        return True
+    img_ds = _find_h5_dataset(group, "img")
+    if img_ds is None:
+        return False
+    if np.issubdtype(img_ds.dtype, np.complexfloating):
+        return img_ds.ndim >= 4 and int(img_ds.shape[-1]) >= 4
+    return img_ds.ndim in (4, 5) and int(img_ds.shape[-1]) == 4
+
+
+def _h5_group_depth(name):
+    token = str(name or "").strip("/")
+    if not token:
+        return 0
+    return len(token.split("/"))
+
+
+def _discover_h5_data_group_names(handle):
+    candidate_names = []
+
+    if _is_h5_data_group_candidate(handle):
+        candidate_names.append("")
+
+    def _visit(name, obj):
+        if isinstance(obj, h5py.Group) and _is_h5_data_group_candidate(obj):
+            candidate_names.append(str(name))
+
+    handle.visititems(_visit)
+    return sorted(set(candidate_names), key=lambda item: (_h5_group_depth(item), item))
+
+
+def discover_h5_input_cases(path):
+    path = os.path.abspath(str(path))
+    stem = os.path.splitext(os.path.basename(path))[0]
+    with h5py.File(path, "r") as handle:
+        candidate_names = _discover_h5_data_group_names(handle)
+    if not candidate_names or candidate_names == [""]:
+        return [
+            InputCase(
+                input_path=path,
+                input_kind="h5",
+                display_name=stem,
+                output_name=stem,
+                source_group=None,
+                metadata={},
+            )
+        ]
+
+    cases = []
+    for group_name in candidate_names:
+        group_token = str(group_name or "").strip("/")
+        short_name = group_token.rsplit("/", 1)[-1] if group_token else stem
+        safe_group = re.sub(r"[^A-Za-z0-9._-]+", "_", group_token).strip("._-") or "group"
+        cases.append(
+            InputCase(
+                input_path=path,
+                input_kind="h5",
+                display_name=f"{stem} | {group_token}",
+                output_name=f"{stem}__{safe_group}",
+                source_group=group_token or None,
+                metadata={
+                    "source_group": group_token or None,
+                    "source_group_name": short_name,
+                },
+            )
+        )
+    return cases
+
+
+def _resolve_h5_data_group(handle, source_group=None):
+    requested_group = str(source_group or "").strip("/")
+    if requested_group:
+        if requested_group not in handle:
+            raise ValueError(f"h5 data group not found: {requested_group}")
+        selected = handle[requested_group]
+        if not isinstance(selected, h5py.Group):
+            raise ValueError(f"h5 data group is not a group: {requested_group}")
+        if not _is_h5_data_group_candidate(selected):
+            raise ValueError(f"h5 group does not contain a supported case layout: {requested_group}")
+        return selected, requested_group
+
+    candidate_names = _discover_h5_data_group_names(handle)
+    if not candidate_names:
+        return handle, None
+    if candidate_names == [""]:
+        return handle, None
+
+    shallowest_depth = _h5_group_depth(candidate_names[0])
+    shallowest = [name for name in candidate_names if _h5_group_depth(name) == shallowest_depth]
+    if len(shallowest) > 1:
+        raise ValueError(
+            "ambiguous h5 layout: multiple candidate data groups found: "
+            + ", ".join(name for name in shallowest if name)
+        )
+
+    selected = shallowest[0]
+    if not selected:
+        return handle, None
+    return handle[selected], selected
+
 
 def _coerce_venc_array(group):
-    if "VENC" in group:
-        return np.asarray(group["VENC"][:], dtype=float)
-    if "venc" in group:
-        return np.asarray(group["venc"][:], dtype=float)
+    venc_value = _read_h5_value(group, "VENC", "venc", default=None)
+    if venc_value is not None:
+        arr = _coerce_h5_numeric_array(venc_value, np.array([150.0, 150.0, 150.0], dtype=float))
+        if arr.size == 1:
+            return np.full(3, float(arr[0]), dtype=float)
+        return np.asarray(arr, dtype=float)
     return np.array([150.0, 150.0, 150.0], dtype=float)
 
 
@@ -360,7 +826,22 @@ def _split_dual_venc_triplets(venc):
     venc = np.asarray(venc, dtype=np.float32).reshape(-1)
     if venc.size != 6:
         raise ValueError(f"dual-venc Nv=7 expects 6 venc entries, got {venc.shape}")
-    return np.asarray(venc[:3], dtype=np.float32), np.asarray(venc[3:6], dtype=np.float32)
+    if not np.all(np.isfinite(venc)) or np.any(venc <= 0.0):
+        raise ValueError(f"dual-venc Nv=7 expects positive finite venc entries, got {venc.tolist()}")
+
+    first = np.asarray(venc[:3], dtype=np.float32)
+    second = np.asarray(venc[3:6], dtype=np.float32)
+    equal = np.isclose(first, second, rtol=1e-5, atol=1e-6)
+    first_is_low = bool(np.all((first < second) | equal) and np.any(first < second))
+    second_is_low = bool(np.all((second < first) | equal) and np.any(second < first))
+    if first_is_low:
+        return first, second, 0, 1
+    if second_is_low:
+        return second, first, 1, 0
+    raise ValueError(
+        "dual-venc Nv=7 cannot determine low/high groups from VENC triplets: "
+        f"first={first.tolist()}, second={second.tolist()}"
+    )
 
 
 def _dual_venc_triplet_ratio(lv, hv):
@@ -412,27 +893,64 @@ def _load_legacy_dual_venc_h5(
     venc_order,
     cfg,
     progress_callback=None,
+    h5_group=None,
+    h5_scopes=None,
+    source_group=None,
+    allow_untagged_root=True,
 ):
     if img_complex.ndim != 5 or img_complex.shape[-1] != 7:
         raise ValueError(f"legacy dual-venc H5 expects XYZT7 complex data, got {img_complex.shape}")
 
     mag = np.abs(img_complex[..., 0]).astype(np.float32)
-    lv_venc, hv_venc = _split_dual_venc_triplets(venc)
-    lv_complex = np.concatenate([img_complex[..., :1], img_complex[..., 1:4]], axis=-1)
-    hv_complex = np.concatenate([img_complex[..., :1], img_complex[..., 4:7]], axis=-1)
+    lv_venc, hv_venc, lv_group_index, hv_group_index = _split_dual_venc_triplets(venc)
+    encoded_groups = (img_complex[..., 1:4], img_complex[..., 4:7])
+    lv_complex = np.concatenate([img_complex[..., :1], encoded_groups[lv_group_index]], axis=-1)
+    hv_complex = np.concatenate([img_complex[..., :1], encoded_groups[hv_group_index]], axis=-1)
+    cache_scopes = list(h5_scopes or ([h5_group] if h5_group is not None else []))
+    lv_cached_corr, lv_cache_report = _read_background_phase_corr_cache_from_scopes(
+        cache_scopes,
+        "corr_low",
+        tuple(lv_complex.shape[:-1]) + (3,),
+        cfg,
+        expected_source_group=source_group,
+        allow_untagged_root=allow_untagged_root,
+    )
+    hv_cached_corr, hv_cache_report = _read_background_phase_corr_cache_from_scopes(
+        cache_scopes,
+        "corr_high",
+        tuple(hv_complex.shape[:-1]) + (3,),
+        cfg,
+        expected_source_group=source_group,
+        allow_untagged_root=allow_untagged_root,
+    )
 
     lv_corr, _lv_stationary, lv_report = apply_background_phase_correction_to_complex(
         lv_complex,
         config=cfg,
         progress_callback=_progress_prefix(progress_callback, "h5_dual_lv_"),
         source_mode="legacy_dual_venc_h5_low",
+        cached_corr=lv_cached_corr,
     )
+    lv_report["cache_name"] = "corr_low"
+    lv_report.setdefault("cache_reason", lv_cache_report.get("cache_reason", "missing"))
+    if "stationary_voxels" in lv_cache_report and bool(lv_report.get("cache_hit", False)):
+        lv_report["stationary_voxels"] = int(lv_cache_report["stationary_voxels"])
+    if bool(lv_report.get("applied", False)) and not bool(lv_report.get("cache_hit", False)) and h5_group is not None:
+        lv_report["cache_written"] = bool(_write_background_phase_corr_cache(h5_group, "corr_low", lv_report, expected_source_group=source_group))
+
     hv_corr, _hv_stationary, hv_report = apply_background_phase_correction_to_complex(
         hv_complex,
         config=cfg,
         progress_callback=_progress_prefix(progress_callback, "h5_dual_hv_"),
         source_mode="legacy_dual_venc_h5_high",
+        cached_corr=hv_cached_corr,
     )
+    hv_report["cache_name"] = "corr_high"
+    hv_report.setdefault("cache_reason", hv_cache_report.get("cache_reason", "missing"))
+    if "stationary_voxels" in hv_cache_report and bool(hv_report.get("cache_hit", False)):
+        hv_report["stationary_voxels"] = int(hv_cache_report["stationary_voxels"])
+    if bool(hv_report.get("applied", False)) and not bool(hv_report.get("cache_hit", False)) and h5_group is not None:
+        hv_report["cache_written"] = bool(_write_background_phase_corr_cache(h5_group, "corr_high", hv_report, expected_source_group=source_group))
     lv_use = lv_corr if bool(lv_report.get("applied", False)) else lv_complex
     hv_use = hv_corr if bool(hv_report.get("applied", False)) else hv_complex
 
@@ -488,9 +1006,13 @@ def _load_legacy_dual_venc_h5(
             "dual_venc_low": background_phase_report_for_metadata(lv_report),
             "dual_venc_high": background_phase_report_for_metadata(hv_report),
         },
+        "spatial_order_raw": [str(x) for x in spatial_order[:3]],
+        "venc_order_raw": [str(x) for x in venc_order[:3]],
         "dual_venc": {
             "enabled": True,
             "input_channels": int(img_complex.shape[-1]),
+            "lv_channel_indices": list(range(1 + 3 * lv_group_index, 4 + 3 * lv_group_index)),
+            "hv_channel_indices": list(range(1 + 3 * hv_group_index, 4 + 3 * hv_group_index)),
             "lv_venc": lv_triplet.astype(float).tolist(),
             "hv_venc": hv_triplet.astype(float).tolist(),
             "ratio1": ratio1.astype(float).tolist(),
@@ -521,31 +1043,71 @@ def _load_legacy_dual_venc_h5(
     )
 
 
-def load_h5_data(path, correction_config=None, progress_callback=None):
+def load_h5_data(path, correction_config=None, progress_callback=None, source_group=None, force_recompute_seg=False):
     target_spatial_order = ("LR", "AP", "FH")
     target_venc_order = ("LR", "AP", "FH")
     cfg = _loader_correction_config(correction_config)
-    with h5py.File(path, "r") as g:
-        VENC = _coerce_venc_array(g)
-        resolution = g["Resolution"][:] if "Resolution" in g else np.array([1, 1, 1], dtype=float)
-        origin = g["Origin"][:] if "Origin" in g else np.array([0.0, 0.0, 0.0], dtype=float)
-        rr = float(g["RR"][()]) if "RR" in g else 1000.0
-        spatial_order = g["SpatialOrder"][:].astype(str) if "SpatialOrder" in g else np.array(["FH", "AP", "LR"])
-        venc_order = g["VENCOrder"][:].astype(str) if "VENCOrder" in g else np.array(["FH", "AP", "LR"])
-        seg_name = "segmask" if "segmask" in g else "segmentation" if "segmentation" in g else None
+    h5_mode = "r+" if bool(cfg.enabled) else "r"
+    try:
+        handle_ctx = h5py.File(path, h5_mode)
+    except OSError:
+        handle_ctx = h5py.File(path, "r")
+    with handle_ctx as handle:
+        candidate_names = _discover_h5_data_group_names(handle)
+        group, group_name = _resolve_h5_data_group(handle, source_group=source_group)
+        allow_untagged_root = bool(group is handle or len(candidate_names) <= 1)
+        scopes = [group] if group is handle else [group, handle]
+        VENC = _coerce_venc_array(group)
+        if VENC.shape == (3,) and group is not handle:
+            root_venc = _coerce_venc_array(handle)
+            if np.allclose(VENC, np.array([150.0, 150.0, 150.0], dtype=float)) and not np.allclose(root_venc, VENC):
+                VENC = root_venc
+        resolution = _coerce_h5_triplet(
+            _read_h5_value_from_scopes(scopes, "Resolution", default=np.array([1, 1, 1], dtype=float)),
+            default=np.array([1.0, 1.0, 1.0], dtype=float),
+            name="Resolution",
+            repeat_scalar=True,
+        )
+        origin = _coerce_h5_triplet(
+            _read_h5_value_from_scopes(scopes, "Origin", default=np.array([0.0, 0.0, 0.0], dtype=float)),
+            default=np.array([0.0, 0.0, 0.0], dtype=float),
+            name="Origin",
+            repeat_scalar=False,
+        )
+        rr = _coerce_h5_scalar_float(_read_h5_value_from_scopes(scopes, "RR", default=1000.0), 1000.0)
+        spatial_order = _coerce_h5_text_array(
+            _read_h5_value_from_scopes(scopes, "SpatialOrder", default=None),
+            default=("FH", "AP", "LR"),
+        )
+        venc_order = _coerce_h5_text_array(
+            _read_h5_value_from_scopes(scopes, "VENCOrder", "VencOrder", default=None),
+            default=("FH", "AP", "LR"),
+        )
 
-        if "img_complex" in g:
-            img_ds = g["img_complex"]
-            src_slices = tuple(slice(0, int(img_ds.shape[i])) for i in range(3))
-            if seg_name is not None:
-                segmask_ds = g[seg_name]
-                segmask = segmask_ds[:].astype(np.int16)
-            else:
-                segmask = None
+        seg_ds = _find_h5_dataset_from_scopes(scopes, "segmask", "segmentation")
+        if seg_ds is not None and bool(force_recompute_seg):
+            seg_source = str(seg_ds.attrs.get("autoflow_source", "") or "").strip().lower()
+            if seg_source == "auto_segmentation":
+                seg_ds = None
+        segmask = None if seg_ds is None else np.asarray(seg_ds[:], dtype=np.int16)
 
-            img_complex = np.asarray(img_ds[src_slices + (slice(None),) * (img_ds.ndim - 3)])
+        img_complex_ds = _find_h5_dataset(group, "img_complex")
+        img_ds = _find_h5_dataset(group, "img")
+        if img_complex_ds is None and img_ds is not None and np.issubdtype(img_ds.dtype, np.complexfloating):
+            img_complex_ds = img_ds
+
+        meta = {
+            "source_group": group_name,
+            "spatial_order_raw": [str(x) for x in spatial_order[:3]],
+            "venc_order_raw": [str(x) for x in venc_order[:3]],
+            "force_recompute_seg": bool(force_recompute_seg),
+        }
+
+        if img_complex_ds is not None:
+            src_slices = tuple(slice(0, int(img_complex_ds.shape[i])) for i in range(3))
+            img_complex = np.asarray(img_complex_ds[src_slices + (slice(None),) * (img_complex_ds.ndim - 3)])
             if img_complex.ndim == 5 and img_complex.shape[-1] == 7:
-                return _load_legacy_dual_venc_h5(
+                loaded = _load_legacy_dual_venc_h5(
                     img_complex,
                     segmask,
                     VENC,
@@ -556,21 +1118,50 @@ def load_h5_data(path, correction_config=None, progress_callback=None):
                     venc_order,
                     cfg,
                     progress_callback=progress_callback,
+                    h5_group=group,
+                    h5_scopes=scopes,
+                    source_group=group_name,
+                    allow_untagged_root=allow_untagged_root,
                 )
+                loaded.source_group = group_name
+                loaded.metadata = dict(loaded.metadata or {})
+                loaded.metadata.setdefault("h5_layout", "complex_img")
+                return loaded
+            cached_corr, cache_report = _read_background_phase_corr_cache_from_scopes(
+                scopes,
+                "corr",
+                tuple(img_complex.shape[:-1]) + (3,),
+                cfg,
+                expected_source_group=group_name,
+                allow_untagged_root=allow_untagged_root,
+            )
             img_complex_corr, _stationary_mask_raw, corr_report = apply_background_phase_correction_to_complex(
                 img_complex,
                 config=cfg,
                 progress_callback=_progress_prefix(progress_callback, "h5_"),
                 source_mode="legacy_complex_h5",
+                cached_corr=cached_corr,
             )
+            corr_report["cache_name"] = "corr"
+            if not bool(corr_report.get("cache_hit", False)):
+                corr_report["cache_reason"] = cache_report.get("cache_reason", "missing")
+            if "stationary_voxels" in cache_report and bool(corr_report.get("cache_hit", False)):
+                corr_report["stationary_voxels"] = int(cache_report["stationary_voxels"])
+            if bool(corr_report.get("applied", False)) and not bool(corr_report.get("cache_hit", False)):
+                corr_report["cache_written"] = bool(_write_background_phase_corr_cache(group, "corr", corr_report, expected_source_group=group_name))
             img_complex_use = img_complex_corr if bool(corr_report.get("applied", False)) else img_complex
             mag = np.abs(img_complex[..., 0]).astype(np.float32)
             flow_raw = np.angle(img_complex_use[..., 1:4] * np.conj(img_complex_use[..., 0][..., None])).astype(np.float32)
             sigma_raw = _sigma_from_complex(img_complex_use, VENC)
             segmask_for_reorient = segmask if segmask is not None else np.zeros(mag.shape, dtype=np.int16)
             flow, mag_out, seg_r, venc_new, res_new = reorient(
-                mag, flow_raw, segmask_for_reorient, venc=VENC, resolution=resolution,
-                spatial_order=spatial_order, venc_order=venc_order,
+                mag,
+                flow_raw,
+                segmask_for_reorient,
+                venc=VENC,
+                resolution=resolution,
+                spatial_order=spatial_order,
+                venc_order=venc_order,
                 target_spatial_order=target_spatial_order,
                 target_venc_order=target_venc_order,
                 return_velocity=True,
@@ -582,9 +1173,13 @@ def load_h5_data(path, correction_config=None, progress_callback=None):
                 venc_order=venc_order,
                 target_venc_order=target_venc_order,
             ).astype(np.float32)
-            meta = {
+            meta.update({
                 "background_phase_correction": background_phase_report_for_metadata(corr_report),
-            }
+                "force_recompute_corr": bool(getattr(cfg, "force_recompute", False)),
+                "h5_layout": "complex_img",
+                "spatial_order_raw": [str(x) for x in spatial_order[:3]],
+                "venc_order_raw": [str(x) for x in venc_order[:3]],
+            })
             return normalize_loaded_case(
                 flow=flow,
                 mag=mag_out,
@@ -597,6 +1192,7 @@ def load_h5_data(path, correction_config=None, progress_callback=None):
                 tke_array=None,
                 metadata=meta,
                 source_format="legacy_h5",
+                source_group=group_name,
                 capabilities=LoaderCapabilities(
                     has_segmentation=segmask is not None,
                     has_tke=True,
@@ -606,34 +1202,94 @@ def load_h5_data(path, correction_config=None, progress_callback=None):
                 ),
             )
 
-        if "flow" in g and "mag" in g:
-            sigma = np.asarray(g["sigma"][:], dtype=np.float32) if "sigma" in g else None
-            tke_array = np.asarray(g["tke_array"][:], dtype=np.float32) if "tke_array" in g else None
-            segmentation = None if seg_name is None else np.asarray(g[seg_name][:], dtype=np.int16)
-            flow_raw = np.asarray(g["flow"][:], dtype=np.float32)
-            mag_raw = np.asarray(g["mag"][:], dtype=np.float32)
+        flow_ds = _find_h5_dataset(group, "flow")
+        mag_ds = _find_h5_dataset(group, "mag")
+        normalized_layout = flow_ds is not None and mag_ds is not None
+
+        if normalized_layout or img_ds is not None:
+            sigma_ds = _find_h5_dataset_from_scopes(scopes, "sigma")
+            tke_ds = _find_h5_dataset_from_scopes(scopes, "tke_array", "tke")
+            sigma = None if sigma_ds is None else np.asarray(sigma_ds[:], dtype=np.float32)
+            tke_array = None if tke_ds is None else np.asarray(tke_ds[:], dtype=np.float32)
+            flow_is_phase_radians = False
+            transposed_from_channel_first = False
+            if normalized_layout:
+                flow_raw = np.asarray(flow_ds[:], dtype=np.float32)
+                mag_raw = np.asarray(mag_ds[:], dtype=np.float32)
+                layout_name = "normalized_h5"
+            else:
+                img = np.asarray(img_ds[:])
+                if np.issubdtype(img.dtype, np.complexfloating):
+                    raise ValueError(f"unsupported complex img layout: {path}")
+                img, transposed_from_channel_first = _normalize_real_img_layout(img)
+                mag_raw = np.asarray(img[..., 0], dtype=np.float32)
+                flow_raw = np.asarray(img[..., 1:4], dtype=np.float32)
+                flow_is_phase_radians = _flow_looks_like_phase_radians(flow_raw, VENC)
+                layout_name = "combined_img_real"
+            flow_raw, mag_raw, segmask_r, venc_new, res_new, sigma_r, tke_array_r = _reorient_real_valued_fields(
+                mag=mag_raw,
+                flow=flow_raw,
+                segmask=segmask,
+                sigma=sigma,
+                tke_array=tke_array,
+                venc=VENC,
+                resolution=resolution,
+                spatial_order=spatial_order,
+                venc_order=venc_order,
+                target_spatial_order=target_spatial_order,
+                target_venc_order=target_venc_order,
+                return_velocity=flow_is_phase_radians,
+            )
+            cached_corr, cache_report = _read_background_phase_corr_cache_from_scopes(
+                scopes,
+                "corr",
+                tuple(flow_raw.shape[:-1]) + (3,),
+                cfg,
+                expected_source_group=group_name,
+                allow_untagged_root=allow_untagged_root,
+            )
             flow_corr, _stationary_mask, corr_report = apply_background_phase_correction_to_mag_flow(
                 mag_raw,
                 flow_raw,
-                VENC,
+                venc_new,
                 config=cfg,
                 progress_callback=_progress_prefix(progress_callback, "h5_"),
+                cached_corr=cached_corr,
             )
+            corr_report["cache_name"] = "corr"
+            if not bool(corr_report.get("cache_hit", False)):
+                corr_report["cache_reason"] = cache_report.get("cache_reason", "missing")
+            if "stationary_voxels" in cache_report and bool(corr_report.get("cache_hit", False)):
+                corr_report["stationary_voxels"] = int(cache_report["stationary_voxels"])
+            if bool(corr_report.get("applied", False)) and not bool(corr_report.get("cache_hit", False)):
+                corr_report["cache_written"] = bool(_write_background_phase_corr_cache(group, "corr", corr_report, expected_source_group=group_name))
+            meta.update({
+                "background_phase_correction": background_phase_report_for_metadata(corr_report),
+                "force_recompute_corr": bool(getattr(cfg, "force_recompute", False)),
+                "h5_layout": layout_name,
+                "flow_rescaled_from_pi_to_venc": bool(flow_is_phase_radians),
+                "spatial_order_raw": [str(x) for x in spatial_order[:3]],
+                "venc_order_raw": [str(x) for x in venc_order[:3]],
+            })
+            if layout_name == "combined_img_real":
+                meta["flow_value_unit_raw"] = "phase_radians" if flow_is_phase_radians else "velocity"
+                meta["real_img_channel_axis_raw"] = "first" if transposed_from_channel_first else "last"
             return normalize_loaded_case(
                 flow=flow_corr,
                 mag=mag_raw,
-                segmentation=segmentation,
-                resolution=resolution,
+                segmentation=segmask_r,
+                resolution=res_new,
                 origin=origin,
-                venc=VENC,
+                venc=venc_new,
                 rr=float(rr),
-                sigma=sigma,
-                tke_array=tke_array,
-                metadata={"background_phase_correction": background_phase_report_for_metadata(corr_report)},
+                sigma=sigma_r,
+                tke_array=tke_array_r,
+                metadata=meta,
                 source_format="normalized_h5",
+                source_group=group_name,
                 capabilities=LoaderCapabilities(
-                    has_segmentation=segmentation is not None,
-                    has_tke=tke_array is not None,
+                    has_segmentation=segmask_r is not None,
+                    has_tke=tke_array_r is not None,
                     has_complex_source=False,
                     supports_wss=True,
                     supports_plane_metrics=True,

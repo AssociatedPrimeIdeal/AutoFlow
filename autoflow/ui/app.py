@@ -24,18 +24,21 @@ from ..algorithms import (
     generate_threshold_segmentation,
     generate_nnunet_auto_segmentation,
     save_segmentation_file,
+    save_segmentation_to_source_h5,
     segmentation_timestamp,
     _plot_plane_flowrate_axes,
     _plot_pwv_axes,
 )
+from ..algorithms.data import discover_h5_input_cases
 from ..core.models import DicomParameterOverrides, ObjectKind, PwvParams, StepId, Workspace
 from ..core.pipeline import PipelineEngine
 from ..config import apply_config_bundle_to_workspace, bundle_to_autoflow_kwargs, load_config_bundle
 from ..algorithms import compute_plane_metrics, apply_internal_consistency_to_metrics, compute_plane_metrics_multithread, augment_plane_metrics_with_derived, save_plane_pixelwise_h5
 from .editors import PlaneEditor, SkeletonEditor
-from .dicom_confirm import DicomImportDialog
+from .dicom_confirm import DicomImportDialog, H5CaseSelectDialog
 from .ortho_viewer import OrthoViewer
 from .segmentation import SegmentationConfigDialog, SegmentationDock, SOURCE_LABELS
+from .theme import apply_application_theme, configure_high_dpi, standard_icon
 from ..rendering import (
     render_plane_rotation_video,
     render_pressure_gradient_video,
@@ -128,7 +131,7 @@ _RUNTIME_RENDER_METRICS = [
 class _AutoSegmentationResult:
     seg: np.ndarray
     provenance: dict
-    sidecar: str
+    cache_path: str
     elapsed_sec: float
 
 
@@ -147,44 +150,57 @@ class _AutoSegmentationWorker(QtCore.QObject):
     finished = QtCore.pyqtSignal(object)
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, mag, flow, resolution, origin, *, model_folder, backend, checkpoint_name, device, auto_label_map, sidecar_path):
+    def __init__(self, mag, flow, resolution, origin, *, model_folder, backend, checkpoint_name, device, auto_label_map, cache_path, artifact_prefix, source_spatial_order=None, source_group=None):
         super().__init__()
-        self._mag = np.asarray(mag, dtype=np.float32).copy()
-        self._flow = np.asarray(flow, dtype=np.float32).copy()
-        self._resolution = np.asarray(resolution, dtype=np.float32).copy()
-        self._origin = np.asarray(origin, dtype=np.float32).copy()
+        self._mag = mag
+        self._flow = flow
+        self._resolution = resolution
+        self._origin = origin
         self._model_folder = str(model_folder)
         self._backend = str(backend)
         self._checkpoint_name = str(checkpoint_name)
         self._device = str(device)
         self._auto_label_map = auto_label_map
-        self._sidecar_path = str(sidecar_path)
+        self._cache_path = str(cache_path or "")
+        self._artifact_prefix = str(artifact_prefix)
+        self._source_spatial_order = tuple(str(x).upper() for x in (source_spatial_order or []))
+        self._source_group = str(source_group).strip("/") if source_group else None
 
     @QtCore.pyqtSlot()
     def run(self):
         t_start = time.perf_counter()
         try:
+            mag = np.asarray(self._mag, dtype=np.float32)
+            flow = np.asarray(self._flow, dtype=np.float32)
+            resolution = np.asarray(self._resolution, dtype=np.float32).copy()
+            origin = np.asarray(self._origin, dtype=np.float32).copy()
             seg, provenance = generate_nnunet_auto_segmentation(
-                mag=self._mag,
-                flow=self._flow,
-                resolution=self._resolution,
-                origin=self._origin,
+                mag=mag,
+                flow=flow,
+                resolution=resolution,
+                origin=origin,
                 model_folder=self._model_folder,
                 backend=self._backend,
                 checkpoint_name=self._checkpoint_name,
                 device=self._device,
                 auto_label_map=self._auto_label_map,
+                artifact_prefix=self._artifact_prefix,
                 progress_callback=self.progress.emit,
             )
-            save_segmentation_file(
-                self._sidecar_path,
-                seg,
-                resolution=self._resolution,
-                origin=self._origin,
-                provenance=provenance,
-            )
+            cache_path = ""
+            if self._cache_path.lower().endswith((".h5", ".hdf5")):
+                save_segmentation_to_source_h5(
+                    self._cache_path,
+                    seg,
+                    resolution=resolution,
+                    origin=origin,
+                    provenance=provenance,
+                    source_spatial_order=self._source_spatial_order,
+                    source_group=self._source_group,
+                )
+                cache_path = self._cache_path
             elapsed = time.perf_counter() - t_start
-            self.finished.emit(_AutoSegmentationResult(seg=seg, provenance=provenance, sidecar=self._sidecar_path, elapsed_sec=float(elapsed)))
+            self.finished.emit(_AutoSegmentationResult(seg=seg, provenance=provenance, cache_path=cache_path, elapsed_sec=float(elapsed)))
         except Exception:
             self.failed.emit(traceback.format_exc())
 
@@ -194,6 +210,7 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("AutoFlow")
         self.resize(1800, 980)
+        self.setMinimumSize(1440, 800)
         self._config_dir = config_dir
         self._config_bundle = load_config_bundle(config_dir)
         self.workspace = Workspace()
@@ -255,6 +272,7 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(0, self._setup_focus_behavior)
         self.ortho_viewer.set_segmentation_edit_handler(self._handle_segmentation_edit)
         self._refresh_all()
+        self.statusBar().showMessage("Ready")
 
     def _setup_focus_behavior(self):
         try:
@@ -267,22 +285,28 @@ class MainWindow(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
-        root.setContentsMargins(6, 6, 6, 6)
-        root.setSpacing(6)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(6)
         root.addWidget(splitter, 1)
         left = QtWidgets.QWidget()
+        left.setMinimumWidth(280)
         left_lay = QtWidgets.QVBoxLayout(left)
         left_lay.setContentsMargins(0, 0, 0, 0)
         left_lay.setSpacing(6)
         self._build_browser(left_lay)
         mid = QtWidgets.QWidget()
+        mid.setMinimumWidth(520)
         mid_lay = QtWidgets.QVBoxLayout(mid)
         mid_lay.setContentsMargins(0, 0, 0, 0)
         mid_lay.setSpacing(6)
         self.plotter = QtInteractor(self)
         self.plotter.setFocusPolicy(QtCore.Qt.ClickFocus)
         mid_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        mid_splitter.setChildrenCollapsible(False)
+        mid_splitter.setHandleWidth(6)
         mid_splitter.addWidget(self.plotter)
         step_and_params = QtWidgets.QWidget()
         sp_lay = QtWidgets.QVBoxLayout(step_and_params)
@@ -291,6 +315,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_step_buttons(sp_lay)
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         params_widget = QtWidgets.QWidget()
         self.params_layout = QtWidgets.QVBoxLayout(params_widget)
         self.params_layout.setContentsMargins(4, 4, 4, 4)
@@ -308,6 +334,7 @@ class MainWindow(QtWidgets.QMainWindow):
         mid_splitter.setStretchFactor(1, 2)
         mid_lay.addWidget(mid_splitter, 1)
         right = QtWidgets.QWidget()
+        right.setMinimumWidth(360)
         right_lay = QtWidgets.QVBoxLayout(right)
         right_lay.setContentsMargins(0, 0, 0, 0)
         self.ortho_viewer = OrthoViewer(self.workspace, self)
@@ -319,28 +346,27 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 4)
         splitter.setStretchFactor(2, 2)
-        bot = QtWidgets.QWidget()
-        bot_lay = QtWidgets.QVBoxLayout(bot)
-        bot_lay.setContentsMargins(0, 0, 0, 0)
-        bot_lay.setSpacing(4)
-        bot_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        root.addWidget(bot_splitter, 0)
         timeline_w = QtWidgets.QWidget()
         tl_lay = QtWidgets.QVBoxLayout(timeline_w)
         tl_lay.setContentsMargins(0, 0, 0, 0)
         self._build_timeline(tl_lay)
-        bot_splitter.addWidget(timeline_w)
+        root.addWidget(timeline_w, 0)
+
+        self.bottom_tabs = QtWidgets.QTabWidget()
+        self.bottom_tabs.setDocumentMode(True)
+        self.bottom_tabs.setMinimumHeight(125)
+        self.bottom_tabs.setMaximumHeight(175)
         sel_w = QtWidgets.QWidget()
         sel_lay = QtWidgets.QVBoxLayout(sel_w)
-        sel_lay.setContentsMargins(0, 0, 0, 0)
+        sel_lay.setContentsMargins(6, 6, 6, 6)
         self._build_selection_info(sel_lay)
-        bot_splitter.addWidget(sel_w)
         log_w = QtWidgets.QWidget()
         log_lay = QtWidgets.QVBoxLayout(log_w)
-        log_lay.setContentsMargins(0, 0, 0, 0)
+        log_lay.setContentsMargins(6, 6, 6, 6)
         self._build_log(log_lay)
-        bot_splitter.addWidget(log_w)
-        bot_splitter.setSizes([40, 80, 60])
+        self.bottom_tabs.addTab(sel_w, "Selection")
+        self.bottom_tabs.addTab(log_w, "Log")
+        root.addWidget(self.bottom_tabs, 0)
         self._build_segmentation_dock()
         self._build_pwv_dock()
 
@@ -349,7 +375,11 @@ class MainWindow(QtWidgets.QMainWindow):
         lay = QtWidgets.QVBoxLayout(grp)
         self.tree_objects = QtWidgets.QTreeWidget()
         self.tree_objects.setHeaderLabels(["Name", "Kind", "Visible"])
-        self.tree_objects.setColumnWidth(0, 200)
+        header = self.tree_objects.header()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+        self.tree_objects.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.tree_objects.itemSelectionChanged.connect(self._on_browser_select)
         self.tree_objects.itemChanged.connect(self._on_tree_item_changed)
         self.tree_objects.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
@@ -357,6 +387,8 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addWidget(self.tree_objects)
         row = QtWidgets.QHBoxLayout()
         self.btn_delete_obj = QtWidgets.QPushButton("Delete Selected")
+        self.btn_delete_obj.setIcon(standard_icon(self, "SP_TrashIcon"))
+        self.btn_delete_obj.setProperty("role", "danger")
         self.btn_delete_obj.clicked.connect(self._on_delete_object)
         row.addWidget(self.btn_delete_obj)
         row.addStretch()
@@ -367,16 +399,28 @@ class MainWindow(QtWidgets.QMainWindow):
         grp = QtWidgets.QGroupBox("Steps")
         gl = QtWidgets.QGridLayout(grp)
         self.step_buttons = {}
-        for row_idx, steps in enumerate([StepId.top_row_steps(), StepId.bottom_row_steps(), StepId.extra_row_steps()]):
-            for i, s in enumerate(steps):
-                b = QtWidgets.QPushButton(s.label)
-                b.clicked.connect(partial(self._run_single_step, s))
-                self.step_buttons[s] = b
-                gl.addWidget(b, row_idx, i)
-        btn_run_all = QtWidgets.QPushButton("▶▶ Run All (Generate → Metrics → PWV → WSS/TKE/PG)")
-        btn_run_all.setStyleSheet("QPushButton { background-color: #2a6; color: white; font-weight: bold; padding: 4px; }")
-        btn_run_all.clicked.connect(self._run_all_pipeline)
-        gl.addWidget(btn_run_all, 3, 0, 1, 4)
+        all_steps = [
+            *StepId.top_row_steps(),
+            *StepId.bottom_row_steps(),
+            *StepId.extra_row_steps(),
+        ]
+        for index, step in enumerate(all_steps):
+            label = step.label
+            if label == "WSS / TKE / Relative Pressure":
+                label = "WSS / TKE / Pressure"
+            button = QtWidgets.QPushButton(label)
+            button.setToolTip(step.label)
+            button.clicked.connect(partial(self._run_single_step, step))
+            self.step_buttons[step] = button
+            row, column = divmod(index, 3)
+            gl.addWidget(button, row, column)
+        self.btn_run_all = QtWidgets.QPushButton("Run All (Generate -> Metrics -> PWV -> WSS/TKE/PG)")
+        self.btn_run_all.setIcon(standard_icon(self, "SP_MediaPlay"))
+        self.btn_run_all.setProperty("role", "primary")
+        self.btn_run_all.setMinimumHeight(34)
+        self.btn_run_all.clicked.connect(self._run_all_pipeline)
+        run_all_row = (len(all_steps) + 2) // 3
+        gl.addWidget(self.btn_run_all, run_all_row, 0, 1, 3)
         parent.addWidget(grp, 0)
 
     def _build_preprocess_params(self):
@@ -422,7 +466,10 @@ class MainWindow(QtWidgets.QMainWindow):
         fl = QtWidgets.QFormLayout(grp)
         self.chk_remove_small_cc = QtWidgets.QCheckBox()
         self.chk_remove_small_cc.setChecked(False)
+        self.combo_cc_filter_mode = QtWidgets.QComboBox()
+        self.combo_cc_filter_mode.addItems(["hybrid", "absolute", "relative", "largest"])
         self.edit_min_cc_volume = QtWidgets.QLineEdit("50.0")
+        self.edit_cc_rel_min_ratio = QtWidgets.QLineEdit("0.01")
         self.chk_closing = QtWidgets.QCheckBox()
         self.chk_closing.setChecked(True)
         self.chk_opening = QtWidgets.QCheckBox()
@@ -430,7 +477,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_gaussian.setChecked(True)
         self.edit_gauss_sigma = QtWidgets.QLineEdit("0.5")
         fl.addRow("Remove Small CC", self.chk_remove_small_cc)
+        fl.addRow("CC Filter Mode", self.combo_cc_filter_mode)
         fl.addRow(u"Min Volume (mm\u00b3)", self.edit_min_cc_volume)
+        fl.addRow("Relative Min Ratio", self.edit_cc_rel_min_ratio)
         fl.addRow("Closing", self.chk_closing)
         fl.addRow("Opening", self.chk_opening)
         fl.addRow("Gaussian", self.chk_gaussian)
@@ -440,28 +489,34 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_plane_params(self):
         grp = QtWidgets.QGroupBox("Generate Planes Parameters")
         fl = QtWidgets.QFormLayout(grp)
-        self.radio_plane_by_distance = QtWidgets.QRadioButton("By Distance")
-        self.radio_plane_center = QtWidgets.QRadioButton("Center of Path")
-        self.radio_plane_center.setChecked(True)
-        mode_row = QtWidgets.QHBoxLayout()
-        mode_row.addWidget(self.radio_plane_by_distance)
-        mode_row.addWidget(self.radio_plane_center)
-        mode_w = QtWidgets.QWidget()
-        mode_w.setLayout(mode_row)
-        self.edit_plane_dist = QtWidgets.QLineEdit("20.0")
+        self.combo_plane_mode = QtWidgets.QComboBox()
+        self.combo_plane_mode.addItem("Count", "count")
+        self.combo_plane_mode.addItem("By Distance", "distance")
+        self.combo_plane_mode.addItem("Anchored Offset", "anchored_offset")
+        self.combo_plane_mode.currentIndexChanged.connect(self._sync_plane_mode_ui)
+        self.edit_plane_count = QtWidgets.QLineEdit("1")
+        self.edit_plane_dist = QtWidgets.QLineEdit("5.0")
         self.edit_plane_start = QtWidgets.QLineEdit("5.0")
         self.edit_plane_end = QtWidgets.QLineEdit("0.0")
+        self.combo_plane_anchor = QtWidgets.QComboBox()
+        self.combo_plane_anchor.addItem("Start", "start")
+        self.combo_plane_anchor.addItem("End", "end")
+        self.edit_plane_offset = QtWidgets.QLineEdit("5.0")
         self.edit_plane_smooth_win = QtWidgets.QLineEdit("15")
         self.edit_plane_smooth_poly = QtWidgets.QLineEdit("2")
         self.edit_plane_inter_time = QtWidgets.QLineEdit("10")
-        fl.addRow("Plane Mode", mode_w)
+        fl.addRow("Plane Mode", self.combo_plane_mode)
+        fl.addRow("Plane Count", self.edit_plane_count)
         fl.addRow("Cross-section Distance (mm)", self.edit_plane_dist)
         fl.addRow("Start Distance (mm)", self.edit_plane_start)
         fl.addRow("End Distance (mm)", self.edit_plane_end)
+        fl.addRow("Anchor", self.combo_plane_anchor)
+        fl.addRow("Anchor Offset (mm)", self.edit_plane_offset)
         fl.addRow("SavGol Window", self.edit_plane_smooth_win)
         fl.addRow("SavGol Polyorder", self.edit_plane_smooth_poly)
         fl.addRow("Inter-time", self.edit_plane_inter_time)
         self.params_layout.addWidget(grp)
+        self._sync_plane_mode_ui()
 
     def _build_streamline_params(self):
         grp = QtWidgets.QGroupBox("Streamline / Pathline Parameters")
@@ -612,11 +667,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.edit_runtime_scalar_bar_gap = QtWidgets.QLineEdit()
         self.edit_runtime_scalar_bar_pos_x = QtWidgets.QLineEdit()
         self.edit_runtime_scalar_bar_pos_y = QtWidgets.QLineEdit()
+        self.edit_runtime_scalar_bar_title_font = QtWidgets.QLineEdit()
+        self.edit_runtime_scalar_bar_label_font = QtWidgets.QLineEdit()
         render_form.addRow("Colorbar Width", self.edit_runtime_scalar_bar_width)
         render_form.addRow("Colorbar Height", self.edit_runtime_scalar_bar_height)
         render_form.addRow("Colorbar Gap", self.edit_runtime_scalar_bar_gap)
         render_form.addRow("Colorbar X", self.edit_runtime_scalar_bar_pos_x)
         render_form.addRow("Colorbar Y", self.edit_runtime_scalar_bar_pos_y)
+        render_form.addRow("Title Font", self.edit_runtime_scalar_bar_title_font)
+        render_form.addRow("Label Font", self.edit_runtime_scalar_bar_label_font)
         render_layout.addLayout(render_form)
 
         render_hint = QtWidgets.QLabel("These values default to config, update the live 3D scene immediately, and are reused by Export Videos in the current session.")
@@ -632,6 +691,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.edit_runtime_scalar_bar_gap,
             self.edit_runtime_scalar_bar_pos_x,
             self.edit_runtime_scalar_bar_pos_y,
+            self.edit_runtime_scalar_bar_title_font,
+            self.edit_runtime_scalar_bar_label_font,
         ]:
             widget.editingFinished.connect(self._on_runtime_render_settings_changed)
 
@@ -689,11 +750,12 @@ class MainWindow(QtWidgets.QMainWindow):
         ws = self.workspace
         render_cfg = dict(getattr(ws, "render_settings", {}) or {})
         mapping = {
-            "wss_surface_live": ("wss_clim", "wss_show_scalar_bar", "wss_bar_cfg"),
-            "tke_volume": ("tke_clim", "tke_show_scalar_bar", "tke_bar_cfg"),
-            "pressure_gradient_volume": ("pressure_gradient_clim", "pressure_gradient_show_scalar_bar", "pressure_gradient_bar_cfg"),
-            "relative_pressure_volume": ("relative_pressure_clim", "relative_pressure_show_scalar_bar", "relative_pressure_bar_cfg"),
-            "streamlines_live": ("streamline_clim", "streamline_show_scalar_bar", "streamline_bar_cfg"),
+            "segmask_raw_surface": (None, "shared_colorbar_show", "shared_colorbar_bar_cfg"),
+            "wss_surface_live": ("wss_clim", "shared_colorbar_show", "wss_bar_cfg"),
+            "tke_volume": ("tke_clim", "shared_colorbar_show", "tke_bar_cfg"),
+            "pressure_gradient_volume": ("pressure_gradient_clim", "shared_colorbar_show", "pressure_gradient_bar_cfg"),
+            "relative_pressure_volume": ("relative_pressure_clim", "shared_colorbar_show", "relative_pressure_bar_cfg"),
+            "streamlines_live": ("streamline_clim", "shared_colorbar_show", "streamline_bar_cfg"),
         }
         touched = False
         for obj in ws.scene_objects.values():
@@ -701,9 +763,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if keys is None:
                 continue
             clim_key, show_key, bar_key = keys
-            obj.clim = render_cfg.get(clim_key)
+            if clim_key is not None:
+                obj.clim = render_cfg.get(clim_key)
             obj.show_scalar_bar = bool(render_cfg.get(show_key, True))
-            obj.scalar_bar_cfg = dict(render_cfg.get(bar_key, {}) or {})
+            obj.scalar_bar_cfg = dict(render_cfg.get(bar_key, render_cfg.get("shared_colorbar_bar_cfg", {})) or {})
             self.scene.readd_object(obj)
             touched = True
         if touched:
@@ -731,13 +794,26 @@ class MainWindow(QtWidgets.QMainWindow):
         gap = max(self._float_from_text(self.edit_runtime_scalar_bar_gap.text(), 0.03), 0.0)
         pos_x = min(max(self._float_from_text(self.edit_runtime_scalar_bar_pos_x.text(), 0.88), 0.0), 0.98)
         pos_y = min(max(self._float_from_text(self.edit_runtime_scalar_bar_pos_y.text(), 0.06), 0.0), 0.95)
+        title_font = max(self._int_from_text(self.edit_runtime_scalar_bar_title_font.text(), 40), 1)
+        label_font = max(self._int_from_text(self.edit_runtime_scalar_bar_label_font.text(), 32), 1)
+        shared_bar_cfg = dict(render_cfg.get("shared_colorbar_bar_cfg", {}) or {})
+        shared_bar_cfg["width"] = float(width)
+        shared_bar_cfg["height"] = float(height)
+        shared_bar_cfg["position_x"] = float(pos_x)
+        shared_bar_cfg["position_y"] = float(pos_y)
+        shared_bar_cfg["stack_gap"] = float(gap)
+        shared_bar_cfg["title_font_size"] = int(title_font)
+        shared_bar_cfg["label_font_size"] = int(label_font)
+        render_cfg["shared_colorbar_bar_cfg"] = shared_bar_cfg
         for bar_key in self._runtime_bar_cfg_keys():
             bar_cfg = dict(render_cfg.get(bar_key, {}) or {})
             bar_cfg["width"] = float(width)
             bar_cfg["height"] = float(height)
-            bar_cfg["position_x"] = float(pos_x)
-            bar_cfg["position_y"] = float(pos_y)
-            bar_cfg["stack_gap"] = float(gap)
+            bar_cfg.setdefault("position_x", float(pos_x))
+            bar_cfg.setdefault("position_y", float(pos_y))
+            bar_cfg.setdefault("stack_gap", float(gap))
+            bar_cfg.setdefault("title_font_size", int(title_font))
+            bar_cfg.setdefault("label_font_size", int(label_font))
             render_cfg[bar_key] = bar_cfg
         ws.render_settings = render_cfg
         self._apply_render_settings_to_scene_objects()
@@ -790,23 +866,35 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_timeline(self, parent):
         grp = QtWidgets.QGroupBox("Timeline")
         tl = QtWidgets.QHBoxLayout(grp)
-        self.btn_prev = QtWidgets.QPushButton(u"\u25c0")
+        self.btn_prev = QtWidgets.QPushButton()
+        self.btn_prev.setIcon(standard_icon(self, "SP_MediaSkipBackward"))
+        self.btn_prev.setToolTip("Previous frame")
         self.btn_prev.clicked.connect(self._on_prev_frame)
-        self.btn_play = QtWidgets.QPushButton(u"\u25b6 Play")
+        self.btn_play = QtWidgets.QPushButton()
+        self.btn_play.setIcon(standard_icon(self, "SP_MediaPlay"))
+        self.btn_play.setToolTip("Play")
         self.btn_play.clicked.connect(self._on_play)
-        self.btn_pause = QtWidgets.QPushButton(u"\u23f8 Pause")
+        self.btn_pause = QtWidgets.QPushButton()
+        self.btn_pause.setIcon(standard_icon(self, "SP_MediaPause"))
+        self.btn_pause.setToolTip("Pause")
         self.btn_pause.clicked.connect(self._on_pause)
-        self.btn_next = QtWidgets.QPushButton(u"\u25b6")
+        self.btn_next = QtWidgets.QPushButton()
+        self.btn_next.setIcon(standard_icon(self, "SP_MediaSkipForward"))
+        self.btn_next.setToolTip("Next frame")
         self.btn_next.clicked.connect(self._on_next_frame)
         self.slider_t = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.slider_t.setRange(0, 0)
         self.slider_t.valueChanged.connect(self._on_t_changed)
         self.lab_t = QtWidgets.QLabel("0")
+        self.lab_t.setAlignment(QtCore.Qt.AlignCenter)
+        self.lab_t.setMinimumWidth(32)
         self.spin_interval = QtWidgets.QSpinBox()
         self.spin_interval.setRange(10, 2000)
         self.spin_interval.setValue(120)
         self.spin_interval.setSuffix(" ms")
         for w in [self.btn_prev, self.btn_play, self.btn_pause, self.btn_next]:
+            w.setProperty("role", "icon")
+            w.setAccessibleName(w.toolTip())
             tl.addWidget(w)
         tl.addWidget(self.slider_t, 1)
         tl.addWidget(self.lab_t)
@@ -814,8 +902,8 @@ class MainWindow(QtWidgets.QMainWindow):
         parent.addWidget(grp)
 
     def _build_selection_info(self, parent):
-        grp = QtWidgets.QGroupBox("Selection")
-        lay = QtWidgets.QHBoxLayout(grp)
+        lay = QtWidgets.QHBoxLayout()
+        lay.setContentsMargins(0, 0, 0, 0)
         box_plane = QtWidgets.QGroupBox("Plane")
         lay_plane = QtWidgets.QVBoxLayout(box_plane)
         self.text_plane_info = QtWidgets.QPlainTextEdit()
@@ -830,16 +918,12 @@ class MainWindow(QtWidgets.QMainWindow):
         lay_path.addWidget(self.text_path_info)
         lay.addWidget(box_plane, 1)
         lay.addWidget(box_path, 1)
-        parent.addWidget(grp)
+        parent.addLayout(lay)
 
     def _build_log(self, parent):
-        grp = QtWidgets.QGroupBox("Log")
-        ll = QtWidgets.QVBoxLayout(grp)
         self.console = QtWidgets.QTextEdit()
         self.console.setReadOnly(True)
-        self.console.setMaximumHeight(80)
-        ll.addWidget(self.console)
-        parent.addWidget(grp)
+        parent.addWidget(self.console)
 
     def _build_segmentation_dock(self):
         self.segmentation_dock = QtWidgets.QDockWidget("Segmentation", self)
@@ -929,7 +1013,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.label_pwv_status.setWordWrap(True)
         layout.addWidget(self.label_pwv_status)
 
-        self.fig_pwv = Figure(figsize=(5.6, 6.2), dpi=90, facecolor="white")
+        self.fig_pwv = Figure(figsize=(4.2, 5.4), dpi=90, facecolor="white")
         self.canvas_pwv = FigureCanvas(self.fig_pwv)
         layout.addWidget(self.canvas_pwv, 1)
 
@@ -941,6 +1025,21 @@ class MainWindow(QtWidgets.QMainWindow):
     def _analysis_mode(self):
         value = self.combo_analysis_mode.currentData() if hasattr(self, "combo_analysis_mode") else "pwv"
         return str(value or "pwv")
+
+    def _sync_plane_mode_ui(self):
+        mode = str(self.combo_plane_mode.currentData() or "count") if hasattr(self, "combo_plane_mode") else "count"
+        is_count = mode == "count"
+        is_distance = mode == "distance"
+        is_anchor = mode == "anchored_offset"
+        for widget in [getattr(self, "edit_plane_count", None)]:
+            if widget is not None:
+                widget.setEnabled(is_count)
+        for widget in [getattr(self, "edit_plane_dist", None)]:
+            if widget is not None:
+                widget.setEnabled(is_distance)
+        for widget in [getattr(self, "combo_plane_anchor", None), getattr(self, "edit_plane_offset", None)]:
+            if widget is not None:
+                widget.setEnabled(is_anchor)
 
     def _sync_analysis_controls(self):
         if not hasattr(self, "analysis_controls_stack"):
@@ -1127,7 +1226,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _plot_pwv_result(self, result):
         if result is None:
             self.label_pwv_status.setText("No PWV results.")
-            self._clear_pwv_axes("Compute PWV to populate this view.", title="PWV")
+            self._clear_pwv_axes("Compute PWV\nto populate this view.", title="PWV")
             return
         self.fig_pwv.clear()
         self.ax_pwv = self.fig_pwv.add_subplot(211)
@@ -1464,6 +1563,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if uid is not None:
                 self.scene.remove_object(uid)
             return
+        render_cfg = dict(getattr(ws, "render_settings", {}) or {})
+        shared_bar_cfg = dict(render_cfg.get("shared_colorbar_bar_cfg", {}) or {})
+        show_shared_colorbar = bool(render_cfg.get("shared_colorbar_show", True))
         if uid is None:
             uid = ws.add_object(
                 name=self._segmentation_object_name(),
@@ -1474,8 +1576,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 scalars="label",
                 cmap="tab10",
                 dynamic=True,
-                show_scalar_bar=True,
+                show_scalar_bar=show_shared_colorbar,
                 scalar_bar_title="Label",
+                scalar_bar_cfg=shared_bar_cfg,
             )
         obj = ws.scene_objects.get(uid)
         if obj is None:
@@ -1486,8 +1589,9 @@ class MainWindow(QtWidgets.QMainWindow):
         obj.scalars = "label"
         obj.cmap = "tab10"
         obj.dynamic = True
-        obj.show_scalar_bar = True
+        obj.show_scalar_bar = show_shared_colorbar
         obj.scalar_bar_title = "Label"
+        obj.scalar_bar_cfg = shared_bar_cfg
 
     def _refresh_segmentation_ui(self):
         panel = self.segmentation_panel
@@ -1743,7 +1847,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         resolved_device = seg_state.auto_device or "cpu"
         checkpoint_name = seg_state.auto_checkpoint or "checkpoint_final.pth"
-        sidecar = self._default_segmentation_sidecar_path("auto")
+        cache_path = ws.paths.flow_path if str(ws.input_state.source_format or "").lower().endswith("h5") else ""
+        artifact_prefix = os.path.splitext(self._default_segmentation_sidecar_path("auto"))[0]
         self._autoseg_started_at = time.perf_counter()
         self._autoseg_progress_dialog = self._create_progress_dialog("Auto Segmentation", "Preparing auto segmentation...")
         self._autoseg_thread = QtCore.QThread(self)
@@ -1757,7 +1862,10 @@ class MainWindow(QtWidgets.QMainWindow):
             checkpoint_name=checkpoint_name,
             device=resolved_device,
             auto_label_map=seg_state.auto_label_map,
-            sidecar_path=sidecar,
+            cache_path=cache_path,
+            artifact_prefix=artifact_prefix,
+            source_spatial_order=tuple(str(x).upper() for x in (ws.input_state.metadata.get("spatial_order_raw") or [])),
+            source_group=ws.input_state.source_group,
         )
         self._autoseg_worker.moveToThread(self._autoseg_thread)
         self._autoseg_thread.started.connect(self._autoseg_worker.run)
@@ -1824,7 +1932,18 @@ class MainWindow(QtWidgets.QMainWindow):
             "auto",
             f"Auto segmentation ready: nnUNet model={seg_state.auto_model} | time={float(result.elapsed_sec):.2f}s",
         )
-        self.log(f"Auto segmentation saved: {result.sidecar}")
+        if result.cache_path:
+            self.log(f"Auto segmentation cached in source h5: {result.cache_path}")
+        else:
+            self.log("Auto segmentation cache skipped for this input format.")
+        feature_files = [str(path) for path in result.provenance.get("feature_files") or [] if str(path).strip()]
+        seg_nifti = str(result.provenance.get("segmentation_nifti") or result.provenance.get("prediction_file") or "").strip()
+        if feature_files:
+            self.log(
+                f"Auto segmentation feature NIfTI saved: {len(feature_files)} file(s) in {os.path.dirname(feature_files[0])}"
+            )
+        if seg_nifti:
+            self.log(f"Auto segmentation NIfTI saved: {seg_nifti}")
         self._close_progress_dialog(self._autoseg_progress_dialog)
         self._autoseg_progress_dialog = None
 
@@ -2850,15 +2969,20 @@ class MainWindow(QtWidgets.QMainWindow):
             ws.input_state.metadata["spatial_order_raw"] = list(ws.spatial_order)
             ws.input_state.metadata["venc_order_raw"] = list(ws.venc_order)
         ws.skeleton_params.remove_small_cc = self.chk_remove_small_cc.isChecked()
+        ws.skeleton_params.cc_filter_mode = str(self.combo_cc_filter_mode.currentText().strip() or "hybrid")
         ws.skeleton_params.min_cc_volume_mm3 = self._float_from_text(self.edit_min_cc_volume.text(), 50.0)
+        ws.skeleton_params.cc_rel_min_ratio = self._float_from_text(self.edit_cc_rel_min_ratio.text(), 0.01)
         ws.skeleton_params.do_closing = self.chk_closing.isChecked()
         ws.skeleton_params.do_opening = self.chk_opening.isChecked()
         ws.skeleton_params.gaussian_enabled = self.chk_gaussian.isChecked()
         ws.skeleton_params.gaussian_sigma = self._float_from_text(self.edit_gauss_sigma.text(), 0.5)
-        ws.plane_gen_params.use_center_plane = self.radio_plane_center.isChecked()
-        ws.plane_gen_params.cross_section_distance = self._float_from_text(self.edit_plane_dist.text(), 20.0)
+        ws.plane_gen_params.plane_mode = str(self.combo_plane_mode.currentData() or "count")
+        ws.plane_gen_params.plane_count = max(self._int_from_text(self.edit_plane_count.text(), 1), 1)
+        ws.plane_gen_params.cross_section_distance = self._float_from_text(self.edit_plane_dist.text(), 5.0)
         ws.plane_gen_params.start_distance = self._float_from_text(self.edit_plane_start.text(), 5.0)
         ws.plane_gen_params.end_distance = self._float_from_text(self.edit_plane_end.text(), 0.0)
+        ws.plane_gen_params.anchor = str(self.combo_plane_anchor.currentData() or "end")
+        ws.plane_gen_params.anchor_offset_mm = self._float_from_text(self.edit_plane_offset.text(), 5.0)
         ws.plane_gen_params.smoothing_window = self._int_from_text(self.edit_plane_smooth_win.text(), 15)
         ws.plane_gen_params.smoothing_polyorder = self._int_from_text(self.edit_plane_smooth_poly.text(), 3)
         ws.plane_gen_params.inter_time = self._int_from_text(self.edit_plane_inter_time.text(), 10)
@@ -2945,19 +3069,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.edit_input_spatial_order.setText(", ".join(str(x) for x in ws.spatial_order[:3]))
         self.edit_input_venc_order.setText(", ".join(str(x) for x in ws.venc_order[:3]))
         self.chk_remove_small_cc.setChecked(ws.skeleton_params.remove_small_cc)
+        self.combo_cc_filter_mode.setCurrentText(str(getattr(ws.skeleton_params, "cc_filter_mode", "hybrid") or "hybrid"))
         self.edit_min_cc_volume.setText(str(ws.skeleton_params.min_cc_volume_mm3))
+        self.edit_cc_rel_min_ratio.setText(str(getattr(ws.skeleton_params, "cc_rel_min_ratio", 0.01)))
         self.chk_closing.setChecked(ws.skeleton_params.do_closing)
         self.chk_opening.setChecked(ws.skeleton_params.do_opening)
         self.chk_gaussian.setChecked(ws.skeleton_params.gaussian_enabled)
         self.edit_gauss_sigma.setText(str(ws.skeleton_params.gaussian_sigma))
-        self.radio_plane_center.setChecked(ws.plane_gen_params.use_center_plane)
-        self.radio_plane_by_distance.setChecked(not ws.plane_gen_params.use_center_plane)
+        mode = str(getattr(ws.plane_gen_params, "plane_mode", "count") or "count")
+        idx = max(self.combo_plane_mode.findData(mode), 0)
+        self.combo_plane_mode.setCurrentIndex(idx)
+        self.edit_plane_count.setText(str(getattr(ws.plane_gen_params, "plane_count", 1)))
         self.edit_plane_dist.setText(str(ws.plane_gen_params.cross_section_distance))
         self.edit_plane_start.setText(str(ws.plane_gen_params.start_distance))
         self.edit_plane_end.setText(str(ws.plane_gen_params.end_distance))
+        self.combo_plane_anchor.setCurrentIndex(max(self.combo_plane_anchor.findData(str(getattr(ws.plane_gen_params, "anchor", "end") or "end")), 0))
+        self.edit_plane_offset.setText(str(getattr(ws.plane_gen_params, "anchor_offset_mm", 5.0)))
         self.edit_plane_smooth_win.setText(str(ws.plane_gen_params.smoothing_window))
         self.edit_plane_smooth_poly.setText(str(ws.plane_gen_params.smoothing_polyorder))
         self.edit_plane_inter_time.setText(str(ws.plane_gen_params.inter_time))
+        self._sync_plane_mode_ui()
         self.chk_pwv_enabled.setChecked(bool(ws.pwv_params.enabled))
         self.edit_pwv_interval.setText(str(ws.pwv_params.plane_interval_mm))
         self.edit_pwv_start.setText(str(ws.pwv_params.start_distance))
@@ -3020,13 +3151,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 max_widget.setText(f"{float(value[1]):.6g}")
             min_widget.blockSignals(False)
             max_widget.blockSignals(False)
-        shared_bar_cfg = dict(render_cfg.get("wss_bar_cfg", {}) or {})
+        shared_bar_cfg = dict(render_cfg.get("shared_colorbar_bar_cfg", {}) or {})
         for widget, key, default in [
             (self.edit_runtime_scalar_bar_width, "width", 0.08),
             (self.edit_runtime_scalar_bar_height, "height", 0.18),
             (self.edit_runtime_scalar_bar_gap, "stack_gap", 0.03),
             (self.edit_runtime_scalar_bar_pos_x, "position_x", 0.88),
             (self.edit_runtime_scalar_bar_pos_y, "position_y", 0.06),
+            (self.edit_runtime_scalar_bar_title_font, "title_font_size", 40),
+            (self.edit_runtime_scalar_bar_label_font, "label_font_size", 32),
         ]:
             widget.blockSignals(True)
             widget.setText(f"{float(shared_bar_cfg.get(key, default)):.6g}")
@@ -3035,9 +3168,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _rebuild_plane_objects(self):
         self._clear_plane_drag_widgets()
         ws = self.workspace
-        plane_video_cfg = dict((getattr(ws, "render_settings", {}) or {}).get("plane_video_cfg", {}) or {})
-        default_cfg = plane_video_cfg.get("default", {}) if isinstance(plane_video_cfg.get("default"), dict) else {}
-        groups_cfg = plane_video_cfg.get("groups", {}) if isinstance(plane_video_cfg.get("groups"), dict) else {}
+        plane_render_cfg = dict((getattr(ws, "render_settings", {}) or {}).get("plane_render_cfg", {}) or {})
+        default_cfg = plane_render_cfg.get("default", {}) if isinstance(plane_render_cfg.get("default"), dict) else {}
+        groups_cfg = plane_render_cfg.get("groups", {}) if isinstance(plane_render_cfg.get("groups"), dict) else {}
         ws.clear_pathlines()
         ws.pathline_colors = {}
         ws.remove_objects_by_prefix("plane_")
@@ -3056,9 +3189,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if not plane_color:
                 plane_color = ws.skeleton_params.scene_color_for_group(group_name, "plane") if group_name else "yellow"
             try:
-                plane_opacity = float(merged_render_cfg.get("plane_opacity", 0.6))
+                plane_opacity = float(merged_render_cfg.get("plane_opacity", 0.75))
             except Exception:
-                plane_opacity = 0.6
+                plane_opacity = 0.75
             plane_opacity = max(0.0, min(1.0, plane_opacity))
             if group_name in ws.multilabel_groups:
                 state = ws.multilabel_groups[group_name]
@@ -3526,7 +3659,20 @@ class MainWindow(QtWidgets.QMainWindow):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open H5", "", "H5 (*.h5 *.hdf5);;All (*)")
         if not path:
             return
-        resolved = self._prompt_background_phase_choice(path)
+        cases = discover_h5_input_cases(path)
+        if not cases:
+            self.log(f"LOAD ERROR: ValueError: no supported H5 cases found: {path}")
+            return
+        resolved = cases[0]
+        if len(cases) > 1:
+            dialog = H5CaseSelectDialog(cases, self)
+            if dialog.exec_() != QtWidgets.QDialog.Accepted:
+                return
+            selected = dialog.selected_case()
+            if selected is None:
+                return
+            resolved = selected
+        resolved = self._prompt_background_phase_choice(resolved)
         if resolved is None:
             return
         self._load_selected_input_case(resolved)
@@ -3583,10 +3729,12 @@ class MainWindow(QtWidgets.QMainWindow):
             "dynamic_rotation_frames": int(rendering_cfg.get("dynamic_rotation_frames", 180)),
             "dynamic_rotation_elevation_deg": rendering_cfg.get("dynamic_rotation_elevation_deg", 10.0),
             "dynamic_time_repeat": int(rendering_cfg.get("dynamic_time_repeat", 3)),
-            "add_plane_idx": bool(rendering_cfg.get("add_plane_idx", False)),
+            "add_plane_idx": bool(rendering_cfg.get("add_plane_idx", True)),
             "add_path_idx": bool(rendering_cfg.get("add_path_idx", False)),
             "plane_video_cfg": dict(rendering_cfg.get("plane_video_cfg", {})),
             "window_size": tuple(rendering_cfg.get("window_size", (1600, 1200))),
+            "shared_colorbar_show": bool(rendering_cfg.get("shared_colorbar_show", True)),
+            "shared_colorbar_bar_cfg": dict(rendering_cfg.get("shared_colorbar_bar_cfg", {})),
             "wss_clim": tuple(rendering_cfg.get("wss_clim", (0.0, 10.0))),
             "wss_show_scalar_bar": bool(rendering_cfg.get("wss_show_scalar_bar", True)),
             "wss_bar_cfg": dict(rendering_cfg.get("wss_bar_cfg", {})),
@@ -4763,7 +4911,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 def main(config_dir=None):
+    configure_high_dpi()
     app = QtWidgets.QApplication(sys.argv)
+    apply_application_theme(app)
     w = MainWindow(config_dir=config_dir)
     w.show()
     sys.exit(app.exec_())

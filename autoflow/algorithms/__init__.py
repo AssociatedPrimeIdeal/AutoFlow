@@ -42,6 +42,9 @@ from .preprocess import (
     binarize_segmask,
     merge_segmask_to_3d,
     _connected_components,
+    component_volume_threshold_mm3,
+    filter_connected_components,
+    filter_labeled_components,
     remove_small_cc_from_binary_mask,
     _component_bbox,
     _preprocess_single_component,
@@ -109,6 +112,7 @@ from .segmentation import (
     generate_threshold_segmentation,
     generate_nnunet_auto_segmentation,
     save_segmentation_file,
+    save_segmentation_to_source_h5,
 )
 
 from .streamlines import (
@@ -142,6 +146,7 @@ from .metrics import (
 from .pwv import (
     compute_pwv_groups,
     detect_waveform_foot_time_ms,
+    build_pwv_results_payload,
     save_pwv_plot,
     save_pwv_results,
     _plot_pwv_axes,
@@ -166,6 +171,9 @@ __all__ = [
     "filter_segmask_labels",
     "binarize_segmask",
     "merge_segmask_to_3d",
+    "component_volume_threshold_mm3",
+    "filter_connected_components",
+    "filter_labeled_components",
     "remove_small_cc_from_binary_mask",
     "preprocess_mask_for_skeleton",
     "largest_connected_component",
@@ -194,6 +202,7 @@ __all__ = [
     "generate_threshold_segmentation",
     "generate_nnunet_auto_segmentation",
     "save_segmentation_file",
+    "save_segmentation_to_source_h5",
     "extract_plane_cross_section",
     "create_uniform_field_grid",
     "create_vector_volume_from_flow",
@@ -222,6 +231,7 @@ __all__ = [
     "load_metrics_as_table",
     "compute_pwv_groups",
     "detect_waveform_foot_time_ms",
+    "build_pwv_results_payload",
     "save_pwv_plot",
     "save_pwv_results",
     "_plot_pwv_axes",

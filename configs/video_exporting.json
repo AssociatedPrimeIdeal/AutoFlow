@@ -1,0 +1,39 @@
+{
+  "fps": 12,
+  "plane_rotation_frames": 180,
+  "make_plane_video": false,
+  "make_wss_video": false,
+  "make_pressure_gradient_video": false,
+  "make_streamlines_video": false,
+  "make_tke_video": false,
+  "camera_view": "right",
+  "camera_distance_scale": 1.5,
+  "rotate_dynamic_video": true,
+  "dynamic_rotation_frames": 180,
+  "dynamic_rotation_elevation_deg": 10.0,
+  "dynamic_time_repeat": 3,
+  "add_plane_idx": true,
+  "add_path_idx": false,
+  "window_size": [
+    1600,
+    1200
+  ],
+  "plane_video": {
+    "show_skeleton": true,
+    "skeleton_point_size": 5.0,
+    "label": {
+      "prefix": "",
+      "font_size": 20,
+      "text_color": "black",
+      "shape_color": "yellow",
+      "shape_opacity": 0.3
+    },
+    "default": {
+      "skeleton_color": "",
+      "plane_size": 10,
+      "plane_color": "yellow",
+      "plane_opacity": 0.75
+    },
+    "groups": {}
+  }
+}

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -12,7 +13,21 @@ import nibabel as nib
 import numpy as np
 from scipy.ndimage import binary_closing, binary_opening
 
+from .data import (
+    _canonical_h5_key,
+    _find_h5_dataset_from_scopes,
+    _h5_member_name_map,
+    _resolve_h5_data_group,
+    _reorient_spatial_only,
+    reorient,
+)
 from .preprocess import largest_connected_component, remove_small_cc_from_binary_mask
+
+
+_AUTOFLOW_INTERNAL_SPATIAL_ORDER = ("LR", "AP", "FH")
+_AUTOFLOW_INTERNAL_VENC_ORDER = ("LR", "AP", "FH")
+_NNUNET_TARGET_SPATIAL_ORDER = ("HF", "AP", "RL")
+_NNUNET_TARGET_VENC_ORDER = ("HF", "AP", "RL")
 
 
 def segmentation_timestamp():
@@ -285,6 +300,50 @@ def save_segmentation_file(path, segmentation, resolution=None, origin=None, pro
     return path
 
 
+def save_segmentation_to_source_h5(path, segmentation, resolution=None, origin=None, provenance=None, dataset_name="segmask", source_spatial_order=None, source_group=None):
+    arr = np.asarray(segmentation, dtype=np.int16)
+    source_order = tuple(str(x).upper() for x in (source_spatial_order or ()))
+    if source_order and source_order != _AUTOFLOW_INTERNAL_SPATIAL_ORDER:
+        arr = _reorient_spatial_only(
+            arr,
+            spatial_order=_AUTOFLOW_INTERNAL_SPATIAL_ORDER,
+            target_spatial_order=source_order,
+        )
+    arr = np.ascontiguousarray(arr, dtype=np.int16)
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in (".h5", ".hdf5"):
+        raise ValueError(f"source segmentation cache requires an H5 input: {path}")
+    with h5py.File(path, "r+") as handle:
+        group, group_name = _resolve_h5_data_group(handle, source_group=source_group)
+        scopes = [group] if group is handle else [group, handle]
+        existing = _find_h5_dataset_from_scopes(scopes, "segmask", "segmentation")
+        target_group = group
+        target_name = str(dataset_name or "segmask")
+        if existing is not None:
+            target_group = existing.parent
+            target_name = str(existing.name.rsplit("/", 1)[-1])
+            del target_group[target_name]
+        else:
+            name_map = _h5_member_name_map(target_group)
+            actual = name_map.get(_canonical_h5_key(target_name))
+            if actual is not None:
+                del target_group[actual]
+                target_name = actual
+        ds = target_group.create_dataset(target_name, data=arr, compression="gzip")
+        ds.attrs["autoflow_source"] = "auto_segmentation"
+        ds.attrs["autoflow_created_at"] = segmentation_timestamp()
+        if group_name is not None:
+            ds.attrs["autoflow_source_group"] = str(group_name)
+        if source_order:
+            ds.attrs["SpatialOrder"] = np.asarray(source_order, dtype="S4")
+        if resolution is not None:
+            ds.attrs["Resolution"] = np.asarray(resolution, dtype=np.float32).reshape(3)
+        if origin is not None:
+            ds.attrs["Origin"] = np.asarray(origin, dtype=np.float32).reshape(3)
+        if provenance:
+            ds.attrs["provenance_json"] = json.dumps(provenance, ensure_ascii=False)
+    return path
+
 def _nnunet_normalize_channel_name(name):
     token = str(name or "").strip().lower()
     aliases = {
@@ -306,18 +365,47 @@ def _nnunet_normalize_channel_name(name):
     return aliases.get(token, token)
 
 
-def _nnunet_spatial_affine(resolution, origin):
+def _sanitize_nnunet_artifact_token(text, default="item"):
+    token = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text or "")).strip("._-")
+    return token or str(default)
+
+
+def _nnunet_artifact_paths(artifact_prefix, channel_names, file_ending):
+    prefix = str(artifact_prefix or "").strip()
+    if not prefix:
+        return [], None
+    prefix_path = Path(prefix)
+    prefix_path.parent.mkdir(parents=True, exist_ok=True)
+    feature_paths = []
+    for idx, channel_name in enumerate(channel_names):
+        channel_token = _sanitize_nnunet_artifact_token(
+            _nnunet_normalize_channel_name(channel_name),
+            default=f"channel_{idx:04d}",
+        )
+        feature_paths.append(
+            prefix_path.parent / f"{prefix_path.name}_feature_{idx:04d}_{channel_token}{file_ending}"
+        )
+    prediction_path = prefix_path.parent / f"{prefix_path.name}{file_ending}"
+    return feature_paths, prediction_path
+
+
+def _nnunet_spatial_affine(resolution, spatial_shape):
     res = np.asarray(resolution, dtype=np.float32).reshape(-1)
     if res.size == 1:
         res = np.repeat(res, 3)
-    origin = np.asarray(origin, dtype=np.float32).reshape(-1)
-    if origin.size == 1:
-        origin = np.repeat(origin, 3)
-    affine = np.eye(4, dtype=np.float32)
-    affine[0, 0] = float(res[0])
-    affine[1, 1] = float(res[1])
-    affine[2, 2] = float(res[2])
-    affine[:3, 3] = np.asarray(origin[:3], dtype=np.float32)
+    shape = np.asarray(spatial_shape, dtype=np.int32).reshape(-1)
+    if shape.size != 3:
+        raise ValueError(f"spatial_shape must be length 3, got {tuple(shape.tolist())}")
+    x_size, y_size, z_size = int(shape[0]), int(shape[1]), int(shape[2])
+    dx, dy, dz = float(res[0]), float(res[1]), float(res[2])
+    # Match the affine convention used by the nnUNet training/export scripts so
+    # auto-seg inference sees the same voxel-to-world geometry.
+    affine = np.array([
+        [0.0, 0.0, -dz, dz * (z_size - 1) / 2.0],
+        [0.0, -dy, 0.0, dy * (y_size - 1) / 2.0],
+        [-dx, 0.0, 0.0, dx * (x_size - 1) / 2.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ], dtype=np.float32)
     return affine
 
 
@@ -341,6 +429,37 @@ def _ensure_nnunet_mag_flow(mag, flow):
         else:
             raise ValueError(f"mag time dimension {mag.shape[3]} does not match flow {nt}")
     return mag, flow
+
+
+def _prepare_nnunet_inputs(mag, flow, resolution):
+    seg_dummy = np.zeros(np.asarray(mag).shape[:3], dtype=np.int16)
+    flow_r, mag_r, _seg_r, _venc_r, resolution_r = reorient(
+        mag,
+        flow,
+        seg_dummy,
+        venc=np.ones(3, dtype=np.float32),
+        resolution=resolution,
+        spatial_order=_AUTOFLOW_INTERNAL_SPATIAL_ORDER,
+        venc_order=_AUTOFLOW_INTERNAL_VENC_ORDER,
+        target_spatial_order=_NNUNET_TARGET_SPATIAL_ORDER,
+        target_venc_order=_NNUNET_TARGET_VENC_ORDER,
+        return_velocity=False,
+        normalize_mag=False,
+    )
+    return (
+        np.asarray(mag_r, dtype=np.float32),
+        np.asarray(flow_r, dtype=np.float32),
+        np.asarray(resolution_r, dtype=np.float32),
+    )
+
+
+def _restore_autoflow_segmentation(segmentation):
+    seg = _reorient_spatial_only(
+        segmentation,
+        spatial_order=_NNUNET_TARGET_SPATIAL_ORDER,
+        target_spatial_order=_AUTOFLOW_INTERNAL_SPATIAL_ORDER,
+    )
+    return np.asarray(seg, dtype=np.int16)
 
 
 def _ordered_mapping_values(payload):
@@ -402,62 +521,86 @@ def _detect_nnunet_folds(model_path):
     raise FileNotFoundError(f"no nnUNet fold_* folders found in {model_path}")
 
 
-def _nnunet_channel_volume(channel_name, mag, flow, channel_index=0):
+_NNUNET_DEFAULT_CHANNEL_ORDER = (
+    "mag_std_xyz",
+    "mag_mean_xyz",
+    "pcmra_std_xyz",
+    "pcmra_mean_xyz",
+    "flow_x_mean_xyz",
+    "flow_y_mean_xyz",
+    "flow_z_mean_xyz",
+    "flow_mag_mean_xyz",
+    "flow_x_std_xyz",
+    "flow_y_std_xyz",
+    "flow_z_std_xyz",
+    "flow_mag_std_xyz",
+)
+
+
+def _resolve_nnunet_channel_token(channel_name, channel_index):
     token = _nnunet_normalize_channel_name(channel_name)
-    speed = np.linalg.norm(flow, axis=-1)
-    mag_mean = np.mean(mag, axis=3)
-    mag_std = np.std(mag, axis=3)
-    pcmra = mag * speed
-    pcmra_mean = np.mean(pcmra, axis=3)
-    pcmra_std = np.std(pcmra, axis=3)
-    flow_x = flow[..., 0]
-    flow_y = flow[..., 1]
-    flow_z = flow[..., 2]
-    flow_x_mean = np.mean(flow_x, axis=3)
-    flow_y_mean = np.mean(flow_y, axis=3)
-    flow_z_mean = np.mean(flow_z, axis=3)
-    flow_mag_mean = np.mean(speed, axis=3)
-    flow_x_std = np.std(flow_x, axis=3)
-    flow_y_std = np.std(flow_y, axis=3)
-    flow_z_std = np.std(flow_z, axis=3)
-    flow_mag_std = np.std(speed, axis=3)
-    channels = {
-        "mag": mag_mean,
-        "mag_mean_xyz": mag_mean,
-        "mag_std_xyz": mag_std,
-        "pcmra": pcmra_mean,
-        "pcmra_mean_xyz": pcmra_mean,
-        "pcmra_std_xyz": pcmra_std,
-        "flow_x_mean_xyz": flow_x_mean,
-        "flow_y_mean_xyz": flow_y_mean,
-        "flow_z_mean_xyz": flow_z_mean,
-        "flow_mag_mean_xyz": flow_mag_mean,
-        "flow_x_std_xyz": flow_x_std,
-        "flow_y_std_xyz": flow_y_std,
-        "flow_z_std_xyz": flow_z_std,
-        "flow_mag_std_xyz": flow_mag_std,
-    }
-    if token in channels:
-        return np.asarray(channels[token], dtype=np.float32)
-    default_order = [
-        "mag_std_xyz",
-        "mag_mean_xyz",
-        "pcmra_std_xyz",
-        "pcmra_mean_xyz",
-        "flow_x_mean_xyz",
-        "flow_y_mean_xyz",
-        "flow_z_mean_xyz",
-        "flow_mag_mean_xyz",
-        "flow_x_std_xyz",
-        "flow_y_std_xyz",
-        "flow_z_std_xyz",
-        "flow_mag_std_xyz",
-    ]
-    if 0 <= int(channel_index) < len(default_order):
-        return np.asarray(channels[default_order[int(channel_index)]], dtype=np.float32)
+    token = {
+        "mag": "mag_mean_xyz",
+        "pcmra": "pcmra_mean_xyz",
+    }.get(token, token)
+    if token in _NNUNET_DEFAULT_CHANNEL_ORDER:
+        return token
+    if 0 <= int(channel_index) < len(_NNUNET_DEFAULT_CHANNEL_ORDER):
+        return _NNUNET_DEFAULT_CHANNEL_ORDER[int(channel_index)]
     raise ValueError(
-        f"unsupported nnUNet channel '{channel_name}'. Supported channels: {sorted(channels.keys())}"
+        f"unsupported nnUNet channel '{channel_name}'. "
+        f"Supported channels: {list(_NNUNET_DEFAULT_CHANNEL_ORDER)}"
     )
+
+
+def _nnunet_channel_volumes(channel_names, mag, flow):
+    tokens = [
+        _resolve_nnunet_channel_token(channel_name, channel_index)
+        for channel_index, channel_name in enumerate(channel_names)
+    ]
+    requested = set(tokens)
+    channels = {}
+
+    if "mag_mean_xyz" in requested:
+        channels["mag_mean_xyz"] = np.mean(mag, axis=3)
+    if "mag_std_xyz" in requested:
+        channels["mag_std_xyz"] = np.std(mag, axis=3)
+
+    for axis_name, axis_index in (("x", 0), ("y", 1), ("z", 2)):
+        mean_key = f"flow_{axis_name}_mean_xyz"
+        std_key = f"flow_{axis_name}_std_xyz"
+        if mean_key in requested or std_key in requested:
+            component = flow[..., axis_index]
+            if mean_key in requested:
+                channels[mean_key] = np.mean(component, axis=3)
+            if std_key in requested:
+                channels[std_key] = np.std(component, axis=3)
+
+    speed_keys = {
+        "flow_mag_mean_xyz",
+        "flow_mag_std_xyz",
+        "pcmra_mean_xyz",
+        "pcmra_std_xyz",
+    }
+    if requested.intersection(speed_keys):
+        speed = np.linalg.norm(flow, axis=-1)
+        if "flow_mag_mean_xyz" in requested:
+            channels["flow_mag_mean_xyz"] = np.mean(speed, axis=3)
+        if "flow_mag_std_xyz" in requested:
+            channels["flow_mag_std_xyz"] = np.std(speed, axis=3)
+        if "pcmra_mean_xyz" in requested or "pcmra_std_xyz" in requested:
+            pcmra = mag * speed
+            if "pcmra_mean_xyz" in requested:
+                channels["pcmra_mean_xyz"] = np.mean(pcmra, axis=3)
+            if "pcmra_std_xyz" in requested:
+                channels["pcmra_std_xyz"] = np.std(pcmra, axis=3)
+
+    return [np.asarray(channels[token], dtype=np.float32) for token in tokens]
+
+
+def _nnunet_channel_volume(channel_name, mag, flow, channel_index=0):
+    token = _resolve_nnunet_channel_token(channel_name, channel_index)
+    return _nnunet_channel_volumes([token], mag, flow)[0]
 
 
 def _parse_nnunet_label_map(label_map_spec, model_labels):
@@ -523,6 +666,11 @@ def _write_nifti_volume(volume, affine, path):
     nib.save(img, str(path))
 
 
+def _write_nifti_segmentation(volume, affine, path):
+    img = nib.Nifti1Image(np.asarray(volume, dtype=np.int16), affine)
+    nib.save(img, str(path))
+
+
 def _read_nifti_segmentation(path):
     arr = np.asarray(nib.load(str(path)).get_fdata(), dtype=np.float32)
     if arr.ndim != 3:
@@ -560,11 +708,18 @@ def _emit_progress(progress_callback, *, stage, message, current=None, total=Non
 
 
 def default_nnunet_model_folder():
-    return (
-        Path(__file__).resolve().parents[1]
-        / "segmodel"
-        / "nnUNetTrainer_500epochs__nnUNetPlans__3d_fullres_iso1mm"
-    )
+    model_name = "nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm"
+    cwd = Path.cwd().resolve()
+    for root in (cwd, *cwd.parents):
+        candidate = root / "autoflow" / "segmodel" / model_name
+        if candidate.is_dir():
+            return candidate
+
+    package_candidate = Path(__file__).resolve().parents[1] / "segmodel" / model_name
+    if package_candidate.is_dir():
+        return package_candidate
+
+    return package_candidate
 
 
 def resolve_nnunet_model_folder(model_folder=""):
@@ -610,6 +765,7 @@ def generate_nnunet_auto_segmentation(
     disable_tta=True,
     num_processes_preprocessing=3,
     num_processes_segmentation_export=3,
+    artifact_prefix="",
     runner=None,
     progress_callback=None,
 ):
@@ -631,6 +787,7 @@ def generate_nnunet_auto_segmentation(
     resolved_device = resolve_auto_segmentation_device(device)
     mag, flow = _ensure_nnunet_mag_flow(mag, flow)
     time_count = int(flow.shape[3])
+    mag_nnunet, flow_nnunet, resolution_nnunet = _prepare_nnunet_inputs(mag, flow, resolution)
     model_path, dataset_json = _load_nnunet_model_metadata(model_folder)
     channel_names = _ordered_mapping_values(dataset_json.get("channel_names") or dataset_json.get("modality") or {})
     if not channel_names:
@@ -640,7 +797,12 @@ def generate_nnunet_auto_segmentation(
         file_ending = f".{file_ending}"
     label_map = _parse_nnunet_label_map(auto_label_map, dataset_json.get("labels", {}))
     folds = _detect_nnunet_folds(model_path)
-    affine = _nnunet_spatial_affine(resolution, origin)
+    affine = _nnunet_spatial_affine(resolution_nnunet, mag_nnunet.shape[:3])
+    artifact_feature_paths, artifact_prediction_path = _nnunet_artifact_paths(
+        artifact_prefix,
+        channel_names,
+        file_ending,
+    )
     _emit_progress(
         progress_callback,
         stage="autoseg_model_ready",
@@ -671,9 +833,11 @@ def generate_nnunet_auto_segmentation(
             detail_current=0,
             detail_total=len(channel_names),
         )
-        for idx, channel_name in enumerate(channel_names):
-            volume = _nnunet_channel_volume(channel_name, mag, flow, channel_index=idx)
+        channel_volumes = _nnunet_channel_volumes(channel_names, mag_nnunet, flow_nnunet)
+        for idx, (channel_name, volume) in enumerate(zip(channel_names, channel_volumes)):
             _write_nifti_volume(volume, affine, input_dir / f"{case_id}_{idx:04d}{file_ending}")
+            if idx < len(artifact_feature_paths):
+                _write_nifti_volume(volume, affine, artifact_feature_paths[idx])
             _emit_progress(
                 progress_callback,
                 stage="autoseg_prepare_inputs",
@@ -736,8 +900,11 @@ def generate_nnunet_auto_segmentation(
             elapsed_sec=time.perf_counter() - t_total_start,
             prediction_file=str(prediction_path),
         )
-        seg_3d = _read_nifti_segmentation(prediction_path)
-        seg_3d = _apply_label_map(seg_3d, label_map)
+        seg_3d_nnunet = _read_nifti_segmentation(prediction_path)
+        seg_3d_nnunet = _apply_label_map(seg_3d_nnunet, label_map)
+        if artifact_prediction_path is not None:
+            _write_nifti_segmentation(seg_3d_nnunet, affine, artifact_prediction_path)
+        seg_3d = _restore_autoflow_segmentation(seg_3d_nnunet)
         seg_4d = broadcast_segmentation_to_time(seg_3d, time_count)
         elapsed_total = time.perf_counter() - t_total_start
         _emit_progress(
@@ -757,15 +924,17 @@ def generate_nnunet_auto_segmentation(
             "device": str(resolved_device),
             "folds": list(folds),
             "channel_names": list(channel_names),
+            "nnunet_spatial_order": list(_NNUNET_TARGET_SPATIAL_ORDER),
+            "nnunet_venc_order": list(_NNUNET_TARGET_VENC_ORDER),
+            "autoflow_internal_spatial_order": list(_AUTOFLOW_INTERNAL_SPATIAL_ORDER),
+            "autoflow_internal_venc_order": list(_AUTOFLOW_INTERNAL_VENC_ORDER),
             "label_map": {str(k): int(v) for k, v in label_map.items()},
             "case_id": str(case_id),
             "created_at": segmentation_timestamp(),
             "command": [str(x) for x in command],
-            "input_dir": str(input_dir),
-            "output_dir": str(output_dir),
-            "prediction_file": str(prediction_path),
+            "feature_files": [str(path) for path in artifact_feature_paths],
+            "segmentation_nifti": "" if artifact_prediction_path is None else str(artifact_prediction_path),
+            "prediction_file": "" if artifact_prediction_path is None else str(artifact_prediction_path),
             "elapsed_sec": float(elapsed_total),
         }
         return seg_4d, provenance
-
-

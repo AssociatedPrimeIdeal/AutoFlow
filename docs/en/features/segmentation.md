@@ -15,7 +15,7 @@ Segmentation gives AutoFlow the lumen mask needed for skeletons, graphs, planes,
 - use it whenever the input has no usable vessel mask
 - use imported segmentation when the mask already exists externally
 - use threshold segmentation for quick mask generation from `mag`, `pcmra`, or `pcmra_std`
-- use automatic segmentation when nnUNet is available and you want a saved, reusable sidecar result
+- use automatic segmentation when nnUNet is available and you want the result cached back into the source H5 for reuse
 - do not expect fake TKE reconstruction from segmentation alone
 
 ## Quick Use
@@ -68,11 +68,13 @@ summary = run_case("case.h5", config=config)
 | `threshold_closing` | bool | `True` | `configs/segmentation.json` | morphological closing |
 | `threshold_opening` | bool | `False` | `configs/segmentation.json` | morphological opening |
 | `auto_backend` / `--autoseg-backend` | string | `nnUNet` | GUI config or CLI/API | automatic backend |
-| `auto_model` / `--autoseg-model` | path | bundled model path in GUI config; empty string in CLI/API config until resolved | GUI config or CLI/API | nnUNet model folder |
+| `auto_model` / `--autoseg-model` | path | bundled `autoflow/segmodel/nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm` in GUI config; empty string in CLI/API config until resolved | GUI config or CLI/API | nnUNet model folder |
 | `auto_checkpoint` / `--autoseg-checkpoint` | string | `checkpoint_final.pth` | GUI config or CLI/API | checkpoint name |
 | `auto_device` / `--autoseg-device` | string | `auto` | GUI config or CLI/API | choose device |
 | `auto_label_map` / `--autoseg-label-map` | JSON | empty | GUI config or CLI/API | remap predicted labels |
 | `edit_all_timepoints` | bool | `True` | segmentation dock | edit a 3D-all-frames mask instead of current-frame 4D editing |
+| `colorbar.show` | bool | `True` | `configs/colorbar.json` | show or hide the shared GUI colorbar used by segmentation labels |
+| `colorbar.bar_cfg` | object | built-in default | `configs/colorbar.json` | shared GUI colorbar placement and font settings used by segmentation labels |
 
 ## Outputs
 
@@ -80,14 +82,16 @@ summary = run_case("case.h5", config=config)
 | --- | --- | --- |
 | active segmentation source in workspace | every segmentation change | current segmentation used by downstream steps |
 | `*_threshold_segmentation.h5` | threshold segmentation succeeds | reusable threshold sidecar |
-| `*_auto_segmentation.h5` | auto segmentation succeeds | reusable auto sidecar saved by both GUI and CLI flows |
+| source input H5 `segmask` dataset | auto segmentation succeeds on an H5 input | reusable auto segmentation cache written back into the source H5 by both GUI and CLI flows |
+| `*_auto_segmentation.nii.gz` | auto segmentation succeeds | saved predicted segmentation NIfTI for review and reuse in the same `HF/AP/RL` geometry convention used by the nnUNet training/export scripts |
+| `*_auto_segmentation_feature_*.nii.gz` | auto segmentation succeeds | saved nnUNet feature-channel NIfTI inputs used for the prediction, written in the same `HF/AP/RL` geometry convention used by the nnUNet training/export scripts |
 | saved H5, NPY, or NPZ chosen by user | `Save Active Segmentation...` | manual export of active segmentation |
 | provenance metadata | segmentation source changes | backend, model, and save provenance |
 
 ## Limitations
 - the implemented automatic backend is `nnUNet`
 - automatic segmentation requires loaded `mag` and `flow`
-- GUI auto segmentation runs in a background worker and shows a progress dialog until inference and sidecar save finish
+- GUI auto segmentation runs in a background worker and shows a progress dialog until inference and H5 cache write finish when the input is H5
 - CLI auto segmentation only runs when the loaded case has no segmentation
 - `Run All` in the GUI does not auto-start segmentation
 - TKE availability is independent of segmentation availability

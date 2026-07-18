@@ -34,6 +34,7 @@ def coerce_background_phase_correction_config(config=None):
 def background_phase_report_for_metadata(report):
     payload = dict(report or {})
     payload.pop("stationary_voxels", None)
+    payload.pop("corr", None)
     return payload
 
 
@@ -97,6 +98,7 @@ def apply_background_phase_correction_to_complex(
     config=None,
     progress_callback=None,
     source_mode="complex_source",
+    cached_corr=None,
 ):
     cfg = coerce_background_phase_correction_config(config)
     arr = np.asarray(img_complex)
@@ -108,6 +110,8 @@ def apply_background_phase_correction_to_complex(
         "threshold": float(cfg.threshold),
         "stationary_voxels": 0,
         "skipped_reason": "",
+        "cache_hit": False,
+        "cache_reason": "missing",
     }
     if not cfg.enabled:
         report["skipped_reason"] = "disabled"
@@ -116,33 +120,66 @@ def apply_background_phase_correction_to_complex(
         report["skipped_reason"] = f"expected complex XYZT4+ input, got shape={arr.shape}"
         return arr.copy(), None, report
 
-    _emit_progress(progress_callback, "background_phase_start", message="Running background phase correction")
-    try:
-        corr_nvtzyx, stationary_mask, diag = execute_msac(
-            np.transpose(np.asarray(arr[..., :4], dtype=np.complex64), (4, 3, 2, 1, 0)),
-            corr_fit_order=int(cfg.corr_fit_order),
-            th=float(cfg.threshold),
-        )
-    except Exception as exc:
-        report["skipped_reason"] = f"{type(exc).__name__}: {exc}"
-        return arr.copy(), None, report
+    corr_xyzt3 = None
+    stationary_mask = None
+    if cached_corr is not None:
+        try:
+            corr_xyzt3 = np.asarray(cached_corr, dtype=np.float32)
+            expected_shape = tuple(arr.shape[:-1]) + (3,)
+            if corr_xyzt3.ndim == len(expected_shape) - 1 and corr_xyzt3.shape[-1] == 3:
+                corr_xyzt3 = corr_xyzt3[..., np.newaxis, :]
+            singleton_time_match = (
+                corr_xyzt3.ndim == 5
+                and corr_xyzt3.shape[:3] == expected_shape[:3]
+                and corr_xyzt3.shape[3] == 1
+                and corr_xyzt3.shape[4] == expected_shape[4]
+            )
+            if corr_xyzt3.shape != expected_shape and not singleton_time_match:
+                raise ValueError(f"cached corr shape {corr_xyzt3.shape} does not match expected {expected_shape}")
+            report["cache_hit"] = True
+            report["cache_reason"] = "hit"
+            report["corr_source"] = "cache"
+        except Exception as exc:
+            corr_xyzt3 = None
+            report["cache_hit"] = False
+            report["cache_reason"] = f"invalid_cache:{type(exc).__name__}: {exc}"
 
-    report.update(diag)
-    if not bool(diag.get("applied", False)):
-        return arr.copy(), None, report
+    if corr_xyzt3 is None:
+        _emit_progress(progress_callback, "background_phase_start", message="Running background phase correction")
+        try:
+            corr_nvtzyx, stationary_mask, diag = execute_msac(
+                np.transpose(np.asarray(arr[..., :4], dtype=np.complex64), (4, 3, 2, 1, 0)),
+                corr_fit_order=int(cfg.corr_fit_order),
+                th=float(cfg.threshold),
+            )
+        except Exception as exc:
+            report["skipped_reason"] = f"{type(exc).__name__}: {exc}"
+            return arr.copy(), None, report
 
-    corr_xyzt3 = np.transpose(corr_nvtzyx, (4, 3, 2, 1, 0))
+        report.update(diag)
+        report["corr_source"] = "computed"
+        if not bool(diag.get("applied", False)):
+            return arr.copy(), None, report
+
+        corr_xyzt3 = np.transpose(corr_nvtzyx, (4, 3, 2, 1, 0))
+        report["stationary_voxels"] = int(np.sum(stationary_mask))
+    else:
+        _emit_progress(progress_callback, "background_phase_start", message="Reusing cached background phase correction")
+
     corrected = np.asarray(arr, dtype=np.complex64).copy()
     corrected[..., 1:4] *= np.exp(-1j * np.asarray(corr_xyzt3, dtype=np.float32))
     corrected = corrected.astype(arr.dtype, copy=False)
     report["applied"] = True
-    report["stationary_voxels"] = int(np.sum(stationary_mask))
+    report["corr_algorithm"] = "msac"
+    report["corr_version"] = 1
+    report["corr_components"] = int(corr_xyzt3.shape[-1])
+    report["corr"] = np.asarray(corr_xyzt3, dtype=np.float32)
     _emit_progress(
         progress_callback,
         "background_phase_done",
-        message="Background phase correction applied",
+        message="Background phase correction reused from cache" if report.get("cache_hit", False) else "Background phase correction applied",
     )
-    return corrected, stationary_mask.astype(bool), report
+    return corrected, (stationary_mask.astype(bool) if stationary_mask is not None else None), report
 
 
 def apply_background_phase_correction_to_mag_flow(
@@ -151,6 +188,7 @@ def apply_background_phase_correction_to_mag_flow(
     venc,
     config=None,
     progress_callback=None,
+    cached_corr=None,
 ):
     cfg = coerce_background_phase_correction_config(config)
     flow_xyzt3, mag_xyzt = _ensure_mag_flow_time(flow, mag)
@@ -171,6 +209,7 @@ def apply_background_phase_correction_to_mag_flow(
         config=cfg,
         progress_callback=progress_callback,
         source_mode="synthetic_complex",
+        cached_corr=cached_corr,
     )
     if not bool(report.get("applied", False)):
         return flow_xyzt3.copy(), stationary_mask, report

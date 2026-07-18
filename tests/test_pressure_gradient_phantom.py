@@ -47,7 +47,7 @@ def _run_phantom_p_case():
         skip_derived=False,
         skip_plane_metrics=False,
         use_multithread=False,
-        use_center_plane=False,
+        plane_mode="distance",
         cross_section_dist=PLANE_SPACING_MM,
         requested_metrics=["pg"],
         make_plane_video=False,
@@ -67,18 +67,37 @@ def test_phantom_p_plane_metrics_include_mean_velocity_error_and_valid_distance_
     case_dir, metrics = _run_phantom_p_case()
     plane_pixelwise_path = case_dir / "plane_metrics_pixelwise.h5"
     plane_positions_path = case_dir / "plane_positions.json"
+    planes_h5_path = case_dir / "planes.h5"
     summary_path = case_dir / "summary.json"
     pixelwise_npz_path = case_dir / "derived_metrics_pixelwise.npz"
     assert plane_pixelwise_path.is_file()
     assert plane_positions_path.is_file()
+    assert planes_h5_path.is_file()
     assert summary_path.is_file()
     assert pixelwise_npz_path.is_file()
 
     plane_positions = json.loads(plane_positions_path.read_text(encoding="utf-8"))["planes"]
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    with h5py.File(planes_h5_path, "r") as planes_h5:
+        plane_keys = sorted(planes_h5.keys())
+        assert plane_keys == [f"plane_{idx:04d}" for idx in range(len(plane_positions))]
+        first_plane = planes_h5[plane_keys[0]]
+        assert int(first_plane["plane_index"][()]) == 0
+        assert np.allclose(np.asarray(first_plane["center_world"][()], dtype=float), np.asarray(plane_positions[0]["center_world"], dtype=float))
+        assert int(first_plane["path_index"][()]) == int(plane_positions[0]["path_index"])
+        assert "label_name" in first_plane
+        assert first_plane["label_name"][()].decode("utf-8")
+        assert "payload_json" in first_plane
+
+    planes_json = json.loads((case_dir / "planes.json").read_text(encoding="utf-8"))
+    assert len(planes_json) == len(plane_positions)
+    assert all(str(item.get("label_name", "")).strip() for item in planes_json)
     assert len(plane_positions) == len(metrics)
     assert len(metrics) >= 1
     assert summary["pressure_method"] == "least_squares"
+    assert "pwv_h5_file" in summary
+    assert "pwv_json_file" in summary
+
 
     centerline_profiles = list(summary.get("centerline_pressure_profiles", []) or [])
     assert centerline_profiles
