@@ -5,18 +5,20 @@ from types import SimpleNamespace
 
 import h5py
 import numpy as np
+import pytest
 
 from autoflow import AutoFlowConfig, run_batch, run_case
-from autoflow.algorithms.data import load_h5_data
+from autoflow.algorithms.data import discover_h5_input_cases, inspect_h5_input_case, load_h5_data
 from autoflow.algorithms.dicom import collect_input_cases
 from autoflow.algorithms.segmentation import default_nnunet_model_folder
 from autoflow.algorithms.pwv import compute_cross_correlation_delay_ms, detect_waveform_foot_time_ms
 from autoflow.algorithms.preprocess import filter_connected_components
 from autoflow.algorithms.segmentation import generate_nnunet_auto_segmentation, save_segmentation_to_source_h5
+from autoflow.algorithms.streamlines import automatic_streamline_clim, generate_streamlines_at_t
 from autoflow.config import bundle_to_autoflow_kwargs
 from autoflow.core.pipeline import PipelineEngine
-from autoflow.core.models import SkeletonParams
-from autoflow.plane_io import build_plane_records
+from autoflow.core.models import PlaneData, SkeletonParams, StepId, Workspace
+from autoflow.plane_io import build_plane_records, project_planes_to_workspace
 from autoflow.plane_io import save_pwv_h5
 from autoflow.rendering.videos import _build_union_surface, _path_color, _path_group_name, _write_video, render_plane_rotation_video
 
@@ -25,6 +27,73 @@ DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 PHANTOM_CASES = ("phantom_S", "phantom_U", "phantom_Y")
 REL_TOL = 0.05
 PLANE_SPACING_MM = 15.0
+
+
+def test_streamline_auto_clim_uses_segmented_velocity_across_time():
+    from autoflow.core.models import ObjectKind, SceneObject, Workspace
+    from autoflow.ui.viewer import SceneController
+
+    flow = np.zeros((2, 2, 2, 2, 3), dtype=np.float32)
+    flow[0, 0, 0, 0] = [30.0, 40.0, 0.0]
+    flow[0, 0, 0, 1] = [30.0, 40.0, 0.0]
+    flow[1, 1, 1, 1] = [300.0, 400.0, 0.0]
+    mask = np.zeros(flow.shape[:4], dtype=bool)
+    mask[0, 0, 0, 0] = True
+
+    assert automatic_streamline_clim(flow, mask) == pytest.approx((0.0, 0.5))
+    assert automatic_streamline_clim(flow, np.any(mask, axis=3)) == pytest.approx((0.0, 0.5))
+
+    workspace = Workspace()
+    workspace.flow_raw = flow
+    workspace.segmask_binary = mask
+    obj = SceneObject(
+        uid="streamlines",
+        name="streamlines",
+        kind=ObjectKind.FLOW,
+        data_key="streamlines_live",
+        scalars="Velocity",
+        clim=None,
+    )
+    dataset = SimpleNamespace(point_data={"Velocity": np.array([0.25])}, cell_data={})
+    controller = SceneController(SimpleNamespace(), workspace, lambda _message: None)
+    mesh_kwargs = controller._mesh_kwargs(obj, dataset)
+
+    assert mesh_kwargs["clim"] == pytest.approx((0.0, 0.5))
+    assert mesh_kwargs["lighting"] is False
+
+    robust_flow = np.zeros((10, 10, 10, 1, 3), dtype=np.float32)
+    robust_flow[..., 0] = 100.0
+    robust_flow[0, 0, 0, 0, 0] = 10000.0
+    assert automatic_streamline_clim(
+        robust_flow, np.ones(robust_flow.shape[:4], dtype=bool)
+    ) == pytest.approx((0.0, 1.0))
+
+
+def test_streamline_velocity_scalar_matches_interpolated_vector_magnitude():
+    flow = np.zeros((6, 6, 6, 1, 3), dtype=np.float32)
+    flow[..., 0, 0] = 100.0
+    flow[:, :3, :, 0, 1] = 100.0
+    flow[:, 3:, :, 0, 1] = -100.0
+    mask = np.ones((6, 6, 6), dtype=bool)
+    seeds = np.array(
+        [[1.0, 2.5, 2.5], [2.0, 2.5, 3.0], [1.0, 3.0, 2.0]],
+        dtype=float,
+    )
+
+    streamlines = generate_streamlines_at_t(
+        flow,
+        0,
+        seeds,
+        spacing=(1.0, 1.0, 1.0),
+        origin=(0.0, 0.0, 0.0),
+        mask_3d=mask,
+        max_steps=30,
+        terminal_speed=0.01,
+    )
+
+    assert streamlines is not None
+    expected = np.linalg.norm(np.asarray(streamlines.point_data["vector"]), axis=1)
+    assert np.asarray(streamlines.point_data["Velocity"]) == pytest.approx(expected)
 
 
 def _run_case(input_name: str, *, skip_derived: bool = False):
@@ -140,6 +209,34 @@ def test_load_h5_data_supports_nested_group_real_img_layout_case_insensitive_key
     assert loaded.rr == 812.5
 
 
+def test_group_h5_corr_and_seg_are_discovered_and_loaded(tmp_path):
+    path = tmp_path / "group_features.h5"
+    img = np.zeros((2, 2, 2, 1, 4), dtype=np.float32)
+    with h5py.File(path, "w") as handle:
+        complete = handle.create_group("Complete")
+        complete.create_dataset("img", data=img)
+        corr = complete.create_dataset("corr", data=np.zeros((2, 2, 2, 1, 3), dtype=np.float32))
+        corr.attrs["corr_algorithm"] = "wrls_arto"
+        complete.create_dataset("seg", data=np.ones((2, 2, 2, 1), dtype=np.int16))
+        incomplete = handle.create_group("Incomplete")
+        incomplete.create_dataset("img", data=img)
+
+    cases = discover_h5_input_cases(str(path))
+    by_group = {case.source_group: case for case in cases}
+
+    assert by_group["Complete"].metadata["has_background_correction_cache"] is True
+    assert by_group["Complete"].metadata["background_correction_method"] == "wrls_arto"
+    assert by_group["Complete"].metadata["has_embedded_segmentation"] is True
+    assert by_group["Incomplete"].metadata["has_background_correction_cache"] is False
+    assert by_group["Incomplete"].metadata["has_embedded_segmentation"] is False
+    inspected = inspect_h5_input_case(by_group["Complete"])
+    assert inspected["source_group"] == "Complete"
+    assert inspected["background_correction_method"] == "wrls_arto"
+    loaded = load_h5_data(str(path), source_group="Complete")
+    assert loaded.segmentation is not None
+    assert loaded.capabilities.has_segmentation is True
+
+
 def test_load_h5_data_orders_dual_venc_channel_groups_by_venc(tmp_path):
     path = tmp_path / "dual_venc_high_first.h5"
     velocity = np.zeros((2, 2, 2, 1, 3), dtype=np.float32)
@@ -202,6 +299,46 @@ def test_load_h5_data_reuses_dual_venc_singleton_time_corr_cache(tmp_path, monke
     reports = loaded.metadata["background_phase_correction"]
     assert reports["dual_venc_low"]["cache_hit"] is True
     assert reports["dual_venc_high"]["cache_hit"] is True
+    assert loaded.flow.shape == (2, 2, 2, 2, 3)
+
+
+def test_load_h5_data_runs_dual_venc_corrections_concurrently(tmp_path, monkeypatch):
+    import threading
+
+    path = tmp_path / "dual_venc_parallel_corr.h5"
+    img = np.ones((2, 2, 2, 2, 7), dtype=np.complex64)
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("img", data=img)
+        handle.create_dataset("Resolution", data=np.ones(3, dtype=np.float32))
+        handle.create_dataset(
+            "VENC",
+            data=np.array([50.0, 50.0, 50.0, 150.0, 150.0, 150.0], dtype=np.float32),
+        )
+        handle.create_dataset("SpatialOrder", data=np.asarray(["LR", "AP", "FH"], dtype="S4"))
+        handle.create_dataset("VENCOrder", data=np.asarray(["LR", "AP", "FH"], dtype="S4"))
+
+    barrier = threading.Barrier(2)
+    worker_names = set()
+    worker_names_lock = threading.Lock()
+
+    def fake_apply(values, config=None, progress_callback=None, source_mode="", cached_corr=None):
+        with worker_names_lock:
+            worker_names.add(threading.current_thread().name)
+        barrier.wait(timeout=2.0)
+        return values, None, {
+            "enabled": True,
+            "applied": False,
+            "source_mode": source_mode,
+            "cache_hit": False,
+            "cache_reason": "missing",
+            "skipped_reason": "test",
+        }
+
+    monkeypatch.setattr("autoflow.algorithms.data.apply_background_phase_correction_to_complex", fake_apply)
+    loaded = load_h5_data(str(path), correction_config={"enabled": True})
+
+    assert len(worker_names) == 2
+    assert all(name.startswith("autoflow-bgc") for name in worker_names)
     assert loaded.flow.shape == (2, 2, 2, 2, 3)
 
 
@@ -456,8 +593,15 @@ def test_load_h5_data_writes_and_reuses_background_phase_corr_cache(monkeypatch,
 
     calls = {"count": 0}
 
-    def fake_execute_msac(im, corr_fit_order=3, th=0.1):
+    def fake_execute_msac(im, corr_fit_order=3, th=0.1, progress_callback=None):
         calls["count"] += 1
+        if progress_callback is not None:
+            progress_callback({
+                "stage": "background_phase_fit",
+                "current": 1,
+                "total": 1,
+                "message": "fit",
+            })
         corr_nvtzyx = np.transpose(corr_xyzt3, (4, 3, 2, 1, 0)).astype(np.float32)
         stationary = np.ones(corr_xyzt3.shape[:3], dtype=bool)
         return corr_nvtzyx, stationary, {
@@ -470,13 +614,17 @@ def test_load_h5_data_writes_and_reuses_background_phase_corr_cache(monkeypatch,
 
     monkeypatch.setattr("autoflow.algorithms.phase_correction.execute_msac", fake_execute_msac)
     cfg = {"enabled": True, "corr_fit_order": 2, "threshold": 0.25}
-    loaded = load_h5_data(str(path), correction_config=cfg)
+    progress_events = []
+    loaded = load_h5_data(str(path), correction_config=cfg, progress_callback=progress_events.append)
 
     assert calls["count"] == 1
     first_meta = loaded.metadata["background_phase_correction"]
     assert first_meta["applied"] is True
     assert first_meta["cache_hit"] is False
     assert first_meta["cache_written"] is True
+    assert any(event["stage"] == "h5_background_phase_fit" for event in progress_events)
+    assert any(event["stage"] == "h5_background_phase_cache_write" for event in progress_events)
+    assert any(event["stage"] == "h5_background_phase_cache_done" for event in progress_events)
     with h5py.File(path, "r") as handle:
         assert "corr" in handle
         assert handle["corr"].shape == corr_xyzt3.shape
@@ -495,6 +643,127 @@ def test_load_h5_data_writes_and_reuses_background_phase_corr_cache(monkeypatch,
     assert cached_meta["cache_hit"] is True
     assert cached_meta["cache_name"] == "corr"
     assert np.allclose(loaded_cached.flow, loaded.flow)
+
+
+def test_msac_reports_trial_progress():
+    from autoflow.algorithms.phase_correction import msac
+
+    points = np.zeros((6, 3), dtype=np.float32)
+    parameters = {
+        "samples": 2,
+        "msac_thresh": 0.1,
+        "trials": 4,
+        "n_enc": 1,
+    }
+    functions = {
+        "msac_fit": lambda _sample: np.zeros((1, 1), dtype=np.float32),
+        "msac_dist": lambda _coeffs, values: np.zeros((values.shape[0], 1), dtype=np.float32),
+    }
+    progress = []
+
+    msac(points, parameters, functions, progress_callback=lambda current, total: progress.append((current, total)))
+
+    assert progress == [(1, 4), (2, 4), (3, 4), (4, 4)]
+
+
+def test_wrls_arto_recovers_synthetic_polynomial_background():
+    from autoflow.algorithms.phase_correction import execute_wrls_arto
+
+    nt, nz, ny, nx = 8, 6, 7, 8
+    x = np.arange(nx, dtype=np.float32) - nx // 2
+    y = np.arange(ny, dtype=np.float32) - ny // 2
+    z = np.arange(nz, dtype=np.float32) - nz // 2
+    xx, yy, zz = np.meshgrid(x, y, z, indexing="ij")
+    expected_fields = [
+        0.10 + 0.005 * xx - 0.003 * yy,
+        -0.05 + 0.002 * zz,
+        0.03 + 0.001 * xx * yy,
+    ]
+    rng = np.random.default_rng(17)
+    image = np.ones((4, nt, nz, ny, nx), dtype=np.complex64)
+    for direction, expected in enumerate(expected_fields):
+        phase_tzyx = np.transpose(expected, (2, 1, 0))[np.newaxis, ...]
+        phase_tzyx = phase_tzyx + rng.normal(0.0, 0.003, size=(nt, nz, ny, nx))
+        image[direction + 1] = np.exp(1j * phase_tzyx).astype(np.complex64)
+
+    correction, stationary, report = execute_wrls_arto(
+        image,
+        corr_fit_order=3,
+        fista_iterations=200,
+        gmm_iterations=30,
+    )
+
+    assert report["applied"] is True
+    assert correction.shape == (3, 1, nz, ny, nx)
+    assert stationary.shape == (nz, ny, nx)
+    assert np.any(stationary)
+    for direction, expected in enumerate(expected_fields):
+        actual = np.transpose(correction[direction, 0], (2, 1, 0))
+        assert np.sqrt(np.mean((actual - expected) ** 2)) < 8e-4
+
+
+def test_wrls_arto_cache_is_separate_from_msac(monkeypatch, tmp_path):
+    path = tmp_path / "wrls_arto_cache.h5"
+    mag = np.ones((3, 3, 3, 2), dtype=np.float32)
+    flow = np.zeros((3, 3, 3, 2, 3), dtype=np.float32)
+    corr_xyzt3 = np.zeros((3, 3, 3, 1, 3), dtype=np.float32)
+    corr_xyzt3[..., 0] = 0.02
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("mag", data=mag)
+        handle.create_dataset("flow", data=flow)
+        handle.create_dataset("Resolution", data=np.ones(3, dtype=np.float32))
+        handle.create_dataset("VENC", data=np.full(3, 100.0, dtype=np.float32))
+        handle.create_dataset("SpatialOrder", data=np.asarray(["LR", "AP", "FH"], dtype="S4"))
+        handle.create_dataset("VENCOrder", data=np.asarray(["LR", "AP", "FH"], dtype="S4"))
+        stale = handle.create_dataset("corr", data=np.zeros_like(corr_xyzt3))
+        stale.attrs["corr_algorithm"] = "msac"
+        stale.attrs["corr_version"] = 1
+        stale.attrs["corr_fit_order"] = 3
+        stale.attrs["corr_threshold"] = 0.1
+
+    calls = {"count": 0}
+
+    def fake_execute_wrls_arto(im, **kwargs):
+        calls["count"] += 1
+        stationary = np.ones(im.shape[2:], dtype=bool)
+        return np.transpose(corr_xyzt3, (4, 3, 2, 1, 0)), stationary, {
+            "applied": True,
+            "corr_fit_order": int(kwargs["corr_fit_order"]),
+            "stationary_voxels": int(np.sum(stationary)),
+            "skipped_reason": "",
+        }
+
+    monkeypatch.setattr(
+        "autoflow.algorithms.phase_correction.execute_wrls_arto",
+        fake_execute_wrls_arto,
+    )
+    config = {
+        "enabled": True,
+        "method": "wrls_arto",
+        "corr_fit_order": 3,
+        "wrls_fista_iterations": 200,
+        "wrls_gmm_iterations": 30,
+    }
+    first = load_h5_data(str(path), correction_config=config)
+
+    assert calls["count"] == 1
+    assert first.metadata["background_phase_correction"]["cache_reason"].startswith("algorithm_mismatch")
+    with h5py.File(path, "r") as handle:
+        attrs = handle["corr"].attrs
+        assert attrs["corr_algorithm"] == "wrls_arto"
+        assert int(attrs["corr_wrls_fista_iterations"]) == 200
+        assert int(attrs["corr_wrls_gmm_iterations"]) == 30
+
+    def fail_execute_wrls_arto(*_args, **_kwargs):
+        raise AssertionError("compatible WRLS+ARTO cache should be reused")
+
+    monkeypatch.setattr(
+        "autoflow.algorithms.phase_correction.execute_wrls_arto",
+        fail_execute_wrls_arto,
+    )
+    cached = load_h5_data(str(path), correction_config=config)
+    assert cached.metadata["background_phase_correction"]["cache_hit"] is True
+    assert np.allclose(cached.flow, first.flow)
 
 
 def test_load_h5_data_grouped_h5_does_not_reuse_untagged_root_corr(monkeypatch, tmp_path):
@@ -520,7 +789,7 @@ def test_load_h5_data_grouped_h5_does_not_reuse_untagged_root_corr(monkeypatch, 
 
     calls = {"count": 0}
 
-    def fake_execute_msac(im, corr_fit_order=3, th=0.1):
+    def fake_execute_msac(im, corr_fit_order=3, th=0.1, progress_callback=None):
         calls["count"] += 1
         corr_nvtzyx = np.transpose(fresh_corr, (4, 3, 2, 1, 0)).astype(np.float32)
         stationary = np.ones(fresh_corr.shape[:3], dtype=bool)
@@ -830,6 +1099,78 @@ def test_nnunet_autoseg_progress_callback_reports_stage_updates(monkeypatch, tmp
     assert stages[-1] == "autoseg_finalize"
     assert all("elapsed_sec" in event for event in events)
 
+
+def test_nnunet_autoseg_prefers_gpu_resampling_and_falls_back_to_cpu(monkeypatch, tmp_path):
+    model_dir = tmp_path / "model"
+    fold_dir = model_dir / "fold_all"
+    fold_dir.mkdir(parents=True)
+    (fold_dir / "checkpoint_final.pth").write_bytes(b"checkpoint")
+    (model_dir / "dataset.json").write_text(
+        json.dumps({
+            "channel_names": {"0": "mag"},
+            "labels": {"background": 0, "vessel": 1},
+            "file_ending": ".nii.gz",
+        }),
+        encoding="utf-8",
+    )
+    (model_dir / "plans.json").write_text(
+        json.dumps({
+            "configurations": {
+                "3d_fullres": {
+                    "resampling_fn_data": "resample_data_or_seg_to_shape",
+                    "resampling_fn_data_kwargs": {
+                        "is_seg": False,
+                        "order": 3,
+                        "force_separate_z": None,
+                    },
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    calls = []
+
+    def fake_runner(command, **_kwargs):
+        calls.append(list(command))
+        model_path = Path(command[command.index("-m") + 1])
+        output_path = Path(command[command.index("-o") + 1])
+        if model_path != model_dir:
+            gpu_plans = json.loads((model_path / "plans.json").read_text(encoding="utf-8"))
+            gpu_config = gpu_plans["configurations"]["3d_fullres"]
+            assert gpu_config["resampling_fn_data"] == "resample_torch_fornnunet"
+            assert gpu_config["resampling_fn_data_kwargs"]["device"] == "cuda"
+            return SimpleNamespace(returncode=1, stdout="", stderr="CUDA out of memory")
+        (output_path / "autoflow_case.nii.gz").write_bytes(b"fake")
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(
+        "autoflow.algorithms.segmentation._read_nifti_segmentation",
+        lambda _path: np.ones((2, 2, 2), dtype=np.int16),
+    )
+    events = []
+    seg, provenance = generate_nnunet_auto_segmentation(
+        mag=np.ones((2, 2, 2, 2), dtype=np.float32),
+        flow=np.zeros((2, 2, 2, 2, 3), dtype=np.float32),
+        resolution=(1.0, 1.0, 1.0),
+        origin=(0.0, 0.0, 0.0),
+        model_folder=str(model_dir),
+        device="cuda",
+        runner=fake_runner,
+        progress_callback=events.append,
+    )
+
+    assert seg.shape == (2, 2, 2, 2)
+    assert len(calls) == 2
+    assert calls[0][calls[0].index("-m") + 1] != str(model_dir)
+    assert calls[1][calls[1].index("-m") + 1] == str(model_dir)
+    assert calls[1][calls[1].index("-nps") + 1] == "1"
+    assert provenance["preprocessing_device_requested"] == "cuda"
+    assert provenance["preprocessing_device"] == "cpu"
+    assert provenance["gpu_preprocessing_fallback"] is True
+    assert "CUDA out of memory" in provenance["gpu_preprocessing_fallback_reason"]
+    assert "autoseg_gpu_preprocessing_fallback" in [event["stage"] for event in events]
+
 def test_pwv_timing_methods_on_synthetic_waveforms():
     rr_ms = 1000.0
     x = np.linspace(0.0, 1.0, 20, endpoint=False)
@@ -1026,7 +1367,14 @@ def test_config_dir_reads_feature_render_settings_from_metric_jsons(tmp_path):
     assert cfg.streamline_bar_cfg["position_x"] == 0.66
     assert resolved["wss_clim"] == (1.0, 9.0)
     assert resolved["streamline_clim"] == (4.0, 44.0)
+    assert cfg.tube_radius == pytest.approx(0.25)
+    assert resolved["tube_radius"] == pytest.approx(0.25)
     assert resolved["plane_video_cfg"]["label"]["prefix"] == "plane="
+
+    auto_resolved = bundle_to_autoflow_kwargs({"streamlines": {"render": {"clim": None}}})
+    assert auto_resolved["streamline_clim"] is None
+    assert AutoFlowConfig().streamline_clim is None
+    assert AutoFlowConfig().tube_radius == pytest.approx(0.25)
 
 
 def test_hybrid_component_filter_keeps_multiple_group_components():
@@ -1072,7 +1420,11 @@ def test_pipeline_group_preprocess_keeps_multiple_components_under_hybrid_filter
     ws.segmask_raw[8:12, 8:12, 8:11] = 1
     ws.segmask_raw[14:15, 14:15, 14:15] = 1
 
-    PipelineEngine().preprocess(ws)
+    engine = PipelineEngine()
+    assert engine.preprocess(ws) is True
+    first_binary = ws.segmask_binary
+    assert engine.preprocess(ws) is False
+    assert ws.segmask_binary is first_binary
 
     group_state = ws.multilabel_groups["vessel"]
     assert ws.group_order == ["vessel"]
@@ -1080,6 +1432,35 @@ def test_pipeline_group_preprocess_keeps_multiple_components_under_hybrid_filter
     assert bool(group_state["clean_mask_3d"][2, 2, 2]) is True
     assert bool(group_state["clean_mask_3d"][9, 9, 9]) is True
     assert bool(group_state["clean_mask_3d"][14, 14, 14]) is False
+
+
+def test_plane_metric_step_does_not_eagerly_compute_derived_metrics(monkeypatch, tmp_path):
+    ws = Workspace()
+    ws.flow_raw = np.zeros((2, 2, 2, 1, 3), dtype=np.float32)
+    ws.segmask_raw = np.ones((2, 2, 2, 1), dtype=np.int16)
+    ws.planes = [
+        PlaneData(
+            center=np.zeros(3, dtype=float),
+            normal=np.array([1.0, 0.0, 0.0], dtype=float),
+        )
+    ]
+    ws.paths.output_dir = str(tmp_path)
+    engine = PipelineEngine()
+    captured = {}
+
+    def fake_compute(_workspace, **kwargs):
+        captured.update(kwargs)
+        return [], {}, "Plane metrics: 0"
+
+    monkeypatch.setattr(engine, "_compute_plane_metrics_internal", fake_compute)
+    monkeypatch.setattr(engine, "_save_planes_json", lambda _workspace: str(tmp_path / "planes.json"))
+
+    result = engine.run_step(ws, StepId.COMPUTE_PLANE_METRICS, lambda _message: None)
+
+    assert result.success is True
+    assert captured["include_derived"] is False
+    assert captured["ensure_derived"] is False
+
 
 def test_plane_video_label_style_uses_plane_render_config(monkeypatch, tmp_path):
     class DummyPlotter:
@@ -1247,10 +1628,98 @@ def test_build_plane_records_include_label_name_from_label_map():
     assert payload[1]["label_name"] == "MPA"
 
 
+def test_manual_plane_records_reload_without_path_projection():
+    from autoflow.core.models import Workspace
+
+    workspace = Workspace()
+    workspace.origin = np.array([10.0, 20.0, 30.0], dtype=float)
+    workspace.centerline_paths_smooth = [
+        np.array([[0.0, 0.0, 0.0], [20.0, 0.0, 0.0]], dtype=float)
+    ]
+    workspace.planes = [
+        PlaneData(
+            center=np.array([4.0, 7.0, 9.0], dtype=float),
+            normal=np.array([0.0, 1.0, 0.0], dtype=float),
+            label=0,
+            path_index=-1,
+            group_name="manual",
+        )
+    ]
+
+    records = build_plane_records(workspace)
+    restored = project_planes_to_workspace(records, workspace)
+
+    assert records[0]["placement_mode"] == "manual"
+    assert len(restored) == 1
+    assert restored[0].path_index == -1
+    assert restored[0].group_name == "manual"
+    assert np.allclose(restored[0].center, workspace.planes[0].center)
+    assert np.allclose(restored[0].normal, workspace.planes[0].normal)
+
+
 def test_default_nnunet_model_folder_prefers_partbalanced():
     model_dir = default_nnunet_model_folder()
     assert model_dir.name == "nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm"
     assert model_dir.is_dir()
+
+
+def test_empty_nnunet_model_uses_bundled_absolute_path(monkeypatch, tmp_path):
+    from autoflow.algorithms.segmentation import resolve_nnunet_model_folder
+    from autoflow.config import load_config_bundle
+    from autoflow.core.models import SegmentationState
+
+    fake_cwd_model = (
+        tmp_path
+        / "autoflow"
+        / "segmodel"
+        / "nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm"
+    )
+    fake_cwd_model.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    resolved = Path(resolve_nnunet_model_folder())
+
+    assert SegmentationState().auto_model == ""
+    assert load_config_bundle()["segmentation"]["auto_model"] == ""
+    assert resolved == default_nnunet_model_folder()
+    assert resolved != fake_cwd_model
+    assert resolved.is_absolute()
+    assert resolved.is_dir()
+
+
+def test_bundled_nnunet_relative_path_resolves_outside_repo_cwd(monkeypatch, tmp_path):
+    from autoflow.algorithms.segmentation import resolve_nnunet_model_folder
+
+    monkeypatch.chdir(tmp_path)
+    resolved = Path(resolve_nnunet_model_folder(
+        "autoflow/segmodel/nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm"
+    ))
+    assert resolved.is_absolute()
+    assert resolved.name == "nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm"
+    assert resolved.is_dir()
+
+
+def test_frozen_nnunet_predict_command_reuses_main_executable(monkeypatch):
+    import autoflow.algorithms.segmentation as segmentation_module
+
+    monkeypatch.setattr(segmentation_module.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(segmentation_module.sys, "executable", "AutoFlow-GUI.exe")
+    assert segmentation_module._nnunet_predict_command() == [
+        "AutoFlow-GUI.exe",
+        "--autoflow-internal-nnunet-predict",
+    ]
+
+
+def test_nnunet_predict_command_stays_in_current_environment(monkeypatch):
+    import autoflow.algorithms.segmentation as segmentation_module
+
+    monkeypatch.setattr(segmentation_module.sys, "frozen", False, raising=False)
+    monkeypatch.setattr(segmentation_module.sys, "executable", "/current/env/bin/python")
+    monkeypatch.setattr(segmentation_module.shutil, "which", lambda _name: None)
+
+    command = segmentation_module._nnunet_predict_command()
+
+    assert command[0] == "/current/env/bin/python"
+    assert command[1] == "-c"
 
 
 def test_save_pwv_h5_exports_group_payloads(tmp_path):
@@ -1275,3 +1744,69 @@ def test_save_pwv_h5_exports_group_payloads(tmp_path):
         assert np.allclose(np.asarray(grp["position_mm"][()], dtype=float), [0.0, 10.0])
         assert np.allclose(np.asarray(grp["arrival_time_ms"][()], dtype=float), [0.0, 2.0])
         assert "planes" in grp
+
+
+def test_remote_plotter_packs_rgba_screenshot_for_qimage():
+    QtGui = pytest.importorskip("PySide6.QtGui")
+    from autoflow.ui.remote_plotter import _prepare_rgb_frame
+
+    rgba = np.zeros((4, 5, 4), dtype=np.uint8)
+    rgba[1, 2] = [12, 34, 56, 78]
+    rgb_view = rgba[:, :, :3]
+    assert not rgb_view.flags.c_contiguous
+
+    rgb = _prepare_rgb_frame(rgba)
+    assert rgb.flags.c_contiguous
+    assert rgb.strides[0] == rgb.shape[1] * 3
+
+    qimage = QtGui.QImage(
+        rgb.data,
+        rgb.shape[1],
+        rgb.shape[0],
+        int(rgb.strides[0]),
+        QtGui.QImage.Format_RGB888,
+    ).copy()
+    assert not qimage.isNull()
+    assert qimage.pixelColor(2, 1).getRgb()[:3] == (12, 34, 56)
+
+
+def test_scene_controller_builds_grouped_skeleton_graph_and_forks():
+    from autoflow.core.models import GraphData, Workspace
+    from autoflow.ui.viewer import SceneController
+
+    workspace = Workspace()
+    workspace.origin = np.array([10.0, 20.0, 30.0], dtype=float)
+    skeleton_points = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        dtype=float,
+    )
+    graph = GraphData(
+        points=skeleton_points.copy(),
+        edges=np.array([[0, 1], [1, 2]], dtype=int),
+    )
+    workspace.multilabel_groups = {
+        "single_label": {
+            "skeleton_points": skeleton_points,
+            "graph": graph,
+            "forks": [{"crosspoint": [1.0, 0.0, 0.0]}],
+        }
+    }
+    controller = SceneController(SimpleNamespace(), workspace, lambda _message: None)
+
+    skeleton_mesh = controller._build_dataset("skeleton_single_label")
+    graph_mesh = controller._build_dataset("graph_single_label")
+    fork_mesh = controller._build_dataset("forks_single_label")
+
+    expected_points = skeleton_points + workspace.origin.reshape(1, 3)
+    assert skeleton_mesh.n_points == 3
+    assert np.allclose(skeleton_mesh.points, expected_points)
+    assert graph_mesh.n_points == 3
+    assert graph_mesh.n_lines == 2
+    assert np.allclose(graph_mesh.points, expected_points)
+    assert fork_mesh.n_points == 1
+    assert np.allclose(fork_mesh.points[0], [11.0, 20.0, 30.0])
+
+    workspace.skeleton_points = skeleton_points
+    workspace.graph = graph
+    assert controller._build_dataset("skeleton_points").n_points == 3
+    assert controller._build_dataset("graph_lines").n_lines == 2

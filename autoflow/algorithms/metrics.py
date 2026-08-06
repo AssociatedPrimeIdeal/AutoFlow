@@ -5,8 +5,14 @@ from scipy.ndimage import binary_erosion, gaussian_filter
 from scipy.sparse import csc_matrix, csr_matrix, diags
 from scipy.sparse.linalg import cg, factorized
 
+try:
+    import pyamg
+except ImportError:  # Keep source checkouts usable before dependencies are refreshed.
+    pyamg = None
+
 from .paths import _determine_plane_forward, _vector_orientation_text
 from .surfaces import (
+    _extract_surface,
     _build_branch_grid,
     _select_connected_region,
     create_uniform_field_grid,
@@ -231,15 +237,25 @@ def _build_mask_phase_lookup(mask4d):
     lookup = []
     for tidx in range(int(mask4d.shape[3])):
         mask_t = mask4d[..., tidx]
-        rep_t = representatives.get(mask_t.tobytes())
+        mask_key = mask_t.tobytes()
+        rep_t = representatives.get(mask_key)
         if rep_t is None:
             rep_t = int(tidx)
-            representatives[mask_t.tobytes()] = rep_t
+            representatives[mask_key] = rep_t
         lookup.append(rep_t)
     return lookup
 
 
-def _build_plane_slice_spec(mask_xyz, plane, spacing, origin, branch_grid=None, target_label=None, *, select_connected=False):
+def _build_plane_slice_spec(
+    mask_xyz,
+    plane,
+    spacing,
+    origin,
+    branch_grid=None,
+    target_label=None,
+    *,
+    select_connected=False,
+):
     mask_xyz = np.asarray(mask_xyz, dtype=bool)
     if not np.any(mask_xyz):
         return None
@@ -276,10 +292,9 @@ def _build_plane_slice_spec(mask_xyz, plane, spacing, origin, branch_grid=None, 
         areas = np.ones(int(pg.n_cells), dtype=float)
     return {
         "cell_ids": cell_ids,
+        "voxel_indices": np.unravel_index(cell_ids, mask_xyz.shape, order="F"),
         "areas": areas,
     }
-
-
 def _get_cached_plane_slice_spec(slice_cache, cache_key, mask_xyz, plane, spacing, origin,
                                  branch_grid=None, target_label=None, *, select_connected=False):
     if cache_key not in slice_cache:
@@ -301,14 +316,17 @@ def _sample_field_from_slice_spec(field_t, mask_shape, field_name, slice_spec):
     field_arr = np.asarray(field_t)
     if tuple(field_arr.shape[:3]) != tuple(mask_shape):
         raise ValueError(f"{field_name} spatial shape {field_arr.shape[:3]} does not match mask {mask_shape}")
-    cell_ids = np.asarray(slice_spec["cell_ids"], dtype=np.int64).reshape(-1)
+    voxel_indices = slice_spec.get("voxel_indices")
+    if voxel_indices is None:
+        cell_ids = np.asarray(slice_spec["cell_ids"], dtype=np.int64).reshape(-1)
+        voxel_indices = np.unravel_index(cell_ids, mask_shape, order="F")
     if field_arr.ndim == 3:
-        return field_arr.reshape(-1, order="F")[cell_ids]
+        return field_arr[voxel_indices]
     if field_arr.ndim == 4 and field_arr.shape[-1] in (1, 3):
         payload = field_arr if field_arr.shape[-1] != 1 else field_arr[..., 0]
         if payload.ndim == 3:
-            return payload.reshape(-1, order="F")[cell_ids]
-        return payload.reshape(-1, payload.shape[-1], order="F")[cell_ids]
+            return payload[voxel_indices]
+        return payload[voxel_indices]
     raise ValueError(f"{field_name} must be XYZ, XYZT-slice scalar, or XYZV, got {field_arr.shape}")
 
 
@@ -403,7 +421,7 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
     has_tke = tke_array is not None
     has_pressure_gradient = pressure_gradient_array is not None
     has_relative_pressure = relative_pressure_array is not None
-    has_wss = wss_surfaces is not None
+    has_wss = bool(wss_surfaces)
     needs_volume_slice = has_tke or has_pressure_gradient or has_relative_pressure
 
     if has_tke:
@@ -717,7 +735,7 @@ def compute_wss_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
             flow[..., showt, 2] / 100.0, spacing, origin=origin)
         mesh = create_uniform_grid(mask4d[..., showt] > 0, spacing, origin=origin)
         mesh = mesh.threshold(0.1)
-        surf = mesh.extract_surface().smooth(n_iter=int(smoothing_iteration))
+        surf = _extract_surface(mesh).smooth(n_iter=int(smoothing_iteration))
         surf = cal_wss_from_surf(surf, velocity, viscosity=viscosity,
                                  inward_distance=inward_distance,
                                  parabolic_fitting=parabolic_fitting,
@@ -777,11 +795,23 @@ def _solve_reconstruction_system(system, rhs, *, tol=1e-5, max_iter=2000):
         return np.zeros(1, dtype=np.float32)
 
     if "preconditioner" not in system:
-        diag = np.asarray(matrix.diagonal(), dtype=np.float64)
-        inv_diag = np.zeros_like(diag)
-        nz = np.abs(diag) > 1e-12
-        inv_diag[nz] = 1.0 / diag[nz]
-        system["preconditioner"] = diags(inv_diag, 0, format="csr")
+        preconditioner = None
+        if pyamg is not None and n >= 5000:
+            try:
+                hierarchy = pyamg.smoothed_aggregation_solver(matrix, max_coarse=50)
+                system["amg_hierarchy"] = hierarchy
+                preconditioner = hierarchy.aspreconditioner(cycle="V")
+                system["preconditioner_kind"] = "amg"
+            except Exception:
+                preconditioner = None
+        if preconditioner is None:
+            diag = np.asarray(matrix.diagonal(), dtype=np.float64)
+            inv_diag = np.zeros_like(diag)
+            nz = np.abs(diag) > 1e-12
+            inv_diag[nz] = 1.0 / diag[nz]
+            preconditioner = diags(inv_diag, 0, format="csr")
+            system["preconditioner_kind"] = "jacobi"
+        system["preconditioner"] = preconditioner
 
     x0 = system.get("last_solution")
     sol, info = cg(
@@ -830,80 +860,43 @@ def _build_least_squares_system(mask_t, spacing_m):
 
     index_map = -np.ones(mask_t.shape, dtype=np.int32)
     index_map[mask_t] = np.arange(n, dtype=np.int32)
-    rows = []
-    cols = []
-    data = []
     edge_pairs = []
     edge_axes = []
     edge_scales = []
-    rhs_rows = []
-    rhs_cols = []
-    rhs_data = []
-    row_idx = 0
     dx, dy, dz = [float(v) for v in spacing_m]
-    for voxel_idx, (ix, iy, iz) in enumerate(coords):
-        if voxel_idx == 0:
-            rows.append(row_idx)
-            cols.append(voxel_idx)
-            data.append(1.0)
-            rhs_rows.append(voxel_idx)
-            rhs_cols.append(row_idx)
-            rhs_data.append(1.0)
-            row_idx += 1
-        if ix + 1 < mask_t.shape[0] and mask_t[ix + 1, iy, iz]:
-            nbr = int(index_map[ix + 1, iy, iz])
-            scale = 1.0 / dx
-            rows.extend((row_idx, row_idx))
-            cols.extend((voxel_idx, nbr))
-            data.extend((-scale, scale))
-            edge_pairs.append((voxel_idx, nbr))
-            edge_axes.append(0)
-            edge_scales.append(scale)
-            rhs_rows.extend((voxel_idx, nbr))
-            rhs_cols.extend((row_idx, row_idx))
-            rhs_data.extend((-scale, scale))
-            row_idx += 1
-        if iy + 1 < mask_t.shape[1] and mask_t[ix, iy + 1, iz]:
-            nbr = int(index_map[ix, iy + 1, iz])
-            scale = 1.0 / dy
-            rows.extend((row_idx, row_idx))
-            cols.extend((voxel_idx, nbr))
-            data.extend((-scale, scale))
-            edge_pairs.append((voxel_idx, nbr))
-            edge_axes.append(1)
-            edge_scales.append(scale)
-            rhs_rows.extend((voxel_idx, nbr))
-            rhs_cols.extend((row_idx, row_idx))
-            rhs_data.extend((-scale, scale))
-            row_idx += 1
-        if iz + 1 < mask_t.shape[2] and mask_t[ix, iy, iz + 1]:
-            nbr = int(index_map[ix, iy, iz + 1])
-            scale = 1.0 / dz
-            rows.extend((row_idx, row_idx))
-            cols.extend((voxel_idx, nbr))
-            data.extend((-scale, scale))
-            edge_pairs.append((voxel_idx, nbr))
-            edge_axes.append(2)
-            edge_scales.append(scale)
-            rhs_rows.extend((voxel_idx, nbr))
-            rhs_cols.extend((row_idx, row_idx))
-            rhs_data.extend((-scale, scale))
-            row_idx += 1
+    for axis, step in enumerate((dx, dy, dz)):
+        left = [slice(None), slice(None), slice(None)]
+        right = [slice(None), slice(None), slice(None)]
+        left[axis] = slice(0, -1)
+        right[axis] = slice(1, None)
+        left = tuple(left)
+        right = tuple(right)
+        adjacent = mask_t[left] & mask_t[right]
+        src = np.asarray(index_map[left][adjacent], dtype=np.int32)
+        dst = np.asarray(index_map[right][adjacent], dtype=np.int32)
+        if src.size:
+            edge_pairs.append(np.column_stack((src, dst)))
+            edge_axes.append(np.full(src.size, axis, dtype=np.int8))
+            edge_scales.append(np.full(src.size, 1.0 / step, dtype=np.float64))
 
-    if row_idx == 0:
-        matrix = diags([1.0], [0], shape=(n, n), dtype=np.float64).tocsr()
-    else:
-        incidence = csr_matrix((np.asarray(data, dtype=np.float64), (np.asarray(rows, dtype=np.int32), np.asarray(cols, dtype=np.int32))), shape=(row_idx, n), dtype=np.float64)
-        matrix = (incidence.T @ incidence).tocsr()
+    pairs = np.vstack(edge_pairs).astype(np.int32, copy=False) if edge_pairs else np.zeros((0, 2), dtype=np.int32)
+    axes = np.concatenate(edge_axes) if edge_axes else np.zeros(0, dtype=np.int8)
+    scales = np.concatenate(edge_scales) if edge_scales else np.zeros(0, dtype=np.float64)
+    edge_rows = np.arange(1, len(pairs) + 1, dtype=np.int32)
+    rows = np.concatenate((np.zeros(1, dtype=np.int32), np.repeat(edge_rows, 2)))
+    cols = np.concatenate((np.zeros(1, dtype=np.int32), pairs.reshape(-1)))
+    data = np.concatenate((np.ones(1, dtype=np.float64), np.column_stack((-scales, scales)).reshape(-1)))
+    incidence = csr_matrix((data, (rows, cols)), shape=(len(pairs) + 1, n), dtype=np.float64)
+    matrix = (incidence.T @ incidence).tocsr()
     matrix = matrix + diags([1e-6], [0], shape=(n, n), dtype=np.float64)
     return {
         "coords": coords,
         "index_map": index_map,
         "matrix": matrix.tocsr(),
-        "rhs_operator": csr_matrix((np.asarray(rhs_data, dtype=np.float64), (np.asarray(rhs_rows, dtype=np.int32), np.asarray(rhs_cols, dtype=np.int32))), shape=(n, row_idx), dtype=np.float64),
-        "edge_pairs": np.asarray(edge_pairs, dtype=np.int32).reshape(-1, 2),
-        "edge_axes": np.asarray(edge_axes, dtype=np.int8),
-        "edge_scales": np.asarray(edge_scales, dtype=np.float64),
+        "rhs_operator": incidence.T.tocsr(),
+        "edge_pairs": pairs,
+        "edge_axes": axes,
+        "edge_scales": scales,
         "anchor_index": 0,
     }
 
@@ -1161,8 +1154,25 @@ def compute_pressure_gradient_metrics(mask4d, flow, spacing, rr, rho=1060.0, vis
     mu_pa_s = float(viscosity) / 1000.0
     sigma = max(float(smoothing_sigma), 0.0)
 
-    velocity = np.asarray(flow, dtype=np.float32) / 100.0
-    mask_float = mask4d.astype(np.float32)
+    # Spatial derivatives only need the vessel extent plus one stencil voxel.
+    # Keep the public result arrays full-sized, but avoid applying every large
+    # finite-difference temporary to the mostly empty image volume.
+    union_mask = np.any(mask4d, axis=3)
+    occupied = np.where(union_mask)
+    if occupied[0].size:
+        lo = [max(int(np.min(axis_values)) - 1, 0) for axis_values in occupied]
+        hi = [
+            min(int(np.max(axis_values)) + 2, int(mask4d.shape[axis]))
+            for axis, axis_values in enumerate(occupied)
+        ]
+        spatial_slices = tuple(slice(lo[axis], hi[axis]) for axis in range(3))
+    else:
+        spatial_slices = tuple(slice(0, int(mask4d.shape[axis])) for axis in range(3))
+
+    work_mask = mask4d[spatial_slices + (slice(None),)]
+    work_flow = flow[spatial_slices + (slice(None), slice(None))]
+    velocity = np.asarray(work_flow, dtype=np.float32) / 100.0
+    mask_float = work_mask.astype(np.float32)
     velocity = velocity * mask_float[..., None]
     if sigma > 0.0:
         for comp in range(3):
@@ -1215,32 +1225,50 @@ def compute_pressure_gradient_metrics(mask4d, flow, spacing, rr, rho=1060.0, vis
         lap[..., comp] = d2u_dx2 + d2u_dy2 + d2u_dz2
 
     grad_inner = -rho * (du_dt + conv) + mu_pa_s * lap
-    support_mask = np.asarray(mask4d, dtype=bool).copy()
+    support_work = np.asarray(work_mask, dtype=bool).copy()
     erosion_iters = max(int(support_erosion_iters), 0)
     if erosion_iters > 0:
         structure = np.ones((3, 3, 3), dtype=bool)
-        for tidx in range(mask4d.shape[3]):
-            support_mask[..., tidx] = binary_erosion(mask4d[..., tidx], structure=structure, iterations=erosion_iters, border_value=0)
-    support_inner = support_mask[1:-1, 1:-1, 1:-1, 1:-1]
+        for tidx in range(work_mask.shape[3]):
+            support_work[..., tidx] = binary_erosion(
+                work_mask[..., tidx],
+                structure=structure,
+                iterations=erosion_iters,
+                border_value=0,
+            )
+    support_inner = support_work[1:-1, 1:-1, 1:-1, 1:-1]
 
-    grad = np.zeros(flow.shape, dtype=np.float32)
-    grad[1:-1, 1:-1, 1:-1, 1:-1, :] = grad_inner.astype(np.float32)
-    grad *= support_mask.astype(np.float32)[..., None]
-    grad_mag = np.sqrt(np.sum(np.square(grad, dtype=np.float32), axis=-1)).astype(np.float32)
-    grad_peak = np.max(grad_mag, axis=3).astype(np.float32)
+    grad_work = np.zeros(work_flow.shape, dtype=np.float32)
+    grad_work[1:-1, 1:-1, 1:-1, 1:-1, :] = grad_inner.astype(np.float32)
+    grad_work *= support_work.astype(np.float32)[..., None]
+    grad_mag_work = np.sqrt(np.sum(np.square(grad_work, dtype=np.float32), axis=-1)).astype(np.float32)
 
     finite_inner = grad_inner[np.isfinite(grad_inner) & support_inner[..., None]]
     display_upper = _finite_percentile_abs(finite_inner, 99.0, default=1.0)
     display_upper = display_upper if display_upper > 0 else 1.0
 
-    pressure_result = reconstruct_relative_pressure_map(
-        grad,
-        support_mask.astype(bool),
+    pressure_result_work = reconstruct_relative_pressure_map(
+        grad_work,
+        support_work,
         spacing_mm,
         method=pressure_method,
     )
+
+    grad = np.zeros(flow.shape, dtype=np.float32)
+    grad[spatial_slices + (slice(None), slice(None))] = grad_work
+    grad_mag = np.zeros(mask4d.shape, dtype=np.float32)
+    grad_mag[spatial_slices + (slice(None),)] = grad_mag_work
+    grad_peak = np.zeros(mask4d.shape[:3], dtype=np.float32)
+    grad_peak[spatial_slices] = np.max(grad_mag_work, axis=3).astype(np.float32)
+    support_mask = np.zeros(mask4d.shape, dtype=bool)
+    support_mask[spatial_slices + (slice(None),)] = support_work
+    relative_pressure = np.zeros(mask4d.shape, dtype=np.float32)
+    relative_pressure[spatial_slices + (slice(None),)] = pressure_result_work["relative_pressure_array"]
+    relative_pressure_peak = np.zeros(mask4d.shape[:3], dtype=np.float32)
+    relative_pressure_peak[spatial_slices] = pressure_result_work["relative_pressure_peak"]
+
     centerline_profiles = compute_centerline_pressure_profiles(
-        pressure_result["relative_pressure_array"],
+        relative_pressure,
         centerline_paths or [],
         spacing_mm,
         origin,
@@ -1253,10 +1281,10 @@ def compute_pressure_gradient_metrics(mask4d, flow, spacing, rr, rho=1060.0, vis
         'pressure_gradient_dt_s': float(dt_s),
         'pressure_gradient_support_mask': support_mask.astype(np.uint8),
         'pressure_gradient_display_clim': (0.0, display_upper),
-        'relative_pressure_array': pressure_result['relative_pressure_array'],
-        'relative_pressure_peak': pressure_result['relative_pressure_peak'],
-        'relative_pressure_display_clim': pressure_result['relative_pressure_display_clim'],
-        'pressure_method': pressure_result['pressure_method'],
+        'relative_pressure_array': relative_pressure,
+        'relative_pressure_peak': relative_pressure_peak,
+        'relative_pressure_display_clim': pressure_result_work['relative_pressure_display_clim'],
+        'pressure_method': pressure_result_work['pressure_method'],
         'centerline_pressure_profiles': centerline_profiles,
     }
 

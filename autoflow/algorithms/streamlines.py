@@ -10,6 +10,59 @@ from .surfaces import (
 )
 
 
+_AUTOMATIC_CLIM_PERCENTILE = 99.0
+
+
+def automatic_streamline_clim(flow_xyzt3, mask=None):
+    """Return a robust, all-phase velocity range in m/s for streamline colors."""
+    if flow_xyzt3 is None:
+        return (0.0, 1.0)
+    flow = np.asarray(flow_xyzt3, dtype=np.float32)
+    if flow.ndim != 5 or flow.shape[-1] != 3:
+        return (0.0, 1.0)
+
+    vectors = None
+    if mask is not None:
+        mask_arr = np.asarray(mask, dtype=bool)
+        if mask_arr.shape == flow.shape[:4]:
+            vectors = flow[mask_arr]
+        elif mask_arr.shape == flow.shape[:3]:
+            vectors = flow[mask_arr].reshape(-1, 3)
+        elif mask_arr.ndim == 4 and mask_arr.shape[:3] == flow.shape[:3] and mask_arr.shape[3] == 1:
+            vectors = flow[np.broadcast_to(mask_arr, flow.shape[:4])]
+    if vectors is None:
+        vectors = flow.reshape(-1, 3)
+    vectors = np.asarray(vectors, dtype=np.float32).reshape(-1, 3)
+    if vectors.size == 0:
+        return (0.0, 1.0)
+    vectors = vectors[np.all(np.isfinite(vectors), axis=1)]
+    if vectors.size == 0:
+        return (0.0, 1.0)
+
+    speed_sq = np.einsum("ij,ij->i", vectors, vectors, optimize=True)
+    speed_cm_s = np.sqrt(speed_sq)
+    speed_limit = float(
+        np.percentile(speed_cm_s, _AUTOMATIC_CLIM_PERCENTILE)
+    ) / 100.0
+    if speed_limit <= 0.0 and np.any(speed_cm_s > 0.0):
+        speed_limit = float(np.max(speed_cm_s)) / 100.0
+    if not np.isfinite(speed_limit) or speed_limit <= 0.0:
+        speed_limit = 1.0
+    return (0.0, max(speed_limit, 1e-6))
+
+
+def _set_streamline_velocity_scalar(streamlines):
+    """Color streamlines by the magnitude of the vector used by the tracer."""
+    if streamlines is None or "vector" not in streamlines.point_data:
+        return streamlines
+    vectors = np.asarray(streamlines.point_data["vector"], dtype=np.float32)
+    streamlines.point_data["Velocity"] = np.linalg.norm(
+        vectors, axis=1
+    ).astype(np.float32, copy=False)
+    streamlines.set_active_scalars("Velocity")
+    return streamlines
+
+
 def generate_seed_points(mask_3d, spacing, origin, ratio=0.02, rng_seed=0,
                          min_seeds=50):
     idx = np.argwhere(np.asarray(mask_3d, dtype=bool))
@@ -24,18 +77,43 @@ def generate_seed_points(mask_3d, spacing, origin, ratio=0.02, rng_seed=0,
     return (org + pick.astype(float) * sp).astype(float)
 
 
+def _crop_vector_domain_to_mask(flow_t, mask_3d, spacing, origin, padding=1):
+    mask = np.asarray(mask_3d, dtype=bool)
+    occupied = np.where(mask)
+    if not occupied[0].size:
+        return np.asarray(flow_t), mask, np.asarray(origin, dtype=float).reshape(3)
+    pad = max(int(padding), 0)
+    lo = np.array([max(int(np.min(axis_values)) - pad, 0) for axis_values in occupied], dtype=int)
+    hi = np.array([
+        min(int(np.max(axis_values)) + pad + 1, int(mask.shape[axis]))
+        for axis, axis_values in enumerate(occupied)
+    ], dtype=int)
+    spatial_slices = tuple(slice(int(lo[axis]), int(hi[axis])) for axis in range(3))
+    cropped_origin = (
+        np.asarray(origin, dtype=float).reshape(3)
+        + lo.astype(float) * np.asarray(spacing, dtype=float).reshape(3)
+    )
+    return np.asarray(flow_t)[spatial_slices], mask[spatial_slices], cropped_origin
+
+
 def generate_streamlines_at_t(flow_xyzt3, t, seeds, spacing, origin, mask_3d=None,
                               max_steps=2000, terminal_speed=0.01,
                               seed_ratio=0.02, min_seeds=50, rng_seed=0):
-    flow_t = np.asarray(flow_xyzt3[..., int(t), :], dtype=np.float32)
+    if mask_3d is None:
+        return None
+    flow_t, mask_work, work_origin = _crop_vector_domain_to_mask(
+        flow_xyzt3[..., int(t), :],
+        mask_3d,
+        spacing,
+        origin,
+    )
+    flow_t = np.asarray(flow_t, dtype=np.float32)
     velocity = create_uniform_vector(
         flow_t[..., 0] / 100.0,
         flow_t[..., 1] / 100.0,
         flow_t[..., 2] / 100.0,
-        spacing, origin=origin)
-    if mask_3d is None:
-        return None
-    mesh = create_uniform_grid(np.asarray(mask_3d) > 0, spacing, origin=origin)
+        spacing, origin=work_origin)
+    mesh = create_uniform_grid(mask_work, spacing, origin=work_origin)
     mesh = mesh.threshold(0.1)
     if mesh.n_points == 0:
         return None
@@ -65,7 +143,7 @@ def generate_streamlines_at_t(flow_xyzt3, t, seeds, spacing, origin, mask_3d=Non
     )
     if sl is None or sl.n_points == 0:
         return None
-    return sl
+    return _set_streamline_velocity_scalar(sl)
 
 
 def _plane_seeds(mask_3d, plane, spacing, origin, seed_ratio, min_seeds,
@@ -144,7 +222,7 @@ def generate_streamlines_from_plane_at_t(flow_xyzt3, t, plane, spacing, origin,
     )
     if sl is None or sl.n_points == 0:
         return None
-    return sl
+    return _set_streamline_velocity_scalar(sl)
 
 
 def _world_to_index(points_xyz, spacing, origin):

@@ -3,6 +3,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +29,7 @@ _AUTOFLOW_INTERNAL_SPATIAL_ORDER = ("LR", "AP", "FH")
 _AUTOFLOW_INTERNAL_VENC_ORDER = ("LR", "AP", "FH")
 _NNUNET_TARGET_SPATIAL_ORDER = ("HF", "AP", "RL")
 _NNUNET_TARGET_VENC_ORDER = ("HF", "AP", "RL")
+_NNUNET_GPU_PREPROCESSING_ENV = "AUTOFLOW_NNUNET_GPU_PREPROCESSING"
 
 
 def segmentation_timestamp():
@@ -502,6 +504,82 @@ def _load_nnunet_model_metadata(model_folder):
     return model_path, dataset_json
 
 
+def _gpu_preprocessing_enabled(device, environ=None):
+    environment = os.environ if environ is None else environ
+    token = str(environment.get(_NNUNET_GPU_PREPROCESSING_ENV, "auto") or "auto").strip().lower()
+    if token in {"0", "false", "no", "off", "cpu", "disabled"}:
+        return False
+    return str(device or "").strip().lower() == "cuda"
+
+
+def _link_nnunet_model_file(source, destination):
+    source = Path(source).resolve()
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.symlink(source, destination)
+        return
+    except OSError:
+        pass
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
+
+
+def _prepare_nnunet_gpu_model_folder(model_path, target_path, folds, checkpoint_name):
+    model_path = Path(model_path).resolve()
+    target_path = Path(target_path)
+    target_path.mkdir(parents=True, exist_ok=True)
+
+    with (model_path / "plans.json").open("r", encoding="utf-8") as handle:
+        plans = json.load(handle)
+    configurations = plans.get("configurations") or {}
+    changed = 0
+    for configuration in configurations.values():
+        if not isinstance(configuration, dict) or "resampling_fn_data" not in configuration:
+            continue
+        original_kwargs = dict(configuration.get("resampling_fn_data_kwargs") or {})
+        gpu_kwargs = {
+            "is_seg": False,
+            "num_threads": max(1, int(original_kwargs.get("num_threads", 4) or 4)),
+            "device": "cuda",
+            "memefficient_seg_resampling": False,
+            "force_separate_z": original_kwargs.get("force_separate_z"),
+            "mode": "linear",
+            "aniso_axis_mode": "nearest-exact",
+        }
+        if "separate_z_anisotropy_threshold" in original_kwargs:
+            gpu_kwargs["separate_z_anisotropy_threshold"] = original_kwargs[
+                "separate_z_anisotropy_threshold"
+            ]
+        configuration["resampling_fn_data"] = "resample_torch_fornnunet"
+        configuration["resampling_fn_data_kwargs"] = gpu_kwargs
+        changed += 1
+    if changed == 0:
+        raise ValueError(f"nnUNet plans do not define an input resampler: {model_path / 'plans.json'}")
+    plans["autoflow_gpu_input_resampling"] = {
+        "enabled": True,
+        "function": "resample_torch_fornnunet",
+        "device": "cuda",
+        "mode": "linear",
+    }
+    with (target_path / "plans.json").open("w", encoding="utf-8") as handle:
+        json.dump(plans, handle, indent=2)
+
+    _link_nnunet_model_file(model_path / "dataset.json", target_path / "dataset.json")
+    for fold in folds:
+        fold_name = f"fold_{fold}"
+        source_checkpoint = model_path / fold_name / checkpoint_name
+        if not source_checkpoint.is_file():
+            raise FileNotFoundError(f"missing nnUNet checkpoint: {source_checkpoint}")
+        _link_nnunet_model_file(
+            source_checkpoint,
+            target_path / fold_name / checkpoint_name,
+        )
+    return target_path
+
+
 def _detect_nnunet_folds(model_path):
     folds = []
     has_fold_all = False
@@ -671,6 +749,19 @@ def _write_nifti_segmentation(volume, affine, path):
     nib.save(img, str(path))
 
 
+def _link_or_copy_file(source, destination):
+    source = Path(source)
+    destination = Path(destination)
+    if source.resolve() == destination.resolve():
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        destination.unlink(missing_ok=True)
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
+
+
 def _read_nifti_segmentation(path):
     arr = np.asarray(nib.load(str(path)).get_fdata(), dtype=np.float32)
     if arr.ndim != 3:
@@ -688,6 +779,43 @@ def _run_subprocess(command, *, env=None, cwd=None, runner=None):
         env=env,
         cwd=cwd,
     )
+
+
+def _subprocess_failure_details(result):
+    stdout = str(getattr(result, "stdout", "") or "").strip()
+    stderr = str(getattr(result, "stderr", "") or "").strip()
+    combined = "\n".join(part for part in (stdout, stderr) if part)
+    return combined[-2000:] if combined else f"exit code {getattr(result, 'returncode', 'unknown')}"
+
+
+def _nnunet_inference_command(
+    input_dir,
+    output_dir,
+    model_path,
+    folds,
+    checkpoint_name,
+    resolved_device,
+    num_processes_preprocessing,
+    num_processes_segmentation_export,
+    step_size,
+    disable_tta,
+):
+    command = [
+        *_nnunet_predict_command(),
+        "-i", str(input_dir),
+        "-o", str(output_dir),
+        "-m", str(model_path),
+        "-f", *folds,
+        "-chk", str(checkpoint_name),
+        "-npp", str(int(num_processes_preprocessing)),
+        "-nps", str(int(num_processes_segmentation_export)),
+        "-device", str(resolved_device),
+    ]
+    if step_size is not None:
+        command.extend(["-step_size", str(float(step_size))])
+    if disable_tta:
+        command.append("--disable_tta")
+    return command
 
 
 def _emit_progress(progress_callback, *, stage, message, current=None, total=None, elapsed_sec=None, **extra):
@@ -709,30 +837,54 @@ def _emit_progress(progress_callback, *, stage, message, current=None, total=Non
 
 def default_nnunet_model_folder():
     model_name = "nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm"
-    cwd = Path.cwd().resolve()
-    for root in (cwd, *cwd.parents):
-        candidate = root / "autoflow" / "segmodel" / model_name
-        if candidate.is_dir():
-            return candidate
+    return Path(__file__).resolve().parents[1] / "segmodel" / model_name
 
-    package_candidate = Path(__file__).resolve().parents[1] / "segmodel" / model_name
-    if package_candidate.is_dir():
-        return package_candidate
 
-    return package_candidate
+def _resolve_bundled_relative_path(path):
+    path = Path(path).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    if path.is_dir():
+        return path.resolve()
+
+    package_root = Path(__file__).resolve().parents[2]
+    packaged_path = package_root / path
+    bundled_default = default_nnunet_model_folder()
+    legacy_default = Path("autoflow") / "segmodel" / bundled_default.name
+    if path == legacy_default:
+        return bundled_default
+    if packaged_path.is_dir():
+        return packaged_path.resolve()
+    return path.resolve()
 
 
 def resolve_nnunet_model_folder(model_folder=""):
     candidate = str(model_folder or "").strip()
     if candidate:
-        return str(Path(candidate).expanduser())
+        return str(_resolve_bundled_relative_path(candidate))
     default_path = default_nnunet_model_folder()
     if default_path.is_dir():
         return str(default_path)
     raise FileNotFoundError(
-        "nnUNet model folder not configured and bundled default model is missing: "
-        f"{default_path}"
+        "bundled nnUNet model folder is missing: "
+        f"{default_path}. Set an explicit model folder to override the bundled default"
     )
+
+
+def _nnunet_predict_command():
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--autoflow-internal-nnunet-predict"]
+    executable = shutil.which("nnUNetv2_predict_from_modelfolder")
+    if executable:
+        return [executable]
+    return [
+        sys.executable,
+        "-c",
+        (
+            "from nnunetv2.inference.predict_from_raw_data import "
+            "predict_entry_point_modelfolder as main; main()"
+        ),
+    ]
 
 
 def resolve_auto_segmentation_device(device="cpu"):
@@ -764,7 +916,7 @@ def generate_nnunet_auto_segmentation(
     step_size=0.5,
     disable_tta=True,
     num_processes_preprocessing=3,
-    num_processes_segmentation_export=3,
+    num_processes_segmentation_export=1,
     artifact_prefix="",
     runner=None,
     progress_callback=None,
@@ -835,9 +987,10 @@ def generate_nnunet_auto_segmentation(
         )
         channel_volumes = _nnunet_channel_volumes(channel_names, mag_nnunet, flow_nnunet)
         for idx, (channel_name, volume) in enumerate(zip(channel_names, channel_volumes)):
-            _write_nifti_volume(volume, affine, input_dir / f"{case_id}_{idx:04d}{file_ending}")
+            input_path = input_dir / f"{case_id}_{idx:04d}{file_ending}"
+            _write_nifti_volume(volume, affine, input_path)
             if idx < len(artifact_feature_paths):
-                _write_nifti_volume(volume, affine, artifact_feature_paths[idx])
+                _link_or_copy_file(input_path, artifact_feature_paths[idx])
             _emit_progress(
                 progress_callback,
                 stage="autoseg_prepare_inputs",
@@ -850,37 +1003,102 @@ def generate_nnunet_auto_segmentation(
                 channel_name=str(channel_name),
             )
 
-        command = [
-            shutil.which("nnUNetv2_predict_from_modelfolder") or "nnUNetv2_predict_from_modelfolder",
-            "-i", str(input_dir),
-            "-o", str(output_dir),
-            "-m", str(model_path),
-            "-f", *folds,
-            "-chk", str(checkpoint_name),
-            "-npp", str(int(num_processes_preprocessing)),
-            "-nps", str(int(num_processes_segmentation_export)),
-            "-device", str(resolved_device),
-        ]
-        if step_size is not None:
-            command.extend(["-step_size", str(float(step_size))])
-        if disable_tta:
-            command.append("--disable_tta")
+        gpu_preprocessing_requested = _gpu_preprocessing_enabled(resolved_device)
+        use_gpu_preprocessing = gpu_preprocessing_requested
+        prediction_model_path = model_path
+        gpu_preprocessing_fallback_reason = ""
+        if use_gpu_preprocessing:
+            try:
+                prediction_model_path = _prepare_nnunet_gpu_model_folder(
+                    model_path,
+                    tmp_root / "model_gpu_preprocessing",
+                    folds,
+                    checkpoint_name,
+                )
+            except Exception as exc:
+                use_gpu_preprocessing = False
+                gpu_preprocessing_fallback_reason = f"{type(exc).__name__}: {exc}"
+                _emit_progress(
+                    progress_callback,
+                    stage="autoseg_gpu_preprocessing_fallback",
+                    message="Could not prepare CUDA input resampling; using CPU resampling...",
+                    current=3,
+                    total=total_stages,
+                    elapsed_sec=time.perf_counter() - t_total_start,
+                    preprocessing_device="cpu",
+                    fallback_reason=gpu_preprocessing_fallback_reason,
+                )
+        command = _nnunet_inference_command(
+            input_dir,
+            output_dir,
+            prediction_model_path,
+            folds,
+            checkpoint_name,
+            resolved_device,
+            num_processes_preprocessing,
+            num_processes_segmentation_export,
+            step_size,
+            disable_tta,
+        )
+        preprocessing_device = "cuda" if use_gpu_preprocessing else "cpu"
+        gpu_preprocessing_command = list(command) if use_gpu_preprocessing else []
         _emit_progress(
             progress_callback,
             stage="autoseg_run_inference",
-            message=f"Running nnUNet inference on {resolved_device}...",
+            message=(
+                "Running nnUNet inference with CUDA input resampling..."
+                if use_gpu_preprocessing
+                else f"Running nnUNet inference on {resolved_device}..."
+            ),
             current=3,
             total=total_stages,
             elapsed_sec=time.perf_counter() - t_total_start,
             command=[str(x) for x in command],
+            preprocessing_device=preprocessing_device,
         )
         result = _run_subprocess(command, runner=runner)
+        if getattr(result, "returncode", 0) != 0 and use_gpu_preprocessing:
+            gpu_preprocessing_fallback_reason = _subprocess_failure_details(result)
+            output_dir = tmp_root / "output_cpu_preprocessing"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            command = _nnunet_inference_command(
+                input_dir,
+                output_dir,
+                model_path,
+                folds,
+                checkpoint_name,
+                resolved_device,
+                num_processes_preprocessing,
+                num_processes_segmentation_export,
+                step_size,
+                disable_tta,
+            )
+            preprocessing_device = "cpu"
+            _emit_progress(
+                progress_callback,
+                stage="autoseg_gpu_preprocessing_fallback",
+                message="CUDA input resampling failed; retrying with CPU resampling...",
+                current=3,
+                total=total_stages,
+                elapsed_sec=time.perf_counter() - t_total_start,
+                command=[str(x) for x in command],
+                preprocessing_device=preprocessing_device,
+                fallback_reason=gpu_preprocessing_fallback_reason,
+            )
+            result = _run_subprocess(command, runner=runner)
         if getattr(result, "returncode", 0) != 0:
             stdout = getattr(result, "stdout", "") or ""
             stderr = getattr(result, "stderr", "") or ""
+            gpu_failure = ""
+            if gpu_preprocessing_fallback_reason:
+                gpu_failure = (
+                    "\nCUDA preprocessing attempt failed before the CPU retry:\n"
+                    f"{gpu_preprocessing_fallback_reason}\n"
+                )
             raise RuntimeError(
                 "nnUNet inference failed\n"
                 f"command: {' '.join(map(str, command))}\n"
+                f"{gpu_failure}"
                 f"stdout:\n{stdout}\n"
                 f"stderr:\n{stderr}"
             )
@@ -932,6 +1150,16 @@ def generate_nnunet_auto_segmentation(
             "case_id": str(case_id),
             "created_at": segmentation_timestamp(),
             "command": [str(x) for x in command],
+            "gpu_preprocessing_command": [str(x) for x in gpu_preprocessing_command],
+            "preprocessing_device_requested": "cuda" if gpu_preprocessing_requested else "cpu",
+            "preprocessing_device": str(preprocessing_device),
+            "preprocessing_resampler": (
+                "resample_torch_fornnunet"
+                if preprocessing_device == "cuda"
+                else "resample_data_or_seg_to_shape"
+            ),
+            "gpu_preprocessing_fallback": bool(gpu_preprocessing_fallback_reason),
+            "gpu_preprocessing_fallback_reason": str(gpu_preprocessing_fallback_reason),
             "feature_files": [str(path) for path in artifact_feature_paths],
             "segmentation_nifti": "" if artifact_prediction_path is None else str(artifact_prediction_path),
             "prediction_file": "" if artifact_prediction_path is None else str(artifact_prediction_path),

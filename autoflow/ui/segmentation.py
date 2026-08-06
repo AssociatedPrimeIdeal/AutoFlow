@@ -1,4 +1,4 @@
-from PyQt5 import QtCore, QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 
 SOURCE_LABELS = {
@@ -101,6 +101,7 @@ class SegmentationConfigDialog(QtWidgets.QDialog):
         form = QtWidgets.QFormLayout(page)
         self.edit_auto_backend = QtWidgets.QLineEdit()
         self.edit_auto_model = QtWidgets.QLineEdit()
+        self.edit_auto_model.setPlaceholderText("Bundled default")
         self.edit_auto_checkpoint = QtWidgets.QLineEdit()
         self.btn_browse_checkpoint = QtWidgets.QPushButton("Browse...")
         self.btn_browse_checkpoint.clicked.connect(self._browse_checkpoint)
@@ -245,10 +246,30 @@ class SegmentationDock(QtWidgets.QWidget):
         self.text_provenance = QtWidgets.QPlainTextEdit()
         self.text_provenance.setReadOnly(True)
         self.text_provenance.setMaximumHeight(100)
+        source_actions = QtWidgets.QWidget()
+        source_actions_layout = QtWidgets.QHBoxLayout(source_actions)
+        source_actions_layout.setContentsMargins(0, 0, 0, 0)
+        source_actions_layout.setSpacing(4)
+        self.btn_configure = QtWidgets.QPushButton("Configure...")
+        self.btn_import = QtWidgets.QPushButton("Import...")
+        self.btn_save = QtWidgets.QPushButton("Save...")
+        self.btn_configure.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView)
+        )
+        self.btn_import.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogOpenButton)
+        )
+        self.btn_save.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton)
+        )
+        source_actions_layout.addWidget(self.btn_configure)
+        source_actions_layout.addWidget(self.btn_import)
+        source_actions_layout.addWidget(self.btn_save)
         source_form.addRow("Active Source", self.combo_source)
         source_form.addRow("Visible", self.check_visible)
         source_form.addRow("Opacity", self.slider_opacity)
         source_form.addRow("Provenance", self.text_provenance)
+        source_form.addRow("Actions", source_actions)
         layout.addWidget(source_group)
 
         labels_group = QtWidgets.QGroupBox("Labels")
@@ -277,45 +298,14 @@ class SegmentationDock(QtWidgets.QWidget):
         active_form.addRow("Color", self.btn_active_color)
         layout.addWidget(active_group)
 
-        tools_group = QtWidgets.QGroupBox("Tools")
-        tools_layout = QtWidgets.QGridLayout(tools_group)
-        self.btn_tool_brush = QtWidgets.QPushButton("Brush")
-        self.btn_tool_erase = QtWidgets.QPushButton("Erase")
-        self.btn_tool_relabel = QtWidgets.QPushButton("Relabel")
-        self.tool_buttons = [self.btn_tool_brush, self.btn_tool_erase, self.btn_tool_relabel]
-        for btn in self.tool_buttons:
-            btn.setCheckable(True)
-        self.btn_tool_brush.setChecked(True)
-        self.spin_brush_radius = QtWidgets.QSpinBox()
-        self.spin_brush_radius.setRange(1, 50)
-        self.spin_brush_radius.setValue(3)
-        self.chk_edit_all_timepoints = QtWidgets.QCheckBox("Edit Across All Frames (3D)")
-        self.chk_edit_all_timepoints.setChecked(True)
-        tools_layout.addWidget(self.btn_tool_brush, 0, 0)
-        tools_layout.addWidget(self.btn_tool_erase, 0, 1)
-        tools_layout.addWidget(self.btn_tool_relabel, 1, 0, 1, 2)
-        tools_layout.addWidget(QtWidgets.QLabel("Brush Radius"), 2, 0)
-        tools_layout.addWidget(self.spin_brush_radius, 2, 1)
-        tools_layout.addWidget(self.chk_edit_all_timepoints, 3, 0, 1, 2)
-        layout.addWidget(tools_group)
-
         actions_group = QtWidgets.QGroupBox("Edit")
-        actions_layout = QtWidgets.QGridLayout(actions_group)
-        self.chk_editing_enabled = QtWidgets.QCheckBox("Enable Ortho Editing")
-        self.btn_undo = QtWidgets.QPushButton("Undo")
-        self.btn_redo = QtWidgets.QPushButton("Redo")
-        self.btn_apply = QtWidgets.QPushButton("Apply")
-        self.btn_cancel = QtWidgets.QPushButton("Cancel")
-        self.btn_undo.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_ArrowBack))
-        self.btn_redo.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_ArrowForward))
-        self.btn_apply.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_DialogApplyButton))
-        self.btn_cancel.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_DialogCancelButton))
-        self.btn_apply.setProperty("role", "primary")
-        actions_layout.addWidget(self.chk_editing_enabled, 0, 0, 1, 2)
-        actions_layout.addWidget(self.btn_undo, 1, 0)
-        actions_layout.addWidget(self.btn_redo, 1, 1)
-        actions_layout.addWidget(self.btn_apply, 2, 0)
-        actions_layout.addWidget(self.btn_cancel, 2, 1)
+        actions_layout = QtWidgets.QVBoxLayout(actions_group)
+        self.btn_open_editor = QtWidgets.QPushButton("Open Manual Editor")
+        self.btn_open_editor.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView)
+        )
+        self.btn_open_editor.setProperty("role", "primary")
+        actions_layout.addWidget(self.btn_open_editor)
         layout.addWidget(actions_group)
 
         self.label_status = QtWidgets.QLabel("No active segmentation")

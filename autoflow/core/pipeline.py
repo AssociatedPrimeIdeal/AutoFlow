@@ -331,6 +331,7 @@ class PipelineEngine:
         ws.derived.pwv_json_file = ""
         ws.derived.pwv_h5_file = ""
         ws.data_loaded = True
+        ws._preprocess_signature = None
 
         for data_key in ["segmask_raw_surface", "segmask_pre_surface", "wss_surface_live", "tke_volume", "pressure_gradient_volume", "relative_pressure_volume"]:
             ws.remove_object_by_data_key(data_key)
@@ -367,6 +368,22 @@ class PipelineEngine:
             raise ValueError("segmask_raw is None")
         from ..algorithms.preprocess import majority_vote_labels_3d, filter_connected_components, filter_labeled_components
 
+        signature = (
+            id(ws.segmask_raw),
+            tuple(np.asarray(ws.segmask_raw).shape),
+            tuple(float(x) for x in np.asarray(ws.resolution, dtype=float).reshape(-1)[:3]),
+            int(ws.time_count()),
+            json.dumps(ws.skeleton_params.to_dict(), sort_keys=True, default=str),
+        )
+        if (
+            getattr(ws, "_preprocess_signature", None) == signature
+            and ws.segmask_binary is not None
+            and ws.segmask_3d is not None
+        ):
+            return False
+
+        ws._video_union_surface_cache = {}
+        ws._pressure_support_surface_cache = {}
         previous_groups = dict(ws.multilabel_groups or {})
         ws.segmask_labels = filter_segmask_labels(ws.segmask_raw)
         voted_labels_3d = majority_vote_labels_3d(ws.segmask_labels)
@@ -378,6 +395,7 @@ class PipelineEngine:
                 min_volume_mm3=ws.skeleton_params.min_cc_volume_mm3,
                 rel_min_ratio=ws.skeleton_params.cc_rel_min_ratio,
             )
+        ws.segmask_labels_3d = np.asarray(voted_labels_3d, dtype=np.int16)
         specs = self._build_group_specs(ws, voted_labels_3d)
         ws.group_order = [str(spec["name"]) for spec in specs]
         ws.multilabel_groups = {}
@@ -440,6 +458,8 @@ class PipelineEngine:
                 opacity=0.15,
                 color=ws.skeleton_params.scene_color_for_group(group_name, "scene"),
             )
+        ws._preprocess_signature = signature
+        return True
 
     def run_step(self, ws, step, log):
         dispatch = {
@@ -533,15 +553,12 @@ class PipelineEngine:
             local_points = np.asarray(group_state.get("skeleton_points"), dtype=float).reshape(-1, 3) if group_state.get("skeleton_points") is not None else np.empty((0, 3), dtype=float)
             local_graph = build_graph_from_points(local_points, ws.resolution)
             group_state["graph"] = local_graph
-            flow_for_orientation = None
             local_binary = np.asarray(group_state.get("segmask_binary"), dtype=bool)
-            if ws.flow_raw is not None and local_binary.size:
-                flow_for_orientation = ws.flow_raw * local_binary[..., None]
             local_labels, local_paths, local_node_paths, local_path_info, local_forks = segment_vessels_from_graph_and_mask(
                 np.asarray(group_state.get("segmask_3d"), dtype=bool),
                 local_graph,
                 ws.resolution,
-                flow_xyzt3=flow_for_orientation,
+                flow_xyzt3=ws.flow_raw if local_binary.size else None,
                 segmask_binary_4d=local_binary,
                 origin=ws.origin,
             )
@@ -553,7 +570,17 @@ class PipelineEngine:
             for item in local_path_info:
                 payload = dict(item)
                 payload["path_index"] = int(payload.get("path_index", 0)) + int(path_offset)
+                for node_key in ("start_node", "end_node"):
+                    local_node = int(payload.get(node_key, -1))
+                    payload[node_key] = local_node + int(graph_node_offset) if local_node >= 0 else -1
                 payload["fork_ids"] = [int(x) + len(forks) for x in payload.get("fork_ids", [])]
+                adjusted_roles = []
+                for role in payload.get("fork_roles", []):
+                    adjusted_role = dict(role)
+                    local_fork_id = int(adjusted_role.get("fork_id", -1))
+                    adjusted_role["fork_id"] = local_fork_id + len(forks) if local_fork_id >= 0 else -1
+                    adjusted_roles.append(adjusted_role)
+                payload["fork_roles"] = adjusted_roles
                 payload["incoming_path_ids"] = [int(x) + int(path_offset) for x in payload.get("incoming_path_ids", [])]
                 payload["outgoing_path_ids"] = [int(x) + int(path_offset) for x in payload.get("outgoing_path_ids", [])]
                 payload["group_name"] = str(group_name)
@@ -564,6 +591,8 @@ class PipelineEngine:
                 payload = dict(fork)
                 payload["left"] = [int(x) + int(path_offset) for x in payload.get("left", [])]
                 payload["right"] = [int(x) + int(path_offset) for x in payload.get("right", [])]
+                local_node = int(payload.get("node", -1))
+                payload["node"] = local_node + int(graph_node_offset) if local_node >= 0 else -1
                 payload["group_name"] = str(group_name)
                 adjusted_forks.append(payload)
             if len(local_graph.points) > 0:
@@ -641,24 +670,22 @@ class PipelineEngine:
         has_tke = ws.derived.tke_array is not None or ws.derived.tke_volume is not None
         source_tke = ws.source_tke_array
         source_sigma = ws.source_sigma if ws.input_state.capabilities.has_complex_source else None
-        need_tke = bool(compute_tke and (source_tke is not None or source_sigma is not None))
-        has_requested = True
-        if compute_wss:
-            has_requested = has_requested and has_wss
-        if compute_pressure_gradient:
-            has_requested = has_requested and has_pg
-        if need_tke:
-            has_requested = has_requested and has_tke
-        if save_pixelwise and not ws.derived.pixelwise_export:
-            has_requested = False
-        if has_requested:
+        request_tke = bool(compute_tke and (source_tke is not None or source_sigma is not None))
+        pixelwise = dict(ws.derived.pixelwise_export or {})
+        need_wss = bool(compute_wss and (not has_wss or (save_pixelwise and "wss" not in pixelwise)))
+        need_pg = bool(
+            compute_pressure_gradient
+            and (not has_pg or (save_pixelwise and "pressure_gradient" not in pixelwise))
+        )
+        need_tke = bool(request_tke and (not has_tke or (save_pixelwise and "tke_time" not in pixelwise)))
+        if not (need_wss or need_pg or need_tke):
             if refresh_scene_objects:
                 self._register_derived_scene_objects(ws)
             return ws.derived
         self.preprocess(ws)
         dp = ws.derived_params
         result = compute_derived_metrics(
-            flow=ws.flow_raw * ws.segmask_binary[..., None],
+            flow=ws.flow_raw,
             mask4d=ws.segmask_binary,
             spacing=ws.resolution,
             origin=ws.origin,
@@ -679,9 +706,9 @@ class PipelineEngine:
             pressure_gradient_use_convective_acceleration=dp.pressure_gradient_use_convective_acceleration,
             pressure_method=dp.pressure_method,
             centerline_paths=ws.centerline_paths_smooth if len(ws.centerline_paths_smooth) > 0 else ws.centerline_paths,
-            compute_wss=bool(compute_wss),
-            compute_tke=bool(compute_tke),
-            compute_pressure_gradient=bool(compute_pressure_gradient),
+            compute_wss=need_wss,
+            compute_tke=need_tke,
+            compute_pressure_gradient=need_pg,
             wss_smoothing_iteration=dp.wss_smoothing_iteration,
             wss_viscosity=dp.wss_viscosity,
             wss_inward_distance=dp.wss_inward_distance,
@@ -691,13 +718,13 @@ class PipelineEngine:
             pressure_gradient_rho=dp.pressure_gradient_rho,
             pressure_gradient_viscosity=dp.pressure_gradient_viscosity,
         )
-        if compute_wss:
+        if need_wss:
             ws.derived.wss_surfaces = result["wss_surfaces"]
             ws.derived.wss_volume = result.get("wss_volume")
-        if compute_tke:
+        if need_tke:
             ws.derived.tke_volume = result["tke_volume"]
             ws.derived.tke_array = result.get("tke_array")
-        if compute_pressure_gradient:
+        if need_pg:
             ws.derived.pressure_gradient_array = result.get("pressure_gradient_array")
             ws.derived.pressure_gradient_magnitude = result.get("pressure_gradient_magnitude")
             ws.derived.pressure_gradient_peak = result.get("pressure_gradient_peak")
@@ -708,20 +735,40 @@ class PipelineEngine:
             ws.derived.relative_pressure_display_clim = result.get("relative_pressure_display_clim")
             ws.derived.centerline_pressure_profiles = list(result.get("centerline_pressure_profiles", []) or [])
         ws.derived.streamlines = []
-        ws.derived.pixelwise_export = result.get("pixelwise_export", {})
+        result_pixelwise = dict(result.get("pixelwise_export", {}) or {})
+        if result_pixelwise:
+            pixelwise.update(result_pixelwise)
+            ws.derived.pixelwise_export = pixelwise
         if refresh_scene_objects:
             self._register_derived_scene_objects(ws)
         return ws.derived
 
-    def _compute_plane_metrics_internal(self, ws, save=True, use_multithread=False, include_derived=True):
+    def _compute_plane_metrics_internal(
+        self,
+        ws,
+        save=True,
+        use_multithread=False,
+        include_derived=True,
+        ensure_derived=True,
+        compute_wss=True,
+        compute_tke=True,
+        compute_pressure_gradient=True,
+    ):
         if not ws.has_flow():
             return [], {}, "Plane metrics skipped: no flow"
         if ws.segmask_raw is None:
             return [], {}, self._missing_segmentation_message(ws, "Plane metrics")
         if ws.segmask_binary is None:
             self.preprocess(ws)
-        if include_derived:
-            self._ensure_derived_metrics(ws, save_pixelwise=False, refresh_scene_objects=False)
+        if include_derived and ensure_derived:
+            self._ensure_derived_metrics(
+                ws,
+                save_pixelwise=False,
+                refresh_scene_objects=False,
+                compute_wss=compute_wss,
+                compute_tke=compute_tke,
+                compute_pressure_gradient=compute_pressure_gradient,
+            )
         # Prefer the smoothed centerlines (better local tangents) but fall back
         # to the raw ordered ones if the smoothing step hasn't been run yet.
         paths_for_tangent = ws.centerline_paths_smooth if len(ws.centerline_paths_smooth) > 0 else ws.centerline_paths
@@ -969,7 +1016,20 @@ class PipelineEngine:
             if plane_result.skipped or not plane_result.success:
                 return StepResult(StepId.COMPUTE_PLANE_METRICS, plane_result.success, True, plane_result.message)
         use_mt = getattr(ws.derived_params, "use_multithread", False)
-        _, _, msg = self._compute_plane_metrics_internal(ws, save=True, use_multithread=use_mt, include_derived=True)
+        include_derived = bool(
+            (ws.derived.wss_surfaces and ws.derived.wss_volume is not None)
+            or ws.derived.tke_array is not None
+            or ws.derived.pressure_gradient_array is not None
+            or ws.derived.relative_pressure_array is not None
+        )
+        _, _, msg = self._compute_plane_metrics_internal(
+            ws,
+            save=True,
+            use_multithread=use_mt,
+            include_derived=include_derived,
+            ensure_derived=False,
+        )
+        msg += " derived=reused" if include_derived else " derived=not_requested"
         self._save_planes_json(ws)
         ws.pipeline.mark_done(StepId.COMPUTE_PLANE_METRICS)
         return StepResult(StepId.COMPUTE_PLANE_METRICS, True, False, msg)
@@ -983,9 +1043,44 @@ class PipelineEngine:
                 self._missing_segmentation_message(ws, "Derived metrics"),
             )
         self._ensure_derived_metrics(ws, save_pixelwise=False, refresh_scene_objects=True)
+        augmented_planes = 0
+        if len(ws.planes) > 0 and len(ws.derived.plane_metrics) == len(ws.planes):
+            metrics, plane_pixelwise = augment_plane_metrics_with_derived(
+                ws.derived.plane_metrics,
+                ws.planes,
+                ws.segmask_binary,
+                ws.resolution,
+                ws.origin,
+                branch_labels_3d=ws.branch_labels,
+                tke_array=ws.derived.tke_array,
+                pressure_gradient_array=ws.derived.pressure_gradient_array,
+                relative_pressure_array=ws.derived.relative_pressure_array,
+                wss_surfaces=ws.derived.wss_surfaces,
+            )
+            ws.derived.plane_metrics = metrics
+            for index, metric in enumerate(metrics):
+                ws.planes[index].metrics = dict(metric)
+            out_dir = self._output_dir(ws)
+            with open(os.path.join(out_dir, "plane_metrics.json"), "w", encoding="utf-8") as f:
+                json.dump(metrics, f, ensure_ascii=False, indent=2)
+            if ws.derived.plane_qc:
+                with open(os.path.join(out_dir, "plane_qc.json"), "w", encoding="utf-8") as f:
+                    json.dump(ws.derived.plane_qc, f, ensure_ascii=False, indent=2)
+            plane_pixelwise_path = os.path.join(out_dir, "plane_metrics_pixelwise.h5")
+            save_plane_pixelwise_h5(
+                plane_pixelwise_path,
+                plane_pixelwise,
+                rr_ms=ws.rr,
+                source_format=ws.input_state.source_format,
+            )
+            ws.derived.plane_pixelwise_file = plane_pixelwise_path
+            self._save_planes_json(ws)
+            augmented_planes = len(metrics)
         has_tke = ws.derived.tke_array is not None or ws.derived.tke_volume is not None
         msg = f"Derived: Nt={len(ws.derived.wss_surfaces)}"
         if not has_tke:
             msg += " tke=unavailable"
+        if augmented_planes:
+            msg += f" plane_summaries={augmented_planes}"
         ws.pipeline.mark_done(StepId.COMPUTE_DERIVED_METRICS)
         return StepResult(StepId.COMPUTE_DERIVED_METRICS, True, False, msg)

@@ -39,8 +39,19 @@ class AutoFlowConfig:
     use_multithread: bool = True
     reuse_planes: str = ""
     background_phase_correction: bool = False
+    background_phase_method: str = "msac"
     background_phase_corr_fit_order: int = 3
     background_phase_threshold: float = 0.1
+    background_phase_wrls_lambda: float = 5.0
+    background_phase_wrls_magnitude_threshold: float = 0.04
+    background_phase_wrls_mid_fov_fraction: float = 0.5
+    background_phase_wrls_mid_slice_fraction: float = 0.65
+    background_phase_wrls_arto_iterations: int = 2
+    background_phase_wrls_tau: float = 3.0
+    background_phase_wrls_delta: float = 2.0
+    background_phase_wrls_central_probability: float = 0.5
+    background_phase_wrls_fista_iterations: int = 5000
+    background_phase_wrls_gmm_iterations: int = 1000
     dual_venc_ratio1: float = 0.0
     dual_venc_ratio2: float = 0.0
     force_recompute_corr: bool = False
@@ -65,7 +76,7 @@ class AutoFlowConfig:
     min_seeds: int = 50
     terminal_speed: float = 0.01
     rng_seed: int = 0
-    tube_radius: float = 0.05
+    tube_radius: float = 0.25
     pathline_color: Optional[str] = None
     plane_pathline_color: Optional[str] = None
     pressure_method: str = "least_squares"
@@ -116,7 +127,7 @@ class AutoFlowConfig:
     relative_pressure_clim: Optional[Tuple[float, float]] = None
     relative_pressure_show_scalar_bar: bool = True
     relative_pressure_bar_cfg: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_RELATIVE_PRESSURE_BAR_CFG))
-    streamline_clim: Tuple[float, float] = (0.0, 1.0)
+    streamline_clim: Optional[Tuple[float, float]] = None
     streamline_show_scalar_bar: bool = True
     streamline_bar_cfg: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_STREAMLINE_BAR_CFG))
 
@@ -140,8 +151,19 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
     ws = Workspace()
     apply_config_bundle_to_workspace(ws, load_config_bundle(cfg.config_dir))
     ws.loader_params.background_phase_correction.enabled = bool(cfg.background_phase_correction)
+    ws.loader_params.background_phase_correction.method = str(cfg.background_phase_method)
     ws.loader_params.background_phase_correction.corr_fit_order = int(cfg.background_phase_corr_fit_order)
     ws.loader_params.background_phase_correction.threshold = float(cfg.background_phase_threshold)
+    ws.loader_params.background_phase_correction.wrls_lambda = float(cfg.background_phase_wrls_lambda)
+    ws.loader_params.background_phase_correction.wrls_magnitude_threshold = float(cfg.background_phase_wrls_magnitude_threshold)
+    ws.loader_params.background_phase_correction.wrls_mid_fov_fraction = float(cfg.background_phase_wrls_mid_fov_fraction)
+    ws.loader_params.background_phase_correction.wrls_mid_slice_fraction = float(cfg.background_phase_wrls_mid_slice_fraction)
+    ws.loader_params.background_phase_correction.wrls_arto_iterations = int(cfg.background_phase_wrls_arto_iterations)
+    ws.loader_params.background_phase_correction.wrls_tau = float(cfg.background_phase_wrls_tau)
+    ws.loader_params.background_phase_correction.wrls_delta = float(cfg.background_phase_wrls_delta)
+    ws.loader_params.background_phase_correction.wrls_central_probability = float(cfg.background_phase_wrls_central_probability)
+    ws.loader_params.background_phase_correction.wrls_fista_iterations = int(cfg.background_phase_wrls_fista_iterations)
+    ws.loader_params.background_phase_correction.wrls_gmm_iterations = int(cfg.background_phase_wrls_gmm_iterations)
     ws.loader_params.background_phase_correction.dual_venc_ratio1 = float(cfg.dual_venc_ratio1)
     ws.loader_params.background_phase_correction.dual_venc_ratio2 = float(cfg.dual_venc_ratio2)
     ws.loader_params.background_phase_correction.force_recompute = bool(cfg.force_recompute_corr)
@@ -292,10 +314,22 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 use_multithread=config.use_multithread,
                 reuse_planes=reuse_file,
                 background_phase_correction=config.background_phase_correction,
+                background_phase_method=config.background_phase_method,
                 background_phase_corr_fit_order=config.background_phase_corr_fit_order,
                 background_phase_threshold=config.background_phase_threshold,
+                background_phase_wrls_lambda=config.background_phase_wrls_lambda,
+                background_phase_wrls_magnitude_threshold=config.background_phase_wrls_magnitude_threshold,
+                background_phase_wrls_mid_fov_fraction=config.background_phase_wrls_mid_fov_fraction,
+                background_phase_wrls_mid_slice_fraction=config.background_phase_wrls_mid_slice_fraction,
+                background_phase_wrls_arto_iterations=config.background_phase_wrls_arto_iterations,
+                background_phase_wrls_tau=config.background_phase_wrls_tau,
+                background_phase_wrls_delta=config.background_phase_wrls_delta,
+                background_phase_wrls_central_probability=config.background_phase_wrls_central_probability,
+                background_phase_wrls_fista_iterations=config.background_phase_wrls_fista_iterations,
+                background_phase_wrls_gmm_iterations=config.background_phase_wrls_gmm_iterations,
                 dual_venc_ratio1=config.dual_venc_ratio1,
                 dual_venc_ratio2=config.dual_venc_ratio2,
+                force_recompute_corr=config.force_recompute_corr,
                 dicom_read_workers=config.dicom_read_workers,
                 plane_mode=config.plane_mode,
                 plane_count=config.plane_count,

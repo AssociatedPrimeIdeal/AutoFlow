@@ -1,5 +1,18 @@
+import inspect
+
 import numpy as np
 import pyvista as pv
+
+
+_EXTRACT_SURFACE_SUPPORTS_ALGORITHM = (
+    "algorithm" in inspect.signature(pv.UnstructuredGrid.extract_surface).parameters
+)
+
+
+def _extract_surface(dataset):
+    if _EXTRACT_SURFACE_SUPPORTS_ALGORITHM:
+        return dataset.extract_surface(algorithm="dataset_surface")
+    return dataset.extract_surface()
 
 
 def build_multilabel_surface(labels_3d, spacing, origin=(0, 0, 0)):
@@ -14,7 +27,7 @@ def build_multilabel_surface(labels_3d, spacing, origin=(0, 0, 0)):
     threshed = grid.threshold(0.5, scalars="label")
     if threshed.n_cells == 0:
         return None
-    surf = threshed.extract_surface()
+    surf = _extract_surface(threshed)
     return surf
 
 
@@ -36,11 +49,43 @@ def build_surface_from_mask3d(mask_xyz, spacing, origin=(0, 0, 0), smooth_iter=1
     grid.origin = tuple(float(x) for x in np.asarray(origin).reshape(-1)[:3])
     grid.point_data["values"] = mask_xyz.astype(np.float32).ravel(order="F")
     th = grid.threshold(0.1, scalars="values")
-    surf = th.extract_surface()
+    surf = _extract_surface(th)
     if smooth_iter > 0 and surf.n_points > 0:
         surf = surf.smooth(n_iter=smooth_iter)
     return surf
 
+
+
+def build_cell_mask_surface(mask_xyz, spacing, origin=(0, 0, 0), *, smooth_iter=80):
+    mask_xyz = np.asarray(mask_xyz, dtype=bool)
+    if not np.any(mask_xyz):
+        return None
+    mask_grid = create_uniform_grid(mask_xyz.astype(np.uint8), spacing, origin=origin, name="mask")
+    support = mask_grid.threshold(0.1, scalars="mask")
+    if support is None or support.n_cells == 0:
+        return None
+
+    surface = _extract_surface(support)
+    if surface is None or surface.n_points == 0:
+        return None
+    if int(smooth_iter) > 0:
+        surface = surface.triangulate().smooth(n_iter=int(smooth_iter))
+    return surface
+
+
+def sample_volume_on_existing_surface(field_xyz, surface, spacing, origin=(0, 0, 0), *, name="field"):
+    field_xyz = np.asarray(field_xyz, dtype=np.float32)
+    if field_xyz.ndim != 3:
+        raise ValueError(f"{name} must be XYZ, got {field_xyz.shape}")
+    if surface is None or surface.n_points == 0:
+        return None
+
+    scalar_grid = create_uniform_grid(field_xyz, spacing, origin=origin, name=name)
+    scalar_grid = scalar_grid.cell_data_to_point_data(pass_cell_data=False)
+    sampled = surface.sample(scalar_grid)
+    if sampled is None or sampled.n_points == 0:
+        return None
+    return sampled
 
 
 def sample_volume_on_surface(field_xyz, mask_xyz, spacing, origin=(0, 0, 0), *, name="field", smooth_iter=80):
@@ -50,26 +95,8 @@ def sample_volume_on_surface(field_xyz, mask_xyz, spacing, origin=(0, 0, 0), *, 
         raise ValueError(f"{name} must be XYZ, got {field_xyz.shape}")
     if field_xyz.shape != mask_xyz.shape:
         raise ValueError(f"{name} shape {field_xyz.shape} does not match mask {mask_xyz.shape}")
-    if not np.any(mask_xyz):
-        return None
-
-    mask_grid = create_uniform_grid(mask_xyz.astype(np.uint8), spacing, origin=origin, name="mask")
-    support = mask_grid.threshold(0.1, scalars="mask")
-    if support is None or support.n_cells == 0:
-        return None
-
-    surface = support.extract_surface()
-    if surface is None or surface.n_points == 0:
-        return None
-    if int(smooth_iter) > 0:
-        surface = surface.triangulate().smooth(n_iter=int(smooth_iter))
-
-    scalar_grid = create_uniform_grid(field_xyz, spacing, origin=origin, name=name)
-    scalar_grid = scalar_grid.cell_data_to_point_data(pass_cell_data=False)
-    sampled = surface.sample(scalar_grid)
-    if sampled is None or sampled.n_points == 0:
-        return None
-    return sampled
+    surface = build_cell_mask_surface(mask_xyz, spacing, origin=origin, smooth_iter=smooth_iter)
+    return sample_volume_on_existing_surface(field_xyz, surface, spacing, origin=origin, name=name)
 
 
 def _build_branch_grid(branch_labels_3d, spacing, origin):

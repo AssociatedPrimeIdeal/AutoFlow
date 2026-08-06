@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import os
 import sys
 
@@ -6,7 +7,14 @@ import numpy as np
 import pyvista as pv
 from PIL import Image
 
-from ..algorithms import create_uniform_grid, generate_seed_points, generate_streamlines_at_t, sample_volume_on_surface
+from ..algorithms import (
+    automatic_streamline_clim,
+    build_cell_mask_surface,
+    create_uniform_grid,
+    generate_seed_points,
+    generate_streamlines_at_t,
+    sample_volume_on_existing_surface,
+)
 from ..config import DEFAULT_PLANE_VIDEO_CFG
 
 WINDOW_SIZE = (1600, 1200)
@@ -36,7 +44,7 @@ def _offscreen_mode():
         return "local"
     # GUI exports already own a live display-backed VTK context, so keep that
     # path instead of forcing a separate local EGL/Xvfb context.
-    qtwidgets = sys.modules.get("PyQt5.QtWidgets")
+    qtwidgets = sys.modules.get("PySide6.QtWidgets")
     if qtwidgets is not None:
         app_cls = getattr(qtwidgets, "QApplication", None)
         try:
@@ -232,6 +240,16 @@ def _time_and_azimuth(frame_idx, rotation_frames, n_time, time_repeat=1):
 
 
 def _build_union_surface(ws, smoothing_iteration=200):
+    cache_key = (
+        id(getattr(ws, "segmask_binary", None)),
+        id(getattr(ws, "segmask_3d", None)),
+        int(smoothing_iteration),
+        tuple(np.asarray(ws.resolution, dtype=float).reshape(3)),
+        tuple(np.asarray(ws.origin, dtype=float).reshape(3)),
+    )
+    cache = getattr(ws, "_video_union_surface_cache", {})
+    if cache_key in cache:
+        return cache[cache_key]
     if ws.segmask_binary is not None:
         mask3d = np.any(np.asarray(ws.segmask_binary, dtype=bool), axis=3)
     else:
@@ -249,7 +267,50 @@ def _build_union_surface(ws, smoothing_iteration=200):
         surf = mesh.extract_surface()
     if surf is not None and surf.n_points > 0 and int(smoothing_iteration) > 0:
         surf = surf.smooth(n_iter=int(smoothing_iteration))
-    return mesh, surf
+    result = (mesh, surf)
+    cache[cache_key] = result
+    ws._video_union_surface_cache = cache
+    return result
+
+
+def _pressure_support_surface(ws, support_source, t, smooth_iter=80):
+    support_key = (
+        id(support_source),
+        tuple(int(x) for x in np.asarray(support_source).shape),
+        tuple(np.asarray(ws.resolution, dtype=float).reshape(3)),
+        tuple(np.asarray(ws.origin, dtype=float).reshape(3)),
+        int(smooth_iter),
+    )
+    cache = getattr(ws, "_pressure_support_surface_cache", {})
+    entry = cache.get(support_key)
+    if entry is None:
+        support = np.asarray(support_source, dtype=bool)
+        if support.ndim == 4:
+            representatives = {}
+            lookup = []
+            for tidx in range(int(support.shape[3])):
+                token = np.ascontiguousarray(support[..., tidx]).tobytes()
+                lookup.append(representatives.setdefault(token, int(tidx)))
+        else:
+            lookup = [0]
+        entry = {"support": support, "lookup": lookup, "surfaces": {}}
+        cache[support_key] = entry
+        ws._pressure_support_surface_cache = cache
+
+    support = entry["support"]
+    lookup = entry["lookup"]
+    tidx = min(max(0, int(t)), len(lookup) - 1)
+    rep_t = int(lookup[tidx])
+    surfaces = entry["surfaces"]
+    if rep_t not in surfaces:
+        support_t = support[..., rep_t] if support.ndim == 4 else support
+        surfaces[rep_t] = build_cell_mask_surface(
+            support_t,
+            ws.resolution,
+            origin=ws.origin,
+            smooth_iter=smooth_iter,
+        )
+    return surfaces[rep_t]
 
 
 def _plane_size_from_surface(surf):
@@ -638,14 +699,7 @@ def render_wss_video(
 
 
 def _streamline_speed_max(ws):
-    if ws.flow_raw is None:
-        return 1e-6
-    speed = np.linalg.norm(np.asarray(ws.flow_raw, dtype=float) / 100.0, axis=-1)
-    if ws.segmask_binary is not None and np.any(ws.segmask_binary):
-        vals = speed[np.asarray(ws.segmask_binary, dtype=bool)]
-        if vals.size:
-            return max(float(np.nanmax(vals)), 1e-6)
-    return max(float(np.nanmax(speed)), 1e-6)
+    return automatic_streamline_clim(ws.flow_raw, ws.segmask_binary)[1]
 
 
 def _ensure_streamline_scalars(sl):
@@ -711,8 +765,56 @@ def render_streamlines_video(
     else:
         total_frames = n_time * int(max(time_repeat, 1))
 
+    def _build_streamline(tidx):
+        mask_t = np.asarray(
+            ws.segmask_binary[..., min(max(0, tidx), ws.segmask_binary.shape[3] - 1)],
+            dtype=bool,
+        )
+        return tidx, _ensure_streamline_scalars(
+            generate_streamlines_at_t(
+                ws.flow_raw,
+                tidx,
+                seeds,
+                ws.resolution,
+                ws.origin,
+                mask_3d=mask_t,
+                max_steps=ws.streamline_params.max_steps,
+                terminal_speed=ws.streamline_params.terminal_speed,
+                seed_ratio=ws.streamline_params.seed_ratio,
+                min_seeds=ws.streamline_params.min_seeds,
+                rng_seed=ws.streamline_params.rng_seed,
+            )
+        )
+
+    worker_count = min(n_time, 8, max(1, os.cpu_count() or 1))
+    if worker_count > 1:
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            streamline_cache = dict(pool.map(_build_streamline, range(n_time)))
+    else:
+        streamline_cache = dict(_build_streamline(tidx) for tidx in range(n_time))
+
+    tube_radius = float(ws.streamline_params.tube_radius)
+    if tube_radius > 0.0:
+        def _build_tube(item):
+            tidx, streamline = item
+            if streamline is None or streamline.n_points == 0 or not hasattr(streamline, "tube"):
+                return tidx, None
+            return tidx, streamline.tube(radius=tube_radius)
+
+        if worker_count > 1:
+            with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                tube_cache = dict(pool.map(_build_tube, streamline_cache.items()))
+        else:
+            tube_cache = dict(_build_tube(item) for item in streamline_cache.items())
+    else:
+        tube_cache = {}
+
     plotter = _make_plotter(window_size=_resolve_window_size(window_size))
     frames = []
+    plotter.set_background("white")
+    plotter.add_mesh(surf, opacity=0.18, color="lightgray")
+    streamline_actor = None
+    text_actor = plotter.add_text("", position="upper_left", font_size=14, color="black")
 
     for frame_idx in range(total_frames):
         if rotate:
@@ -727,52 +829,42 @@ def render_streamlines_video(
             t = min(frame_idx, n_time - 1)
             camera_position = _camera_from_view(surf, view, distance_scale)
 
-        mask_t = np.asarray(
-            ws.segmask_binary[..., min(max(0, t), ws.segmask_binary.shape[3] - 1)],
-            dtype=bool,
-        )
-
-        sl = generate_streamlines_at_t(
-            ws.flow_raw,
-            t,
-            seeds,
-            ws.resolution,
-            ws.origin,
-            mask_3d=mask_t,
-            max_steps=ws.streamline_params.max_steps,
-            terminal_speed=ws.streamline_params.terminal_speed,
-            seed_ratio=ws.streamline_params.seed_ratio,
-            min_seeds=ws.streamline_params.min_seeds,
-            rng_seed=ws.streamline_params.rng_seed,
-        )
-        sl = _ensure_streamline_scalars(sl)
-
-        plotter.clear()
-        plotter.set_background("white")
-        plotter.add_mesh(surf, opacity=0.18, color="lightgray")
+        sl = streamline_cache[t]
 
         if sl is not None and sl.n_points > 0:
-            sl_show = sl
-            render_lines_as_tubes = True
-            if float(ws.streamline_params.tube_radius) > 0.0 and hasattr(sl, "tube"):
-                sl_show = sl.tube(radius=float(ws.streamline_params.tube_radius))
-                render_lines_as_tubes = False
-            plotter.add_mesh(
-                sl_show,
-                scalars="Velocity",
-                cmap="turbo",
-                clim=clim,
-                render_lines_as_tubes=render_lines_as_tubes,
-                line_width=3,
-                **_scalar_bar_mesh_kwargs(show_scalar_bar, "Velocity (m/s)", streamline_bar_cfg),
-            )
+            sl_show = tube_cache.get(t) if tube_radius > 0.0 else sl
+            if sl_show is not None:
+                if streamline_actor is None:
+                    streamline_actor = plotter.add_mesh(
+                        sl_show,
+                        scalars="Velocity",
+                        cmap="turbo",
+                        clim=clim,
+                        render_lines_as_tubes=tube_radius <= 0.0,
+                        line_width=3,
+                        lighting=False,
+                        **_scalar_bar_mesh_kwargs(show_scalar_bar, "Velocity (m/s)", streamline_bar_cfg),
+                    )
+                else:
+                    streamline_actor.SetVisibility(1)
+                    mapper = streamline_actor.GetMapper()
+                    mapper.dataset = sl_show
+                    mapper.Update()
+        elif streamline_actor is not None:
+            streamline_actor.SetVisibility(0)
 
         if rotate:
             txt = f"t={t} | rot {frame_idx + 1}/{total_frames}"
         else:
             txt = f"t={t}"
 
-        plotter.add_text(txt, position="upper_left", font_size=14, color="black")
+        try:
+            text_actor.SetText(2, txt)
+        except Exception:
+            try:
+                text_actor.SetInput(txt)
+            except Exception:
+                pass
         plotter.camera_position = camera_position
         plotter.render()
         frames.append(np.asarray(plotter.screenshot(return_img=True)))
@@ -837,6 +929,14 @@ def render_tke_video(
 
     plotter = _make_plotter(window_size=_resolve_window_size(window_size))
     frames = []
+    tke_mesh_cache = {}
+    mesh_union = None
+    if ws.derived.tke_array is not None:
+        mesh_union = create_uniform_grid(
+            np.max(ws.segmask_binary > 0, axis=-1),
+            ws.resolution,
+            origin=ws.origin,
+        ).threshold(0.1)
 
     for frame_idx in range(total_frames):
         if rotate:
@@ -857,18 +957,12 @@ def render_tke_video(
 
         if ws.derived.tke_array is not None:
             arr = np.asarray(ws.derived.tke_array, dtype=np.float32)
-            if arr.ndim == 4:
-                vol_t = arr[..., min(max(0, t), arr.shape[3] - 1)]
-            else:
-                vol_t = arr
-            tke_mesh = create_uniform_grid(vol_t, ws.resolution, origin=ws.origin, name="TKE")
-            mesh_union = create_uniform_grid(
-                np.max(ws.segmask_binary > 0, axis=-1),
-                ws.resolution,
-                origin=ws.origin,
-            )
-            mesh_union = mesh_union.threshold(0.1)
-            tke_mesh = mesh_union.sample(tke_mesh)
+            tidx = min(max(0, t), arr.shape[3] - 1) if arr.ndim == 4 else 0
+            if tidx not in tke_mesh_cache:
+                vol_t = arr[..., tidx] if arr.ndim == 4 else arr
+                tke_grid = create_uniform_grid(vol_t, ws.resolution, origin=ws.origin, name="TKE")
+                tke_mesh_cache[tidx] = mesh_union.sample(tke_grid)
+            tke_mesh = tke_mesh_cache[tidx]
             plotter.add_mesh(
                 tke_mesh,
                 scalars="TKE",
@@ -904,26 +998,26 @@ def _pressure_gradient_max(ws):
     arr = ws.derived.pressure_gradient_magnitude
     if arr is None:
         return 1e-6
-    arr = np.asarray(arr, dtype=float)
+    arr = np.asarray(arr, dtype=np.float32)
     if arr.size == 0:
         return 1e-6
-    finite = arr[np.isfinite(arr)]
-    if finite.size == 0:
+    value = float(np.nanmax(arr))
+    if not np.isfinite(value):
         return 1e-6
-    return max(float(np.nanmax(finite)), 1e-6)
+    return max(value, 1e-6)
 
 
 def _relative_pressure_max(ws):
     arr = ws.derived.relative_pressure_array
     if arr is None:
         return 1e-6
-    arr = np.asarray(arr, dtype=float)
+    arr = np.asarray(arr, dtype=np.float32)
     if arr.size == 0:
         return 1e-6
-    finite = arr[np.isfinite(arr)]
-    if finite.size == 0:
+    value = float(np.nanmax(np.abs(arr)))
+    if not np.isfinite(value):
         return 1e-6
-    return max(float(np.nanmax(np.abs(finite))), 1e-6)
+    return max(value, 1e-6)
 
 
 def render_pressure_gradient_video(
@@ -969,8 +1063,17 @@ def render_pressure_gradient_video(
     else:
         total_frames = n_time * int(max(time_repeat, 1))
 
+    support_source = ws.derived.pressure_gradient_support_mask
+    if support_source is None:
+        support_source = ws.segmask_3d if ws.segmask_3d is not None else np.max(ws.segmask_binary > 0, axis=-1)
+    support_arr = np.asarray(support_source, dtype=bool)
     plotter = _make_plotter(window_size=_resolve_window_size(window_size))
     frames = []
+    pg_mesh_cache = {}
+    plotter.set_background("white")
+    plotter.add_mesh(surf, opacity=0.08, color="white")
+    pg_actor = None
+    text_actor = plotter.add_text("", position="upper_left", font_size=14, color="black")
 
     for frame_idx in range(total_frames):
         if rotate:
@@ -985,31 +1088,42 @@ def render_pressure_gradient_video(
             t = min(frame_idx, n_time - 1)
             camera_position = _camera_from_view(surf, view, distance_scale)
 
-        plotter.clear()
-        plotter.set_background("white")
-        plotter.add_mesh(surf, opacity=0.08, color="white")
-
         tidx = min(max(0, t), pg_arr.shape[3] - 1) if pg_arr.ndim == 4 else 0
-        vol_t = pg_arr if pg_arr.ndim == 3 else pg_arr[..., tidx]
-        support = ws.derived.pressure_gradient_support_mask
-        if support is not None:
-            support_arr = np.asarray(support, dtype=bool)
+        if tidx not in pg_mesh_cache:
+            vol_t = pg_arr if pg_arr.ndim == 3 else pg_arr[..., tidx]
             support_t = support_arr if support_arr.ndim == 3 else support_arr[..., tidx]
-        else:
-            support_t = np.asarray(ws.segmask_3d if ws.segmask_3d is not None else np.max(ws.segmask_binary > 0, axis=-1), dtype=bool)
-        vol_t = np.where(support_t, vol_t, 0.0)
-        pg_mesh = sample_volume_on_surface(vol_t, support_t, ws.resolution, origin=ws.origin, name="PressureGradient", smooth_iter=80)
-        if pg_mesh is not None and pg_mesh.n_points > 0:
-            plotter.add_mesh(
-                pg_mesh,
-                scalars="PressureGradient",
-                cmap="magma",
-                clim=clim,
-                **_scalar_bar_mesh_kwargs(show_scalar_bar, "|Pressure Grad| (Pa/m)", pressure_gradient_bar_cfg),
+            vol_t = np.where(support_t, vol_t, 0.0)
+            support_surface = _pressure_support_surface(ws, support_source, tidx, smooth_iter=80)
+            pg_mesh_cache[tidx] = sample_volume_on_existing_surface(
+                vol_t, support_surface, ws.resolution, origin=ws.origin,
+                name="PressureGradient",
             )
+        pg_mesh = pg_mesh_cache[tidx]
+        if pg_mesh is not None and pg_mesh.n_points > 0:
+            if pg_actor is None:
+                pg_actor = plotter.add_mesh(
+                    pg_mesh,
+                    scalars="PressureGradient",
+                    cmap="magma",
+                    clim=clim,
+                    **_scalar_bar_mesh_kwargs(show_scalar_bar, "|Pressure Grad| (Pa/m)", pressure_gradient_bar_cfg),
+                )
+            else:
+                pg_actor.SetVisibility(1)
+                mapper = pg_actor.GetMapper()
+                mapper.SetInputData(pg_mesh)
+                mapper.Update()
+        elif pg_actor is not None:
+            pg_actor.SetVisibility(0)
 
         txt = f"t={t} | rot {frame_idx + 1}/{total_frames}" if rotate else f"t={t}"
-        plotter.add_text(txt, position="upper_left", font_size=14, color="black")
+        try:
+            text_actor.SetText(2, txt)
+        except Exception:
+            try:
+                text_actor.SetInput(txt)
+            except Exception:
+                pass
         plotter.camera_position = camera_position
         plotter.render()
         frames.append(np.asarray(plotter.screenshot(return_img=True)))
@@ -1062,8 +1176,17 @@ def render_relative_pressure_video(
     else:
         total_frames = n_time * int(max(time_repeat, 1))
 
+    support_source = ws.derived.pressure_gradient_support_mask
+    if support_source is None:
+        support_source = ws.segmask_3d if ws.segmask_3d is not None else np.max(ws.segmask_binary > 0, axis=-1)
+    support_arr = np.asarray(support_source, dtype=bool)
     plotter = _make_plotter(window_size=_resolve_window_size(window_size))
     frames = []
+    rp_mesh_cache = {}
+    plotter.set_background("white")
+    plotter.add_mesh(surf, opacity=0.08, color="white")
+    rp_actor = None
+    text_actor = plotter.add_text("", position="upper_left", font_size=14, color="black")
 
     for frame_idx in range(total_frames):
         if rotate:
@@ -1078,31 +1201,42 @@ def render_relative_pressure_video(
             t = min(frame_idx, n_time - 1)
             camera_position = _camera_from_view(surf, view, distance_scale)
 
-        plotter.clear()
-        plotter.set_background("white")
-        plotter.add_mesh(surf, opacity=0.08, color="white")
-
         tidx = min(max(0, t), rp_arr.shape[3] - 1) if rp_arr.ndim == 4 else 0
-        vol_t = rp_arr if rp_arr.ndim == 3 else rp_arr[..., tidx]
-        support = ws.derived.pressure_gradient_support_mask
-        if support is not None:
-            support_arr = np.asarray(support, dtype=bool)
+        if tidx not in rp_mesh_cache:
+            vol_t = rp_arr if rp_arr.ndim == 3 else rp_arr[..., tidx]
             support_t = support_arr if support_arr.ndim == 3 else support_arr[..., tidx]
-        else:
-            support_t = np.asarray(ws.segmask_3d if ws.segmask_3d is not None else np.max(ws.segmask_binary > 0, axis=-1), dtype=bool)
-        vol_t = np.where(support_t, vol_t, 0.0)
-        rp_mesh = sample_volume_on_surface(vol_t, support_t, ws.resolution, origin=ws.origin, name="RelativePressure", smooth_iter=80)
-        if rp_mesh is not None and rp_mesh.n_points > 0:
-            plotter.add_mesh(
-                rp_mesh,
-                scalars="RelativePressure",
-                cmap="RdBu_r",
-                clim=clim,
-                **_scalar_bar_mesh_kwargs(show_scalar_bar, "Relative Pressure (Pa)", relative_pressure_bar_cfg),
+            vol_t = np.where(support_t, vol_t, 0.0)
+            support_surface = _pressure_support_surface(ws, support_source, tidx, smooth_iter=80)
+            rp_mesh_cache[tidx] = sample_volume_on_existing_surface(
+                vol_t, support_surface, ws.resolution, origin=ws.origin,
+                name="RelativePressure",
             )
+        rp_mesh = rp_mesh_cache[tidx]
+        if rp_mesh is not None and rp_mesh.n_points > 0:
+            if rp_actor is None:
+                rp_actor = plotter.add_mesh(
+                    rp_mesh,
+                    scalars="RelativePressure",
+                    cmap="RdBu_r",
+                    clim=clim,
+                    **_scalar_bar_mesh_kwargs(show_scalar_bar, "Relative Pressure (Pa)", relative_pressure_bar_cfg),
+                )
+            else:
+                rp_actor.SetVisibility(1)
+                mapper = rp_actor.GetMapper()
+                mapper.SetInputData(rp_mesh)
+                mapper.Update()
+        elif rp_actor is not None:
+            rp_actor.SetVisibility(0)
 
         txt = f"t={t} | rot {frame_idx + 1}/{total_frames}" if rotate else f"t={t}"
-        plotter.add_text(txt, position="upper_left", font_size=14, color="black")
+        try:
+            text_actor.SetText(2, txt)
+        except Exception:
+            try:
+                text_actor.SetInput(txt)
+            except Exception:
+                pass
         plotter.camera_position = camera_position
         plotter.render()
         frames.append(np.asarray(plotter.screenshot(return_img=True)))

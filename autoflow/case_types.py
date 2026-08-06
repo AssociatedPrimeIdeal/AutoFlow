@@ -36,8 +36,19 @@ class LoaderCapabilities:
 @dataclass
 class BackgroundPhaseCorrectionConfig:
     enabled: bool = True
+    method: str = "msac"
     corr_fit_order: int = 3
     threshold: float = 0.1
+    wrls_lambda: float = 5.0
+    wrls_magnitude_threshold: float = 0.04
+    wrls_mid_fov_fraction: float = 0.5
+    wrls_mid_slice_fraction: float = 0.65
+    wrls_arto_iterations: int = 2
+    wrls_tau: float = 3.0
+    wrls_delta: float = 2.0
+    wrls_central_probability: float = 0.5
+    wrls_fista_iterations: int = 5000
+    wrls_gmm_iterations: int = 1000
     dual_venc_ratio1: float = 0.0
     dual_venc_ratio2: float = 0.0
     force_recompute: bool = False
@@ -45,8 +56,19 @@ class BackgroundPhaseCorrectionConfig:
     def to_dict(self):
         return {
             "enabled": bool(self.enabled),
+            "method": str(self.method),
             "corr_fit_order": int(self.corr_fit_order),
             "threshold": float(self.threshold),
+            "wrls_lambda": float(self.wrls_lambda),
+            "wrls_magnitude_threshold": float(self.wrls_magnitude_threshold),
+            "wrls_mid_fov_fraction": float(self.wrls_mid_fov_fraction),
+            "wrls_mid_slice_fraction": float(self.wrls_mid_slice_fraction),
+            "wrls_arto_iterations": int(self.wrls_arto_iterations),
+            "wrls_tau": float(self.wrls_tau),
+            "wrls_delta": float(self.wrls_delta),
+            "wrls_central_probability": float(self.wrls_central_probability),
+            "wrls_fista_iterations": int(self.wrls_fista_iterations),
+            "wrls_gmm_iterations": int(self.wrls_gmm_iterations),
             "dual_venc_ratio1": float(self.dual_venc_ratio1),
             "dual_venc_ratio2": float(self.dual_venc_ratio2),
             "force_recompute": bool(self.force_recompute),
@@ -57,8 +79,19 @@ class BackgroundPhaseCorrectionConfig:
         payload = d or {}
         return BackgroundPhaseCorrectionConfig(
             enabled=bool(payload.get("enabled", False)),
+            method=str(payload.get("method", "msac") or "msac").strip().lower(),
             corr_fit_order=int(payload.get("corr_fit_order", 3)),
             threshold=float(payload.get("threshold", 0.1)),
+            wrls_lambda=float(payload.get("wrls_lambda", 5.0)),
+            wrls_magnitude_threshold=float(payload.get("wrls_magnitude_threshold", 0.04)),
+            wrls_mid_fov_fraction=float(payload.get("wrls_mid_fov_fraction", 0.5)),
+            wrls_mid_slice_fraction=float(payload.get("wrls_mid_slice_fraction", 0.65)),
+            wrls_arto_iterations=int(payload.get("wrls_arto_iterations", 2)),
+            wrls_tau=float(payload.get("wrls_tau", 3.0)),
+            wrls_delta=float(payload.get("wrls_delta", 2.0)),
+            wrls_central_probability=float(payload.get("wrls_central_probability", 0.5)),
+            wrls_fista_iterations=int(payload.get("wrls_fista_iterations", 5000)),
+            wrls_gmm_iterations=int(payload.get("wrls_gmm_iterations", 1000)),
             dual_venc_ratio1=float(payload.get("dual_venc_ratio1", 0.0)),
             dual_venc_ratio2=float(payload.get("dual_venc_ratio2", 0.0)),
             force_recompute=bool(payload.get("force_recompute", False)),

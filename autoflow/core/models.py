@@ -297,7 +297,7 @@ class StreamlineParams:
     min_seeds: int = 50
     terminal_speed: float = 0.01
     rng_seed: int = 0
-    tube_radius: float = 0.05
+    tube_radius: float = 0.25
     pathline_color: str = "deepskyblue"
 
     def to_dict(self):
@@ -319,7 +319,7 @@ class StreamlineParams:
             min_seeds=int(d.get("min_seeds", 50)),
             terminal_speed=float(d.get("terminal_speed", 0.01)),
             rng_seed=int(d.get("rng_seed", 0)),
-            tube_radius=float(d.get("tube_radius", 0.05)),
+            tube_radius=float(d.get("tube_radius", 0.25)),
             pathline_color=str(d.get("pathline_color", d.get("plane_pathline_color", "deepskyblue")) or "deepskyblue"),
         )
 
@@ -903,7 +903,7 @@ class SegmentationState:
     threshold_closing: bool = True
     threshold_opening: bool = False
     auto_backend: str = "nnUNet"
-    auto_model: str = "autoflow/segmodel/nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm"
+    auto_model: str = ""
     auto_checkpoint: str = "checkpoint_final.pth"
     auto_device: str = "auto"
     auto_label_map: str = ""
@@ -1001,7 +1001,7 @@ class SegmentationState:
             threshold_closing=bool(payload.get("threshold_closing", True)),
             threshold_opening=bool(payload.get("threshold_opening", False)),
             auto_backend=str(payload.get("auto_backend", "nnUNet")),
-            auto_model=str(payload.get("auto_model", "autoflow/segmodel/nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm")),
+            auto_model=str(payload.get("auto_model", "")),
             auto_checkpoint=str(payload.get("auto_checkpoint", "checkpoint_final.pth")),
             auto_device=str(payload.get("auto_device", "auto")),
             auto_label_map=str(payload.get("auto_label_map", "")),
@@ -1033,6 +1033,7 @@ class Workspace:
 
     segmask_raw: Optional[np.ndarray] = None
     segmask_labels: Optional[np.ndarray] = None
+    segmask_labels_3d: Optional[np.ndarray] = None
     segmask_binary: Optional[np.ndarray] = None
     segmask_3d: Optional[np.ndarray] = None
     group_order: List[str] = field(default_factory=list)
@@ -1070,6 +1071,7 @@ class Workspace:
 
     ortho_cursor: np.ndarray = field(default_factory=lambda: np.array([0, 0, 0], dtype=int))
     selected_path_index: int = -1
+    _preprocess_signature: Any = field(default=None, repr=False, compare=False)
 
     def _segmentation_version(self, source):
         if source not in ("original", "imported", "threshold", "auto"):
@@ -1223,8 +1225,10 @@ class Workspace:
         self.clear_pathlines()
 
     def reset_segmentation_results(self):
+        self._preprocess_signature = None
         for attr in [
             "segmask_labels",
+            "segmask_labels_3d",
             "segmask_binary",
             "segmask_3d",
             "skeleton_points",
@@ -1287,7 +1291,7 @@ class Workspace:
         self.origin = np.array([0., 0., 0.])
         self.venc = np.array([1., 1., 1.])
         self.rr = 1000.0
-        for attr in ["segmask_raw", "segmask_labels", "segmask_binary", "segmask_3d",
+        for attr in ["segmask_raw", "segmask_labels", "segmask_labels_3d", "segmask_binary", "segmask_3d",
                       "skeleton_points", "skeleton_mask", "branch_labels", "flow_raw",
                       "streamline_seeds", "mag_raw", "source_sigma", "source_tke_array"]:
             setattr(self, attr, None)
@@ -1311,6 +1315,7 @@ class Workspace:
         self.data_loaded = False
         self.ortho_cursor = np.array([0, 0, 0], dtype=int)
         self.selected_path_index = -1
+        self._preprocess_signature = None
 
     def snapshot_dict(self):
         def arr(v):
@@ -1506,7 +1511,8 @@ class Workspace:
             self.planes.append(PlaneData(
                 center=np.asarray(p["center"], dtype=float), normal=np.asarray(p["normal"], dtype=float),
                 label=int(p.get("label", 1)), path_index=int(p.get("path_index", 0)),
-                distance=float(p.get("distance", 0.0)), group_name=str(p.get("group_name", "") or ""), metrics=copy.deepcopy(p.get("metrics", {}))))
+                distance=float(p.get("distance", 0.0)), group_name=str(p.get("group_name", "") or ""),
+                metrics=copy.deepcopy(p.get("metrics", {}))))
         self.flow_raw = nparr("flow_raw")
         self.streamline_seeds = nparr("streamline_seeds")
         self.streamline_cache = {}

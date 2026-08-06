@@ -12,6 +12,7 @@ license = { file = "LICENSE" }
 dependencies = [
   "numpy",
   "scipy",
+  "pyamg>=5.0,<6",
   "scikit-image",
   "networkx",
   "pyvista",
@@ -23,20 +24,27 @@ dependencies = [
 
 [project.optional-dependencies]
 gui = [
-  "PyQt5",
+  "PySide6>=6.6",
+  "pyqtgraph>=0.13",
   "pyvistaqt",
   "matplotlib",
+  "numpy<2",
+  "nnunetv2==2.5.2",
+  "nibabel",
 ]
-test = [
-  "pytest",
-]
-
 [project.scripts]
 autoflow-run = "autoflow.cli:main"
 autoflow-gui = "autoflow.ui.launcher:main"
 
 [tool.setuptools.packages.find]
 include = ["autoflow", "autoflow.*"]
+
+[tool.setuptools.package-data]
+autoflow = [
+  "segmodel/nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm/dataset.json",
+  "segmodel/nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm/plans.json",
+  "segmodel/nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm/fold_all/checkpoint_final.pth",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

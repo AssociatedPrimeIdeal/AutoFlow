@@ -22,6 +22,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--single-thread", dest="use_multithread", action="store_false", help="Disable multithreaded plane metric calculation.")
     parser.add_argument("--bgc", dest="background_phase_correction", action="store_true", help="Enable background phase offset correction during loading.")
     parser.add_argument(
+        "--bgc-method",
+        choices=["msac", "wrls_arto"],
+        default=None,
+        help="Background phase correction algorithm. MSAC remains the default.",
+    )
+    parser.add_argument(
         "--bgc-fit-order",
         "--background-phase-fit-order",
         dest="background_phase_fit_order",
@@ -37,6 +43,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="MSAC threshold in venc units for background phase correction when --bgc is enabled.",
     )
+    parser.add_argument("--bgc-wrls-lambda", type=float, default=None, help="WRLS+ARTO L1 regularization strength.")
+    parser.add_argument("--bgc-wrls-magnitude-threshold", type=float, default=None, help="WRLS+ARTO reference-magnitude mask fraction.")
+    parser.add_argument("--bgc-wrls-mid-fov-fraction", type=float, default=None, help="WRLS+ARTO middle-FOV initialization fraction.")
+    parser.add_argument("--bgc-wrls-mid-slice-fraction", type=float, default=None, help="WRLS+ARTO through-plane initialization fraction.")
+    parser.add_argument("--bgc-wrls-arto-iterations", type=int, default=None, help="WRLS+ARTO exclusion/refit iteration count.")
+    parser.add_argument("--bgc-wrls-tau", type=float, default=None, help="WRLS+ARTO central-Gaussian exclusion width in standard deviations.")
+    parser.add_argument("--bgc-wrls-delta", type=float, default=None, help="WRLS+ARTO minimum side-Gaussian separation.")
+    parser.add_argument("--bgc-wrls-central-probability", type=float, default=None, help="WRLS+ARTO minimum central-Gaussian prior.")
+    parser.add_argument("--bgc-wrls-fista-iterations", type=int, default=None, help="WRLS+ARTO FISTA iteration count per fit.")
+    parser.add_argument("--bgc-wrls-gmm-iterations", type=int, default=None, help="WRLS+ARTO maximum GMM EM iterations per ARTO pass.")
     parser.add_argument(
         "--dual-venc-ratio1",
         type=float,
@@ -138,8 +154,19 @@ def main() -> None:
         "reuse_planes": args.reuse_planes,
         "use_multithread": args.use_multithread,
         "background_phase_correction": args.background_phase_correction,
+        "background_phase_method": args.bgc_method,
         "background_phase_corr_fit_order": args.background_phase_fit_order,
         "background_phase_threshold": args.background_phase_threshold,
+        "background_phase_wrls_lambda": args.bgc_wrls_lambda,
+        "background_phase_wrls_magnitude_threshold": args.bgc_wrls_magnitude_threshold,
+        "background_phase_wrls_mid_fov_fraction": args.bgc_wrls_mid_fov_fraction,
+        "background_phase_wrls_mid_slice_fraction": args.bgc_wrls_mid_slice_fraction,
+        "background_phase_wrls_arto_iterations": args.bgc_wrls_arto_iterations,
+        "background_phase_wrls_tau": args.bgc_wrls_tau,
+        "background_phase_wrls_delta": args.bgc_wrls_delta,
+        "background_phase_wrls_central_probability": args.bgc_wrls_central_probability,
+        "background_phase_wrls_fista_iterations": args.bgc_wrls_fista_iterations,
+        "background_phase_wrls_gmm_iterations": args.bgc_wrls_gmm_iterations,
         "dual_venc_ratio1": args.dual_venc_ratio1,
         "dual_venc_ratio2": args.dual_venc_ratio2,
         "force_recompute_corr": args.force_recompute_corr,

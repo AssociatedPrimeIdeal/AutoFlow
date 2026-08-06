@@ -1,4 +1,4 @@
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 
 _APP_STYLESHEET = """
@@ -44,6 +44,53 @@ QGroupBox::title {
     left: 8px;
     padding: 0 4px;
     color: #36414a;
+}
+QFrame#sliceView {
+    background: #050809;
+    border: 1px solid #aeb9be;
+    border-radius: 3px;
+}
+QWidget#sliceHeader {
+    background: #17282c;
+    border: 0;
+}
+QLabel#sliceTitle {
+    background: transparent;
+    color: #eef4f5;
+    font-size: 12px;
+    font-weight: 600;
+}
+QLabel#slicePosition {
+    background: transparent;
+    color: #b8c8cc;
+    font-size: 11px;
+}
+QWidget#segmentationLabelPanel {
+    background: #eef2f3;
+    border: 1px solid #c5cfd3;
+    border-radius: 3px;
+}
+QToolBar {
+    background: #ffffff;
+    border: 0;
+    border-bottom: 1px solid #cfd6dc;
+    spacing: 4px;
+    padding: 5px;
+}
+QToolButton {
+    border: 1px solid transparent;
+    border-radius: 3px;
+    min-height: 26px;
+    padding: 3px 7px;
+}
+QToolButton:hover {
+    background: #eef4f2;
+    border-color: #a9bbb5;
+}
+QToolButton:checked {
+    background: #dcece6;
+    border-color: #147d64;
+    color: #075e49;
 }
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox,
 QPlainTextEdit, QTextEdit, QTreeView, QTableView, QListView {
@@ -213,7 +260,7 @@ QStatusBar {
 
 def configure_high_dpi():
     for attribute_name in ("AA_EnableHighDpiScaling", "AA_UseHighDpiPixmaps"):
-        attribute = getattr(QtCore.Qt, attribute_name, None)
+        attribute = getattr(QtCore.Qt.ApplicationAttribute, attribute_name, None)
         if attribute is not None:
             QtWidgets.QApplication.setAttribute(attribute, True)
 
@@ -238,4 +285,15 @@ def standard_icon(widget, icon_name):
     icon_id = getattr(QtWidgets.QStyle, str(icon_name), None)
     if icon_id is None:
         return QtGui.QIcon()
-    return widget.style().standardIcon(icon_id)
+    pixmap = widget.style().standardPixmap(icon_id, None, widget)
+    if pixmap.isNull():
+        return QtGui.QIcon()
+    target = QtCore.QSize(16, 16)
+    if pixmap.size() != target:
+        pixmap = pixmap.scaled(
+            target,
+            QtCore.Qt.KeepAspectRatio,
+            QtCore.Qt.SmoothTransformation,
+        )
+    pixmap.setDevicePixelRatio(1.0)
+    return QtGui.QIcon(pixmap)

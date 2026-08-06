@@ -20,7 +20,7 @@
   "threshold_closing": true,
   "threshold_opening": false,
   "auto_backend": "nnUNet",
-  "auto_model": "autoflow/segmodel/nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm",
+  "auto_model": "",
   "auto_checkpoint": "checkpoint_final.pth",
   "auto_device": "auto",
   "auto_label_map": "",

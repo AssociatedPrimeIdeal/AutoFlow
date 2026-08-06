@@ -447,6 +447,7 @@ def process_single(
             save=True,
             use_multithread=use_multithread,
             include_derived=include_plane_derived,
+            ensure_derived=False,
         )
         step_parts.append(("plane_metrics", _time.perf_counter() - t_part))
         try:
@@ -795,7 +796,7 @@ def build_base_workspace():
     ws.streamline_params.seed_ratio = globals().get("SEED_RATIO", 0.02)
     ws.streamline_params.terminal_speed = globals().get("TERMINAL_SPEED", 0.01)
     ws.streamline_params.rng_seed = globals().get("RNG_SEED", 0)
-    ws.streamline_params.tube_radius = globals().get("TUBE_RADIUS", 0.05)
+    ws.streamline_params.tube_radius = globals().get("TUBE_RADIUS", 0.25)
     ws.streamline_params.pathline_color = globals().get("PATHLINE_COLOR", globals().get("PLANE_PATHLINE_COLOR", "deepskyblue"))
     return ws
 
@@ -847,7 +848,7 @@ def run_batch():
         "PRESSURE_GRADIENT_BAR_CFG",
         {"position_x": 0.75, "position_y": 0.2, "height": 0.22, "width": 0.05, "title_font_size": 40, "label_font_size": 32},
     )
-    streamline_clim = globals().get("STREAMLINE_CLIM", (0, 0.6))
+    streamline_clim = globals().get("STREAMLINE_CLIM", None)
     streamline_show_scalar_bar = globals().get("STREAMLINE_SHOW_SCALAR_BAR", True)
     streamline_bar_cfg = globals().get(
         "STREAMLINE_BAR_CFG",

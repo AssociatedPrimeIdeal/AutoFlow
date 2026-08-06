@@ -86,11 +86,13 @@ from .planes import (
 )
 
 from .surfaces import (
+    build_cell_mask_surface,
     build_multilabel_surface,
     build_multilabel_surface_t,
     build_binary_surface_t,
     build_surface_from_mask3d,
     sample_volume_on_surface,
+    sample_volume_on_existing_surface,
     _build_branch_grid,
     _select_connected_region,
     extract_plane_cross_section,
@@ -116,6 +118,7 @@ from .segmentation import (
 )
 
 from .streamlines import (
+    automatic_streamline_clim,
     generate_seed_points,
     generate_streamlines_at_t,
     generate_streamlines_from_plane_at_t,
@@ -192,7 +195,9 @@ __all__ = [
     "build_multilabel_surface_t",
     "build_binary_surface_t",
     "build_surface_from_mask3d",
+    "build_cell_mask_surface",
     "sample_volume_on_surface",
+    "sample_volume_on_existing_surface",
     "segmentation_timestamp",
     "collapse_segmentation_to_3d",
     "broadcast_segmentation_to_time",
@@ -208,6 +213,7 @@ __all__ = [
     "create_vector_volume_from_flow",
     "create_uniform_grid",
     "create_uniform_vector",
+    "automatic_streamline_clim",
     "generate_seed_points",
     "generate_streamlines_at_t",
     "generate_streamlines_from_plane_at_t",

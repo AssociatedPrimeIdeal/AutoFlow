@@ -1,20 +1,29 @@
 import numpy as np
-from PyQt5 import QtWidgets, QtCore
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib import colors as mcolors
+from PySide6 import QtCore, QtGui, QtWidgets
+import pyqtgraph as pg
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from scipy.ndimage import map_coordinates
 
+from .slice_view import PLANE_SPECS, SliceView, make_colormap, make_label_overlay
+
 
 class OrthoViewer(QtWidgets.QWidget):
+    timeStepRequested = QtCore.Signal(int)
+
     def __init__(self, workspace, parent=None):
         super().__init__(parent)
         self.workspace = workspace
         self._selected_plane_idx = None
-        self._scalar_cbar = None
         self._cache = {}
-        self._segmentation_edit_handler = None
-        self._dragging_segmentation_view = None
+        self._playback_active = False
+        self._manual_levels = None
+        self._current_volume = None
+        self._current_title = ""
+        self._updating_colorbar = False
+        self._maximized_view = None
+        self._slice_keys = {}
+        self._colorbar_state = None
         self._build_ui()
 
     def _cached(self, group, key, builder, max_items=24):
@@ -30,33 +39,42 @@ class OrthoViewer(QtWidgets.QWidget):
     def _build_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
-        layout.setSpacing(2)
+        layout.setSpacing(4)
 
         ctrl = QtWidgets.QHBoxLayout()
         self.combo_content = QtWidgets.QComboBox()
         self.combo_content.addItems([
-            "Flow X (cm/s)", "Flow Y (cm/s)", "Flow Z (cm/s)",
+            "Flow LR (cm/s)", "Flow AP (cm/s)", "Flow FH (cm/s)",
             "Magnitude", "PC-MRA", "Speed (cm/s)",
             "WSS (Pa)", "TKE (J/m³)",
-            "Pressure Grad X (Pa/m)", "Pressure Grad Y (Pa/m)", "Pressure Grad Z (Pa/m)", "|Pressure Grad| (Pa/m)",
+            "Pressure Grad LR (Pa/m)", "Pressure Grad AP (Pa/m)", "Pressure Grad FH (Pa/m)", "|Pressure Grad| (Pa/m)",
             "Relative Pressure (Pa)"
         ])
         self.combo_content.setCurrentIndex(4)
         self.combo_content.currentIndexChanged.connect(self._on_content_changed)
         ctrl.addWidget(QtWidgets.QLabel("Content:"))
-        ctrl.addWidget(self.combo_content)
+        ctrl.addWidget(self.combo_content, 1)
+        self.btn_reset_views = QtWidgets.QPushButton()
+        self.btn_reset_views.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_BrowserReload)
+        )
+        self.btn_reset_views.setToolTip("Reset slice zoom and display range (R)")
+        self.btn_reset_views.setProperty("role", "icon")
+        self.btn_reset_views.clicked.connect(self._reset_views)
+        ctrl.addWidget(self.btn_reset_views)
         ctrl.addStretch()
         layout.addLayout(ctrl)
 
         slider_layout = QtWidgets.QHBoxLayout()
-        self.slider_x = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.slider_y = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.slider_z = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.label_x = QtWidgets.QLabel("X:0")
-        self.label_y = QtWidgets.QLabel("Y:0")
-        self.label_z = QtWidgets.QLabel("Z:0")
+        self.slider_x = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.slider_y = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.slider_z = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.label_x = QtWidgets.QLabel("LR:0")
+        self.label_y = QtWidgets.QLabel("AP:0")
+        self.label_z = QtWidgets.QLabel("FH:0")
         for lbl, sl in [(self.label_x, self.slider_x), (self.label_y, self.slider_y), (self.label_z, self.slider_z)]:
             sl.setRange(0, 0)
+            sl.setTracking(False)
             sl.valueChanged.connect(self._on_slider_changed)
             slider_layout.addWidget(lbl)
             slider_layout.addWidget(sl)
@@ -69,102 +87,129 @@ class OrthoViewer(QtWidgets.QWidget):
         layout.addWidget(self.label_value)
         layout.addWidget(self.label_plane_metric)
 
-        self.fig = Figure(figsize=(6.2, 6.6), dpi=80, facecolor="black")
-        self.canvas = FigureCanvas(self.fig)
-        self.canvas.setMinimumSize(300, 300)
-        self.ax_ax = self.fig.add_subplot(2, 2, 1)
-        self.ax_cor = self.fig.add_subplot(2, 2, 2)
-        self.ax_sag = self.fig.add_subplot(2, 2, 3)
-        self.ax_plane = self.fig.add_subplot(2, 2, 4)
-        for ax in [self.ax_ax, self.ax_cor, self.ax_sag, self.ax_plane]:
-            ax.set_facecolor("black")
-            ax.tick_params(colors="white", labelsize=6)
-            ax.set_xticks([])
-            ax.set_yticks([])
-        self.fig.subplots_adjust(left=0.03, right=0.96, top=0.96, bottom=0.03, wspace=0.14, hspace=0.24)
-        layout.addWidget(self.canvas, 1)
+        view_row = QtWidgets.QHBoxLayout()
+        view_row.setSpacing(4)
+        self.view_grid = QtWidgets.QWidget()
+        self.view_grid_layout = QtWidgets.QGridLayout(self.view_grid)
+        self.view_grid_layout.setContentsMargins(0, 0, 0, 0)
+        self.view_grid_layout.setSpacing(4)
+        self.slice_views = {name: SliceView(name, self) for name in PLANE_SPECS}
+        self.view_grid_layout.addWidget(self.slice_views["axial"], 0, 0)
+        self.view_grid_layout.addWidget(self.slice_views["coronal"], 0, 1)
+        self.view_grid_layout.addWidget(self.slice_views["sagittal"], 1, 0)
 
-        self.canvas.mpl_connect("scroll_event", self._on_scroll)
-        self.canvas.mpl_connect("button_press_event", self._on_click)
-        self.canvas.mpl_connect("motion_notify_event", self._on_motion)
-        self.canvas.mpl_connect("button_release_event", self._on_release)
+        self.plane_panel = QtWidgets.QFrame()
+        self.plane_panel.setObjectName("sliceView")
+        plane_layout = QtWidgets.QVBoxLayout(self.plane_panel)
+        plane_layout.setContentsMargins(0, 0, 0, 0)
+        plane_layout.setSpacing(0)
+        plane_header = QtWidgets.QWidget()
+        plane_header.setObjectName("sliceHeader")
+        plane_header_layout = QtWidgets.QHBoxLayout(plane_header)
+        plane_header_layout.setContentsMargins(7, 3, 7, 3)
+        plane_title = QtWidgets.QLabel("Selected Plane")
+        plane_title.setObjectName("sliceTitle")
+        plane_header_layout.addWidget(plane_title)
+        plane_layout.addWidget(plane_header)
+        self.fig = Figure(figsize=(3.2, 3.2), dpi=80, facecolor="#050809")
+        self.canvas = FigureCanvas(self.fig)
+        self.ax_plane = self.fig.add_subplot(1, 1, 1)
+        self.ax_plane.set_facecolor("#050809")
+        self.ax_plane.set_xticks([])
+        self.ax_plane.set_yticks([])
+        self.fig.subplots_adjust(left=0.03, right=0.97, top=0.88, bottom=0.03)
+        plane_layout.addWidget(self.canvas, 1)
+        self.view_grid_layout.addWidget(self.plane_panel, 1, 1)
+        self.view_grid_layout.setRowStretch(0, 1)
+        self.view_grid_layout.setRowStretch(1, 1)
+        self.view_grid_layout.setColumnStretch(0, 1)
+        self.view_grid_layout.setColumnStretch(1, 1)
+        view_row.addWidget(self.view_grid, 1)
+
+        self.colorbar_widget = pg.GraphicsLayoutWidget()
+        self.colorbar_widget.setBackground("#050809")
+        self.colorbar_widget.setMinimumWidth(62)
+        self.colorbar_widget.setMaximumWidth(82)
+        self.colorbar_item = pg.ColorBarItem(
+            values=(0.0, 1.0),
+            width=18,
+            colorMap=make_colormap("gray"),
+            interactive=True,
+            colorMapMenu=False,
+            pen="#d7e0e3",
+        )
+        self.colorbar_widget.addItem(self.colorbar_item)
+        self.colorbar_item.sigLevelsChanged.connect(self._on_colorbar_levels_changed)
+        view_row.addWidget(self.colorbar_widget)
+        layout.addLayout(view_row, 1)
+
+        for view in self.slice_views.values():
+            view.cursorRequested.connect(self._on_slice_cursor_requested)
+            view.hoverMoved.connect(self._on_slice_hovered)
+            view.sliceStepRequested.connect(self._on_slice_step_requested)
+            view.windowLevelDragged.connect(self._adjust_window_level)
+            view.viewDoubleClicked.connect(self._toggle_maximized_view)
+
+        self._reset_shortcut = QtGui.QShortcut(QtGui.QKeySequence("R"), self)
+        self._reset_shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._reset_shortcut.activated.connect(self._reset_views)
+        self._previous_shortcut = QtGui.QShortcut(
+            QtGui.QKeySequence(QtCore.Qt.Key.Key_Left), self
+        )
+        self._previous_shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._previous_shortcut.activated.connect(lambda: self.timeStepRequested.emit(-1))
+        self._next_shortcut = QtGui.QShortcut(
+            QtGui.QKeySequence(QtCore.Qt.Key.Key_Right), self
+        )
+        self._next_shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._next_shortcut.activated.connect(lambda: self.timeStepRequested.emit(1))
 
     def set_segmentation_edit_handler(self, handler):
-        self._segmentation_edit_handler = handler
+        # Manual editing now lives in a dedicated window. Keep this method as
+        # a compatibility no-op for callers outside the bundled GUI.
+        return None
 
-    def _remove_colorbar(self):
-        if self._scalar_cbar is not None:
-            try:
-                self._scalar_cbar.remove()
-            except Exception:
-                pass
-        self._scalar_cbar = None
+    def set_playback_active(self, active):
+        self._playback_active = bool(active)
 
-    def _on_scroll(self, event):
-        if event.inaxes is None:
-            return
-        ax = event.inaxes
-        factor = 0.8 if event.button == "up" else 1.25
-        xlim = ax.get_xlim()
-        ylim = ax.get_ylim()
-        xdata = event.xdata if event.xdata is not None else (xlim[0] + xlim[1]) / 2
-        ydata = event.ydata if event.ydata is not None else (ylim[0] + ylim[1]) / 2
-        new_w = (xlim[1] - xlim[0]) * factor
-        new_h = (ylim[1] - ylim[0]) * factor
-        ax.set_xlim(xdata - new_w / 2, xdata + new_w / 2)
-        ax.set_ylim(ydata - new_h / 2, ydata + new_h / 2)
-        self.canvas.draw_idle()
-
-    def _on_click(self, event):
-        if event.inaxes is None or event.xdata is None or event.ydata is None:
-            return
-        mapped = self._event_to_voxel(event)
-        if mapped is None:
-            return
-        view_name, x, y, z = mapped
-        if event.button == 1 and self._segmentation_edit_handler is not None:
-            if self._segmentation_edit_handler(view_name, int(x), int(y), int(z), False):
-                self._dragging_segmentation_view = view_name
-                self._set_cursor(int(x), int(y), int(z))
-                return
-        self._set_cursor(int(x), int(y), int(z))
-
-    def _on_motion(self, event):
-        if self._dragging_segmentation_view is None:
-            return
-        if event.inaxes is None or event.xdata is None or event.ydata is None:
-            return
-        mapped = self._event_to_voxel(event)
-        if mapped is None:
-            return
-        view_name, x, y, z = mapped
-        if view_name != self._dragging_segmentation_view:
-            return
-        if self._segmentation_edit_handler is not None:
-            if self._segmentation_edit_handler(view_name, int(x), int(y), int(z), True):
-                self._set_cursor(int(x), int(y), int(z))
-
-    def _on_release(self, _event):
-        self._dragging_segmentation_view = None
-
-    def _event_to_voxel(self, event):
+    def _plane_voxel(self, plane, h, v):
         shape = self._get_volume_shape()
         if shape is None:
             return None
         cx, cy, cz = self.slider_x.value(), self.slider_y.value(), self.slider_z.value()
-        if event.inaxes == self.ax_ax:
-            x = int(np.clip(np.round(event.xdata), 0, shape[0] - 1))
-            y = int(np.clip(np.round(event.ydata), 0, shape[1] - 1))
-            return "axial", x, y, cz
-        if event.inaxes == self.ax_cor:
-            x = int(np.clip(np.round(event.xdata), 0, shape[0] - 1))
-            z = int(np.clip(np.round(event.ydata), 0, shape[2] - 1))
-            return "coronal", x, cy, z
-        if event.inaxes == self.ax_sag:
-            y = int(np.clip(np.round(event.xdata), 0, shape[1] - 1))
-            z = int(np.clip(np.round(event.ydata), 0, shape[2] - 1))
-            return "sagittal", cx, y, z
+        if plane == "axial":
+            return int(h), int(v), cz
+        if plane == "coronal":
+            return int(h), cy, int(v)
+        if plane == "sagittal":
+            return cx, int(h), int(v)
         return None
+
+    def _on_slice_cursor_requested(self, plane, h, v):
+        voxel = self._plane_voxel(plane, h, v)
+        if voxel is not None:
+            self._set_cursor(*voxel)
+
+    def _on_slice_hovered(self, plane, h, v):
+        voxel = self._plane_voxel(plane, h, v)
+        if voxel is None or self._current_volume is None:
+            return
+        try:
+            value = float(self._current_volume[voxel])
+            self.label_value.setText(
+                f"Voxel (LR, AP, FH): {tuple(int(x) for x in voxel)}   {self._current_title}: {value:.6g}"
+            )
+        except Exception:
+            pass
+
+    def _on_slice_step_requested(self, plane, delta):
+        shape = self._get_volume_shape()
+        if shape is None:
+            return
+        cursor = [self.slider_x.value(), self.slider_y.value(), self.slider_z.value()]
+        axis = PLANE_SPECS[plane].fixed_axis
+        cursor[axis] = int(np.clip(cursor[axis] + int(delta), 0, shape[axis] - 1))
+        self._set_cursor(*cursor)
 
     def _set_cursor(self, x, y, z):
         self.slider_x.blockSignals(True)
@@ -178,12 +223,14 @@ class OrthoViewer(QtWidgets.QWidget):
         self.slider_z.blockSignals(False)
         self._update_labels()
         self.workspace.ortho_cursor = np.array([int(x), int(y), int(z)], dtype=int)
-        self.refresh()
+        self.refresh(update_plane=False)
 
     def update_slider_ranges(self):
         shape = self._get_volume_shape()
         if shape is None:
             return
+        self._slice_keys.clear()
+        self._colorbar_state = None
         self.slider_x.blockSignals(True)
         self.slider_y.blockSignals(True)
         self.slider_z.blockSignals(True)
@@ -198,7 +245,7 @@ class OrthoViewer(QtWidgets.QWidget):
         self.slider_z.blockSignals(False)
         self._update_labels()
         self.workspace.ortho_cursor = np.array([self.slider_x.value(), self.slider_y.value(), self.slider_z.value()], dtype=int)
-        self.refresh()
+        self.refresh(update_plane=False)
 
     def _get_volume_shape(self):
         ws = self.workspace
@@ -214,9 +261,9 @@ class OrthoViewer(QtWidgets.QWidget):
         return None
 
     def _update_labels(self):
-        self.label_x.setText(f"X:{self.slider_x.value()}")
-        self.label_y.setText(f"Y:{self.slider_y.value()}")
-        self.label_z.setText(f"Z:{self.slider_z.value()}")
+        self.label_x.setText(f"LR:{self.slider_x.value()}")
+        self.label_y.setText(f"AP:{self.slider_y.value()}")
+        self.label_z.setText(f"FH:{self.slider_z.value()}")
 
     def _on_slider_changed(self, _):
         self._update_labels()
@@ -224,7 +271,28 @@ class OrthoViewer(QtWidgets.QWidget):
         self.refresh()
 
     def _on_content_changed(self, _):
-        self.refresh()
+        self._manual_levels = None
+        self.refresh(update_plane=False)
+
+    def _reset_views(self):
+        self._manual_levels = None
+        for view in self.slice_views.values():
+            view.reset_view()
+        self.refresh(update_plane=False)
+
+    def _toggle_maximized_view(self, plane):
+        if self._maximized_view == plane:
+            self._maximized_view = None
+            for view in self.slice_views.values():
+                view.show()
+            self.plane_panel.show()
+            self.colorbar_widget.setVisible(self._current_volume is not None)
+            return
+        self._maximized_view = plane
+        for name, view in self.slice_views.items():
+            view.setVisible(name == plane)
+        self.plane_panel.hide()
+        self.colorbar_widget.hide()
 
     def set_selected_plane(self, idx):
         self._selected_plane_idx = idx
@@ -265,7 +333,7 @@ class OrthoViewer(QtWidgets.QWidget):
         if ws.derived.wss_volume is not None:
             cmap, clim = self._scene_style("wss_surface_live", "jet", None)
             tidx = min(max(0, int(t)), ws.derived.wss_volume.shape[3] - 1)
-            return np.asarray(ws.derived.wss_volume[..., tidx], dtype=float), "WSS (Pa)", {"cmap": cmap, "clim": clim}
+            return np.asarray(ws.derived.wss_volume[..., tidx], dtype=np.float32), "WSS (Pa)", {"cmap": cmap, "clim": clim}
         if not ws.derived.wss_surfaces:
             return None, "WSS (no data)", {"cmap": "jet", "clim": None}
         tidx = min(max(0, t), len(ws.derived.wss_surfaces) - 1)
@@ -299,7 +367,7 @@ class OrthoViewer(QtWidgets.QWidget):
     def _get_tke_volume(self, t):
         ws = self.workspace
         if ws.derived.tke_array is not None:
-            arr = np.asarray(ws.derived.tke_array, dtype=float)
+            arr = np.asarray(ws.derived.tke_array, dtype=np.float32)
             tidx = min(max(0, int(t)), arr.shape[3] - 1) if arr.ndim == 4 else 0
             mask_id = id(ws.segmask_binary) if ws.segmask_binary is not None else -1
             key = (id(ws.derived.tke_array), mask_id, int(tidx))
@@ -313,8 +381,8 @@ class OrthoViewer(QtWidgets.QWidget):
                         mask_t = ws.segmask_binary[..., min(max(0, int(t)), ws.segmask_binary.shape[3] - 1)]
                     else:
                         mask_t = ws.segmask_binary
-                    vol = np.asarray(vol, dtype=float) * np.asarray(mask_t, dtype=float)
-                return np.asarray(vol, dtype=float)
+                    vol = np.asarray(vol, dtype=np.float32) * np.asarray(mask_t, dtype=np.float32)
+                return np.asarray(vol, dtype=np.float32)
             vol = self._cached("tke_volume", key, _build)
             cmap, clim = self._scene_style("tke_volume", "hot", None)
             return vol, "TKE (J/m³)", {"cmap": cmap, "clim": clim}
@@ -354,12 +422,17 @@ class OrthoViewer(QtWidgets.QWidget):
         ws = self.workspace
         if ws.derived.relative_pressure_array is None:
             return None, "Relative Pressure (no data)", {"cmap": "RdBu_r", "clim": None}
-        arr = np.asarray(ws.derived.relative_pressure_array, dtype=float)
+        arr = np.asarray(ws.derived.relative_pressure_array, dtype=np.float32)
         tidx = min(max(0, int(t)), arr.shape[3] - 1)
-        vol = np.asarray(arr[..., tidx], dtype=float)
-        if ws.segmask_binary is not None:
-            mask_t = ws.segmask_binary[..., tidx] if ws.segmask_binary.ndim == 4 else ws.segmask_binary
-            vol = np.where(np.asarray(mask_t, dtype=bool), vol, 0.0)
+        mask_id = id(ws.segmask_binary) if ws.segmask_binary is not None else -1
+        key = (id(ws.derived.relative_pressure_array), mask_id, int(tidx))
+        def _build():
+            vol_t = np.asarray(arr[..., tidx], dtype=np.float32)
+            if ws.segmask_binary is not None:
+                mask_t = ws.segmask_binary[..., tidx] if ws.segmask_binary.ndim == 4 else ws.segmask_binary
+                vol_t = np.where(np.asarray(mask_t, dtype=bool), vol_t, np.float32(0.0))
+            return np.asarray(vol_t, dtype=np.float32)
+        vol = self._cached("scalar_volume", ("relative_pressure",) + key, _build)
         cmap, clim = self._scene_style("relative_pressure_volume", "RdBu_r", None)
         if clim is None and ws.derived.relative_pressure_display_clim is not None:
             clim = tuple(ws.derived.relative_pressure_display_clim)
@@ -374,63 +447,80 @@ class OrthoViewer(QtWidgets.QWidget):
         ws = self.workspace
         if ws.derived.pressure_gradient_array is None:
             return None, "Pressure Gradient (no data)", {"cmap": "magma", "clim": None}
-        arr = np.asarray(ws.derived.pressure_gradient_array, dtype=float)
-        support = None if ws.derived.pressure_gradient_support_mask is None else np.asarray(ws.derived.pressure_gradient_support_mask, dtype=bool)
+        arr = np.asarray(ws.derived.pressure_gradient_array, dtype=np.float32)
+        support_source = ws.derived.pressure_gradient_support_mask
+        support = None if support_source is None else np.asarray(support_source, dtype=bool)
+        support_id = id(support_source) if support_source is not None else -1
         tidx = min(max(0, int(t)), arr.shape[3] - 1)
         if component is None:
             if ws.derived.pressure_gradient_magnitude is None:
                 vol = np.sqrt(np.sum(arr[..., tidx, :] ** 2, axis=-1))
             else:
-                vol = np.asarray(ws.derived.pressure_gradient_magnitude[..., tidx], dtype=float)
+                vol = np.asarray(ws.derived.pressure_gradient_magnitude[..., tidx], dtype=np.float32)
             if support is not None:
-                vol = np.where(support[..., tidx], vol, 0.0)
+                key = (id(ws.derived.pressure_gradient_magnitude), support_id, int(tidx))
+                vol = self._cached(
+                    "scalar_volume",
+                    ("pressure_gradient_magnitude",) + key,
+                    lambda: np.where(support[..., tidx], vol, np.float32(0.0)).astype(np.float32, copy=False),
+                )
             cmap, clim = self._scene_style("pressure_gradient_volume", "magma", None)
             if clim is None and ws.derived.pressure_gradient_display_clim is not None:
                 clim = tuple(ws.derived.pressure_gradient_display_clim)
-            return np.asarray(vol, dtype=float), "|Pressure Grad| (Pa/m)", {"cmap": cmap, "clim": clim}
-        vol = np.asarray(arr[..., tidx, int(component)], dtype=float)
+            return np.asarray(vol, dtype=np.float32), "|Pressure Grad| (Pa/m)", {"cmap": cmap, "clim": clim}
+        vol = np.asarray(arr[..., tidx, int(component)], dtype=np.float32)
         if support is not None:
-            vol = np.where(support[..., tidx], vol, 0.0)
+            key = (id(ws.derived.pressure_gradient_array), support_id, int(tidx), int(component))
+            vol = self._cached(
+                "scalar_volume",
+                ("pressure_gradient_component",) + key,
+                lambda: np.where(support[..., tidx], vol, np.float32(0.0)).astype(np.float32, copy=False),
+            )
             finite = vol[support[..., tidx] & np.isfinite(vol)]
         else:
             finite = vol[np.isfinite(vol)]
         vmax = float(np.percentile(np.abs(finite), 99.0)) if finite.size else 1e-6
         vmax = max(vmax, 1e-6)
-        return vol, f"Pressure Grad {'XYZ'[int(component)]} (Pa/m)", {"cmap": "RdBu_r", "clim": (-vmax, vmax)}
+        direction = ("LR", "AP", "FH")[int(component)]
+        return vol, f"Pressure Grad {direction} (Pa/m)", {"cmap": "RdBu_r", "clim": (-vmax, vmax)}
 
     def _get_scalar_slice(self, t):
         ws = self.workspace
         content_idx = self.combo_content.currentIndex()
         if content_idx == 0 and ws.flow_raw is not None:
-            vol = np.asarray(ws.flow_raw[..., t, 0], dtype=float)
-            vmax = max(abs(np.nanmin(vol)), abs(np.nanmax(vol)), 1e-6)
-            return vol, "Flow X (cm/s)", {"cmap": "RdBu_r", "clim": (-vmax, vmax)}
+            vol = np.asarray(ws.flow_raw[..., t, 0], dtype=np.float32)
+            vmax = self._cached("scalar_clim", ("flow", id(ws.flow_raw), int(t), 0), lambda: max(abs(float(np.nanmin(vol))), abs(float(np.nanmax(vol))), 1e-6))
+            return vol, "Flow LR (cm/s)", {"cmap": "RdBu_r", "clim": (-vmax, vmax)}
         if content_idx == 1 and ws.flow_raw is not None:
-            vol = np.asarray(ws.flow_raw[..., t, 1], dtype=float)
-            vmax = max(abs(np.nanmin(vol)), abs(np.nanmax(vol)), 1e-6)
-            return vol, "Flow Y (cm/s)", {"cmap": "RdBu_r", "clim": (-vmax, vmax)}
+            vol = np.asarray(ws.flow_raw[..., t, 1], dtype=np.float32)
+            vmax = self._cached("scalar_clim", ("flow", id(ws.flow_raw), int(t), 1), lambda: max(abs(float(np.nanmin(vol))), abs(float(np.nanmax(vol))), 1e-6))
+            return vol, "Flow AP (cm/s)", {"cmap": "RdBu_r", "clim": (-vmax, vmax)}
         if content_idx == 2 and ws.flow_raw is not None:
-            vol = np.asarray(ws.flow_raw[..., t, 2], dtype=float)
-            vmax = max(abs(np.nanmin(vol)), abs(np.nanmax(vol)), 1e-6)
-            return vol, "Flow Z (cm/s)", {"cmap": "RdBu_r", "clim": (-vmax, vmax)}
+            vol = np.asarray(ws.flow_raw[..., t, 2], dtype=np.float32)
+            vmax = self._cached("scalar_clim", ("flow", id(ws.flow_raw), int(t), 2), lambda: max(abs(float(np.nanmin(vol))), abs(float(np.nanmax(vol))), 1e-6))
+            return vol, "Flow FH (cm/s)", {"cmap": "RdBu_r", "clim": (-vmax, vmax)}
         if content_idx == 3 and ws.mag_raw is not None:
-            vol = np.asarray(ws.mag_raw[..., t], dtype=float)
-            return vol, "Magnitude", {"cmap": "gray", "clim": (float(np.nanmin(vol)), float(np.nanmax(vol)))}
+            vol = np.asarray(ws.mag_raw[..., t], dtype=np.float32)
+            clim = self._cached("scalar_clim", ("magnitude", id(ws.mag_raw), int(t)), lambda: (float(np.nanmin(vol)), float(np.nanmax(vol))))
+            return vol, "Magnitude", {"cmap": "gray", "clim": clim}
         if content_idx == 4 and ws.mag_raw is not None and ws.flow_raw is not None:
             key = (id(ws.mag_raw), id(ws.flow_raw), int(t))
             def _build():
-                speed = np.sqrt(np.sum(ws.flow_raw[..., t, :] ** 2, axis=-1))
-                return np.asarray(ws.mag_raw[..., t], dtype=float) * np.asarray(speed, dtype=float)
+                flow_t = np.asarray(ws.flow_raw[..., t, :], dtype=np.float32)
+                speed = np.sqrt(np.sum(np.square(flow_t, dtype=np.float32), axis=-1))
+                return np.asarray(ws.mag_raw[..., t], dtype=np.float32) * speed
             vol = self._cached("scalar_volume", ("pcmra",) + key, _build)
-            return vol, "PC-MRA", {"cmap": "gray", "clim": (float(np.nanmin(vol)), float(np.nanmax(vol)))}
+            clim = self._cached("scalar_clim", ("pcmra",) + key, lambda: (float(np.nanmin(vol)), float(np.nanmax(vol))))
+            return vol, "PC-MRA", {"cmap": "gray", "clim": clim}
         if content_idx == 5 and ws.flow_raw is not None:
             key = (id(ws.flow_raw), int(t))
             vol = self._cached(
                 "scalar_volume",
                 ("speed",) + key,
-                lambda: np.sqrt(np.sum(ws.flow_raw[..., t, :] ** 2, axis=-1)),
+                lambda: np.sqrt(np.sum(np.square(np.asarray(ws.flow_raw[..., t, :], dtype=np.float32), dtype=np.float32), axis=-1)),
             )
-            return np.asarray(vol, dtype=float), "Speed (cm/s)", {"cmap": "turbo", "clim": (0.0, float(np.nanmax(vol)) if np.nanmax(vol) > 0 else 1.0)}
+            vmax = self._cached("scalar_clim", ("speed",) + key, lambda: max(float(np.nanmax(vol)), 1.0))
+            return np.asarray(vol, dtype=np.float32), "Speed (cm/s)", {"cmap": "turbo", "clim": (0.0, vmax)}
         if content_idx == 6:
             return self._get_wss_volume(t)
         if content_idx == 7:
@@ -473,33 +563,16 @@ class OrthoViewer(QtWidgets.QWidget):
             return color
         return palette[(max(1, int(label_id)) - 1) % len(palette)]
 
-    def _draw_segmentation_overlay(self, ax, labels_2d, aspect):
+    def _label_overlay(self, labels_2d):
         seg_state = self.workspace.segmentation
-        if not seg_state.visible:
-            return
-        if labels_2d is None:
-            return
-        labels_2d = np.asarray(labels_2d, dtype=np.int16)
-        if not np.any(labels_2d > 0):
-            return
-        rgba = np.zeros(labels_2d.shape + (4,), dtype=float)
-        alpha = float(np.clip(seg_state.opacity, 0.0, 1.0))
-        for label_id in [int(x) for x in np.unique(labels_2d) if int(x) != 0]:
-            color = mcolors.to_rgba(self._label_color(label_id), alpha=alpha)
-            rgba[labels_2d == label_id, :] = color
-        ax.imshow(rgba, origin="lower", aspect=aspect, interpolation="none")
-        active = int(seg_state.active_label)
-        if active > 0 and np.any(labels_2d == active):
-            try:
-                ax.contour(
-                    (labels_2d == active).astype(float),
-                    levels=[0.5],
-                    colors=[self._label_color(active)],
-                    linewidths=1.0,
-                    origin="lower",
-                )
-            except Exception:
-                pass
+        if not seg_state.visible or labels_2d is None:
+            return None
+        colors = {
+            int(value): self._label_color(int(value))
+            for value in np.unique(labels_2d)
+            if int(value) > 0
+        }
+        return make_label_overlay(labels_2d, colors, seg_state.opacity)
 
     def _update_value_label(self, vol, title):
         if vol is None:
@@ -508,9 +581,9 @@ class OrthoViewer(QtWidgets.QWidget):
         x, y, z = self.slider_x.value(), self.slider_y.value(), self.slider_z.value()
         try:
             val = float(vol[x, y, z])
-            self.label_value.setText(f"Voxel: ({x}, {y}, {z})   {title}: {val:.6g}")
+            self.label_value.setText(f"Voxel (LR, AP, FH): ({x}, {y}, {z})   {title}: {val:.6g}")
         except Exception:
-            self.label_value.setText(f"Voxel: ({x}, {y}, {z})   {title}: -")
+            self.label_value.setText(f"Voxel (LR, AP, FH): ({x}, {y}, {z})   {title}: -")
 
     def _update_plane_metric_label(self):
         ws = self.workspace
@@ -536,75 +609,119 @@ class OrthoViewer(QtWidgets.QWidget):
             txt += f"   Path IC={float(path_ic):.3f}"
         self.label_plane_metric.setText(txt)
 
-    def refresh(self):
+    def _on_colorbar_levels_changed(self):
+        if self._updating_colorbar:
+            return
+        levels = self.colorbar_item.levels()
+        if levels is None:
+            return
+        self._manual_levels = tuple(float(value) for value in levels)
+        for view in self.slice_views.values():
+            view.image_item.setLevels(self._manual_levels)
+
+    def _adjust_window_level(self, delta_x, delta_y):
+        if self._current_volume is None:
+            return
+        levels = self._manual_levels
+        if levels is None:
+            finite = self._current_volume[np.isfinite(self._current_volume)]
+            if finite.size == 0:
+                return
+            levels = (float(np.min(finite)), float(np.max(finite)))
+        low, high = levels
+        width = max(float(high - low), 1e-6)
+        center = (float(low) + float(high)) / 2.0
+        width *= float(np.exp(float(delta_x) * 0.012))
+        center -= float(delta_y) * width * 0.004
+        self._manual_levels = (center - width / 2.0, center + width / 2.0)
+        self._set_colorbar(make_colormap(self._current_cmap), self._manual_levels, self._current_title)
+        for view in self.slice_views.values():
+            view.image_item.setLevels(self._manual_levels)
+        self._update_value_label(self._current_volume, self._current_title)
+
+    def _set_colorbar(self, colormap, levels, title):
+        state = (
+            str(getattr(self, "_current_cmap", "gray")),
+            tuple(float(value) for value in levels),
+            str(title or ""),
+        )
+        if state == self._colorbar_state:
+            return
+        self._updating_colorbar = True
+        try:
+            self.colorbar_item.setColorMap(colormap)
+            self.colorbar_item.setLevels(values=levels, update_items=False)
+            self.colorbar_item.axis.setLabel(text=str(title or ""), color="#d7e0e3")
+            self._colorbar_state = state
+        finally:
+            self._updating_colorbar = False
+
+    def refresh(self, update_plane=True):
         ws = self.workspace
         t = int(ws.current_t)
+        if update_plane:
+            self._slice_keys.clear()
         shape = self._get_volume_shape()
         if shape is None:
-            self._remove_colorbar()
+            self._current_volume = None
+            self.colorbar_widget.hide()
+            for view in self.slice_views.values():
+                view.clear()
+            self.ax_plane.clear()
+            self.ax_plane.set_facecolor("#050809")
             self.canvas.draw_idle()
             return
 
         cx, cy, cz = self.slider_x.value(), self.slider_y.value(), self.slider_z.value()
         vol, title, style = self._get_scalar_slice(t)
         labels_3d = self._get_mask_3d()
-        mask_3d = None if labels_3d is None else np.asarray(labels_3d) > 0
         res = self._get_resolution()
-
-        for ax in [self.ax_ax, self.ax_cor, self.ax_sag]:
-            ax.clear()
-            ax.set_facecolor("black")
-            ax.set_xticks([])
-            ax.set_yticks([])
-
-        self._remove_colorbar()
-        im = None
+        self._current_volume = vol
+        self._current_title = title
         if vol is not None:
-            cmap = style.get("cmap", "gray")
+            if self._maximized_view is None:
+                self.colorbar_widget.show()
+            self._current_cmap = style.get("cmap", "gray")
+            cmap = make_colormap(self._current_cmap)
             clim = style.get("clim", None)
             if clim is None:
                 clim = (float(np.nanmin(vol)), float(np.nanmax(vol)))
-            axial = vol[:, :, cz]
-            im = self.ax_ax.imshow(axial.T, origin="lower", cmap=cmap, vmin=clim[0], vmax=clim[1], aspect=float(res[1] / res[0]))
-            self.ax_ax.axhline(cy, color="lime", linewidth=0.5, alpha=0.5)
-            self.ax_ax.axvline(cx, color="lime", linewidth=0.5, alpha=0.5)
-            self.ax_ax.plot(cx, cy, "r+", markersize=8, markeredgewidth=1.5)
-            self.ax_ax.set_title(f"Axial Z={cz}", color="white", fontsize=8)
-            if labels_3d is not None and cz < labels_3d.shape[2]:
-                self._draw_segmentation_overlay(self.ax_ax, labels_3d[:, :, cz].T, float(res[1] / res[0]))
+            if self._manual_levels is not None:
+                clim = self._manual_levels
+            clim = tuple(float(value) for value in clim)
+            self._set_colorbar(cmap, clim, title)
+            slices = {
+                "axial": (vol[:, :, cz], None if labels_3d is None else labels_3d[:, :, cz], (cx, cy), cz),
+                "coronal": (vol[:, cy, :], None if labels_3d is None else labels_3d[:, cy, :], (cx, cz), cy),
+                "sagittal": (vol[cx, :, :], None if labels_3d is None else labels_3d[cx, :, :], (cy, cz), cx),
+            }
+            for plane, (image, labels, cursor, fixed) in slices.items():
+                spec = PLANE_SPECS[plane]
+                slice_key = (int(self.combo_content.currentIndex()), int(t), int(fixed))
+                if self._slice_keys.get(plane) == slice_key:
+                    self.slice_views[plane].update_cursor(cursor, fixed, clim)
+                else:
+                    self.slice_views[plane].set_slice(
+                        image,
+                        self._label_overlay(labels),
+                        (res[spec.horizontal_axis], res[spec.vertical_axis]),
+                        cursor,
+                        fixed,
+                        cmap,
+                        clim,
+                    )
+                    self._slice_keys[plane] = slice_key
+        else:
+            self.colorbar_widget.hide()
+            self._colorbar_state = None
+            for view in self.slice_views.values():
+                view.clear()
 
-            coronal = vol[:, cy, :]
-            self.ax_cor.imshow(coronal.T, origin="lower", cmap=cmap, vmin=clim[0], vmax=clim[1], aspect=float(res[2] / res[0]))
-            self.ax_cor.axhline(cz, color="lime", linewidth=0.5, alpha=0.5)
-            self.ax_cor.axvline(cx, color="lime", linewidth=0.5, alpha=0.5)
-            self.ax_cor.plot(cx, cz, "r+", markersize=8, markeredgewidth=1.5)
-            self.ax_cor.set_title(f"Coronal Y={cy}", color="white", fontsize=8)
-            if labels_3d is not None and cy < labels_3d.shape[1]:
-                self._draw_segmentation_overlay(self.ax_cor, labels_3d[:, cy, :].T, float(res[2] / res[0]))
-
-            sagittal = vol[cx, :, :]
-            self.ax_sag.imshow(sagittal.T, origin="lower", cmap=cmap, vmin=clim[0], vmax=clim[1], aspect=float(res[2] / res[1]))
-            self.ax_sag.axhline(cz, color="lime", linewidth=0.5, alpha=0.5)
-            self.ax_sag.axvline(cy, color="lime", linewidth=0.5, alpha=0.5)
-            self.ax_sag.plot(cy, cz, "r+", markersize=8, markeredgewidth=1.5)
-            self.ax_sag.set_title(f"Sagittal X={cx}", color="white", fontsize=8)
-            if labels_3d is not None and cx < labels_3d.shape[0]:
-                self._draw_segmentation_overlay(self.ax_sag, labels_3d[cx, :, :].T, float(res[2] / res[1]))
-
-            if self.combo_content.currentIndex() in (6, 7, 8, 9, 10, 11, 12):
-                self._scalar_cbar = self.fig.colorbar(im, ax=[self.ax_ax, self.ax_cor, self.ax_sag], fraction=0.025, pad=0.01)
-                self._scalar_cbar.ax.tick_params(labelsize=6, colors="white")
-                self._scalar_cbar.set_label(title, color="white", fontsize=7)
-                try:
-                    self._scalar_cbar.outline.set_edgecolor("white")
-                except Exception:
-                    pass
-
-        self._draw_plane_flow(t)
+        if update_plane and not self._playback_active:
+            self._draw_plane_flow(t)
+            self.canvas.draw_idle()
         self._update_value_label(vol, title)
         self._update_plane_metric_label()
-        self.fig.subplots_adjust(left=0.03, right=0.96, top=0.96, bottom=0.03, wspace=0.14, hspace=0.24)
-        self.canvas.draw_idle()
 
     def _resample_oblique(self, volume_3d, center_vox, normal, half_size=30):
         normal = np.asarray(normal, dtype=float)
@@ -692,13 +809,18 @@ class OrthoViewer(QtWidgets.QWidget):
 
     def reset_state(self):
         self._selected_plane_idx = None
-        self._remove_colorbar()
         self._cache.clear()
+        self._manual_levels = None
+        self._current_volume = None
+        self._current_title = ""
+        self._slice_keys.clear()
+        self._colorbar_state = None
         self.label_value.setText("Voxel: -   Value: -")
         self.label_plane_metric.setText("Plane metrics: -")
-        for ax in [self.ax_ax, self.ax_cor, self.ax_sag, self.ax_plane]:
-            ax.clear()
-            ax.set_facecolor("black")
-            ax.set_xticks([])
-            ax.set_yticks([])
+        for view in self.slice_views.values():
+            view.clear()
+        self.ax_plane.clear()
+        self.ax_plane.set_facecolor("#050809")
+        self.ax_plane.set_xticks([])
+        self.ax_plane.set_yticks([])
         self.canvas.draw_idle()

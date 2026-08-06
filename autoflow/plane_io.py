@@ -80,6 +80,9 @@ def _majority_vote_labels_3d(labels):
 
 
 def _segmentation_labels_3d(ws):
+    labels_3d = getattr(ws, "segmask_labels_3d", None)
+    if labels_3d is not None:
+        return np.asarray(labels_3d, dtype=np.int16)
     labels = getattr(ws, "segmask_labels", None)
     if labels is None:
         labels = getattr(ws, "segmask_raw", None)
@@ -177,6 +180,7 @@ def _plane_record(ws, plane_index, label_volume=None, path_info=None):
         "path_index": int(plane.path_index),
         "distance": float(plane.distance),
         "group_name": str(getattr(plane, "group_name", "") or ""),
+        "placement_mode": "manual" if int(plane.path_index) < 0 else "path",
     }
     if plane.metrics:
         record.update(_json_safe(plane.metrics))
@@ -215,6 +219,7 @@ def _make_plane_payload(ws, source_path=""):
                 "label": int(plane.label),
                 "path_index": int(plane.path_index),
                 "distance": float(plane.distance),
+                "placement_mode": "manual" if int(plane.path_index) < 0 else "path",
             }
         )
     return payload
@@ -409,22 +414,24 @@ def project_planes_to_workspace(plane_items, ws):
         normal = _normalize(item.get("normal", [1.0, 0.0, 0.0]))
         path_index = int(item.get("path_index", -1))
         distance = float(item.get("distance", 0.0))
-        if paths_world:
+        manual_placement = str(item.get("placement_mode", "")).strip().lower() == "manual"
+        if paths_world and not manual_placement:
             nearest_path_idx, nearest_point_idx, _, nearest_distance = _nearest_path_info(center_world, paths_world)
             if nearest_path_idx >= 0:
                 path_index = int(nearest_path_idx)
                 distance = float(nearest_distance)
                 if np.linalg.norm(normal) <= 1e-12:
                     normal = _path_tangent(paths_world[path_index], nearest_point_idx)
-        if path_index < 0:
+        if path_index < 0 and not manual_placement:
             path_index = 0
         planes.append(
             PlaneData(
                 center=center_world - origin,
                 normal=_normalize(normal),
-                label=int(path_index) + 1,
+                label=int(item.get("label", int(path_index) + 1)),
                 path_index=int(path_index),
                 distance=float(distance),
+                group_name=str(item.get("group_name", "") or ""),
             )
         )
     return planes

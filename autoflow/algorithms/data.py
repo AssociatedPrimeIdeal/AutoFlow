@@ -1,5 +1,7 @@
 import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import h5py
@@ -9,6 +11,7 @@ from ..case_types import BackgroundPhaseCorrectionConfig, InputCase, LoadedCase,
 from .phase_correction import (
     apply_background_phase_correction_to_complex,
     apply_background_phase_correction_to_mag_flow,
+    background_phase_correction_cache_metadata,
     background_phase_report_for_metadata,
     coerce_background_phase_correction_config,
 )
@@ -491,13 +494,20 @@ def _read_background_phase_corr_cache(scope, cache_name, expected_shape, cfg, ex
             report["cache_reason"] = "missing_group_tag"
             return None, report
 
+    expected_metadata = background_phase_correction_cache_metadata(cfg)
+    expected_algorithm = str(expected_metadata["corr_algorithm"])
     algorithm = _background_phase_corr_attr_scalar(ds.attrs, "corr_algorithm", "")
-    if algorithm not in ("", None) and str(algorithm).lower() != "msac":
+    if algorithm in ("", None):
+        if expected_algorithm != "msac":
+            report["cache_reason"] = "algorithm_mismatch:untagged"
+            return None, report
+        algorithm = "msac"
+    elif str(algorithm).lower() != expected_algorithm:
         report["cache_reason"] = f"algorithm_mismatch:{algorithm}"
         return None, report
 
     version = _background_phase_corr_attr_scalar(ds.attrs, "corr_version", 1)
-    if version is not None and int(version) != 1:
+    if version is not None and int(version) != int(expected_metadata["corr_version"]):
         report["cache_reason"] = f"version_mismatch:{version}"
         return None, report
 
@@ -506,20 +516,40 @@ def _read_background_phase_corr_cache(scope, cache_name, expected_shape, cfg, ex
         report["cache_reason"] = f"fit_order_mismatch:{fit_order}"
         return None, report
 
-    threshold = _background_phase_corr_attr_scalar(ds.attrs, "corr_threshold", None)
-    if threshold is not None and not np.isclose(float(threshold), float(cfg.threshold)):
-        report["cache_reason"] = f"threshold_mismatch:{float(threshold)}"
-        return None, report
+    algorithm_metadata = {
+        key: value
+        for key, value in expected_metadata.items()
+        if key not in {"corr_algorithm", "corr_version", "corr_fit_order"}
+    }
+    stored_algorithm_metadata = {}
+    for key, expected_value in algorithm_metadata.items():
+        stored_value = _background_phase_corr_attr_scalar(ds.attrs, key, None)
+        if stored_value is None:
+            if expected_algorithm == "msac" and key == "corr_threshold":
+                stored_value = expected_value
+            else:
+                report["cache_reason"] = f"parameter_missing:{key}"
+                return None, report
+        if isinstance(expected_value, (float, np.floating)):
+            matches = np.isclose(float(stored_value), float(expected_value))
+        elif isinstance(expected_value, (int, np.integer)):
+            matches = int(stored_value) == int(expected_value)
+        else:
+            matches = str(stored_value) == str(expected_value)
+        if not bool(matches):
+            report["cache_reason"] = f"parameter_mismatch:{key}={stored_value}"
+            return None, report
+        stored_algorithm_metadata[key] = expected_value
 
     report.update({
         "cache_hit": True,
         "cache_reason": "hit",
-        "corr_algorithm": str(algorithm or "msac"),
-        "corr_version": int(version) if version is not None else 1,
+        "corr_algorithm": expected_algorithm,
+        "corr_version": int(version) if version is not None else int(expected_metadata["corr_version"]),
         "corr_fit_order": int(fit_order) if fit_order is not None else int(cfg.corr_fit_order),
-        "corr_threshold": float(threshold) if threshold is not None else float(cfg.threshold),
         "corr_components": int(corr.shape[-1]),
     })
+    report.update(stored_algorithm_metadata)
     if stored_group is not None:
         report["corr_source_group"] = str(stored_group)
     source_mode = _background_phase_corr_attr_scalar(ds.attrs, "corr_source_mode", None)
@@ -557,7 +587,13 @@ def _read_background_phase_corr_cache_from_scopes(scopes, cache_name, expected_s
     return None, last_report or {"cache_hit": False, "cache_reason": "missing", "cache_name": str(cache_name)}
 
 
-def _write_background_phase_corr_cache(scope, cache_name, report, expected_source_group=None):
+def _write_background_phase_corr_cache(
+    scope,
+    cache_name,
+    report,
+    expected_source_group=None,
+    progress_callback=None,
+):
     corr = report.get("corr") if isinstance(report, dict) else None
     if corr is None:
         return False
@@ -567,6 +603,11 @@ def _write_background_phase_corr_cache(scope, cache_name, report, expected_sourc
     if corr_arr.ndim != 5 or corr_arr.shape[-1] != 3:
         return False
     try:
+        if progress_callback is not None:
+            progress_callback({
+                "stage": "background_phase_cache_write",
+                "message": f"Writing background phase cache: {cache_name}",
+            })
         existing_name = _h5_member_name_map(scope).get(_canonical_h5_key(cache_name))
         if existing_name is not None:
             del scope[existing_name]
@@ -574,7 +615,17 @@ def _write_background_phase_corr_cache(scope, cache_name, report, expected_sourc
         ds.attrs["corr_algorithm"] = str(report.get("corr_algorithm", "msac"))
         ds.attrs["corr_version"] = int(report.get("corr_version", 1))
         ds.attrs["corr_fit_order"] = int(report.get("corr_fit_order", 3))
-        ds.attrs["corr_threshold"] = float(report.get("threshold", 0.1))
+        for key, value in report.items():
+            if not str(key).startswith("corr_") or key in {
+                "corr_algorithm",
+                "corr_version",
+                "corr_fit_order",
+                "corr_components",
+                "corr_source",
+            }:
+                continue
+            if isinstance(value, (str, int, float, bool, np.integer, np.floating, np.bool_)):
+                ds.attrs[str(key)] = value
         ds.attrs["corr_components"] = int(report.get("corr_components", corr_arr.shape[-1]))
         ds.attrs["corr_source_mode"] = str(report.get("source_mode", ""))
         ds.attrs["corr_cache_hit"] = int(bool(report.get("cache_hit", False)))
@@ -586,6 +637,13 @@ def _write_background_phase_corr_cache(scope, cache_name, report, expected_sourc
             ds.attrs["corr_stationary_voxels"] = int(report.get("stationary_voxels"))
     except Exception:
         return False
+    if progress_callback is not None:
+        progress_callback({
+            "stage": "background_phase_cache_done",
+            "current": 1,
+            "total": 1,
+            "message": f"Background phase cache saved: {cache_name}",
+        })
     return True
 
 
@@ -742,41 +800,100 @@ def _discover_h5_data_group_names(handle):
     return sorted(set(candidate_names), key=lambda item: (_h5_group_depth(item), item))
 
 
+def _h5_group_embedded_features(handle, group_name=None):
+    group = handle if not group_name else handle[str(group_name).strip("/")]
+    scopes = [group] if group is handle else [group, handle]
+    seg_ds = _find_h5_dataset_from_scopes(scopes, "segmask", "segmentation", "seg")
+    corr_ds = _find_h5_dataset_from_scopes(scopes, "corr")
+    corr_low_ds = _find_h5_dataset_from_scopes(scopes, "corr_low")
+    corr_high_ds = _find_h5_dataset_from_scopes(scopes, "corr_high")
+
+    def _cache_method(dataset):
+        if dataset is None:
+            return None
+        value = dataset.attrs.get("corr_algorithm", "msac")
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="replace")
+        token = str(value or "msac").strip().lower().replace("-", "_").replace("+", "_")
+        token = {"wrls": "wrls_arto", "arto": "wrls_arto", "wrlsarto": "wrls_arto"}.get(token, token)
+        return token if token in {"msac", "wrls_arto"} else None
+
+    correction_method = None
+    has_correction_cache = False
+    if corr_ds is not None:
+        correction_method = _cache_method(corr_ds)
+        has_correction_cache = correction_method is not None
+    elif corr_low_ds is not None and corr_high_ds is not None:
+        low_method = _cache_method(corr_low_ds)
+        high_method = _cache_method(corr_high_ds)
+        if low_method is not None and low_method == high_method:
+            correction_method = low_method
+            has_correction_cache = True
+
+    features = {
+        "has_embedded_segmentation": seg_ds is not None,
+        "has_background_correction_cache": bool(has_correction_cache),
+    }
+    if correction_method is not None:
+        features["background_correction_method"] = correction_method
+    return features
+
+
+def inspect_h5_input_case(case):
+    """Inspect embedded H5 artifacts without materializing image arrays."""
+    if isinstance(case, InputCase):
+        path = os.path.abspath(str(case.input_path))
+        source_group = case.source_group
+    else:
+        path = os.path.abspath(str(case))
+        source_group = None
+    with h5py.File(path, "r") as handle:
+        group, group_name = _resolve_h5_data_group(handle, source_group=source_group)
+        features = _h5_group_embedded_features(
+            handle,
+            group_name=None if group is handle else group_name,
+        )
+    features["source_group"] = group_name
+    return features
+
+
 def discover_h5_input_cases(path):
     path = os.path.abspath(str(path))
     stem = os.path.splitext(os.path.basename(path))[0]
     with h5py.File(path, "r") as handle:
         candidate_names = _discover_h5_data_group_names(handle)
-    if not candidate_names or candidate_names == [""]:
-        return [
-            InputCase(
-                input_path=path,
-                input_kind="h5",
-                display_name=stem,
-                output_name=stem,
-                source_group=None,
-                metadata={},
-            )
-        ]
+        if not candidate_names or candidate_names == [""]:
+            return [
+                InputCase(
+                    input_path=path,
+                    input_kind="h5",
+                    display_name=stem,
+                    output_name=stem,
+                    source_group=None,
+                    metadata=_h5_group_embedded_features(handle),
+                )
+            ]
 
-    cases = []
-    for group_name in candidate_names:
-        group_token = str(group_name or "").strip("/")
-        short_name = group_token.rsplit("/", 1)[-1] if group_token else stem
-        safe_group = re.sub(r"[^A-Za-z0-9._-]+", "_", group_token).strip("._-") or "group"
-        cases.append(
-            InputCase(
-                input_path=path,
-                input_kind="h5",
-                display_name=f"{stem} | {group_token}",
-                output_name=f"{stem}__{safe_group}",
-                source_group=group_token or None,
-                metadata={
-                    "source_group": group_token or None,
-                    "source_group_name": short_name,
-                },
+        cases = []
+        for group_name in candidate_names:
+            group_token = str(group_name or "").strip("/")
+            short_name = group_token.rsplit("/", 1)[-1] if group_token else stem
+            safe_group = re.sub(r"[^A-Za-z0-9._-]+", "_", group_token).strip("._-") or "group"
+            metadata = {
+                "source_group": group_token or None,
+                "source_group_name": short_name,
+            }
+            metadata.update(_h5_group_embedded_features(handle, group_token or None))
+            cases.append(
+                InputCase(
+                    input_path=path,
+                    input_kind="h5",
+                    display_name=f"{stem} | {group_token}",
+                    output_name=f"{stem}__{safe_group}",
+                    source_group=group_token or None,
+                    metadata=metadata,
+                )
             )
-        )
     return cases
 
 
@@ -924,33 +1041,78 @@ def _load_legacy_dual_venc_h5(
         allow_untagged_root=allow_untagged_root,
     )
 
-    lv_corr, _lv_stationary, lv_report = apply_background_phase_correction_to_complex(
-        lv_complex,
-        config=cfg,
-        progress_callback=_progress_prefix(progress_callback, "h5_dual_lv_"),
-        source_mode="legacy_dual_venc_h5_low",
-        cached_corr=lv_cached_corr,
-    )
+    progress_lock = threading.Lock()
+
+    def _locked_progress(payload):
+        if progress_callback is None:
+            return
+        with progress_lock:
+            progress_callback(payload)
+
+    callback = _locked_progress if progress_callback is not None else None
+    lv_kwargs = {
+        "config": cfg,
+        "progress_callback": _progress_prefix(callback, "h5_dual_lv_"),
+        "source_mode": "legacy_dual_venc_h5_low",
+        "cached_corr": lv_cached_corr,
+    }
+    hv_kwargs = {
+        "config": cfg,
+        "progress_callback": _progress_prefix(callback, "h5_dual_hv_"),
+        "source_mode": "legacy_dual_venc_h5_high",
+        "cached_corr": hv_cached_corr,
+    }
+    if bool(cfg.enabled):
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="autoflow-bgc") as executor:
+            lv_future = executor.submit(
+                apply_background_phase_correction_to_complex,
+                lv_complex,
+                **lv_kwargs,
+            )
+            hv_future = executor.submit(
+                apply_background_phase_correction_to_complex,
+                hv_complex,
+                **hv_kwargs,
+            )
+            lv_corr, _lv_stationary, lv_report = lv_future.result()
+            hv_corr, _hv_stationary, hv_report = hv_future.result()
+    else:
+        lv_corr, _lv_stationary, lv_report = apply_background_phase_correction_to_complex(
+            lv_complex,
+            **lv_kwargs,
+        )
+        hv_corr, _hv_stationary, hv_report = apply_background_phase_correction_to_complex(
+            hv_complex,
+            **hv_kwargs,
+        )
+
     lv_report["cache_name"] = "corr_low"
-    lv_report.setdefault("cache_reason", lv_cache_report.get("cache_reason", "missing"))
+    if not bool(lv_report.get("cache_hit", False)):
+        lv_report["cache_reason"] = lv_cache_report.get("cache_reason", "missing")
     if "stationary_voxels" in lv_cache_report and bool(lv_report.get("cache_hit", False)):
         lv_report["stationary_voxels"] = int(lv_cache_report["stationary_voxels"])
     if bool(lv_report.get("applied", False)) and not bool(lv_report.get("cache_hit", False)) and h5_group is not None:
-        lv_report["cache_written"] = bool(_write_background_phase_corr_cache(h5_group, "corr_low", lv_report, expected_source_group=source_group))
+        lv_report["cache_written"] = bool(_write_background_phase_corr_cache(
+            h5_group,
+            "corr_low",
+            lv_report,
+            expected_source_group=source_group,
+            progress_callback=_progress_prefix(progress_callback, "h5_dual_lv_"),
+        ))
 
-    hv_corr, _hv_stationary, hv_report = apply_background_phase_correction_to_complex(
-        hv_complex,
-        config=cfg,
-        progress_callback=_progress_prefix(progress_callback, "h5_dual_hv_"),
-        source_mode="legacy_dual_venc_h5_high",
-        cached_corr=hv_cached_corr,
-    )
     hv_report["cache_name"] = "corr_high"
-    hv_report.setdefault("cache_reason", hv_cache_report.get("cache_reason", "missing"))
+    if not bool(hv_report.get("cache_hit", False)):
+        hv_report["cache_reason"] = hv_cache_report.get("cache_reason", "missing")
     if "stationary_voxels" in hv_cache_report and bool(hv_report.get("cache_hit", False)):
         hv_report["stationary_voxels"] = int(hv_cache_report["stationary_voxels"])
     if bool(hv_report.get("applied", False)) and not bool(hv_report.get("cache_hit", False)) and h5_group is not None:
-        hv_report["cache_written"] = bool(_write_background_phase_corr_cache(h5_group, "corr_high", hv_report, expected_source_group=source_group))
+        hv_report["cache_written"] = bool(_write_background_phase_corr_cache(
+            h5_group,
+            "corr_high",
+            hv_report,
+            expected_source_group=source_group,
+            progress_callback=_progress_prefix(progress_callback, "h5_dual_hv_"),
+        ))
     lv_use = lv_corr if bool(lv_report.get("applied", False)) else lv_complex
     hv_use = hv_corr if bool(hv_report.get("applied", False)) else hv_complex
 
@@ -1084,7 +1246,7 @@ def load_h5_data(path, correction_config=None, progress_callback=None, source_gr
             default=("FH", "AP", "LR"),
         )
 
-        seg_ds = _find_h5_dataset_from_scopes(scopes, "segmask", "segmentation")
+        seg_ds = _find_h5_dataset_from_scopes(scopes, "segmask", "segmentation", "seg")
         if seg_ds is not None and bool(force_recompute_seg):
             seg_source = str(seg_ds.attrs.get("autoflow_source", "") or "").strip().lower()
             if seg_source == "auto_segmentation":
@@ -1148,7 +1310,13 @@ def load_h5_data(path, correction_config=None, progress_callback=None, source_gr
             if "stationary_voxels" in cache_report and bool(corr_report.get("cache_hit", False)):
                 corr_report["stationary_voxels"] = int(cache_report["stationary_voxels"])
             if bool(corr_report.get("applied", False)) and not bool(corr_report.get("cache_hit", False)):
-                corr_report["cache_written"] = bool(_write_background_phase_corr_cache(group, "corr", corr_report, expected_source_group=group_name))
+                corr_report["cache_written"] = bool(_write_background_phase_corr_cache(
+                    group,
+                    "corr",
+                    corr_report,
+                    expected_source_group=group_name,
+                    progress_callback=_progress_prefix(progress_callback, "h5_"),
+                ))
             img_complex_use = img_complex_corr if bool(corr_report.get("applied", False)) else img_complex
             mag = np.abs(img_complex[..., 0]).astype(np.float32)
             flow_raw = np.angle(img_complex_use[..., 1:4] * np.conj(img_complex_use[..., 0][..., None])).astype(np.float32)
@@ -1262,7 +1430,13 @@ def load_h5_data(path, correction_config=None, progress_callback=None, source_gr
             if "stationary_voxels" in cache_report and bool(corr_report.get("cache_hit", False)):
                 corr_report["stationary_voxels"] = int(cache_report["stationary_voxels"])
             if bool(corr_report.get("applied", False)) and not bool(corr_report.get("cache_hit", False)):
-                corr_report["cache_written"] = bool(_write_background_phase_corr_cache(group, "corr", corr_report, expected_source_group=group_name))
+                corr_report["cache_written"] = bool(_write_background_phase_corr_cache(
+                    group,
+                    "corr",
+                    corr_report,
+                    expected_source_group=group_name,
+                    progress_callback=_progress_prefix(progress_callback, "h5_"),
+                ))
             meta.update({
                 "background_phase_correction": background_phase_report_for_metadata(corr_report),
                 "force_recompute_corr": bool(getattr(cfg, "force_recompute", False)),

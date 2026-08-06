@@ -1,9 +1,72 @@
+import threading
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
-from skimage import filters
+from skimage import exposure, filters
 
 from ..case_types import BackgroundPhaseCorrectionConfig
+
+
+_CORRECTION_ALGORITHM_VERSION = {"msac": 1, "wrls_arto": 1}
+_WRLS_BASIS_CACHE = {}
+_WRLS_BASIS_CACHE_LOCK = threading.Lock()
+_TORCH_STATE = {"checked": False, "module": None, "reason": ""}
+_TORCH_STATE_LOCK = threading.Lock()
+
+
+def _available_torch_cuda():
+    with _TORCH_STATE_LOCK:
+        if not _TORCH_STATE["checked"]:
+            try:
+                import torch
+
+                if not bool(torch.cuda.is_available()):
+                    raise RuntimeError("no CUDA device")
+                probe = torch.arange(1, dtype=torch.float32, device="cuda") + 1.0
+                probe.cpu()
+                _TORCH_STATE.update({"checked": True, "module": torch, "reason": ""})
+            except Exception as exc:
+                _TORCH_STATE.update({
+                    "checked": True,
+                    "module": None,
+                    "reason": f"{type(exc).__name__}: {exc}",
+                })
+        return _TORCH_STATE["module"], str(_TORCH_STATE["reason"])
+
+
+def _normalize_correction_method(method):
+    value = str(method or "msac").strip().lower().replace("-", "_").replace("+", "_")
+    aliases = {"wrls": "wrls_arto", "arto": "wrls_arto", "wrlsarto": "wrls_arto"}
+    value = aliases.get(value, value)
+    if value not in _CORRECTION_ALGORITHM_VERSION:
+        raise ValueError(f"unsupported background phase correction method: {method!r}")
+    return value
+
+
+def background_phase_correction_cache_metadata(config=None):
+    cfg = coerce_background_phase_correction_config(config)
+    method = _normalize_correction_method(cfg.method)
+    metadata = {
+        "corr_algorithm": method,
+        "corr_version": int(_CORRECTION_ALGORITHM_VERSION[method]),
+        "corr_fit_order": int(cfg.corr_fit_order),
+    }
+    if method == "msac":
+        metadata["corr_threshold"] = float(cfg.threshold)
+    else:
+        metadata.update({
+            "corr_wrls_lambda": float(cfg.wrls_lambda),
+            "corr_wrls_magnitude_threshold": float(cfg.wrls_magnitude_threshold),
+            "corr_wrls_mid_fov_fraction": float(cfg.wrls_mid_fov_fraction),
+            "corr_wrls_mid_slice_fraction": float(cfg.wrls_mid_slice_fraction),
+            "corr_wrls_arto_iterations": int(cfg.wrls_arto_iterations),
+            "corr_wrls_tau": float(cfg.wrls_tau),
+            "corr_wrls_delta": float(cfg.wrls_delta),
+            "corr_wrls_central_probability": float(cfg.wrls_central_probability),
+            "corr_wrls_fista_iterations": int(cfg.wrls_fista_iterations),
+            "corr_wrls_gmm_iterations": int(cfg.wrls_gmm_iterations),
+        })
+    return metadata
 
 
 def _emit_progress(progress_callback, stage, current=None, total=None, message=""):
@@ -54,7 +117,60 @@ def _magnitude_threshold(magnitude):
     unique_count = int(np.unique(np.round(values, decimals=6)).size)
     try:
         classes = min(5, max(2, unique_count))
-        return float(filters.threshold_multiotsu(values, classes=classes)[0])
+        if classes <= 2:
+            return float(filters.threshold_otsu(values))
+        probability, bin_centers = exposure.histogram(
+            values,
+            nbins=256,
+            source_range="image",
+            normalize=True,
+        )
+        probability = np.asarray(probability, dtype=np.float32)
+        nonzero_count = int(np.count_nonzero(probability))
+        classes = min(classes, nonzero_count)
+        if classes <= 2:
+            return float(filters.threshold_otsu(values))
+
+        level_count = int(probability.size)
+        levels = np.arange(level_count, dtype=np.float32)
+        cumulative_probability = np.concatenate([
+            np.zeros(1, dtype=np.float32),
+            np.cumsum(probability, dtype=np.float32),
+        ])
+        cumulative_moment = np.concatenate([
+            np.zeros(1, dtype=np.float32),
+            np.cumsum(probability * levels, dtype=np.float32),
+        ])
+        class_score = np.zeros((level_count, level_count), dtype=np.float32)
+        for start in range(level_count):
+            mass = cumulative_probability[start + 1:] - cumulative_probability[start]
+            moment = cumulative_moment[start + 1:] - cumulative_moment[start]
+            class_score[start, start:] = np.divide(
+                moment * moment,
+                mass,
+                out=np.zeros_like(mass),
+                where=mass > 0.0,
+            )
+
+        score = np.full((classes + 1, level_count), -np.inf, dtype=np.float32)
+        split = np.full((classes + 1, level_count), -1, dtype=np.int16)
+        score[1] = class_score[0]
+        for class_count in range(2, classes + 1):
+            for end in range(class_count - 1, level_count):
+                starts = np.arange(class_count - 1, end + 1)
+                candidates = score[class_count - 1, starts - 1] + class_score[starts, end]
+                best = int(np.argmax(candidates))
+                score[class_count, end] = candidates[best]
+                split[class_count, end] = int(starts[best])
+
+        threshold_indices = []
+        end = level_count - 1
+        for class_count in range(classes, 1, -1):
+            start = int(split[class_count, end])
+            threshold_indices.append(start - 1)
+            end = start - 1
+        threshold_indices.reverse()
+        return float(np.asarray(bin_centers)[threshold_indices[0]])
     except Exception:
         try:
             return float(filters.threshold_otsu(values))
@@ -101,11 +217,14 @@ def apply_background_phase_correction_to_complex(
     cached_corr=None,
 ):
     cfg = coerce_background_phase_correction_config(config)
+    method = _normalize_correction_method(cfg.method)
     arr = np.asarray(img_complex)
     report = {
         "enabled": bool(cfg.enabled),
         "applied": False,
         "source_mode": str(source_mode),
+        "corr_algorithm": method,
+        "corr_version": int(_CORRECTION_ALGORITHM_VERSION[method]),
         "corr_fit_order": int(cfg.corr_fit_order),
         "threshold": float(cfg.threshold),
         "stationary_voxels": 0,
@@ -115,7 +234,7 @@ def apply_background_phase_correction_to_complex(
     }
     if not cfg.enabled:
         report["skipped_reason"] = "disabled"
-        return arr.copy(), None, report
+        return arr, None, report
     if arr.ndim != 5 or arr.shape[-1] < 4:
         report["skipped_reason"] = f"expected complex XYZT4+ input, got shape={arr.shape}"
         return arr.copy(), None, report
@@ -145,13 +264,39 @@ def apply_background_phase_correction_to_complex(
             report["cache_reason"] = f"invalid_cache:{type(exc).__name__}: {exc}"
 
     if corr_xyzt3 is None:
-        _emit_progress(progress_callback, "background_phase_start", message="Running background phase correction")
+        _emit_progress(
+            progress_callback,
+            "background_phase_start",
+            message=f"Running {method} background phase correction",
+        )
         try:
-            corr_nvtzyx, stationary_mask, diag = execute_msac(
-                np.transpose(np.asarray(arr[..., :4], dtype=np.complex64), (4, 3, 2, 1, 0)),
-                corr_fit_order=int(cfg.corr_fit_order),
-                th=float(cfg.threshold),
+            algorithm_input = np.transpose(
+                np.asarray(arr[..., :4], dtype=np.complex64),
+                (4, 3, 2, 1, 0),
             )
+            if method == "msac":
+                corr_nvtzyx, stationary_mask, diag = execute_msac(
+                    algorithm_input,
+                    corr_fit_order=int(cfg.corr_fit_order),
+                    th=float(cfg.threshold),
+                    progress_callback=progress_callback,
+                )
+            else:
+                corr_nvtzyx, stationary_mask, diag = execute_wrls_arto(
+                    algorithm_input,
+                    corr_fit_order=int(cfg.corr_fit_order),
+                    lam=float(cfg.wrls_lambda),
+                    magnitude_threshold=float(cfg.wrls_magnitude_threshold),
+                    mid_fov_fraction=float(cfg.wrls_mid_fov_fraction),
+                    mid_slice_fraction=float(cfg.wrls_mid_slice_fraction),
+                    arto_iterations=int(cfg.wrls_arto_iterations),
+                    tau=float(cfg.wrls_tau),
+                    delta=float(cfg.wrls_delta),
+                    central_probability=float(cfg.wrls_central_probability),
+                    fista_iterations=int(cfg.wrls_fista_iterations),
+                    gmm_iterations=int(cfg.wrls_gmm_iterations),
+                    progress_callback=progress_callback,
+                )
         except Exception as exc:
             report["skipped_reason"] = f"{type(exc).__name__}: {exc}"
             return arr.copy(), None, report
@@ -170,8 +315,7 @@ def apply_background_phase_correction_to_complex(
     corrected[..., 1:4] *= np.exp(-1j * np.asarray(corr_xyzt3, dtype=np.float32))
     corrected = corrected.astype(arr.dtype, copy=False)
     report["applied"] = True
-    report["corr_algorithm"] = "msac"
-    report["corr_version"] = 1
+    report.update(background_phase_correction_cache_metadata(cfg))
     report["corr_components"] = int(corr_xyzt3.shape[-1])
     report["corr"] = np.asarray(corr_xyzt3, dtype=np.float32)
     _emit_progress(
@@ -192,6 +336,20 @@ def apply_background_phase_correction_to_mag_flow(
 ):
     cfg = coerce_background_phase_correction_config(config)
     flow_xyzt3, mag_xyzt = _ensure_mag_flow_time(flow, mag)
+    if not cfg.enabled:
+        metadata = background_phase_correction_cache_metadata(cfg)
+        return flow_xyzt3, None, {
+            "enabled": False,
+            "applied": False,
+            "source_mode": "synthetic_complex",
+            **metadata,
+            "corr_fit_order": int(cfg.corr_fit_order),
+            "threshold": float(cfg.threshold),
+            "stationary_voxels": 0,
+            "skipped_reason": "disabled",
+            "cache_hit": False,
+            "cache_reason": "missing",
+        }
     venc_arr = np.asarray(venc, dtype=np.float32).reshape(-1)
     if venc_arr.size == 1:
         venc_arr = np.repeat(venc_arr, 3)
@@ -219,8 +377,482 @@ def apply_background_phase_correction_to_mag_flow(
     return np.asarray(corrected_flow, dtype=np.float32), stationary_mask, report
 
 
-def execute_msac(im, corr_fit_order=3, th=0.1):
-    np.random.seed(274612)
+def _polynomial_exponents_3d(order):
+    order = int(order)
+    if order < 0 or order > 4:
+        raise ValueError(f"WRLS+ARTO supports 3D polynomial orders 0 through 4, got {order}")
+    exponents = []
+    for degree in range(order + 1):
+        for z_power in range(degree + 1):
+            for y_power in range(degree - z_power + 1):
+                x_power = degree - y_power - z_power
+                exponents.append((x_power, y_power, z_power))
+    return tuple(exponents)
+
+
+def _build_normalized_polynomial_basis(shape, order):
+    shape = tuple(int(value) for value in shape)
+    requested_order = max(1, int(order))
+    with _WRLS_BASIS_CACHE_LOCK:
+        for (cached_shape, cached_order), cached_basis in _WRLS_BASIS_CACHE.items():
+            if cached_shape == shape and cached_order >= requested_order:
+                count = len(_polynomial_exponents_3d(requested_order))
+                return cached_basis[:count]
+
+        x = np.arange(shape[0], dtype=np.float64) - np.floor(shape[0] / 2.0)
+        y = np.arange(shape[1], dtype=np.float64) - np.floor(shape[1] / 2.0)
+        z = np.arange(shape[2], dtype=np.float64) - np.floor(shape[2] / 2.0)
+        exponents = _polynomial_exponents_3d(requested_order)
+        basis = np.empty((len(exponents), int(np.prod(shape))), dtype=np.float64)
+        for column, (x_power, y_power, z_power) in enumerate(exponents):
+            x_term = x ** x_power
+            y_term = y ** y_power
+            z_term = z ** z_power
+            norm = np.sqrt(
+                np.sum(x_term * x_term)
+                * np.sum(y_term * y_term)
+                * np.sum(z_term * z_term)
+            )
+            term = (
+                x_term[:, np.newaxis, np.newaxis]
+                * y_term[np.newaxis, :, np.newaxis]
+                * z_term[np.newaxis, np.newaxis, :]
+            )
+            basis[column] = np.ravel(term / norm, order="C")
+        _WRLS_BASIS_CACHE.clear()
+        _WRLS_BASIS_CACHE[(shape, requested_order)] = basis
+        return basis
+
+
+def _fista_l1_normal_equations(gram, rhs, initial, lam, iterations):
+    gram = np.asarray(gram, dtype=np.float64)
+    rhs = np.asarray(rhs, dtype=np.float64)
+    x = np.asarray(initial, dtype=np.float64).copy()
+    y = x.copy()
+    t_value = 1.0
+    largest_eigenvalue = float(np.max(np.linalg.eigvalsh(gram))) if gram.size else 0.0
+    lipschitz = 2.05 * largest_eigenvalue
+    if not np.isfinite(lipschitz) or lipschitz <= np.finfo(np.float64).eps:
+        return x
+    shrink_threshold = float(lam) / lipschitz
+    for _ in range(max(0, int(iterations))):
+        alpha = y - (2.0 / lipschitz) * (gram @ y - rhs)
+        x_new = np.sign(alpha) * np.maximum(np.abs(alpha) - shrink_threshold, 0.0)
+        t_new = (1.0 + np.sqrt(1.0 + 4.0 * t_value * t_value)) / 2.0
+        y = x_new + ((t_value - 1.0) / t_new) * (x_new - x)
+        x = x_new
+        t_value = t_new
+    return x
+
+
+def _wrls_fit(phi, sigma, fit_mask, basis, order, lam, fista_iterations):
+    exponent_count = len(_polynomial_exponents_3d(order))
+    fit_basis = basis[:exponent_count]
+    flat_indices = np.flatnonzero(np.asarray(fit_mask, dtype=bool).ravel(order="C"))
+    if flat_indices.size < exponent_count:
+        raise ValueError(
+            f"not enough WRLS candidates for order {order}: {flat_indices.size} < {exponent_count}"
+        )
+
+    phi_flat = np.asarray(phi, dtype=np.float64).ravel(order="C")
+    sigma_flat = np.asarray(sigma, dtype=np.float64).ravel(order="C")
+    gram = np.zeros((exponent_count, exponent_count), dtype=np.float64)
+    rhs = np.zeros(exponent_count, dtype=np.float64)
+    chunk_size = 131072
+    for start in range(0, flat_indices.size, chunk_size):
+        index = flat_indices[start:start + chunk_size]
+        design = fit_basis[:, index].T
+        inverse_sigma = 1.0 / sigma_flat[index]
+        weighted_design = design * inverse_sigma[:, np.newaxis]
+        weighted_phi = phi_flat[index] * inverse_sigma
+        gram += weighted_design.T @ weighted_design
+        rhs += weighted_design.T @ weighted_phi
+
+    try:
+        initial = np.linalg.solve(gram, rhs)
+    except np.linalg.LinAlgError:
+        initial = np.linalg.lstsq(gram, rhs, rcond=None)[0]
+    coefficients = _fista_l1_normal_equations(
+        gram,
+        rhs,
+        initial,
+        lam=float(lam),
+        iterations=int(fista_iterations),
+    )
+    correction = np.asarray(coefficients @ fit_basis, dtype=np.float64).reshape(phi.shape, order="C")
+    return np.asarray(phi, dtype=np.float64) - correction, correction
+
+
+def _middle_fov_mask(shape, mid_fov_fraction, mid_slice_fraction):
+    mask = np.zeros(tuple(int(value) for value in shape), dtype=bool)
+    center_y = int(np.floor(shape[1] / 2.0))
+    center_z = int(np.floor(shape[2] / 2.0))
+    extent_y = int(np.floor((shape[1] * float(mid_fov_fraction)) / 2.0))
+    extent_z = int(np.floor((shape[2] * float(mid_slice_fraction)) / 2.0))
+    y0 = max(0, center_y - extent_y)
+    y1 = min(shape[1], center_y + extent_y + 1)
+    z0 = max(0, center_z - extent_z)
+    z1 = min(shape[2], center_z + extent_z + 1)
+    mask[:, y0:y1, z0:z1] = True
+    return mask
+
+
+def _gmm_arto_cpu(
+    epsilon,
+    delta=2.0,
+    central_probability=0.5,
+    max_iterations=1000,
+    initial_means=None,
+):
+    values = np.sort(np.asarray(epsilon, dtype=np.float64).reshape(-1))
+    values = values[np.isfinite(values)]
+    if values.size < 3:
+        raise ValueError(f"not enough finite ARTO residuals: {values.size}")
+    variance = float(np.var(values, ddof=1))
+    overall_std = float(np.sqrt(max(variance, 0.0)))
+    if not np.isfinite(overall_std) or overall_std <= np.finfo(np.float64).eps:
+        return 0.0, max(overall_std, np.finfo(np.float64).eps), np.array([-1.0, 0.0, 1.0]), np.ones(3), np.array([0.25, 0.5, 0.25]), 0, "cpu"
+
+    means = (
+        np.array([-float(delta) * overall_std, 0.0, float(delta) * overall_std], dtype=np.float64)
+        if initial_means is None
+        else np.asarray(initial_means, dtype=np.float64).reshape(3).copy()
+    )
+    means[int(np.argmin(means))] = max(float(np.min(means)), float(values[0]))
+    means[int(np.argmax(means))] = min(float(np.max(means)), float(values[-1]))
+    gamma = np.full(3, overall_std / 2.0, dtype=np.float64)
+    probability = np.array(
+        [(1.0 - float(central_probability)) / 2.0, float(central_probability), (1.0 - float(central_probability)) / 2.0],
+        dtype=np.float64,
+    )
+    tolerance = variance * 1e-4
+    gamma_floor = overall_std / 50.0
+    central_index = 1
+    values_squared = values * values
+
+    for iteration in range(max(0, int(max_iterations))):
+        previous_means = means.copy()
+        gamma = np.maximum(gamma, gamma_floor)
+        scaled = (values[:, np.newaxis] - means[np.newaxis, :]) / gamma[np.newaxis, :]
+        weighted_pdf = (
+            np.exp(-0.5 * scaled * scaled)
+            / (gamma[np.newaxis, :] * np.sqrt(2.0 * np.pi))
+        ) * probability[np.newaxis, :]
+        denominator = np.sum(weighted_pdf, axis=1)
+        positive = denominator > 0.0
+        if not np.all(positive):
+            replacement = float(np.min(denominator[positive])) if np.any(positive) else np.finfo(np.float64).tiny
+            denominator[~positive] = replacement
+        weights = np.empty(3, dtype=np.float64)
+        means = np.empty(3, dtype=np.float64)
+        second_moments = np.empty(3, dtype=np.float64)
+        for component in range(3):
+            responsibility = weighted_pdf[:, component] / denominator
+            weights[component] = np.sum(responsibility)
+            means[component] = (responsibility @ values) / weights[component]
+            second_moments[component] = (responsibility @ values_squared) / weights[component]
+        probability = weights / float(values.size)
+        gamma = np.sqrt(np.maximum(second_moments - means * means, 0.0))
+
+        left_index = int(np.argmin(means))
+        right_index = int(np.argmax(means))
+        central_index = int(({0, 1, 2} - {left_index, right_index}).pop())
+        means[left_index] = min(means[left_index], -gamma[central_index] * float(delta))
+        means[right_index] = max(means[right_index], gamma[central_index] * float(delta))
+        probability[central_index] = max(probability[central_index], float(central_probability))
+        if np.all(np.abs(means - previous_means) < tolerance):
+            return means[central_index], gamma[central_index], means, gamma, probability, iteration + 1, "cpu"
+
+    return means[central_index], gamma[central_index], means, gamma, probability, int(max_iterations), "cpu"
+
+
+def _gmm_arto_torch(
+    torch,
+    epsilon,
+    delta=2.0,
+    central_probability=0.5,
+    max_iterations=1000,
+    initial_means=None,
+):
+    values = torch.as_tensor(
+        np.asarray(epsilon, dtype=np.float64).reshape(-1),
+        dtype=torch.float64,
+        device="cuda",
+    )
+    values = torch.sort(values[torch.isfinite(values)]).values
+    value_count = int(values.numel())
+    if value_count < 3:
+        raise ValueError(f"not enough finite ARTO residuals: {value_count}")
+    variance = float(torch.var(values, correction=1).item())
+    overall_std = float(np.sqrt(max(variance, 0.0)))
+    if not np.isfinite(overall_std) or overall_std <= np.finfo(np.float64).eps:
+        return 0.0, max(overall_std, np.finfo(np.float64).eps), np.array([-1.0, 0.0, 1.0]), np.ones(3), np.array([0.25, 0.5, 0.25]), 0, "cuda"
+
+    means = (
+        np.array([-float(delta) * overall_std, 0.0, float(delta) * overall_std], dtype=np.float64)
+        if initial_means is None
+        else np.asarray(initial_means, dtype=np.float64).reshape(3).copy()
+    )
+    means[int(np.argmin(means))] = max(float(np.min(means)), float(values[0].item()))
+    means[int(np.argmax(means))] = min(float(np.max(means)), float(values[-1].item()))
+    gamma = np.full(3, overall_std / 2.0, dtype=np.float64)
+    probability = np.array(
+        [(1.0 - float(central_probability)) / 2.0, float(central_probability), (1.0 - float(central_probability)) / 2.0],
+        dtype=np.float64,
+    )
+    tolerance = variance * 1e-4
+    gamma_floor = overall_std / 50.0
+    values_squared = values * values
+    central_index = 1
+
+    for iteration in range(max(0, int(max_iterations))):
+        previous_means = means.copy()
+        gamma = np.maximum(gamma, gamma_floor)
+        means_gpu = torch.as_tensor(means, dtype=torch.float64, device="cuda")
+        gamma_gpu = torch.as_tensor(gamma, dtype=torch.float64, device="cuda")
+        probability_gpu = torch.as_tensor(probability, dtype=torch.float64, device="cuda")
+        scaled = (values[:, None] - means_gpu[None, :]) / gamma_gpu[None, :]
+        weighted_pdf = (
+            torch.exp(-0.5 * scaled * scaled)
+            / (gamma_gpu[None, :] * np.sqrt(2.0 * np.pi))
+        ) * probability_gpu[None, :]
+        denominator = torch.sum(weighted_pdf, dim=1)
+        positive = denominator > 0.0
+        replacement = torch.min(
+            torch.where(
+                positive,
+                denominator,
+                torch.full_like(denominator, float("inf")),
+            )
+        )
+        replacement = torch.where(
+            torch.isfinite(replacement),
+            replacement,
+            torch.full_like(replacement, np.finfo(np.float64).tiny),
+        )
+        safe_denominator = torch.where(positive, denominator, replacement)
+        weights = []
+        updated_means = []
+        second_moments = []
+        for component in range(3):
+            responsibility = weighted_pdf[:, component] / safe_denominator
+            weight = torch.sum(responsibility)
+            weights.append(weight)
+            updated_means.append((responsibility @ values) / weight)
+            second_moments.append((responsibility @ values_squared) / weight)
+        weights = torch.stack(weights)
+        updated_means = torch.stack(updated_means)
+        second_moments = torch.stack(second_moments)
+        updated_gamma = torch.sqrt(torch.clamp(second_moments - updated_means * updated_means, min=0.0))
+        means = updated_means.detach().cpu().numpy()
+        gamma = updated_gamma.detach().cpu().numpy()
+        probability = (weights / float(value_count)).detach().cpu().numpy()
+
+        left_index = int(np.argmin(means))
+        right_index = int(np.argmax(means))
+        central_index = int(({0, 1, 2} - {left_index, right_index}).pop())
+        means[left_index] = min(means[left_index], -gamma[central_index] * float(delta))
+        means[right_index] = max(means[right_index], gamma[central_index] * float(delta))
+        probability[central_index] = max(probability[central_index], float(central_probability))
+        if np.all(np.abs(means - previous_means) < tolerance):
+            return means[central_index], gamma[central_index], means, gamma, probability, iteration + 1, "cuda"
+
+    return means[central_index], gamma[central_index], means, gamma, probability, int(max_iterations), "cuda"
+
+
+def _gmm_arto(*args, **kwargs):
+    torch, _unavailable_reason = _available_torch_cuda()
+    if torch is not None:
+        try:
+            return _gmm_arto_torch(torch, *args, **kwargs)
+        except Exception:
+            torch.cuda.empty_cache()
+    return _gmm_arto_cpu(*args, **kwargs)
+
+
+def _execute_wrls_arto_impl(
+    im,
+    corr_fit_order=3,
+    lam=5.0,
+    magnitude_threshold=0.04,
+    mid_fov_fraction=0.5,
+    mid_slice_fraction=0.65,
+    arto_iterations=2,
+    tau=3.0,
+    delta=2.0,
+    central_probability=0.5,
+    fista_iterations=5000,
+    gmm_iterations=1000,
+    progress_callback=None,
+):
+    raw = np.asarray(im)
+    zero_corr = _zero_corr_nvtzyx(raw.shape)
+    diag = {
+        "applied": False,
+        "compute_device": "cpu",
+        "corr_fit_order": int(corr_fit_order),
+        "stationary_voxels": 0,
+        "skipped_reason": "",
+        "wrls_lambda": float(lam),
+        "wrls_magnitude_threshold": float(magnitude_threshold),
+        "wrls_mid_fov_fraction": float(mid_fov_fraction),
+        "wrls_mid_slice_fraction": float(mid_slice_fraction),
+        "wrls_arto_iterations": int(arto_iterations),
+        "wrls_tau": float(tau),
+        "wrls_delta": float(delta),
+        "wrls_central_probability": float(central_probability),
+        "wrls_fista_iterations": int(fista_iterations),
+        "wrls_gmm_iterations": int(gmm_iterations),
+    }
+    if raw.ndim != 5 or raw.shape[0] < 4:
+        diag["skipped_reason"] = f"expected NVTZYX with at least 4 encodes, got shape={raw.shape}"
+        return zero_corr, np.zeros((1, 1, 1), dtype=bool), diag
+    if raw.shape[1] < 2:
+        diag["skipped_reason"] = "WRLS+ARTO requires at least two time frames for temporal sigma"
+        return zero_corr, np.zeros(raw.shape[2:], dtype=bool), diag
+    if int(arto_iterations) < 1:
+        diag["skipped_reason"] = "WRLS+ARTO requires at least one ARTO iteration"
+        return zero_corr, np.zeros(raw.shape[2:], dtype=bool), diag
+    if not 0.0 < float(central_probability) < 1.0:
+        raise ValueError("wrls_central_probability must be between 0 and 1")
+
+    reference = np.asarray(raw[0], dtype=np.complex64)
+    magnitude_xyz = np.transpose(np.mean(np.abs(reference), axis=0), (2, 1, 0))
+    slice_max = np.max(magnitude_xyz, axis=(0, 1), keepdims=True)
+    magnitude_mask = magnitude_xyz > (float(magnitude_threshold) * slice_max)
+    if not np.any(magnitude_mask):
+        diag["skipped_reason"] = "no WRLS magnitude mask candidates"
+        return zero_corr, np.zeros(raw.shape[2:], dtype=bool), diag
+
+    basis = _build_normalized_polynomial_basis(magnitude_xyz.shape, max(1, int(corr_fit_order)))
+    initial_region = _middle_fov_mask(
+        magnitude_xyz.shape,
+        mid_fov_fraction=float(mid_fov_fraction),
+        mid_slice_fraction=float(mid_slice_fraction),
+    )
+    corrections_xyz = np.zeros((3,) + magnitude_xyz.shape, dtype=np.float32)
+    direction_masks = []
+    gmm_iteration_counts = []
+    gmm_devices = []
+    total_fits = 3 * (1 + int(arto_iterations))
+    completed_fits = 0
+
+    for direction in range(3):
+        phase_txyz = np.transpose(
+            np.angle(np.asarray(raw[direction + 1], dtype=np.complex64) * np.conj(reference)) / np.pi,
+            (0, 3, 2, 1),
+        )
+        phi = np.mean(phase_txyz, axis=0, dtype=np.float64)
+        sigma = np.std(phase_txyz, axis=0, ddof=1, dtype=np.float64)
+        valid = magnitude_mask & np.isfinite(phi) & np.isfinite(sigma) & (sigma > np.finfo(np.float32).eps)
+        fit_mask = valid & initial_region
+        phi_corrected, correction = _wrls_fit(
+            phi,
+            sigma,
+            fit_mask,
+            basis,
+            order=1,
+            lam=float(lam),
+            fista_iterations=int(fista_iterations),
+        )
+        completed_fits += 1
+        _emit_progress(
+            progress_callback,
+            "background_phase_fit",
+            current=completed_fits,
+            total=total_fits,
+            message=f"WRLS+ARTO direction {direction + 1}/3 initialization",
+        )
+
+        initial_means = None
+        final_mask = fit_mask
+        for arto_index in range(int(arto_iterations)):
+            epsilon = phi_corrected[valid] / sigma[valid]
+            mu_center, gamma_center, means, _gamma, _probability, gmm_count, gmm_device = _gmm_arto(
+                epsilon,
+                delta=float(delta),
+                central_probability=float(central_probability),
+                max_iterations=int(gmm_iterations),
+                initial_means=initial_means,
+            )
+            gmm_iteration_counts.append(int(gmm_count))
+            gmm_devices.append(str(gmm_device))
+            weighted_residual = np.full(phi.shape, np.nan, dtype=np.float64)
+            np.divide(phi_corrected, sigma, out=weighted_residual, where=valid)
+            lower = mu_center - float(tau) * gamma_center
+            upper = mu_center + float(tau) * gamma_center
+            final_mask = valid & (weighted_residual > lower) & (weighted_residual < upper)
+            phi_corrected, correction = _wrls_fit(
+                phi,
+                sigma,
+                final_mask,
+                basis,
+                order=int(corr_fit_order),
+                lam=float(lam),
+                fista_iterations=int(fista_iterations),
+            )
+            # The source assigns sigma0/phi0, but gmmArto reads gamma0/prob0;
+            # only the component means are therefore carried into the next pass.
+            initial_means = means
+            completed_fits += 1
+            _emit_progress(
+                progress_callback,
+                "background_phase_fit",
+                current=completed_fits,
+                total=total_fits,
+                message=f"WRLS+ARTO direction {direction + 1}/3 ARTO {arto_index + 1}/{arto_iterations}",
+            )
+
+        corrections_xyz[direction] = np.asarray(correction * np.pi, dtype=np.float32)
+        direction_masks.append(final_mask)
+
+    stationary_xyz = np.logical_and.reduce(direction_masks)
+    correction_nvtzyx = np.transpose(corrections_xyz, (0, 3, 2, 1))[:, np.newaxis, ...]
+    stationary_zyx = np.transpose(stationary_xyz, (2, 1, 0))
+    diag["applied"] = True
+    diag["stationary_voxels"] = int(np.sum(stationary_zyx))
+    diag["stationary_voxels_by_direction"] = [int(np.sum(mask)) for mask in direction_masks]
+    diag["gmm_iteration_counts"] = gmm_iteration_counts
+    if "cuda" in gmm_devices:
+        diag["compute_device"] = "cuda"
+        diag["gpu_accelerated_stages"] = ["arto_gmm"]
+    return np.asarray(correction_nvtzyx, dtype=np.float32), stationary_zyx, diag
+
+
+def execute_wrls_arto(
+    im,
+    corr_fit_order=3,
+    lam=5.0,
+    magnitude_threshold=0.04,
+    mid_fov_fraction=0.5,
+    mid_slice_fraction=0.65,
+    arto_iterations=2,
+    tau=3.0,
+    delta=2.0,
+    central_probability=0.5,
+    fista_iterations=5000,
+    gmm_iterations=1000,
+    progress_callback=None,
+):
+    kwargs = {
+        "corr_fit_order": corr_fit_order,
+        "lam": lam,
+        "magnitude_threshold": magnitude_threshold,
+        "mid_fov_fraction": mid_fov_fraction,
+        "mid_slice_fraction": mid_slice_fraction,
+        "arto_iterations": arto_iterations,
+        "tau": tau,
+        "delta": delta,
+        "central_probability": central_probability,
+        "fista_iterations": fista_iterations,
+        "gmm_iterations": gmm_iterations,
+        "progress_callback": progress_callback,
+    }
+    return _execute_wrls_arto_impl(im, **kwargs)
+
+
+def execute_msac(im, corr_fit_order=3, th=0.1, progress_callback=None):
+    rng = np.random.RandomState(274612)
     raw = np.asarray(im)
     zero_corr = _zero_corr_nvtzyx(raw.shape)
     if raw.ndim != 5:
@@ -247,14 +879,13 @@ def execute_msac(im, corr_fit_order=3, th=0.1):
 
     im = im[..., 1:4] * np.conj(im[..., 0:1]) / (np.abs(im[..., 0:1]) + 1e-9)
     phase_im_t = np.angle(im) / np.pi
-    magnitude_im_t = np.abs(im)
-    magnitude_im_t = np.mean(magnitude_im_t, axis=-1)
+    magnitude_im_t = np.mean(np.abs(im), axis=-1)
     mag_max = float(np.max(magnitude_im_t)) if magnitude_im_t.size else 0.0
     if not np.isfinite(mag_max) or mag_max <= 1e-12:
         diag["skipped_reason"] = "empty magnitude image"
         return zero_corr, np.zeros(phase_im_t.shape[:3], dtype=bool), diag
-    magnitude_im_t = magnitude_im_t / mag_max
 
+    magnitude_im_t = magnitude_im_t / mag_max
     magnitude = np.mean(magnitude_im_t, axis=3)
     phase = np.mean(phase_im_t, axis=3)
     threshold = _magnitude_threshold(magnitude)
@@ -302,7 +933,8 @@ def execute_msac(im, corr_fit_order=3, th=0.1):
         "samples": int(min(10, mp.shape[0])),
         "trials": 100,
         "msac_fit_order": 1,
-        "n_enc": int(im.shape[-1]),
+        "n_enc": int(d),
+        "rng": rng,
     }
 
     mfunc, cfunc, _fmfunc, fcfunc, dfunc = get_functions(run_4d, parameters["msac_fit_order"], corr_fit_order)
@@ -310,7 +942,25 @@ def execute_msac(im, corr_fit_order=3, th=0.1):
         "msac_fit": mfunc,
         "msac_dist": dfunc,
     }
-    _cost, inlier_idx = msac(mp, parameters, functions)
+    def _report_trial(current, total):
+        _emit_progress(
+            progress_callback,
+            "background_phase_fit",
+            current=current,
+            total=total,
+            message=f"Fitting background phase model: {current}/{total}",
+        )
+
+    diag["compute_device"] = "cpu"
+    _cost, inlier_idx = msac(mp, parameters, functions, progress_callback=_report_trial)
+
+    _emit_progress(
+        progress_callback,
+        "background_phase_finalize",
+        current=int(parameters["trials"]),
+        total=int(parameters["trials"]),
+        message="Finalizing background phase correction",
+    )
 
     model = cfunc(mp, **{"inlierIndx": inlier_idx})
     est, _xyz = fcfunc(model, ap)
@@ -342,11 +992,22 @@ def execute_msac(im, corr_fit_order=3, th=0.1):
 
 def get_functions(run_4d, fitorder_msac, fitorder_corr):
     if run_4d:
+        dist_cache = {}
+
+        def _dist4d_cached(coeffs, points):
+            key = (id(points), tuple(points.shape), tuple(points.strides), int(fitorder_msac))
+            prepared = dist_cache.get(key)
+            if prepared is None:
+                prepared = get_in_out_4d(fitorder_msac, points)[:2]
+                dist_cache[key] = prepared
+            xyz, design = prepared
+            return np.abs((xyz - design @ coeffs) / 2)
+
         mfunc = lambda points, **kwargs: fit4d(fitorder_msac, points, **kwargs)
         cfunc = lambda points, **kwargs: fit4d(fitorder_corr, points, **kwargs)
         fmfunc = lambda coeffs, points: eval4d(fitorder_msac, coeffs, points)
         fcfunc = lambda coeffs, points: eval4d(fitorder_corr, coeffs, points)
-        dfunc = lambda coeffs, points: dist4d(fitorder_msac, coeffs, points)
+        dfunc = _dist4d_cached
     else:
         mfunc = lambda points, **kwargs: fit2d(fitorder_msac, points, **kwargs)
         cfunc = lambda points, **kwargs: fit2d(fitorder_corr, points, **kwargs)
@@ -416,6 +1077,14 @@ def fit4d(order, points, **kwargs):
     indx = inlier_idx == 1
     xyz, a, no = get_in_out_4d(order, points)
     coeffs = np.zeros((no, 3), dtype=np.float32)
+    if order != 0 and np.all(indx == indx[:, :1]):
+        shared_inliers = indx[:, 0]
+        coeffs[:, :] = np.linalg.lstsq(
+            a[shared_inliers, :],
+            xyz[shared_inliers, :],
+            rcond=None,
+        )[0]
+        return coeffs
     for direction in np.arange(3):
         if order == 0:
             coeffs[0, direction] = np.mean(xyz[indx[:, direction], direction], 0)
@@ -498,11 +1167,12 @@ def eval2d(order, coeffs, points):
     return est, xyz
 
 
-def msac(points, parameters, functions):
+def msac(points, parameters, functions, progress_callback=None):
     samples = parameters["samples"]
     threshold = parameters["msac_thresh"]
     trials = parameters["trials"]
     n_enc = parameters["n_enc"]
+    rng = parameters.get("rng")
 
     msac_fit = functions["msac_fit"]
     msac_dist = functions["msac_dist"]
@@ -510,9 +1180,10 @@ def msac(points, parameters, functions):
     no_p = points.shape[0]
     best_cost = np.ones(n_enc, dtype=np.float32) * threshold * no_p
     best_inliers = np.zeros((no_p, n_enc), dtype=bool)
+    permutation = np.random.permutation if rng is None else rng.permutation
 
-    for _ in np.arange(trials):
-        indx = np.random.permutation(no_p)[0:samples]
+    for trial_index in np.arange(trials):
+        indx = permutation(no_p)[0:samples]
         sample = points[indx, :]
 
         coeffs = msac_fit(sample)
@@ -525,5 +1196,8 @@ def msac(points, parameters, functions):
 
         best_cost[comp_cost] = cost[comp_cost]
         best_inliers[:, comp_cost] = inliers[:, comp_cost]
+
+        if progress_callback is not None:
+            progress_callback(int(trial_index) + 1, int(trials))
 
     return best_cost, best_inliers

@@ -10,7 +10,7 @@ def _orient_node_paths_by_flow(node_paths, graph_points, flow_xyzt3=None, segmas
                                confidence_eps=0.05):
     if flow_xyzt3 is None or segmask_binary_4d is None:
         return [list(map(int, p)) for p in node_paths]
-    flow = np.asarray(flow_xyzt3, dtype=float)
+    flow = np.asarray(flow_xyzt3, dtype=np.float32)
     mask = np.asarray(segmask_binary_4d, dtype=bool)
     spacing = np.asarray(spacing, dtype=float).reshape(3)
     origin = np.asarray(origin, dtype=float).reshape(3)
@@ -190,6 +190,5 @@ def segment_vessels_from_graph_and_mask(segmask_3d, graph, resolution, flow_xyzt
     if len(idx_mask) > 0:
         world = idx_mask.astype(float) * np.asarray(resolution, dtype=float).reshape(1, 3)
         _, nearest = tree.query(world)
-        for k, idx in enumerate(idx_mask):
-            labels[tuple(idx)] = all_ids[nearest[k]] + 1
+        labels[tuple(idx_mask.T)] = all_ids[np.asarray(nearest, dtype=int)] + 1
     return labels, point_paths, node_paths, path_info, forks

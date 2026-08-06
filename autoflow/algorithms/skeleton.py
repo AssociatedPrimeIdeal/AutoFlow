@@ -1,17 +1,18 @@
 import numpy as np
+from scipy.ndimage import find_objects
 from skimage.morphology import skeletonize
 
-from .preprocess import _component_bbox, _connected_components
+from .preprocess import _label_components
 
 
 def generate_skeleton_from_mask3d(mask3d, resolution):
     mask3d = np.asarray(mask3d, dtype=bool)
     skel = np.zeros_like(mask3d, dtype=bool)
-    for _, cc in _connected_components(mask3d):
-        bbox = _component_bbox(cc)
-        if bbox is None:
+    component_labels, component_count = _label_components(mask3d)
+    for component_id, bbox in enumerate(find_objects(component_labels), start=1):
+        if component_id > int(component_count) or bbox is None:
             continue
-        local = cc[bbox]
+        local = component_labels[bbox] == int(component_id)
         if not np.any(local):
             continue
         local_skel = skeletonize(local).astype(bool)

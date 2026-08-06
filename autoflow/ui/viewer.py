@@ -5,14 +5,16 @@ from ..core.models import ObjectKind
 from ..algorithms import (
     build_multilabel_surface_t,
     build_surface_from_mask3d,
+    build_cell_mask_surface,
     graph_to_polydata,
     generate_seed_points,
     generate_streamlines_at_t,
     generate_streamlines_from_plane_at_t,
     generate_pathlines_from_plane_at_t,
     create_uniform_grid,
-    sample_volume_on_surface,
+    sample_volume_on_existing_surface,
 )
+from ..algorithms.streamlines import automatic_streamline_clim
 
 
 def _parse_indexed_data_key(data_key, prefix):
@@ -78,6 +80,9 @@ class SceneController:
         self.logger = logger
         self._axes_shown = True
         self._mesh_cache = {}
+        self._display_mesh_cache = {}
+        self._phase_lookup_cache = {}
+        self._automatic_clim_cache = {}
         self._tracked_actors = {}
         self._saved_camera = None
         self._playback_active = False
@@ -96,7 +101,12 @@ class SceneController:
 
     def initialize(self):
         self.plotter.set_background("white")
-        self.plotter.add_axes(line_width=2)
+        self.plotter.add_axes(
+            xlabel="LR",
+            ylabel="AP",
+            zlabel="FH",
+            line_width=2,
+        )
         self.plotter.reset_camera()
 
     def reset_scene(self):
@@ -112,16 +122,26 @@ class SceneController:
             obj.label_actor = None
         self._tracked_actors.clear()
         self._mesh_cache.clear()
+        self._display_mesh_cache.clear()
+        self._phase_lookup_cache.clear()
+        self._automatic_clim_cache.clear()
         self._active_scalar_bar_uid = None
         self._remove_plane_highlight()
         self._remove_path_highlight()
         self.initialize()
 
     def invalidate_cache(self, prefix=None):
+        self._phase_lookup_cache.clear()
+        self._automatic_clim_cache.clear()
         if prefix is None:
             self._mesh_cache.clear()
+            self._display_mesh_cache.clear()
         else:
             self._mesh_cache = {k: v for k, v in self._mesh_cache.items() if not k[0].startswith(prefix)}
+            self._display_mesh_cache = {
+                key: value for key, value in self._display_mesh_cache.items()
+                if not key[0].startswith(prefix)
+            }
 
     def set_background(self, color):
         self.plotter.set_background(color)
@@ -162,7 +182,9 @@ class SceneController:
         if active:
             self.save_camera()
 
-    def sync_from_workspace(self):
+    def sync_from_workspace(self, rebuild_prefixes=None):
+        had_rendered_scene = bool(self._tracked_actors)
+        prefixes = None if rebuild_prefixes is None else tuple(str(x) for x in rebuild_prefixes)
         current_uids = set(self.workspace.scene_objects.keys())
         stale = set(self._tracked_actors.keys()) - current_uids
         for uid in stale:
@@ -175,7 +197,19 @@ class SceneController:
                         self.plotter.renderer.RemoveActor(actor)
                     except Exception:
                         pass
-        self.render_all()
+        for obj in self.workspace.scene_objects.values():
+            rebuild = prefixes is None or any(obj.data_key.startswith(prefix) for prefix in prefixes)
+            if obj.actor is None or rebuild:
+                self._render_object(obj, refresh_scalar_bar=False)
+            else:
+                self._apply_basic_properties_only(obj)
+        self._refresh_shared_scalar_bar(render=False)
+        if not had_rendered_scene and self._tracked_actors:
+            self.plotter.reset_camera()
+        try:
+            self.plotter.render()
+        except Exception:
+            pass
 
     def remove_object(self, uid):
         obj = self.workspace.scene_objects.get(uid)
@@ -199,9 +233,15 @@ class SceneController:
             pass
 
     def render_all(self):
+        had_rendered_scene = bool(self._tracked_actors)
         for obj in self.workspace.scene_objects.values():
-            self._render_object(obj, refresh_scalar_bar=False)
+            if obj.actor is None:
+                self._render_object(obj, refresh_scalar_bar=False)
+            else:
+                self._apply_basic_properties_only(obj)
         self._refresh_shared_scalar_bar(render=False)
+        if not had_rendered_scene and self._tracked_actors:
+            self.plotter.reset_camera()
         try:
             self.plotter.render()
         except Exception:
@@ -217,8 +257,7 @@ class SceneController:
                 cam_before = None
         for obj in self.workspace.scene_objects.values():
             if obj.dynamic:
-                self.readd_object(obj, refresh_scalar_bar=False)
-        self._refresh_shared_scalar_bar(preferred_uid=self._active_scalar_bar_uid, render=False)
+                self._update_dynamic_object(obj)
         if self._playback_active and cam_before is not None:
             try:
                 self.plotter.camera_position = cam_before
@@ -232,14 +271,64 @@ class SceneController:
     def rebuild_dynamic(self):
         for obj in self.workspace.scene_objects.values():
             if obj.dynamic:
-                self.readd_object(obj, refresh_scalar_bar=False)
-        self._refresh_shared_scalar_bar(preferred_uid=self._active_scalar_bar_uid, render=False)
+                self._update_dynamic_object(obj)
+
+    def _update_dynamic_object(self, obj):
+        data = self._build_dataset(obj.data_key)
+        if data is None:
+            self._remove_actor(obj)
+            return
+        if obj.actor is None:
+            self._render_object(obj, refresh_scalar_bar=False)
+            return
+        try:
+            self._segmentation_category_metadata(obj, data)
+            data_show = self._display_dataset(obj, data)
+            mapper = obj.actor.GetMapper()
+            # Preserve PyVista's active-scalar pipeline when swapping phases.
+            # Raw VTK SetInputData leaves the mapper's scalar texture connected
+            # to the previous dataset and renders much of the new mesh black.
+            mapper.dataset = data_show
+            mapper.Update()
+        except Exception:
+            self.readd_object(obj, refresh_scalar_bar=False)
 
     def readd_object(self, obj, refresh_scalar_bar=True):
         self._remove_actor(obj)
         self._render_object(obj, refresh_scalar_bar=refresh_scalar_bar)
 
-    def apply_object_properties(self, obj):
+    def update_plane_geometry(self, uid, *, render=True):
+        obj = self.workspace.scene_objects.get(uid)
+        if obj is None or obj.kind != ObjectKind.PLANE:
+            return False
+        data = self._build_dataset(obj.data_key)
+        if data is None:
+            return False
+        actors = [obj.actor]
+        if self._highlight_plane_uid == uid:
+            actors.append(self._highlight_plane_actor)
+        updated = False
+        for actor in actors:
+            if actor is None:
+                continue
+            try:
+                mapper = actor.GetMapper()
+                mapper.dataset = data
+                mapper.Update()
+                updated = True
+            except Exception:
+                continue
+        if not updated and obj.actor is not None:
+            self.readd_object(obj, refresh_scalar_bar=False)
+            updated = True
+        if render:
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
+        return updated
+
+    def apply_object_properties(self, obj, *, render=True, refresh_scalar_bar=True):
         if obj.actor is None:
             self._render_object(obj, refresh_scalar_bar=True)
             return
@@ -252,16 +341,17 @@ class SceneController:
             prop.SetOpacity(float(obj.opacity))
             prop.SetLineWidth(float(obj.line_width))
             prop.SetPointSize(float(obj.point_size))
+            if not obj.scalars and obj.color:
+                prop.SetColor(*pv.Color(obj.color).float_rgb)
         except Exception:
             pass
-        if obj.visible:
-            self.readd_object(obj)
-            return
-        self._refresh_shared_scalar_bar(render=False)
-        try:
-            self.plotter.render()
-        except Exception:
-            pass
+        if refresh_scalar_bar:
+            self._refresh_shared_scalar_bar(render=False)
+        if render:
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
 
     def highlight_plane(self, uid):
         self._remove_plane_highlight()
@@ -505,10 +595,7 @@ class SceneController:
             self._remove_actor(obj)
         kwargs = self._mesh_kwargs(obj, data)
         try:
-            if obj.tube_radius > 0 and hasattr(data, "tube") and obj.kind.value in ("Graph", "Branch", "Flow", "Metric", "Skeleton"):
-                data_show = data.tube(radius=float(obj.tube_radius))
-            else:
-                data_show = data
+            data_show = self._display_dataset(obj, data)
             obj.actor = self.plotter.add_mesh(data_show, name=obj.uid, **kwargs)
             self._tracked_actors[obj.uid] = obj.actor
             self._apply_basic_properties_only(obj)
@@ -539,10 +626,26 @@ class SceneController:
             if hasattr(data, "cell_data") and obj.scalars in data.cell_data:
                 use_scalars = True
         if use_scalars:
-            kw["scalars"] = obj.scalars
-            kw["cmap"] = obj.cmap
-            if obj.clim:
-                kw["clim"] = obj.clim
+            category_metadata = self._segmentation_category_metadata(obj, data)
+            if category_metadata is None:
+                kw["scalars"] = obj.scalars
+                kw["cmap"] = obj.cmap
+            else:
+                display_name, labels = category_metadata
+                kw["scalars"] = display_name
+                label_names = getattr(self.workspace.segmentation, "label_names", {})
+                label_colors = getattr(self.workspace.segmentation, "label_colors", {})
+                kw["categories"] = True
+                kw["n_colors"] = max(2, len(labels))
+                kw["annotations"] = {
+                    float(index): str(label_names.get(str(label), f"Label {label}"))
+                    for index, label in enumerate(labels)
+                }
+                colors = [label_colors.get(str(label), "") for label in labels]
+                kw["cmap"] = colors if colors and all(colors) else obj.cmap
+            clim = self._resolved_object_clim(obj)
+            if clim is not None and category_metadata is None:
+                kw["clim"] = clim
         else:
             kw["color"] = obj.color
         if obj.data_key == "pwv_planes":
@@ -556,11 +659,64 @@ class SceneController:
         if obj.kind.value in ("Graph", "Branch", "Flow", "Aux"):
             kw["line_width"] = obj.line_width
             kw["render_lines_as_tubes"] = True
+        if obj.kind == ObjectKind.FLOW and use_scalars:
+            # Quantitative streamline colors must match the scalar bar instead
+            # of being darkened by the tube surface orientation.
+            kw["lighting"] = False
         if obj.kind == ObjectKind.PLANE:
             kw["show_edges"] = True
             kw["edge_color"] = "black"
             kw["line_width"] = max(float(obj.line_width), 2.0)
         return kw
+
+    def _resolved_object_clim(self, obj):
+        if obj.clim is not None:
+            return tuple(obj.clim)
+        if obj.data_key != "streamlines_live" or obj.scalars != "Velocity":
+            return None
+        ws = self.workspace
+        flow = ws.flow_raw
+        mask = ws.segmask_binary if ws.segmask_binary is not None else ws.segmask_3d
+        key = (id(flow), id(mask))
+        clim = self._automatic_clim_cache.get(key)
+        if clim is None:
+            clim = automatic_streamline_clim(flow, mask)
+            self._automatic_clim_cache[key] = clim
+        return clim
+
+    def _display_dataset(self, obj, data):
+        if not (
+            obj.tube_radius > 0
+            and hasattr(data, "tube")
+            and obj.kind.value in ("Graph", "Branch", "Flow", "Metric", "Skeleton")
+        ):
+            return data
+        key = (str(obj.data_key), id(data), float(obj.tube_radius))
+        cached = self._display_mesh_cache.get(key)
+        if cached is None:
+            cached = data.tube(radius=float(obj.tube_radius))
+            self._display_mesh_cache[key] = cached
+        return cached
+
+    def _segmentation_category_metadata(self, obj, data):
+        if obj.kind != ObjectKind.SEGMENTATION or not obj.scalars:
+            return None
+        association = None
+        if hasattr(data, "point_data") and obj.scalars in data.point_data:
+            association = data.point_data
+        elif hasattr(data, "cell_data") and obj.scalars in data.cell_data:
+            association = data.cell_data
+        if association is None:
+            return None
+        scalar_values = np.asarray(association[obj.scalars])
+        labels = sorted(int(value) for value in np.unique(scalar_values) if np.isfinite(value))
+        if not labels:
+            return None
+        display_name = f"__autoflow_category_{obj.scalars}"
+        association[display_name] = np.searchsorted(
+            np.asarray(labels, dtype=np.int64), scalar_values.astype(np.int64)
+        ).astype(np.int16, copy=False)
+        return display_name, labels
 
     def _scalar_bar_args_for_object(self, obj):
         scalar_bar_args = {
@@ -574,11 +730,32 @@ class SceneController:
         shared_cfg = dict(getattr(self.workspace, "render_settings", {}).get("shared_colorbar_bar_cfg", {}) or {})
         if shared_cfg:
             scalar_bar_args.update({k: v for k, v in shared_cfg.items() if k != "stack_gap"})
-        if isinstance(obj.scalar_bar_cfg, dict):
-            scalar_bar_args.update({k: v for k, v in obj.scalar_bar_cfg.items() if k != "stack_gap"})
+        width = min(max(float(scalar_bar_args.get("width", 0.08)), 0.02), 0.4)
+        height = min(max(float(scalar_bar_args.get("height", 0.6)), 0.15), 0.95)
+        scalar_bar_args["width"] = width
+        scalar_bar_args["height"] = height
+        scalar_bar_args["position_x"] = min(
+            max(float(scalar_bar_args.get("position_x", 0.87)), 0.0),
+            max(0.0, 0.98 - width),
+        )
+        scalar_bar_args["position_y"] = min(
+            max(float(scalar_bar_args.get("position_y", 0.15)), 0.0),
+            max(0.0, 0.98 - height),
+        )
+        try:
+            background = np.asarray(pv.Color(self.plotter.background_color).float_rgb, dtype=float)
+            luminance = float(np.dot(background, [0.2126, 0.7152, 0.0722]))
+            scalar_bar_args.setdefault("color", "black" if luminance >= 0.5 else "white")
+        except Exception:
+            pass
+        if obj.kind == ObjectKind.SEGMENTATION:
+            scalar_bar_args["n_labels"] = 0
         return scalar_bar_args
 
     def _object_can_drive_scalar_bar(self, obj):
+        render_settings = getattr(self.workspace, "render_settings", {}) or {}
+        if not bool(render_settings.get("shared_colorbar_show", True)):
+            return False
         if obj is None or not bool(obj.visible) or not bool(obj.show_scalar_bar) or not obj.scalars:
             return False
         actor = getattr(obj, "actor", None)
@@ -665,7 +842,8 @@ class SceneController:
             seg_display = ws.segmentation_display_4d()
             if seg_display is None:
                 return None
-            return self._cached(data_key, t, lambda: build_multilabel_surface_t(seg_display, t, sp, org))
+            rep_t = self._representative_phase(seg_display, t)
+            return self._cached(data_key, rep_t, lambda: build_multilabel_surface_t(seg_display, rep_t, sp, org))
 
         if data_key == "segmask_pre_surface":
             if ws.segmask_labels is None:
@@ -676,6 +854,86 @@ class SceneController:
             if ws.segmask_3d is None:
                 return None
             return self._cached(data_key, 0, lambda: build_surface_from_mask3d(ws.segmask_3d, sp, org, smooth_iter=1000))
+
+        if isinstance(data_key, str) and data_key.startswith("segmask_group_"):
+            group_name = str(data_key[len("segmask_group_"):])
+            group_state = ws.multilabel_groups.get(group_name, {})
+            mask = group_state.get("segmask_3d")
+            if mask is None:
+                return None
+            return self._cached(
+                data_key,
+                0,
+                lambda: build_surface_from_mask3d(
+                    np.asarray(mask, dtype=bool), sp, org, smooth_iter=1000
+                ),
+            )
+
+        if data_key == "skeleton_points":
+            if ws.skeleton_points is None or len(ws.skeleton_points) == 0:
+                return None
+            return pv.PolyData(
+                np.asarray(ws.skeleton_points, dtype=float)
+                + np.asarray(org, dtype=float).reshape(1, 3)
+            )
+
+        if data_key == "skeleton_mask_surface":
+            if ws.skeleton_mask is None:
+                return None
+            return self._cached(
+                data_key,
+                0,
+                lambda: build_surface_from_mask3d(
+                    ws.skeleton_mask, sp, org, smooth_iter=1000
+                ),
+            )
+
+        if isinstance(data_key, str) and data_key.startswith("skeleton_"):
+            group_name = str(data_key[len("skeleton_"):])
+            if group_name and group_name != "points":
+                group_state = ws.multilabel_groups.get(group_name, {})
+                points = group_state.get("skeleton_points")
+                if points is None or len(points) == 0:
+                    return None
+                return pv.PolyData(
+                    np.asarray(points, dtype=float)
+                    + np.asarray(org, dtype=float).reshape(1, 3)
+                )
+
+        if data_key == "graph_lines":
+            if ws.graph is None or len(ws.graph.points) == 0:
+                return None
+            return graph_to_polydata(
+                np.asarray(ws.graph.points, dtype=float)
+                + np.asarray(org, dtype=float).reshape(1, 3),
+                ws.graph.edges,
+            )
+
+        if isinstance(data_key, str) and data_key.startswith("graph_"):
+            group_name = str(data_key[len("graph_"):])
+            if group_name and group_name != "lines":
+                group_state = ws.multilabel_groups.get(group_name, {})
+                graph = group_state.get("graph")
+                if graph is None or len(getattr(graph, "points", [])) == 0:
+                    return None
+                return graph_to_polydata(
+                    np.asarray(graph.points, dtype=float)
+                    + np.asarray(org, dtype=float).reshape(1, 3),
+                    graph.edges,
+                )
+
+        if isinstance(data_key, str) and data_key.startswith("forks_"):
+            group_name = str(data_key[len("forks_"):])
+            group_state = ws.multilabel_groups.get(group_name, {})
+            forks = list(group_state.get("forks", []))
+            points = [
+                np.asarray(fork.get("crosspoint", [0.0, 0.0, 0.0]), dtype=float)
+                + np.asarray(org, dtype=float).reshape(3)
+                for fork in forks
+            ]
+            if not points:
+                return None
+            return pv.PolyData(np.asarray(points, dtype=float).reshape(-1, 3))
 
         if data_key == "streamlines_live":
             return self._get_streamline_mesh(t)
@@ -723,6 +981,7 @@ class SceneController:
             def _build_pressure_gradient_t():
                 arr = np.asarray(ws.derived.pressure_gradient_magnitude, dtype=np.float32)
                 support = ws.derived.pressure_gradient_support_mask
+                support_source = support
                 if arr.ndim == 4:
                     tidx = min(max(0, int(t)), arr.shape[3] - 1)
                     vol_t = arr[..., tidx]
@@ -732,22 +991,20 @@ class SceneController:
                     support_t = np.asarray(support, dtype=bool) if support is not None else None
                 if support_t is None:
                     if ws.segmask_binary is not None:
+                        support_source = ws.segmask_binary
                         if ws.segmask_binary.ndim == 4:
                             support_t = np.asarray(ws.segmask_binary[..., min(max(0, int(t)), ws.segmask_binary.shape[3] - 1)], dtype=bool)
                         else:
                             support_t = np.asarray(ws.segmask_binary, dtype=bool)
                     elif ws.segmask_3d is not None:
+                        support_source = ws.segmask_3d
                         support_t = np.asarray(ws.segmask_3d, dtype=bool)
                     else:
                         support_t = np.ones(vol_t.shape, dtype=bool)
+                        support_source = support_t
                 vol_t = np.where(support_t, vol_t, 0.0)
-                return sample_volume_on_surface(
-                    vol_t,
-                    support_t,
-                    sp,
-                    origin=org,
-                    name="PressureGradient",
-                    smooth_iter=80,
+                return self._sample_supported_surface(
+                    vol_t, support_source, t, sp, org, name="PressureGradient"
                 )
             return self._cached(data_key, t, _build_pressure_gradient_t)
 
@@ -757,6 +1014,7 @@ class SceneController:
             def _build_relative_pressure_t():
                 arr = np.asarray(ws.derived.relative_pressure_array, dtype=np.float32)
                 support = ws.derived.pressure_gradient_support_mask
+                support_source = support
                 if arr.ndim == 4:
                     tidx = min(max(0, int(t)), arr.shape[3] - 1)
                     vol_t = arr[..., tidx]
@@ -766,22 +1024,20 @@ class SceneController:
                     support_t = np.asarray(support, dtype=bool) if support is not None else None
                 if support_t is None:
                     if ws.segmask_binary is not None:
+                        support_source = ws.segmask_binary
                         if ws.segmask_binary.ndim == 4:
                             support_t = np.asarray(ws.segmask_binary[..., min(max(0, int(t)), ws.segmask_binary.shape[3] - 1)], dtype=bool)
                         else:
                             support_t = np.asarray(ws.segmask_binary, dtype=bool)
                     elif ws.segmask_3d is not None:
+                        support_source = ws.segmask_3d
                         support_t = np.asarray(ws.segmask_3d, dtype=bool)
                     else:
                         support_t = np.ones(vol_t.shape, dtype=bool)
+                        support_source = support_t
                 vol_t = np.where(support_t, vol_t, 0.0)
-                return sample_volume_on_surface(
-                    vol_t,
-                    support_t,
-                    sp,
-                    origin=org,
-                    name="RelativePressure",
-                    smooth_iter=80,
+                return self._sample_supported_surface(
+                    vol_t, support_source, t, sp, org, name="RelativePressure"
                 )
             return self._cached(data_key, t, _build_relative_pressure_t)
 
@@ -868,6 +1124,41 @@ class SceneController:
         if mesh is not None:
             self._mesh_cache[key] = mesh
         return mesh
+
+    def _representative_phase(self, array, t):
+        arr = np.asarray(array)
+        if arr.ndim < 4 or arr.shape[3] <= 1:
+            return 0
+        key = (id(array), tuple(int(x) for x in arr.shape), arr.dtype.str)
+        lookup = self._phase_lookup_cache.get(key)
+        if lookup is None:
+            representatives = {}
+            lookup = []
+            for tidx in range(int(arr.shape[3])):
+                token = np.ascontiguousarray(arr[..., tidx]).tobytes()
+                rep_t = representatives.setdefault(token, int(tidx))
+                lookup.append(rep_t)
+            self._phase_lookup_cache[key] = lookup
+        return int(lookup[min(max(0, int(t)), len(lookup) - 1)])
+
+    def _sample_supported_surface(self, volume_t, support_4d_or_3d, t, spacing, origin, *, name):
+        support = np.asarray(support_4d_or_3d, dtype=bool)
+        if support.ndim == 4:
+            rep_t = self._representative_phase(support_4d_or_3d, t)
+            support_t = support[..., rep_t]
+        else:
+            rep_t = 0
+            support_t = support
+        surface = self._cached(
+            "pressure_support_surface",
+            rep_t,
+            lambda: build_cell_mask_surface(
+                support_t, spacing, origin=origin, smooth_iter=80
+            ),
+        )
+        return sample_volume_on_existing_surface(
+            volume_t, surface, spacing, origin=origin, name=name
+        )
 
     def _get_streamline_mesh(self, t):
         ws = self.workspace

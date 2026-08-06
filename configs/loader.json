@@ -1,8 +1,19 @@
 {
   "background_phase_correction": {
     "enabled": false,
+    "method": "msac",
     "corr_fit_order": 3,
     "threshold": 0.1,
+    "wrls_lambda": 5.0,
+    "wrls_magnitude_threshold": 0.04,
+    "wrls_mid_fov_fraction": 0.5,
+    "wrls_mid_slice_fraction": 0.65,
+    "wrls_arto_iterations": 2,
+    "wrls_tau": 3.0,
+    "wrls_delta": 2.0,
+    "wrls_central_probability": 0.5,
+    "wrls_fista_iterations": 5000,
+    "wrls_gmm_iterations": 1000,
     "dual_venc_ratio1": 0.0,
     "dual_venc_ratio2": 0.0,
     "force_recompute": false
