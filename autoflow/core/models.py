@@ -836,6 +836,8 @@ class DerivedResults:
     pressure_gradient_array: Optional[np.ndarray] = None
     pressure_gradient_magnitude: Optional[np.ndarray] = None
     pressure_gradient_peak: Optional[np.ndarray] = None
+    pressure_gradient_dt_s: Optional[float] = None
+    pressure_gradient_temporal_scheme: str = ""
     pressure_gradient_support_mask: Optional[np.ndarray] = None
     pressure_gradient_display_clim: Optional[Tuple[float, float]] = None
     relative_pressure_array: Optional[np.ndarray] = None
@@ -850,6 +852,9 @@ class DerivedResults:
     pwv_file: str = ""
     pwv_json_file: str = ""
     pwv_h5_file: str = ""
+    # Hashes of the inputs and parameters used to create each derived family.
+    # Missing signatures deliberately invalidate legacy workspace caches.
+    artifact_signatures: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -1399,11 +1404,14 @@ class Workspace:
                 "plane_qc": copy.deepcopy(self.derived.plane_qc),
                 "plane_pixelwise_file": str(self.derived.plane_pixelwise_file or ""),
                 "centerline_pressure_profiles": copy.deepcopy(self.derived.centerline_pressure_profiles),
+                "pressure_gradient_dt_s": self.derived.pressure_gradient_dt_s,
+                "pressure_gradient_temporal_scheme": str(self.derived.pressure_gradient_temporal_scheme or ""),
                 "pwv_results": copy.deepcopy(self.derived.pwv_results),
                 "pwv_planes": copy.deepcopy(self.derived.pwv_planes),
                 "pwv_file": str(self.derived.pwv_file or ""),
                 "pwv_json_file": str(self.derived.pwv_json_file or ""),
                 "pwv_h5_file": str(self.derived.pwv_h5_file or ""),
+                "artifact_signatures": copy.deepcopy(self.derived.artifact_signatures),
             },
             "render_settings": copy.deepcopy(self.render_settings),
             "scene_objects": [
@@ -1435,7 +1443,7 @@ class Workspace:
         self.input_state = InputState.from_dict(d.get("input_state", {}))
         self.segmentation = SegmentationState.from_dict(d.get("segmentation", {}))
         self.resolution = np.asarray(d.get("resolution", [1, 1, 1]), dtype=float)
-        self.origin = np.array([0.0, 0.0, 0.0], dtype=float)
+        self.origin = np.asarray(d.get("origin", [0.0, 0.0, 0.0]), dtype=float).reshape(3)
         self.spatial_order = [str(x) for x in d.get("spatial_order", ["FH", "AP", "LR"])]
         self.venc_order = [str(x) for x in d.get("venc_order", ["FH", "AP", "LR"])]
         self.venc = np.asarray(d.get("venc", [1, 1, 1]), dtype=float)
@@ -1526,11 +1534,23 @@ class Workspace:
             plane_qc=copy.deepcopy(derived_state.get("plane_qc", {})),
             plane_pixelwise_file=str(derived_state.get("plane_pixelwise_file", "") or ""),
             centerline_pressure_profiles=copy.deepcopy(derived_state.get("centerline_pressure_profiles", [])),
+            pressure_gradient_dt_s=(
+                None
+                if derived_state.get("pressure_gradient_dt_s") is None
+                else float(derived_state.get("pressure_gradient_dt_s"))
+            ),
+            pressure_gradient_temporal_scheme=str(
+                derived_state.get("pressure_gradient_temporal_scheme", "") or ""
+            ),
             pwv_results=copy.deepcopy(derived_state.get("pwv_results", [])),
             pwv_planes=copy.deepcopy(derived_state.get("pwv_planes", [])),
             pwv_file=str(derived_state.get("pwv_file", "") or ""),
             pwv_json_file=str(derived_state.get("pwv_json_file", "") or ""),
             pwv_h5_file=str(derived_state.get("pwv_h5_file", "") or ""),
+            artifact_signatures={
+                str(k): str(v)
+                for k, v in dict(derived_state.get("artifact_signatures", {})).items()
+            },
         )
         self.render_settings = copy.deepcopy(d.get("render_settings", {}))
         self.scene_objects = {}

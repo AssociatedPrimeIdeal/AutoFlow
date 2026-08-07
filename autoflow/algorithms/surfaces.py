@@ -157,7 +157,13 @@ def extract_plane_cross_section(mask_xyz, plane, spacing, origin, branch_grid=No
     mesh = mesh.threshold(0.1)
     if mesh.n_cells == 0:
         return None
-    pg = mesh.slice(normal=np.asarray(plane.normal, dtype=float), origin=np.asarray(plane.center, dtype=float))
+    # PlaneData stores local physical coordinates.  VTK meshes include the
+    # image origin, so convert the plane center at the VTK boundary.
+    plane_center_world = (
+        np.asarray(plane.center, dtype=float).reshape(3)
+        + np.asarray(origin, dtype=float).reshape(3)
+    )
+    pg = mesh.slice(normal=np.asarray(plane.normal, dtype=float), origin=plane_center_world)
     if pg is None or pg.n_cells == 0:
         return None
     pg = pg.compute_cell_sizes(area=True)
@@ -173,7 +179,7 @@ def extract_plane_cross_section(mask_xyz, plane, spacing, origin, branch_grid=No
         if pg is None or pg.n_cells == 0:
             return None
         pg = pg.compute_cell_sizes(area=True)
-    return _select_connected_region(pg, ref_point=np.asarray(plane.center, dtype=float))
+    return _select_connected_region(pg, ref_point=plane_center_world)
 
 
 def _flow_grid_for_t(flow_t, spacing, origin):
@@ -210,7 +216,11 @@ def _extract_plane_flow_region(mask_xyz, flow_t, plane, spacing, origin, branch_
     mesh = grid.threshold(0.1, scalars="mask")
     if mesh is None or mesh.n_cells == 0:
         return None
-    pg = mesh.slice(normal=np.asarray(plane.normal, dtype=float), origin=np.asarray(plane.center, dtype=float))
+    plane_center_world = (
+        np.asarray(plane.center, dtype=float).reshape(3)
+        + np.asarray(origin, dtype=float).reshape(3)
+    )
+    pg = mesh.slice(normal=np.asarray(plane.normal, dtype=float), origin=plane_center_world)
     if pg is None or pg.n_cells == 0:
         return None
     pg = pg.compute_cell_sizes(area=True)
@@ -226,7 +236,7 @@ def _extract_plane_flow_region(mask_xyz, flow_t, plane, spacing, origin, branch_
         if pg is None or pg.n_cells == 0:
             return None
         pg = pg.compute_cell_sizes(area=True)
-    return _select_connected_region(pg, ref_point=np.asarray(plane.center, dtype=float))
+    return _select_connected_region(pg, ref_point=plane_center_world)
 
 
 def create_vector_volume_from_flow(flow_xyz3, spacing, origin=(0, 0, 0), scale=1.0):

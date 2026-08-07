@@ -30,3 +30,7 @@ autoflow_mri.egg-info/
 build/
 /scripts/
 data/phantom_*.h5
+
+# Local-only archive and experimental reconstruction work
+/autoflow-gui-source-final-model.zip
+/ztemp/

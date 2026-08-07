@@ -163,6 +163,7 @@ def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes
     Nt = int(flow.shape[3])
     branch_grid = _build_branch_grid(branch_labels_3d, spacing, origin)
     mask_phase_lookup = _build_mask_phase_lookup(mask)
+    support_mesh_cache = _build_plane_support_mesh_cache(mask, mask_phase_lookup, spacing, origin)
     mask_static = all(int(rep_t) == 0 for rep_t in mask_phase_lookup)
     mask_template = mask[..., 0] if mask_static else None
 
@@ -182,9 +183,7 @@ def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes
         if branch_labels_3d is not None:
             target_label = int(getattr(plane, "label", 0) or 0)
             if target_label <= 0:
-                ijk = np.rint((np.asarray(plane.center, dtype=float).reshape(3) - origin) / (spacing + 1e-12)).astype(int)
-                ijk = np.clip(ijk, 0, np.array(np.asarray(branch_labels_3d).shape) - 1)
-                target_label = int(np.asarray(branch_labels_3d)[ijk[0], ijk[1], ijk[2]])
+                target_label = _target_label_for_plane(plane, branch_labels_3d, spacing, origin)
         pp = None
         if paths_lookup is not None:
             pi = int(getattr(plane, "path_index", -1))
@@ -192,7 +191,8 @@ def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes
                 pp = paths_lookup[pi]
         results.append(_compute_single_plane_metric(
             (flow, mask, spacing, origin, plane, Nt, RR,
-             branch_grid, target_label, path_info, pp, mask_template, mask_phase_lookup)
+             branch_grid, target_label, path_info, pp, mask_template, mask_phase_lookup,
+             support_mesh_cache)
         ))
 
     results, qc = apply_internal_consistency_to_metrics(results, path_info=path_info, forks=forks)
@@ -226,7 +226,9 @@ def _target_label_for_plane(plane, branch_labels_3d, spacing, origin):
     target_label = int(getattr(plane, "label", 0) or 0)
     if target_label > 0:
         return target_label
-    ijk = np.rint((np.asarray(plane.center, dtype=float).reshape(3) - origin) / (spacing + 1e-12)).astype(int)
+    # PlaneData.center is local physical space.  The origin is only applied
+    # when crossing into world-space VTK geometry.
+    ijk = np.rint(np.asarray(plane.center, dtype=float).reshape(3) / (spacing + 1e-12)).astype(int)
     ijk = np.clip(ijk, 0, np.array(np.asarray(branch_labels_3d).shape) - 1)
     return int(np.asarray(branch_labels_3d)[ijk[0], ijk[1], ijk[2]])
 
@@ -246,6 +248,27 @@ def _build_mask_phase_lookup(mask4d):
     return lookup
 
 
+def _build_plane_support_mesh(mask_xyz, spacing, origin):
+    """Build the thresholded mask mesh once for all planes using this mask."""
+    mask_xyz = np.asarray(mask_xyz, dtype=bool)
+    if not np.any(mask_xyz):
+        return None
+    grid = create_uniform_field_grid(mask_xyz.astype(np.uint8), spacing, origin=origin, name="mask")
+    grid.cell_data["_cell_id"] = np.arange(mask_xyz.size, dtype=np.int32)
+    mesh = grid.threshold(0.1, scalars="mask")
+    if mesh is None or mesh.n_cells == 0:
+        return None
+    return mesh
+
+
+def _build_plane_support_mesh_cache(mask4d, mask_phase_lookup, spacing, origin):
+    mask4d = _ensure_mask4d(mask4d)
+    cache = {}
+    for rep_t in sorted({int(x) for x in mask_phase_lookup}):
+        cache[rep_t] = _build_plane_support_mesh(mask4d[..., rep_t], spacing, origin)
+    return cache
+
+
 def _build_plane_slice_spec(
     mask_xyz,
     plane,
@@ -255,16 +278,21 @@ def _build_plane_slice_spec(
     target_label=None,
     *,
     select_connected=False,
+    support_mesh=None,
 ):
     mask_xyz = np.asarray(mask_xyz, dtype=bool)
     if not np.any(mask_xyz):
         return None
-    grid = create_uniform_field_grid(mask_xyz.astype(np.uint8), spacing, origin=origin, name="mask")
-    grid.cell_data["_cell_id"] = np.arange(mask_xyz.size, dtype=np.int32)
-    mesh = grid.threshold(0.1, scalars="mask")
+    mesh = support_mesh
+    if mesh is None:
+        mesh = _build_plane_support_mesh(mask_xyz, spacing, origin)
     if mesh is None or mesh.n_cells == 0:
         return None
-    pg = mesh.slice(normal=np.asarray(plane.normal, dtype=float), origin=np.asarray(plane.center, dtype=float))
+    plane_center_world = (
+        np.asarray(plane.center, dtype=float).reshape(3)
+        + np.asarray(origin, dtype=float).reshape(3)
+    )
+    pg = mesh.slice(normal=np.asarray(plane.normal, dtype=float), origin=plane_center_world)
     if pg is None or pg.n_cells == 0:
         return None
     pg = pg.compute_cell_sizes(area=True)
@@ -281,7 +309,7 @@ def _build_plane_slice_spec(
             return None
         pg = pg.compute_cell_sizes(area=True)
     if select_connected:
-        pg = _select_connected_region(pg, ref_point=np.asarray(plane.center, dtype=float))
+        pg = _select_connected_region(pg, ref_point=plane_center_world)
         if pg is None or pg.n_cells == 0:
             return None
     cell_ids = np.asarray(pg.cell_data.get("_cell_id", []), dtype=np.int64).reshape(-1)
@@ -296,7 +324,8 @@ def _build_plane_slice_spec(
         "areas": areas,
     }
 def _get_cached_plane_slice_spec(slice_cache, cache_key, mask_xyz, plane, spacing, origin,
-                                 branch_grid=None, target_label=None, *, select_connected=False):
+                                 branch_grid=None, target_label=None, *, select_connected=False,
+                                 support_mesh=None):
     if cache_key not in slice_cache:
         slice_cache[cache_key] = _build_plane_slice_spec(
             mask_xyz,
@@ -306,6 +335,7 @@ def _get_cached_plane_slice_spec(slice_cache, cache_key, mask_xyz, plane, spacin
             branch_grid=branch_grid,
             target_label=target_label,
             select_connected=select_connected,
+            support_mesh=support_mesh,
         )
     return slice_cache[cache_key]
 
@@ -351,7 +381,11 @@ def _extract_plane_field_region(mask_xyz, field_t, plane, spacing, origin, field
     mesh = grid.threshold(0.1, scalars="mask")
     if mesh is None or mesh.n_cells == 0:
         return None
-    pg = mesh.slice(normal=np.asarray(plane.normal, dtype=float), origin=np.asarray(plane.center, dtype=float))
+    plane_center_world = (
+        np.asarray(plane.center, dtype=float).reshape(3)
+        + np.asarray(origin, dtype=float).reshape(3)
+    )
+    pg = mesh.slice(normal=np.asarray(plane.normal, dtype=float), origin=plane_center_world)
     if pg is None or pg.n_cells == 0:
         return None
     pg = pg.compute_cell_sizes(area=True)
@@ -405,7 +439,8 @@ def _append_summary(metric, prefix, series):
 def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_labels_3d=None,
                                     tke_array=None, pressure_gradient_array=None,
                                     relative_pressure_array=None, wss_surfaces=None,
-                                    branch_grid=None, mask_phase_lookup=None):
+                                    branch_grid=None, mask_phase_lookup=None,
+                                    support_mesh_cache=None):
     mask4d = _ensure_mask4d(mask4d)
     spacing = np.asarray(spacing, dtype=float).reshape(3)
     origin = np.asarray(origin, dtype=float).reshape(3)
@@ -436,6 +471,8 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
             raise ValueError(f"relative_pressure_array must be XYZT, got {relative_pressure_array.shape}")
     if mask_phase_lookup is None:
         mask_phase_lookup = _build_mask_phase_lookup(mask4d) if needs_volume_slice else []
+    if support_mesh_cache is None and needs_volume_slice:
+        support_mesh_cache = _build_plane_support_mesh_cache(mask4d, mask_phase_lookup, spacing, origin)
     slice_cache = {}
 
     tke_mean_t = []
@@ -475,6 +512,7 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
                 branch_grid=branch_grid,
                 target_label=target_label,
                 select_connected=False,
+                support_mesh=support_mesh_cache.get(rep_t) if support_mesh_cache is not None else None,
             )
 
         if has_tke and slice_spec is not None:
@@ -564,7 +602,10 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
         surf = None if not has_wss or tidx >= len(wss_surfaces) else wss_surfaces[tidx]
         if surf is not None and getattr(surf, "n_points", 0) > 0:
             try:
-                wall = surf.slice(normal=normal, origin=np.asarray(plane.center, dtype=float))
+                wall = surf.slice(
+                    normal=normal,
+                    origin=np.asarray(plane.center, dtype=float).reshape(3) + origin,
+                )
             except Exception:
                 wall = None
             if wall is not None and getattr(wall, "n_points", 0) > 0:
@@ -612,6 +653,7 @@ def augment_plane_metrics_with_derived(plane_metrics, planes, mask4d, spacing, o
     mask4d = _ensure_mask4d(mask4d)
     shared_branch_grid = _build_branch_grid(branch_labels_3d, spacing, origin)
     mask_phase_lookup = _build_mask_phase_lookup(mask4d)
+    support_mesh_cache = _build_plane_support_mesh_cache(mask4d, mask_phase_lookup, spacing, origin)
     metrics = [dict(m) for m in plane_metrics]
     pixelwise = []
     for idx, metric in enumerate(metrics):
@@ -625,6 +667,7 @@ def augment_plane_metrics_with_derived(plane_metrics, planes, mask4d, spacing, o
             wss_surfaces=wss_surfaces,
             branch_grid=shared_branch_grid,
             mask_phase_lookup=mask_phase_lookup,
+            support_mesh_cache=support_mesh_cache,
         )
         metric.update(summary)
         payload["plane_index"] = int(idx)
@@ -728,14 +771,30 @@ def compute_wss_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
     inward_distance = resolve_wss_inward_distance(spacing, inward_distance)
     origin = np.asarray(origin, dtype=float).reshape(3)
     wss_volume = np.zeros(mask4d.shape, dtype=np.float32)
+    mask_phase_lookup = _build_mask_phase_lookup(mask4d)
+    surface_cache = {}
     surfs = []
     for showt in range(int(mask4d.shape[-1])):
         velocity = create_uniform_vector(
             flow[..., showt, 0] / 100.0, flow[..., showt, 1] / 100.0,
             flow[..., showt, 2] / 100.0, spacing, origin=origin)
-        mesh = create_uniform_grid(mask4d[..., showt] > 0, spacing, origin=origin)
-        mesh = mesh.threshold(0.1)
-        surf = _extract_surface(mesh).smooth(n_iter=int(smoothing_iteration))
+        rep_t = int(mask_phase_lookup[showt])
+        if rep_t not in surface_cache:
+            mesh = create_uniform_grid(mask4d[..., rep_t] > 0, spacing, origin=origin)
+            mesh = mesh.threshold(0.1)
+            if mesh is None or mesh.n_cells == 0:
+                surface_cache[rep_t] = None
+                surfs.append(None)
+                continue
+            surface_cache[rep_t] = _extract_surface(mesh).smooth(n_iter=int(smoothing_iteration))
+        base_surface = surface_cache[rep_t]
+        if base_surface is None:
+            surfs.append(None)
+            continue
+        # cal_wss_from_surf writes phase-specific point data, so each phase
+        # gets a cheap geometry copy while the expensive surface preparation
+        # remains shared for identical masks.
+        surf = base_surface.copy(deep=True)
         surf = cal_wss_from_surf(surf, velocity, viscosity=viscosity,
                                  inward_distance=inward_distance,
                                  parabolic_fitting=parabolic_fitting,
@@ -755,6 +814,15 @@ def compute_wss_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
         "wss_surfaces": surfs,
         "wss_volume": wss_volume,
     }
+
+
+def _periodic_central_difference(values, dt_s):
+    """Central temporal derivative with the cardiac cycle treated as periodic."""
+    arr = np.asarray(values)
+    if arr.ndim < 2 or arr.shape[-2] <= 1:
+        return np.zeros_like(arr, dtype=np.result_type(arr, np.float32))
+    dt = max(float(dt_s), 1e-12)
+    return (np.roll(arr, -1, axis=-2) - np.roll(arr, 1, axis=-2)) / (2.0 * dt)
 
 
 def _finite_percentile_abs(values, q, default=0.0):
@@ -1036,13 +1104,17 @@ def reconstruct_relative_pressure_map(pressure_gradient_array, support_mask, spa
     }
 
 
-def _points_as_voxels(points_xyz, spacing, origin, shape):
+def _points_as_voxels(points_xyz, spacing, origin, shape, coordinate_space="world"):
     pts = np.asarray(points_xyz, dtype=float).reshape(-1, 3)
     spacing = np.asarray(spacing, dtype=float).reshape(3)
     origin = np.asarray(origin, dtype=float).reshape(3)
     shape = np.asarray(shape, dtype=int).reshape(3)
     if len(pts) == 0:
         return pts, False
+    if str(coordinate_space).lower() == "local":
+        return pts / (spacing.reshape(1, 3) + 1e-12), True
+    if str(coordinate_space).lower() == "voxel":
+        return pts, True
     looks_like_voxels = (
         np.all(np.isfinite(pts))
         and np.all(pts >= -0.5)
@@ -1054,7 +1126,7 @@ def _points_as_voxels(points_xyz, spacing, origin, shape):
     return vox, False
 
 
-def _sample_volume_at_points(volume_xyz, points_xyz, spacing, origin):
+def _sample_volume_at_points(volume_xyz, points_xyz, spacing, origin, coordinate_space="world"):
     vol = np.asarray(volume_xyz, dtype=np.float32)
     pts = np.asarray(points_xyz, dtype=float).reshape(-1, 3)
     if vol.ndim != 3 or len(pts) == 0:
@@ -1062,7 +1134,7 @@ def _sample_volume_at_points(volume_xyz, points_xyz, spacing, origin):
     spacing = np.asarray(spacing, dtype=float).reshape(3)
     origin = np.asarray(origin, dtype=float).reshape(3)
     shape = np.array(vol.shape, dtype=int)
-    vox, _ = _points_as_voxels(pts, spacing, origin, shape)
+    vox, _ = _points_as_voxels(pts, spacing, origin, shape, coordinate_space=coordinate_space)
     out = np.zeros(len(pts), dtype=np.float32)
     for idx, coord in enumerate(vox):
         if np.any(coord < 0.0) or np.any(coord > (shape - 1)):
@@ -1111,18 +1183,24 @@ def compute_centerline_pressure_profiles(relative_pressure_array, centerline_pat
                 "pressure_drop_peak_Pa": 0.0,
             })
             continue
-        pts_vox, are_voxels = _points_as_voxels(pts, spacing, origin, pressure.shape[:3])
+        # Centerline paths are stored in local physical millimetres.  Convert
+        # explicitly instead of guessing from coordinate magnitudes.
+        pts_vox, _ = _points_as_voxels(
+            pts, spacing, origin, pressure.shape[:3], coordinate_space="local"
+        )
         if len(pts_vox) > 1:
             diffs = np.diff(pts_vox, axis=0)
             seg = np.linalg.norm(diffs * spacing.reshape(1, 3), axis=1)
         else:
             seg = np.zeros(0, dtype=float)
         dist = np.concatenate([[0.0], np.cumsum(seg)]) if len(pts) > 0 else np.zeros(0, dtype=float)
-        sample_pts = pts_vox if are_voxels else pts
+        sample_pts = pts_vox
         samples_t = []
         drop_t = []
         for tidx in range(nt):
-            vals = _sample_volume_at_points(pressure[..., tidx], sample_pts, spacing, origin)
+            vals = _sample_volume_at_points(
+                pressure[..., tidx], sample_pts, spacing, origin, coordinate_space="voxel"
+            )
             samples_t.append(vals.astype(np.float32).tolist())
             drop_t.append(float(vals[0] - vals[-1]) if len(vals) else 0.0)
         profiles.append({
@@ -1184,41 +1262,38 @@ def compute_pressure_gradient_metrics(mask4d, flow, spacing, rr, rho=1060.0, vis
         velocity = velocity * mask_float[..., None]
 
     dx, dy, dz = [float(max(s, 1e-12)) for s in spacing_m]
-    vc = velocity[1:-1, 1:-1, 1:-1, 1:-1, :]
-    du_dt = (
-        velocity[1:-1, 1:-1, 1:-1, 2:, :]
-        - velocity[1:-1, 1:-1, 1:-1, :-2, :]
-    ) / (2.0 * max(dt_s, 1e-12))
+    vc = velocity[1:-1, 1:-1, 1:-1, :, :]
+    du_dt = _periodic_central_difference(velocity, dt_s)[1:-1, 1:-1, 1:-1, :, :]
 
     conv = np.zeros_like(vc, dtype=np.float32)
     lap = np.zeros_like(vc, dtype=np.float32)
     for comp in range(3):
         du_dx = (
-            velocity[2:, 1:-1, 1:-1, 1:-1, comp]
-            - velocity[:-2, 1:-1, 1:-1, 1:-1, comp]
+            velocity[2:, 1:-1, 1:-1, :, comp]
+            - velocity[:-2, 1:-1, 1:-1, :, comp]
         ) / (2.0 * dx)
         du_dy = (
-            velocity[1:-1, 2:, 1:-1, 1:-1, comp]
-            - velocity[1:-1, :-2, 1:-1, 1:-1, comp]
+            velocity[1:-1, 2:, 1:-1, :, comp]
+            - velocity[1:-1, :-2, 1:-1, :, comp]
         ) / (2.0 * dy)
         du_dz = (
-            velocity[1:-1, 1:-1, 2:, 1:-1, comp]
-            - velocity[1:-1, 1:-1, :-2, 1:-1, comp]
+            velocity[1:-1, 1:-1, 2:, :, comp]
+            - velocity[1:-1, 1:-1, :-2, :, comp]
         ) / (2.0 * dz)
         d2u_dx2 = (
-            velocity[2:, 1:-1, 1:-1, 1:-1, comp]
-            - 2.0 * velocity[1:-1, 1:-1, 1:-1, 1:-1, comp]
-            + velocity[:-2, 1:-1, 1:-1, 1:-1, comp]
+            velocity[2:, 1:-1, 1:-1, :, comp]
+            - 2.0 * velocity[1:-1, 1:-1, 1:-1, :, comp]
+            + velocity[:-2, 1:-1, 1:-1, :, comp]
         ) / (dx * dx)
         d2u_dy2 = (
-            velocity[1:-1, 2:, 1:-1, 1:-1, comp]
-            - 2.0 * velocity[1:-1, 1:-1, 1:-1, 1:-1, comp]
-            + velocity[1:-1, :-2, 1:-1, 1:-1, comp]
+            velocity[1:-1, 2:, 1:-1, :, comp]
+            - 2.0 * velocity[1:-1, 1:-1, 1:-1, :, comp]
+            + velocity[1:-1, :-2, 1:-1, :, comp]
         ) / (dy * dy)
         d2u_dz2 = (
-            velocity[1:-1, 1:-1, 2:, 1:-1, comp]
-            - 2.0 * velocity[1:-1, 1:-1, 1:-1, 1:-1, comp]
-            + velocity[1:-1, 1:-1, :-2, 1:-1, comp]
+            velocity[1:-1, 1:-1, 2:, :, comp]
+            - 2.0 * velocity[1:-1, 1:-1, 1:-1, :, comp]
+            + velocity[1:-1, 1:-1, :-2, :, comp]
         ) / (dz * dz)
         if use_convective_acceleration:
             conv[..., comp] = vc[..., 0] * du_dx + vc[..., 1] * du_dy + vc[..., 2] * du_dz
@@ -1236,10 +1311,10 @@ def compute_pressure_gradient_metrics(mask4d, flow, spacing, rr, rho=1060.0, vis
                 iterations=erosion_iters,
                 border_value=0,
             )
-    support_inner = support_work[1:-1, 1:-1, 1:-1, 1:-1]
+    support_inner = support_work[1:-1, 1:-1, 1:-1, :]
 
     grad_work = np.zeros(work_flow.shape, dtype=np.float32)
-    grad_work[1:-1, 1:-1, 1:-1, 1:-1, :] = grad_inner.astype(np.float32)
+    grad_work[1:-1, 1:-1, 1:-1, :, :] = grad_inner.astype(np.float32)
     grad_work *= support_work.astype(np.float32)[..., None]
     grad_mag_work = np.sqrt(np.sum(np.square(grad_work, dtype=np.float32), axis=-1)).astype(np.float32)
 
@@ -1279,6 +1354,7 @@ def compute_pressure_gradient_metrics(mask4d, flow, spacing, rr, rho=1060.0, vis
         'pressure_gradient_magnitude': grad_mag,
         'pressure_gradient_peak': grad_peak,
         'pressure_gradient_dt_s': float(dt_s),
+        'pressure_gradient_temporal_scheme': 'periodic_central_difference',
         'pressure_gradient_support_mask': support_mask.astype(np.uint8),
         'pressure_gradient_display_clim': (0.0, display_upper),
         'relative_pressure_array': relative_pressure,
@@ -1363,6 +1439,9 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
         "pressure_gradient_magnitude": None if pressure_gradient is None else pressure_gradient["pressure_gradient_magnitude"],
         "pressure_gradient_peak": None if pressure_gradient is None else pressure_gradient["pressure_gradient_peak"],
         "pressure_gradient_dt_s": None if pressure_gradient is None else pressure_gradient["pressure_gradient_dt_s"],
+        "pressure_gradient_temporal_scheme": (
+            None if pressure_gradient is None else pressure_gradient["pressure_gradient_temporal_scheme"]
+        ),
         "pressure_gradient_support_mask": None if pressure_gradient is None else pressure_gradient["pressure_gradient_support_mask"],
         "pressure_gradient_display_clim": None if pressure_gradient is None else pressure_gradient["pressure_gradient_display_clim"],
         "relative_pressure_array": None if pressure_gradient is None else pressure_gradient["relative_pressure_array"],
@@ -1398,7 +1477,8 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
 
 def _compute_single_plane_metric(args):
     (flow, mask, spacing, origin, plane, Nt, RR, branch_grid, target_label,
-     path_info, path_points, mask_template, mask_phase_lookup) = args
+     path_info, path_points, mask_template, mask_phase_lookup,
+     support_mesh_cache) = args
     normal = np.asarray(plane.normal, dtype=float).reshape(3)
     normal = normal / (np.linalg.norm(normal) + 1e-12)
 
@@ -1431,6 +1511,7 @@ def _compute_single_plane_metric(args):
             branch_grid=branch_grid,
             target_label=target_label,
             select_connected=True,
+            support_mesh=support_mesh_cache.get(rep_t) if support_mesh_cache is not None else None,
         )
         if slice_spec is None:
             flowrate.append(0.0); flowrate_fwd.append(0.0); flowrate_rev.append(0.0)
@@ -1555,6 +1636,7 @@ def compute_plane_metrics_multithread(flow_xyzt3, segmask_binary_4d, spacing, or
         mask = np.repeat(mask, flow.shape[3], axis=3)
     Nt = int(flow.shape[3])
     mask_phase_lookup = _build_mask_phase_lookup(mask)
+    support_mesh_cache = _build_plane_support_mesh_cache(mask, mask_phase_lookup, spacing, origin)
     mask_static = all(int(rep_t) == 0 for rep_t in mask_phase_lookup)
     mask_template = mask[..., 0] if mask_static else None
 
@@ -1575,21 +1657,26 @@ def compute_plane_metrics_multithread(flow_xyzt3, segmask_binary_4d, spacing, or
         if branch_labels_3d is not None:
             target_label = int(getattr(plane, "label", 0) or 0)
             if target_label <= 0:
-                ijk = np.rint((np.asarray(plane.center, dtype=float).reshape(3) - origin) / (spacing + 1e-12)).astype(int)
-                ijk = np.clip(ijk, 0, np.array(np.asarray(branch_labels_3d).shape) - 1)
-                target_label = int(np.asarray(branch_labels_3d)[ijk[0], ijk[1], ijk[2]])
+                target_label = _target_label_for_plane(plane, branch_labels_3d, spacing, origin)
         pp = None
         if paths_lookup is not None:
             pi = int(getattr(plane, "path_index", -1))
             if 0 <= pi < len(paths_lookup):
                 pp = paths_lookup[pi]
         args_list.append((flow, mask, spacing, origin, plane, Nt, RR,
-                          branch_grid, target_label, path_info, pp, mask_template, mask_phase_lookup))
+                          branch_grid, target_label, path_info, pp, mask_template,
+                          mask_phase_lookup, support_mesh_cache))
     if max_workers is None:
         import os as _os
-        max_workers = min(len(planes), max(1, _os.cpu_count() or 4))
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        results = list(pool.map(_compute_single_plane_metric, args_list))
+        # Shared VTK support geometry makes small and medium plane sets faster
+        # without thread scheduling.  Reserve parallel slicing for unusually
+        # large sets and cap it to avoid oversubscribing VTK/BLAS workers.
+        max_workers = 1 if len(planes) < 128 else min(len(planes), 8, max(1, _os.cpu_count() or 4))
+    if int(max_workers) <= 1:
+        results = [_compute_single_plane_metric(args) for args in args_list]
+    else:
+        with ThreadPoolExecutor(max_workers=int(max_workers)) as pool:
+            results = list(pool.map(_compute_single_plane_metric, args_list))
     results, qc = apply_internal_consistency_to_metrics(results, path_info=path_info, forks=forks)
     for plane_index, metric in enumerate(results):
         if isinstance(metric, dict):

@@ -131,18 +131,12 @@ def _plane_source_label_value(ws, plane, label_volume=None):
         label_volume = _segmentation_labels_3d(ws)
     if label_volume is not None:
         resolution = np.asarray(getattr(ws, "resolution", [1.0, 1.0, 1.0]), dtype=float).reshape(3)
-        origin = np.asarray(getattr(ws, "origin", [0.0, 0.0, 0.0]), dtype=float).reshape(3)
         center = np.asarray(getattr(plane, "center", [0.0, 0.0, 0.0]), dtype=float).reshape(3)
-        candidate_points = [center]
-        shifted = center - origin
-        if not np.allclose(shifted, center):
-            candidate_points.append(shifted)
         for radius in (0, 1, 2):
-            for point in candidate_points:
-                ijk = np.rint(point / (resolution + 1e-12)).astype(int)
-                label_value = _sample_label_neighborhood(label_volume, ijk, group_labels, radius)
-                if label_value > 0:
-                    return int(label_value)
+            ijk = np.rint(center / (resolution + 1e-12)).astype(int)
+            label_value = _sample_label_neighborhood(label_volume, ijk, group_labels, radius)
+            if label_value > 0:
+                return int(label_value)
     if len(group_labels) == 1:
         return int(group_labels[0])
     plane_label = int(getattr(plane, "label", 0) or 0)

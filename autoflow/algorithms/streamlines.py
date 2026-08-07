@@ -159,7 +159,9 @@ def _plane_seeds(mask_3d, plane, spacing, origin, seed_ratio, min_seeds,
     if branch_labels_3d is not None:
         target_label = int(getattr(plane, 'label', 0) or 0)
         if target_label <= 0:
-            ijk = np.rint((np.asarray(plane.center, dtype=float) - np.asarray(origin, dtype=float).reshape(3)) / (np.asarray(spacing, dtype=float).reshape(3) + 1e-12)).astype(int)
+            # PlaneData.center is local physical space; do not subtract the
+            # world origin when converting it to an array index.
+            ijk = np.rint(np.asarray(plane.center, dtype=float) / (np.asarray(spacing, dtype=float).reshape(3) + 1e-12)).astype(int)
             ijk = np.clip(ijk, 0, np.array(np.asarray(branch_labels_3d).shape) - 1)
             target_label = int(np.asarray(branch_labels_3d)[ijk[0], ijk[1], ijk[2]])
     pg = extract_plane_cross_section(mask_3d, plane, spacing, origin, branch_grid=branch_grid, target_label=target_label)

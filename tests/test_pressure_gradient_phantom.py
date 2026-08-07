@@ -4,13 +4,43 @@ import tempfile
 
 import h5py
 import numpy as np
+import pytest
 
 from autoflow import AutoFlowConfig, run_batch
+from autoflow.algorithms.metrics import _periodic_central_difference, compute_centerline_pressure_profiles
 
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 REL_TOL = 0.05
 PLANE_SPACING_MM = 15.0
+
+
+def test_pressure_temporal_derivative_wraps_first_and_last_phases():
+    phase = np.arange(8, dtype=np.float32)
+    waveform = np.sin(2.0 * np.pi * phase / 8.0)
+    values = waveform.reshape(1, 1, 1, 8, 1)
+    derivative = _periodic_central_difference(values, 0.1)
+    expected = (np.roll(waveform, -1) - np.roll(waveform, 1)) / 0.2
+
+    assert derivative.reshape(-1) == pytest.approx(expected)
+    assert abs(float(derivative[0, 0, 0, 0, 0])) > 0.0
+    assert abs(float(derivative[0, 0, 0, -1, 0])) > 0.0
+
+
+def test_centerline_pressure_sampling_uses_local_coordinates_with_nonzero_origin():
+    pressure = np.zeros((5, 3, 3, 2), dtype=np.float32)
+    pressure[:] = np.arange(5, dtype=np.float32).reshape(5, 1, 1, 1)
+    path_local = np.array([[0.0, 1.0, 1.0], [4.0, 1.0, 1.0]], dtype=float)
+
+    at_zero = compute_centerline_pressure_profiles(
+        pressure, [path_local], (1.0, 1.0, 1.0), (0.0, 0.0, 0.0)
+    )
+    shifted = compute_centerline_pressure_profiles(
+        pressure, [path_local], (1.0, 1.0, 1.0), (100.0, 200.0, 300.0)
+    )
+
+    assert shifted == at_zero
+    assert shifted[0]["relative_pressure_Pa_t"][0] == pytest.approx([0.0, 4.0])
 
 
 def _relative_error(measured: float, truth: float) -> float:
@@ -95,6 +125,7 @@ def test_phantom_p_plane_metrics_include_mean_velocity_error_and_valid_distance_
     assert len(plane_positions) == len(metrics)
     assert len(metrics) >= 1
     assert summary["pressure_method"] == "least_squares"
+    assert summary["pressure_gradient_temporal_scheme"] == "periodic_central_difference"
     assert "pwv_h5_file" in summary
     assert "pwv_json_file" in summary
 
@@ -150,7 +181,7 @@ def test_phantom_p_plane_metrics_include_mean_velocity_error_and_valid_distance_
                 valid_metrics.append(metric)
 
     assert valid_metrics
-    assert len(valid_metrics) < len(metrics)
+    assert len(valid_metrics) == len(metrics)
     assert _mean_relative_error(flow_errors) < REL_TOL
     assert _mean_relative_error(meanv_errors) < REL_TOL
     for metric in valid_metrics:

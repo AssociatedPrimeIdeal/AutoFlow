@@ -13,8 +13,9 @@ from autoflow.algorithms.dicom import collect_input_cases
 from autoflow.algorithms.segmentation import default_nnunet_model_folder
 from autoflow.algorithms.pwv import compute_cross_correlation_delay_ms, detect_waveform_foot_time_ms
 from autoflow.algorithms.preprocess import filter_connected_components
+from autoflow.algorithms.metrics import compute_plane_metrics, compute_wss_metrics
 from autoflow.algorithms.segmentation import generate_nnunet_auto_segmentation, save_segmentation_to_source_h5
-from autoflow.algorithms.streamlines import automatic_streamline_clim, generate_streamlines_at_t
+from autoflow.algorithms.streamlines import automatic_streamline_clim, generate_streamlines_at_t, _plane_seeds
 from autoflow.config import bundle_to_autoflow_kwargs
 from autoflow.core.pipeline import PipelineEngine
 from autoflow.core.models import PlaneData, SkeletonParams, StepId, Workspace
@@ -27,6 +28,113 @@ DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 PHANTOM_CASES = ("phantom_S", "phantom_U", "phantom_Y")
 REL_TOL = 0.05
 PLANE_SPACING_MM = 15.0
+
+
+def test_nonzero_origin_preserves_plane_metrics_and_plane_seeds():
+    mask = np.zeros((12, 12, 12, 4), dtype=bool)
+    mask[2:10, 2:10, 2:10, :] = True
+    flow = np.zeros(mask.shape + (3,), dtype=np.float32)
+    flow[..., 0] = 10.0
+    plane = PlaneData(
+        center=np.array([6.0, 6.0, 6.0], dtype=float),
+        normal=np.array([1.0, 0.0, 0.0], dtype=float),
+    )
+
+    at_zero = compute_plane_metrics(flow, mask, (1.0, 1.0, 1.0), (0.0, 0.0, 0.0), [plane])[0]
+    shifted = compute_plane_metrics(flow, mask, (1.0, 1.0, 1.0), (100.0, 200.0, 300.0), [plane])[0]
+    assert shifted["area_mm2"] == pytest.approx(at_zero["area_mm2"])
+    assert shifted["flowrate_mL_s"] == pytest.approx(at_zero["flowrate_mL_s"])
+    assert all(value > 0.0 for value in shifted["area_mm2"])
+
+    seeds = _plane_seeds(
+        mask[..., 0], plane, (1.0, 1.0, 1.0), (100.0, 200.0, 300.0),
+        seed_ratio=1.0, min_seeds=1, rng_seed=0,
+    )
+    assert seeds is not None and len(seeds) > 0
+    assert np.all(np.min(seeds, axis=0) >= np.array([100.0, 200.0, 300.0]))
+
+
+def test_workspace_snapshot_restores_nonzero_origin():
+    workspace = Workspace()
+    workspace.origin = np.array([10.0, 20.0, 30.0], dtype=float)
+    restored = Workspace()
+    restored.restore_dict(workspace.snapshot_dict())
+    assert np.allclose(restored.origin, workspace.origin)
+
+
+def test_static_masks_reuse_plane_and_wss_geometry(monkeypatch):
+    import autoflow.algorithms.metrics as metrics_module
+
+    mask = np.zeros((8, 8, 8, 3), dtype=bool)
+    mask[1:7, 1:7, 1:7, :] = True
+    flow = np.zeros(mask.shape + (3,), dtype=np.float32)
+    flow[..., 0] = 10.0
+    planes = [
+        PlaneData(center=np.array([x, 4.0, 4.0]), normal=np.array([1.0, 0.0, 0.0]))
+        for x in (2.0, 3.0, 4.0, 5.0)
+    ]
+
+    support_calls = 0
+    original_support = metrics_module._build_plane_support_mesh
+
+    def counting_support(*args, **kwargs):
+        nonlocal support_calls
+        support_calls += 1
+        return original_support(*args, **kwargs)
+
+    monkeypatch.setattr(metrics_module, "_build_plane_support_mesh", counting_support)
+    compute_plane_metrics(flow, mask, (1.0, 1.0, 1.0), (0.0, 0.0, 0.0), planes)
+    assert support_calls == 1
+
+    surface_calls = 0
+    original_extract_surface = metrics_module._extract_surface
+
+    def counting_surface(*args, **kwargs):
+        nonlocal surface_calls
+        surface_calls += 1
+        return original_extract_surface(*args, **kwargs)
+
+    monkeypatch.setattr(metrics_module, "_extract_surface", counting_surface)
+    result = compute_wss_metrics(
+        mask, flow, (1.0, 1.0, 1.0), smoothing_iteration=0,
+    )
+    assert surface_calls == 1
+    assert len(result["wss_surfaces"]) == mask.shape[3]
+
+
+def test_derived_cache_signature_invalidates_changed_wss_parameters(monkeypatch):
+    import autoflow.core.pipeline as pipeline_module
+
+    workspace = Workspace()
+    workspace.flow_raw = np.zeros((3, 3, 3, 2, 3), dtype=np.float32)
+    workspace.segmask_raw = np.ones((3, 3, 3, 2), dtype=np.int16)
+    workspace.segmask_binary = np.ones((3, 3, 3, 2), dtype=bool)
+    engine = PipelineEngine()
+    monkeypatch.setattr(engine, "preprocess", lambda _workspace: False)
+    calls = []
+
+    def fake_compute_derived_metrics(**kwargs):
+        calls.append(float(kwargs["wss_viscosity"]))
+        return {
+            "wss_surfaces": [object(), object()],
+            "wss_volume": np.full(workspace.segmask_binary.shape, calls[-1], dtype=np.float32),
+            "pixelwise_export": {},
+        }
+
+    monkeypatch.setattr(pipeline_module, "compute_derived_metrics", fake_compute_derived_metrics)
+    engine._ensure_derived_metrics(
+        workspace, compute_wss=True, compute_tke=False, compute_pressure_gradient=False,
+    )
+    engine._ensure_derived_metrics(
+        workspace, compute_wss=True, compute_tke=False, compute_pressure_gradient=False,
+    )
+    workspace.derived_params.wss_viscosity = 5.0
+    engine._ensure_derived_metrics(
+        workspace, compute_wss=True, compute_tke=False, compute_pressure_gradient=False,
+    )
+
+    assert calls == [4.0, 5.0]
+    assert float(workspace.derived.wss_volume[0, 0, 0, 0]) == pytest.approx(5.0)
 
 
 def test_streamline_auto_clim_uses_segmented_velocity_across_time():

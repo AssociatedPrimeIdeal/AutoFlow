@@ -749,6 +749,8 @@ def process_single(
         "pixelwise_export": {k: list(np.asarray(v).shape) for k, v in pixelwise_result.items()} if pixelwise_result else {},
         "centerline_pressure_profiles": list(ws.derived.centerline_pressure_profiles or []),
         "pressure_method": str(getattr(ws.derived_params, "pressure_method", "least_squares") or "least_squares"),
+        "pressure_gradient_dt_s": ws.derived.pressure_gradient_dt_s,
+        "pressure_gradient_temporal_scheme": str(ws.derived.pressure_gradient_temporal_scheme or ""),
         "plane_pixelwise_file": ws.derived.plane_pixelwise_file,
     }
     summary_path = os.path.join(out_dir, "summary.json")

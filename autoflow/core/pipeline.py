@@ -1,5 +1,6 @@
 import json
 import os
+import hashlib
 import numpy as np
 
 from .models import StepId, ObjectKind, GraphData
@@ -19,6 +20,31 @@ from ..algorithms import (
     segmentation_timestamp,
 )
 from ..plane_io import build_plane_records, save_planes_h5, save_planes_json, save_pwv_h5
+
+
+_DERIVED_ALGORITHM_VERSIONS = {
+    "wss": "wss-geometry-cache-v1",
+    "tke": "tke-v1",
+    "pressure": "pressure-periodic-time-v1",
+}
+
+
+def _array_fingerprint(value):
+    if value is None:
+        return None
+    arr = np.asarray(value)
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(str(arr.dtype).encode("ascii"))
+    digest.update(json.dumps(list(arr.shape)).encode("ascii"))
+    if arr.size:
+        contiguous = np.ascontiguousarray(arr)
+        digest.update(memoryview(contiguous).cast("B"))
+    return digest.hexdigest()
+
+
+def _payload_fingerprint(payload):
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return hashlib.blake2b(encoded, digest_size=16).hexdigest()
 
 
 class StepResult:
@@ -315,6 +341,8 @@ class PipelineEngine:
         ws.derived.pressure_gradient_array = None
         ws.derived.pressure_gradient_magnitude = None
         ws.derived.pressure_gradient_peak = None
+        ws.derived.pressure_gradient_dt_s = None
+        ws.derived.pressure_gradient_temporal_scheme = ""
         ws.derived.pressure_gradient_support_mask = None
         ws.derived.pressure_gradient_display_clim = None
         ws.derived.relative_pressure_array = None
@@ -330,6 +358,7 @@ class PipelineEngine:
         ws.derived.pwv_file = ""
         ws.derived.pwv_json_file = ""
         ws.derived.pwv_h5_file = ""
+        ws.derived.artifact_signatures = {}
         ws.data_loaded = True
         ws._preprocess_signature = None
 
@@ -655,7 +684,89 @@ class PipelineEngine:
         ws.pipeline.mark_done(StepId.EDIT_GRAPH, skipped=True)
         return StepResult(StepId.EDIT_GRAPH, True, True, "Graph edit")
 
-    
+    def _derived_artifact_signatures(self, ws):
+        dp = ws.derived_params
+        paths = ws.centerline_paths_smooth if len(ws.centerline_paths_smooth) > 0 else ws.centerline_paths
+        common = {
+            "flow": _array_fingerprint(ws.flow_raw),
+            "mask": _array_fingerprint(ws.segmask_binary),
+            "spacing": np.asarray(ws.resolution, dtype=float).reshape(3).tolist(),
+            "origin": np.asarray(ws.origin, dtype=float).reshape(3).tolist(),
+        }
+        return {
+            "wss": _payload_fingerprint({
+                **common,
+                "algorithm": _DERIVED_ALGORITHM_VERSIONS["wss"],
+                "params": {
+                    "smoothing_iteration": int(dp.wss_smoothing_iteration),
+                    "viscosity": float(dp.wss_viscosity),
+                    "inward_distance": None if dp.wss_inward_distance is None else float(dp.wss_inward_distance),
+                    "parabolic_fitting": bool(dp.wss_parabolic_fitting),
+                    "no_slip_condition": bool(dp.wss_no_slip_condition),
+                },
+            }),
+            "tke": _payload_fingerprint({
+                "mask": common["mask"],
+                "spacing": common["spacing"],
+                "origin": common["origin"],
+                "source_tke": _array_fingerprint(ws.source_tke_array),
+                "source_sigma": _array_fingerprint(ws.source_sigma),
+                "algorithm": _DERIVED_ALGORITHM_VERSIONS["tke"],
+                "rho": float(dp.tke_rho),
+            }),
+            "pressure": _payload_fingerprint({
+                **common,
+                "algorithm": _DERIVED_ALGORITHM_VERSIONS["pressure"],
+                "rr_ms": float(ws.rr),
+                "centerline_paths": [_array_fingerprint(path) for path in paths],
+                "params": {
+                    "rho": float(dp.pressure_gradient_rho),
+                    "viscosity": float(dp.pressure_gradient_viscosity),
+                    "smoothing_sigma": float(dp.pressure_gradient_smoothing_sigma),
+                    "support_erosion_iters": int(dp.pressure_gradient_support_erosion_iters),
+                    "use_convective_acceleration": bool(dp.pressure_gradient_use_convective_acceleration),
+                    "method": str(dp.pressure_method),
+                },
+            }),
+        }
+
+    @staticmethod
+    def _drop_stale_pixelwise_family(pixelwise, family):
+        keys = {
+            "wss": {"wss"},
+            "tke": {"tke", "tke_time"},
+            "pressure": {
+                "pressure_gradient",
+                "pressure_gradient_mag",
+                "pressure_gradient_peak",
+                "pressure_gradient_support_mask",
+                "relative_pressure",
+                "relative_pressure_peak",
+            },
+        }[family]
+        for key in keys:
+            pixelwise.pop(key, None)
+
+    @staticmethod
+    def _derived_artifact_validity(ws, signatures):
+        stored = dict(ws.derived.artifact_signatures or {})
+        return {
+            "wss": (
+                ws.derived.wss_volume is not None
+                and np.size(ws.derived.wss_volume) > 0
+                and stored.get("wss") == signatures["wss"]
+            ),
+            "tke": (
+                (ws.derived.tke_array is not None or ws.derived.tke_volume is not None)
+                and stored.get("tke") == signatures["tke"]
+            ),
+            "pressure": (
+                ws.derived.pressure_gradient_array is not None
+                and np.size(ws.derived.pressure_gradient_array) > 0
+                and stored.get("pressure") == signatures["pressure"]
+            ),
+        }
+
     def _ensure_derived_metrics(
         self,
         ws,
@@ -665,13 +776,22 @@ class PipelineEngine:
         compute_tke=True,
         compute_pressure_gradient=True,
     ):
-        has_wss = ws.derived.wss_volume is not None and np.size(ws.derived.wss_volume) > 0
-        has_pg = ws.derived.pressure_gradient_array is not None and np.size(ws.derived.pressure_gradient_array) > 0
-        has_tke = ws.derived.tke_array is not None or ws.derived.tke_volume is not None
+        self.preprocess(ws)
+        signatures = self._derived_artifact_signatures(ws)
+        validity = self._derived_artifact_validity(ws, signatures)
+        has_wss = validity["wss"]
+        has_pg = validity["pressure"]
+        has_tke = validity["tke"]
         source_tke = ws.source_tke_array
         source_sigma = ws.source_sigma if ws.input_state.capabilities.has_complex_source else None
         request_tke = bool(compute_tke and (source_tke is not None or source_sigma is not None))
         pixelwise = dict(ws.derived.pixelwise_export or {})
+        if compute_wss and not has_wss:
+            self._drop_stale_pixelwise_family(pixelwise, "wss")
+        if compute_pressure_gradient and not has_pg:
+            self._drop_stale_pixelwise_family(pixelwise, "pressure")
+        if request_tke and not has_tke:
+            self._drop_stale_pixelwise_family(pixelwise, "tke")
         need_wss = bool(compute_wss and (not has_wss or (save_pixelwise and "wss" not in pixelwise)))
         need_pg = bool(
             compute_pressure_gradient
@@ -682,7 +802,6 @@ class PipelineEngine:
             if refresh_scene_objects:
                 self._register_derived_scene_objects(ws)
             return ws.derived
-        self.preprocess(ws)
         dp = ws.derived_params
         result = compute_derived_metrics(
             flow=ws.flow_raw,
@@ -721,24 +840,31 @@ class PipelineEngine:
         if need_wss:
             ws.derived.wss_surfaces = result["wss_surfaces"]
             ws.derived.wss_volume = result.get("wss_volume")
+            ws.derived.artifact_signatures["wss"] = signatures["wss"]
         if need_tke:
             ws.derived.tke_volume = result["tke_volume"]
             ws.derived.tke_array = result.get("tke_array")
+            ws.derived.artifact_signatures["tke"] = signatures["tke"]
         if need_pg:
             ws.derived.pressure_gradient_array = result.get("pressure_gradient_array")
             ws.derived.pressure_gradient_magnitude = result.get("pressure_gradient_magnitude")
             ws.derived.pressure_gradient_peak = result.get("pressure_gradient_peak")
+            ws.derived.pressure_gradient_dt_s = result.get("pressure_gradient_dt_s")
+            ws.derived.pressure_gradient_temporal_scheme = str(
+                result.get("pressure_gradient_temporal_scheme", "") or ""
+            )
             ws.derived.pressure_gradient_support_mask = result.get("pressure_gradient_support_mask")
             ws.derived.pressure_gradient_display_clim = result.get("pressure_gradient_display_clim")
             ws.derived.relative_pressure_array = result.get("relative_pressure_array")
             ws.derived.relative_pressure_peak = result.get("relative_pressure_peak")
             ws.derived.relative_pressure_display_clim = result.get("relative_pressure_display_clim")
             ws.derived.centerline_pressure_profiles = list(result.get("centerline_pressure_profiles", []) or [])
+            ws.derived.artifact_signatures["pressure"] = signatures["pressure"]
         ws.derived.streamlines = []
         result_pixelwise = dict(result.get("pixelwise_export", {}) or {})
         if result_pixelwise:
             pixelwise.update(result_pixelwise)
-            ws.derived.pixelwise_export = pixelwise
+        ws.derived.pixelwise_export = pixelwise
         if refresh_scene_objects:
             self._register_derived_scene_objects(ws)
         return ws.derived
@@ -769,6 +895,11 @@ class PipelineEngine:
                 compute_tke=compute_tke,
                 compute_pressure_gradient=compute_pressure_gradient,
             )
+        derived_validity = {"wss": False, "tke": False, "pressure": False}
+        if include_derived:
+            signatures = self._derived_artifact_signatures(ws)
+            derived_validity = self._derived_artifact_validity(ws, signatures)
+            include_derived = any(derived_validity.values())
         # Prefer the smoothed centerlines (better local tangents) but fall back
         # to the raw ordered ones if the smoothing step hasn't been run yet.
         paths_for_tangent = ws.centerline_paths_smooth if len(ws.centerline_paths_smooth) > 0 else ws.centerline_paths
@@ -788,10 +919,14 @@ class PipelineEngine:
             metrics, plane_pixelwise = augment_plane_metrics_with_derived(
                 metrics, ws.planes, ws.segmask_binary, ws.resolution, ws.origin,
                 branch_labels_3d=ws.branch_labels,
-                tke_array=ws.derived.tke_array,
-                pressure_gradient_array=ws.derived.pressure_gradient_array,
-                relative_pressure_array=ws.derived.relative_pressure_array,
-                wss_surfaces=ws.derived.wss_surfaces,
+                tke_array=ws.derived.tke_array if derived_validity["tke"] else None,
+                pressure_gradient_array=(
+                    ws.derived.pressure_gradient_array if derived_validity["pressure"] else None
+                ),
+                relative_pressure_array=(
+                    ws.derived.relative_pressure_array if derived_validity["pressure"] else None
+                ),
+                wss_surfaces=ws.derived.wss_surfaces if derived_validity["wss"] else None,
             )
         else:
             metrics = [dict(metric) for metric in metrics]
