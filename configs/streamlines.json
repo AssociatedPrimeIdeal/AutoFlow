@@ -5,7 +5,6 @@
   "terminal_speed": 0.01,
   "rng_seed": 0,
   "tube_radius": 0.25,
-  "pathline_color": "deepskyblue",
   "render": {
     "clim": null,
     "show_scalar_bar": true,

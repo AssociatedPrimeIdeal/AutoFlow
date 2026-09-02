@@ -235,7 +235,7 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
     "loader": {
         "background_phase_correction": {
             "enabled": False,
-            "method": "msac",
+            "method": "wrls_arto",
             "corr_fit_order": 3,
             "threshold": 0.1,
             "wrls_lambda": 5.0,
@@ -251,9 +251,21 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
             "dual_venc_ratio1": 0.0,
             "dual_venc_ratio2": 0.0,
             "force_recompute": False,
+            "write_cache": True,
         },
         "dicom_parameter_overrides": {},
         "dicom_read_workers": 1,
+        "ignore_embedded_segmentation": False,
+    },
+    "phase_unwrapping": {
+        "mask_source": "segmentation",
+        "device": "auto",
+        "tfc": True,
+        "lap4d_ts": 2.0,
+        "nprs_upsampling_factor": 2,
+        "nprs_pi_unwrap": True,
+        "nprs_auto_crop": True,
+        "write_output": True,
     },
     "skeleton": {
         "remove_small_cc": True,
@@ -277,13 +289,17 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "label_groups": copy.deepcopy(DEFAULT_SKELETON_LABEL_GROUPS),
     },
     "planes": {
-        "plane_mode": "count",
-        "plane_count": 1,
+        "plane_mode": "fixed_step",
+        "plane_count": 3,
         "cross_section_distance": 5.0,
-        "start_distance": 5.0,
+        "start_distance": 0.0,
         "end_distance": 0.0,
-        "anchor": "end",
+        "anchor": "center",
         "anchor_offset_mm": 5.0,
+        "direction": "both",
+        "spacing_mode": "fraction",
+        "spacing_ratio": 0.25,
+        "segmentation_filter": True,
         "smoothing_window": 15,
         "smoothing_polyorder": 2,
         "inter_time": 10,
@@ -296,12 +312,24 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "terminal_speed": 0.01,
         "rng_seed": 0,
         "tube_radius": 0.25,
-        "pathline_color": "deepskyblue",
         "render": {
             "clim": None,
             "show_scalar_bar": True,
             "bar_cfg": dict(DEFAULT_STREAMLINE_BAR_CFG),
         },
+    },
+    "pathlines": {
+        "seed_ratio": 0.2,
+        "max_steps": 200,
+        "min_seeds": 50,
+        "seed_mode": "fixed",
+        "seed_count": 250,
+        "terminal_speed": 0.01,
+        "rng_seed": 0,
+        "tube_radius": 0.25,
+        "color": "deepskyblue",
+        "color_mode": "per_plane",
+        "temporal_cache_mb": 512.0,
     },
     "derived": {
     },
@@ -340,6 +368,10 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
             "bar_cfg": dict(DEFAULT_PRESSURE_GRADIENT_BAR_CFG),
         },
     },
+    "vortex": {
+        "smoothing_sigma": 0.0,
+        "support_erosion_iters": 1,
+    },
     "pwv": {
         "enabled": False,
         "groups": [],
@@ -373,6 +405,9 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "tool": "brush",
         "brush_radius": 3,
         "edit_all_timepoints": True,
+        "cleanup_4d_components": False,
+        "cleanup_4d_mode": "absolute",
+        "cleanup_4d_min_volume_mm3": 50.0,
         "mode": "input",
         "input_source": "original",
         "import_path": "",
@@ -386,9 +421,10 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "threshold_min_component_volume_mm3": 0.0,
         "threshold_closing": True,
         "threshold_opening": False,
-        "auto_backend": "nnUNet",
-        "auto_model": "",
+        "auto_backend": "nnUNet4D",
+        "auto_model": "/nas-data2/ryy/CMR4DFlow2026/Segdata/scripts/nnunet/4D/run_7020_4d_full_ssd_20260824.sh",
         "auto_checkpoint": "checkpoint_final.pth",
+        "auto_folds": "single",
         "auto_device": "auto",
         "auto_label_map": "",
     },
@@ -465,7 +501,60 @@ def load_config_module(module_name: str, config_dir: Optional[str] = None) -> Di
 
 
 def load_config_bundle(config_dir: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
-    return {name: load_config_module(name, config_dir=config_dir) for name in CONFIG_MODULES}
+    bundle = {name: load_config_module(name, config_dir=config_dir) for name in CONFIG_MODULES}
+    # Older user config directories put pathline values in streamlines.json.
+    # Preserve those values when no dedicated pathlines.json exists yet.
+    if config_dir:
+        config_root = resolve_config_dir(config_dir, require_exists=True)
+        if not (config_root / "pathlines.json").exists():
+            legacy = bundle.get("streamlines", {})
+            pathlines = bundle.setdefault("pathlines", {})
+            legacy_map = {
+                "pathline_seed_ratio": "seed_ratio",
+                "pathline_seed_mode": "seed_mode",
+                "pathline_max_seeds": "seed_count",
+                "pathline_max_steps": "max_steps",
+                "pathline_min_seeds": "min_seeds",
+                "pathline_terminal_speed": "terminal_speed",
+                "pathline_rng_seed": "rng_seed",
+                "pathline_tube_radius": "tube_radius",
+                "pathline_color": "color",
+                "pathline_color_mode": "color_mode",
+                "pathline_temporal_cache_mb": "temporal_cache_mb",
+            }
+            for old_key, new_key in legacy_map.items():
+                if old_key in legacy:
+                    pathlines[new_key] = copy.deepcopy(legacy[old_key])
+            for old_key, new_key in (("seed_ratio", "seed_ratio"), ("max_steps", "max_steps"), ("min_seeds", "min_seeds"), ("terminal_speed", "terminal_speed"), ("rng_seed", "rng_seed"), ("tube_radius", "tube_radius")):
+                if old_key in legacy:
+                    pathlines[new_key] = copy.deepcopy(legacy[old_key])
+    return bundle
+
+
+def _pathline_model_payload(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    path_cfg = dict(config_bundle.get("pathlines", {}) or {})
+    legacy = dict(config_bundle.get("streamlines", {}) or {})
+
+    def pick(new_key, legacy_key, default):
+        if new_key in path_cfg:
+            return path_cfg[new_key]
+        if legacy_key in legacy:
+            return legacy[legacy_key]
+        return default
+
+    return {
+        "pathline_seed_ratio": pick("seed_ratio", "pathline_seed_ratio", 0.2),
+        "pathline_max_steps": pick("max_steps", "pathline_max_steps", 200),
+        "pathline_min_seeds": pick("min_seeds", "pathline_min_seeds", 50),
+        "pathline_seed_mode": pick("seed_mode", "pathline_seed_mode", "fixed"),
+        "pathline_max_seeds": pick("seed_count", "pathline_max_seeds", 250),
+        "pathline_terminal_speed": pick("terminal_speed", "pathline_terminal_speed", 0.01),
+        "pathline_rng_seed": pick("rng_seed", "pathline_rng_seed", 0),
+        "pathline_tube_radius": pick("tube_radius", "pathline_tube_radius", 0.25),
+        "pathline_color": pick("color", "pathline_color", "deepskyblue"),
+        "pathline_color_mode": pick("color_mode", "pathline_color_mode", "per_plane"),
+        "pathline_temporal_cache_mb": pick("temporal_cache_mb", "pathline_temporal_cache_mb", 512.0),
+    }
 
 
 def _coerce_render_clim(value: Any) -> Optional[tuple[float, float]]:
@@ -567,6 +656,7 @@ def resolve_render_settings(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[st
     wss_cfg = dict(config_bundle.get("wss", {}))
     tke_cfg = dict(config_bundle.get("tke", {}))
     pressure_gradient_cfg = dict(config_bundle.get("pressure_gradient", {}))
+    vortex_cfg = dict(config_bundle.get("vortex", {}))
     streamline_cfg = dict(config_bundle.get("streamlines", {}))
     colorbar_cfg = dict(config_bundle.get("colorbar", {}))
 
@@ -633,6 +723,7 @@ def _build_derived_metrics_config(config_bundle: Dict[str, Dict[str, Any]]) -> D
     wss_cfg = dict(config_bundle.get("wss", {}))
     tke_cfg = dict(config_bundle.get("tke", {}))
     pressure_gradient_cfg = dict(config_bundle.get("pressure_gradient", {}))
+    vortex_cfg = dict(config_bundle.get("vortex", {}))
     shared_viscosity = float(fluid_cfg.get("viscosity", legacy_cfg.get("viscosity", 4.0)))
     shared_rho = float(fluid_cfg.get("rho", legacy_cfg.get("rho", 1060.0)))
     return {
@@ -650,6 +741,8 @@ def _build_derived_metrics_config(config_bundle: Dict[str, Dict[str, Any]]) -> D
         "relative_pressure_layer_opacity": float(pressure_gradient_cfg.get("relative_pressure_opacity", legacy_cfg.get("relative_pressure_layer_opacity", 0.6))),
         "pressure_gradient_use_convective_acceleration": bool(pressure_gradient_cfg.get("use_convective_acceleration", legacy_cfg.get("pressure_gradient_use_convective_acceleration", True))),
         "pressure_method": str(pressure_gradient_cfg.get("method", legacy_cfg.get("pressure_method", legacy_cfg.get("pressure_gradient_method", "least_squares"))) or "least_squares"),
+        "vortex_smoothing_sigma": max(float(vortex_cfg.get("smoothing_sigma", legacy_cfg.get("vortex_smoothing_sigma", 0.0))), 0.0),
+        "vortex_support_erosion_iters": max(int(vortex_cfg.get("support_erosion_iters", legacy_cfg.get("vortex_support_erosion_iters", 1))), 0),
         "step_size": int(legacy_cfg.get("step_size", 5)),
         "tube_radius": float(legacy_cfg.get("tube_radius", 0.1)),
     }
@@ -668,6 +761,8 @@ def apply_config_bundle_to_workspace(workspace: Workspace, config_bundle: Dict[s
         if key not in labels_cfg and key in skeleton_cfg:
             labels_cfg[key] = copy.deepcopy(skeleton_cfg[key])
     workspace.loader_params = LoaderParams.from_dict(config_bundle.get("loader", {}))
+    from .case_types import PhaseUnwrappingConfig
+    workspace.phase_unwrap_params = PhaseUnwrappingConfig.from_dict(config_bundle.get("phase_unwrapping", {}))
     workspace.skeleton_params = SkeletonParams.from_dict(skeleton_cfg)
     workspace.label_params = LabelParams.from_dict(labels_cfg)
     workspace.skeleton_params.label_map = copy.deepcopy(workspace.label_params.label_map)
@@ -676,7 +771,9 @@ def apply_config_bundle_to_workspace(workspace: Workspace, config_bundle: Dict[s
     workspace.skeleton_params.single_label_browser_color = str(workspace.label_params.single_label_browser_color)
     workspace.skeleton_params.default_group_browser_color = str(workspace.label_params.default_group_browser_color)
     workspace.plane_gen_params = PlaneGenerationParams.from_dict(config_bundle.get("planes", {}))
-    workspace.streamline_params = StreamlineParams.from_dict(config_bundle.get("streamlines", {}))
+    streamline_payload = dict(config_bundle.get("streamlines", {}) or {})
+    streamline_payload.update(_pathline_model_payload(config_bundle))
+    workspace.streamline_params = StreamlineParams.from_dict(streamline_payload)
     workspace.derived_params = DerivedMetricsParams.from_dict(_build_derived_metrics_config(config_bundle))
     workspace.pwv_params = PwvParams.from_dict(config_bundle.get("pwv", {}), label_map=workspace.label_params.label_map)
     workspace.render_settings = resolve_render_settings(config_bundle)
@@ -691,12 +788,17 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
     batch_cfg = config_bundle.get("batch", {})
     loader_cfg = config_bundle.get("loader", {})
     bpc_cfg = loader_cfg.get("background_phase_correction", {})
+    unwrap_cfg = config_bundle.get("phase_unwrapping", {}) or {}
     plane_cfg = config_bundle.get("planes", {})
     skeleton_cfg = config_bundle.get("skeleton", {})
     streamline_cfg = config_bundle.get("streamlines", {})
+    pathline_cfg = _pathline_model_payload(config_bundle)
     render_settings = copy.deepcopy(resolve_render_settings(config_bundle))
     render_settings.pop("plane_render_cfg", None)
     derived_cfg = _build_derived_metrics_config(config_bundle)
+    plane_count = int(plane_cfg.get("plane_count", 1) or 1)
+    if plane_count != -1:
+        plane_count = max(1, plane_count)
     return {
         "output_dir": str(batch_cfg.get("output_dir", "./results")),
         "skip_derived": bool(batch_cfg.get("skip_derived", False)),
@@ -707,7 +809,7 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
         "use_multithread": bool(batch_cfg.get("use_multithread", True)),
         "reuse_planes": str(batch_cfg.get("reuse_planes", "")),
         "background_phase_correction": bool(bpc_cfg.get("enabled", False)),
-        "background_phase_method": str(bpc_cfg.get("method", "msac") or "msac"),
+        "background_phase_method": str(bpc_cfg.get("method", "wrls_arto") or "wrls_arto"),
         "background_phase_corr_fit_order": int(bpc_cfg.get("corr_fit_order", 3)),
         "background_phase_threshold": float(bpc_cfg.get("threshold", 0.1)),
         "background_phase_wrls_lambda": float(bpc_cfg.get("wrls_lambda", 5.0)),
@@ -723,15 +825,30 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
         "dual_venc_ratio1": float(bpc_cfg.get("dual_venc_ratio1", 0.0)),
         "dual_venc_ratio2": float(bpc_cfg.get("dual_venc_ratio2", 0.0)),
         "force_recompute_corr": bool(bpc_cfg.get("force_recompute", False)),
+        "background_phase_write_cache": bool(bpc_cfg.get("write_cache", True)),
+        "phase_unwrap_enabled": bool(unwrap_cfg.get("enabled", False)),
+        "phase_unwrap_method": str(unwrap_cfg.get("method", "none") or "none"),
+        "phase_unwrap_mask": str(unwrap_cfg.get("mask_source", "segmentation") or "segmentation"),
+        "phase_unwrap_device": str(unwrap_cfg.get("device", "auto") or "auto"),
+        "phase_unwrap_tfc": bool(unwrap_cfg.get("tfc", True)),
+        "phase_unwrap_lap4d_ts": float(unwrap_cfg.get("lap4d_ts", 2.0)),
+        "phase_unwrap_nprs_upsampling_factor": int(unwrap_cfg.get("nprs_upsampling_factor", 2)),
+        "phase_unwrap_nprs_pi_unwrap": bool(unwrap_cfg.get("nprs_pi_unwrap", True)),
+        "phase_unwrap_nprs_auto_crop": bool(unwrap_cfg.get("nprs_auto_crop", True)),
         "dicom_read_workers": int(loader_cfg.get("dicom_read_workers", 1)),
-        "plane_mode": str(plane_cfg.get("plane_mode", "count") or "count"),
-        "plane_count": int(plane_cfg.get("plane_count", 1) or 1),
+        "ignore_embedded_segmentation": bool(loader_cfg.get("ignore_embedded_segmentation", False)),
+        "plane_mode": str(plane_cfg.get("plane_mode", "fixed_step") or "fixed_step"),
+        "plane_count": plane_count,
         "cross_section_dist": float(plane_cfg.get("cross_section_distance", 5.0)),
-        "start_dist": float(plane_cfg.get("start_distance", 5.0)),
+        "start_dist": float(plane_cfg.get("start_distance", 0.0)),
         "end_dist": float(plane_cfg.get("end_distance", 0.0)),
-        "plane_anchor": str(plane_cfg.get("anchor", "end") or "end"),
+        "plane_anchor": str(plane_cfg.get("anchor", "center") or "center"),
         "plane_offset_mm": float(plane_cfg.get("anchor_offset_mm", 5.0)),
-        "use_center_plane": bool(plane_cfg.get("use_center_plane", True)),
+        "plane_direction": str(plane_cfg.get("direction", "both") or "both"),
+        "plane_spacing_mode": str(plane_cfg.get("spacing_mode", "fraction") or "fraction"),
+        "plane_spacing_ratio": float(plane_cfg.get("spacing_ratio", 0.25)),
+        "segmentation_filter": bool(plane_cfg.get("segmentation_filter", True)),
+        "use_center_plane": plane_cfg.get("use_center_plane", None),
         "remove_small_cc": bool(skeleton_cfg.get("remove_small_cc", True)),
         "min_cc_volume": float(skeleton_cfg.get("min_cc_volume_mm3", 50.0)),
         "cc_filter_mode": str(skeleton_cfg.get("cc_filter_mode", "hybrid") or "hybrid"),
@@ -742,8 +859,25 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
         "terminal_speed": float(streamline_cfg.get("terminal_speed", 0.01)),
         "rng_seed": int(streamline_cfg.get("rng_seed", 0)),
         "tube_radius": float(streamline_cfg.get("tube_radius", 0.25)),
-        "pathline_color": str(streamline_cfg.get("pathline_color", streamline_cfg.get("plane_pathline_color", "deepskyblue")) or "deepskyblue"),
+        "pathline_seed_mode": ("ratio" if str(pathline_cfg["pathline_seed_mode"] or "fixed").strip().lower() == "ratio" else "fixed"),
+        "pathline_max_seeds": max(1, int(pathline_cfg["pathline_max_seeds"])),
+        "pathline_seed_ratio": float(pathline_cfg["pathline_seed_ratio"]),
+        "pathline_max_steps": int(pathline_cfg["pathline_max_steps"]),
+        "pathline_min_seeds": int(pathline_cfg["pathline_min_seeds"]),
+        "pathline_terminal_speed": float(pathline_cfg["pathline_terminal_speed"]),
+        "pathline_rng_seed": int(pathline_cfg["pathline_rng_seed"]),
+        "pathline_tube_radius": float(pathline_cfg["pathline_tube_radius"]),
+        "pathline_color": str(pathline_cfg["pathline_color"] or "deepskyblue"),
+        "pathline_color_mode": (str(pathline_cfg["pathline_color_mode"] or "per_plane").strip().lower() if str(pathline_cfg["pathline_color_mode"] or "per_plane").strip().lower() in {"uniform", "per_plane", "per_group"} else "per_plane"),
+        "pathline_temporal_cache_mb": max(0.0, float(pathline_cfg["pathline_temporal_cache_mb"])),
         "pressure_method": str(derived_cfg.get("pressure_method", "least_squares") or "least_squares"),
         "force_recompute_seg": bool(config_bundle.get("segmentation", {}).get("force_recompute_auto_cache", False)),
+        "write_segmentation_cache": bool(config_bundle.get("segmentation", {}).get("write_auto_cache", True)),
+        "autoseg_backend": str(config_bundle.get("segmentation", {}).get("auto_backend", "nnUNet") or "nnUNet"),
+        "autoseg_model": str(config_bundle.get("segmentation", {}).get("auto_model", "") or ""),
+        "autoseg_checkpoint": str(config_bundle.get("segmentation", {}).get("auto_checkpoint", "checkpoint_final.pth") or "checkpoint_final.pth"),
+        "autoseg_folds": str(config_bundle.get("segmentation", {}).get("auto_folds", "single") or "single"),
+        "autoseg_device": str(config_bundle.get("segmentation", {}).get("auto_device", "auto") or "auto"),
+        "autoseg_label_map": str(config_bundle.get("segmentation", {}).get("auto_label_map", "") or ""),
         **copy.deepcopy(render_settings),
     }

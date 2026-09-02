@@ -245,6 +245,10 @@ def normalize_loaded_case(
     segmentation=None,
     tke_array=None,
     sigma=None,
+    correction=None,
+    correction_high=None,
+    phase_wrapped=None,
+    phase_wrapped_high=None,
     metadata=None,
     source_format="",
     source_group=None,
@@ -255,6 +259,10 @@ def normalize_loaded_case(
     seg_out = _ensure_optional_time_volume(segmentation, nt, "segmentation", np.int16)
     tke_out = _ensure_optional_time_volume(tke_array, nt, "tke_array", np.float32)
     sigma_out = _ensure_optional_sigma_time(sigma, nt)
+    correction_out = _ensure_optional_sigma_time(correction, nt)
+    correction_high_out = _ensure_optional_sigma_time(correction_high, nt)
+    phase_wrapped_out = _ensure_optional_sigma_time(phase_wrapped, nt)
+    phase_wrapped_high_out = _ensure_optional_sigma_time(phase_wrapped_high, nt)
     if capabilities is None:
         capabilities = LoaderCapabilities(
             has_segmentation=seg_out is not None,
@@ -262,6 +270,8 @@ def normalize_loaded_case(
             has_complex_source=False,
             supports_wss=False,
             supports_plane_metrics=False,
+            has_wrapped_phase=phase_wrapped_out is not None,
+            supports_phase_unwrap=phase_wrapped_out is not None,
         )
     else:
         capabilities = LoaderCapabilities(
@@ -270,8 +280,12 @@ def normalize_loaded_case(
             has_complex_source=bool(capabilities.has_complex_source),
             supports_wss=bool(capabilities.supports_wss),
             supports_plane_metrics=bool(capabilities.supports_plane_metrics),
+            has_wrapped_phase=bool(getattr(capabilities, "has_wrapped_phase", False)),
+            supports_phase_unwrap=bool(getattr(capabilities, "supports_phase_unwrap", False)),
         )
     capabilities.has_tke = bool(capabilities.has_tke or tke_out is not None)
+    capabilities.has_wrapped_phase = bool(capabilities.has_wrapped_phase or phase_wrapped_out is not None)
+    capabilities.supports_phase_unwrap = bool(capabilities.supports_phase_unwrap or phase_wrapped_out is not None)
 
     resolution = np.asarray(resolution, dtype=float).reshape(-1)
     if resolution.size == 1:
@@ -292,6 +306,10 @@ def normalize_loaded_case(
         venc=np.asarray(venc[:3], dtype=float).reshape(3),
         rr=float(rr),
         sigma=sigma_out,
+        correction=correction_out,
+        correction_high=correction_high_out,
+        phase_wrapped=phase_wrapped_out,
+        phase_wrapped_high=phase_wrapped_high_out,
         tke_array=tke_out,
         metadata=dict(metadata or {}),
         source_format=str(source_format or ""),
@@ -364,6 +382,28 @@ def _reorient_component_abs(arr, spatial_order, target_spatial_order, venc_order
     comp_perm = np.array([vb.index(x) for x in tb], dtype=int)
 
     return arr_r[..., comp_perm]
+
+
+def _reorient_component_signed(arr, spatial_order, target_spatial_order, venc_order, target_venc_order):
+    """Reorient a directional phase field into the normalized velocity axes."""
+    spatial_order = [s.upper() for s in spatial_order]
+    venc_order = [v.upper() for v in venc_order]
+    target_venc_order = [v.upper() for v in target_venc_order]
+    arr_r = _reorient_component_abs(
+        arr,
+        spatial_order=spatial_order,
+        target_spatial_order=target_spatial_order,
+        venc_order=venc_order,
+        target_venc_order=target_venc_order,
+    )
+    vb = [_axis_pair(v) for v in venc_order]
+    tb = [_axis_pair(v) for v in target_venc_order]
+    comp_perm = np.array([vb.index(axis) for axis in tb], dtype=int)
+    sign = np.array(
+        [(-1.0 if _need_flip(venc_order[comp_perm[i]], target_venc_order[i]) else 1.0) for i in range(3)],
+        dtype=np.float32,
+    )
+    return np.asarray(arr_r, dtype=np.float32) * sign.reshape((1,) * (arr_r.ndim - 1) + (3,))
 
 
 def _reorient_real_valued_fields(
@@ -999,6 +1039,22 @@ def _dual_venc_correct_alias(flow_lv_vtzyx, flow_hv_vtzyx, lv_triplet, ratio1, r
     return np.asarray(flow_lv_vtzyx + dual_alias_corr, dtype=np.float32), np.asarray(dual_alias_corr, dtype=np.float32)
 
 
+def _dual_alias_shift_unique_values(alias_corr, lv_triplet):
+    """Return the exact small set of rounded alias shifts without sorting all voxels."""
+    corr = np.asarray(alias_corr, dtype=np.float32)
+    venc = np.asarray(lv_triplet, dtype=np.float32).reshape(3)
+    values = set()
+    for component in range(min(3, corr.shape[0])):
+        rounded = np.round(corr[component], decimals=6)
+        candidates = (0.0, 2.0 * float(venc[component]), -2.0 * float(venc[component]),
+                      4.0 * float(venc[component]), -4.0 * float(venc[component]))
+        for candidate in candidates:
+            candidate = float(np.round(candidate, decimals=6))
+            if np.any(rounded == candidate):
+                values.add(candidate)
+    return sorted(values)
+
+
 def _load_legacy_dual_venc_h5(
     img_complex,
     segmask,
@@ -1091,7 +1147,12 @@ def _load_legacy_dual_venc_h5(
         lv_report["cache_reason"] = lv_cache_report.get("cache_reason", "missing")
     if "stationary_voxels" in lv_cache_report and bool(lv_report.get("cache_hit", False)):
         lv_report["stationary_voxels"] = int(lv_cache_report["stationary_voxels"])
-    if bool(lv_report.get("applied", False)) and not bool(lv_report.get("cache_hit", False)) and h5_group is not None:
+    if (
+        bool(cfg.write_cache)
+        and bool(lv_report.get("applied", False))
+        and not bool(lv_report.get("cache_hit", False))
+        and h5_group is not None
+    ):
         lv_report["cache_written"] = bool(_write_background_phase_corr_cache(
             h5_group,
             "corr_low",
@@ -1105,7 +1166,12 @@ def _load_legacy_dual_venc_h5(
         hv_report["cache_reason"] = hv_cache_report.get("cache_reason", "missing")
     if "stationary_voxels" in hv_cache_report and bool(hv_report.get("cache_hit", False)):
         hv_report["stationary_voxels"] = int(hv_cache_report["stationary_voxels"])
-    if bool(hv_report.get("applied", False)) and not bool(hv_report.get("cache_hit", False)) and h5_group is not None:
+    if (
+        bool(cfg.write_cache)
+        and bool(hv_report.get("applied", False))
+        and not bool(hv_report.get("cache_hit", False))
+        and h5_group is not None
+    ):
         hv_report["cache_written"] = bool(_write_background_phase_corr_cache(
             h5_group,
             "corr_high",
@@ -1144,6 +1210,24 @@ def _load_legacy_dual_venc_h5(
         target_venc_order=("LR", "AP", "FH"),
         return_velocity=True,
     )
+    # Preserve canonical wrapped phases for the optional traditional unwrap
+    # stage.  The public loaded flow remains the dual-VENC reconstruction.
+    phase_lv, _m_phase, _s_phase, _v_phase, _r_phase = reorient(
+        mag, flow_lv_raw, segmask_for_reorient,
+        venc=lv_venc, resolution=resolution,
+        spatial_order=spatial_order, venc_order=venc_order,
+        target_spatial_order=("LR", "AP", "FH"),
+        target_venc_order=("LR", "AP", "FH"),
+        return_velocity=False,
+    )
+    phase_hv, _m_phase_h, _s_phase_h, _v_phase_h, _r_phase_h = reorient(
+        mag, flow_hv_raw, segmask_for_reorient,
+        venc=hv_venc, resolution=resolution,
+        spatial_order=spatial_order, venc_order=venc_order,
+        target_spatial_order=("LR", "AP", "FH"),
+        target_venc_order=("LR", "AP", "FH"),
+        return_velocity=False,
+    )
 
     flow_lv_vtzyx = np.transpose(flow_lv, (4, 3, 2, 1, 0))
     flow_hv_vtzyx = np.transpose(flow_hv, (4, 3, 2, 1, 0))
@@ -1162,6 +1246,24 @@ def _load_legacy_dual_venc_h5(
     )
     flow_dual = np.transpose(flow_dual_vtzyx, (4, 3, 2, 1, 0)).astype(np.float32)
     dual_alias_corr = np.transpose(dual_alias_corr_vtzyx, (4, 3, 2, 1, 0)).astype(np.float32)
+    correction_low = None
+    if isinstance(lv_report, dict) and lv_report.get("corr") is not None:
+        correction_low = _reorient_component_signed(
+            lv_report["corr"],
+            spatial_order=spatial_order,
+            target_spatial_order=("LR", "AP", "FH"),
+            venc_order=venc_order,
+            target_venc_order=("LR", "AP", "FH"),
+        )
+    correction_high = None
+    if isinstance(hv_report, dict) and hv_report.get("corr") is not None:
+        correction_high = _reorient_component_signed(
+            hv_report["corr"],
+            spatial_order=spatial_order,
+            target_spatial_order=("LR", "AP", "FH"),
+            venc_order=venc_order,
+            target_venc_order=("LR", "AP", "FH"),
+        )
 
     meta = {
         "background_phase_correction": {
@@ -1180,7 +1282,12 @@ def _load_legacy_dual_venc_h5(
             "ratio1": ratio1.astype(float).tolist(),
             "ratio2": ratio2.astype(float).tolist(),
             "hv_lv_ratio": ratio_hv_lv.astype(float).tolist(),
-            "alias_shift_unique_cm_s": sorted({float(x) for x in np.unique(np.round(dual_alias_corr, decimals=6))}),
+            "alias_shift_unique_cm_s": _dual_alias_shift_unique_values(dual_alias_corr, lv_triplet),
+            "display_correction": {
+                "low": correction_low is not None,
+                "high": correction_high is not None,
+                "units": "rad",
+            },
         },
     }
     return normalize_loaded_case(
@@ -1192,6 +1299,10 @@ def _load_legacy_dual_venc_h5(
         venc=np.asarray(hv_triplet, dtype=float),
         rr=float(rr),
         sigma=None,
+        correction=correction_low,
+        correction_high=correction_high,
+        phase_wrapped=np.asarray(phase_lv, dtype=np.float32),
+        phase_wrapped_high=np.asarray(phase_hv, dtype=np.float32),
         tke_array=None,
         metadata=meta,
         source_format="legacy_h5_dual_venc",
@@ -1201,15 +1312,24 @@ def _load_legacy_dual_venc_h5(
             has_complex_source=False,
             supports_wss=True,
             supports_plane_metrics=True,
+            has_wrapped_phase=True,
+            supports_phase_unwrap=True,
         ),
     )
 
 
-def load_h5_data(path, correction_config=None, progress_callback=None, source_group=None, force_recompute_seg=False):
+def load_h5_data(
+    path,
+    correction_config=None,
+    progress_callback=None,
+    source_group=None,
+    force_recompute_seg=False,
+    ignore_embedded_segmentation=False,
+):
     target_spatial_order = ("LR", "AP", "FH")
     target_venc_order = ("LR", "AP", "FH")
     cfg = _loader_correction_config(correction_config)
-    h5_mode = "r+" if bool(cfg.enabled) else "r"
+    h5_mode = "r+" if bool(cfg.enabled) and bool(cfg.write_cache) else "r"
     try:
         handle_ctx = h5py.File(path, h5_mode)
     except OSError:
@@ -1247,7 +1367,9 @@ def load_h5_data(path, correction_config=None, progress_callback=None, source_gr
         )
 
         seg_ds = _find_h5_dataset_from_scopes(scopes, "segmask", "segmentation", "seg")
-        if seg_ds is not None and bool(force_recompute_seg):
+        if seg_ds is not None and bool(ignore_embedded_segmentation):
+            seg_ds = None
+        elif seg_ds is not None and bool(force_recompute_seg):
             seg_source = str(seg_ds.attrs.get("autoflow_source", "") or "").strip().lower()
             if seg_source == "auto_segmentation":
                 seg_ds = None
@@ -1263,6 +1385,7 @@ def load_h5_data(path, correction_config=None, progress_callback=None, source_gr
             "spatial_order_raw": [str(x) for x in spatial_order[:3]],
             "venc_order_raw": [str(x) for x in venc_order[:3]],
             "force_recompute_seg": bool(force_recompute_seg),
+            "ignore_embedded_segmentation": bool(ignore_embedded_segmentation),
         }
 
         if img_complex_ds is not None:
@@ -1309,7 +1432,7 @@ def load_h5_data(path, correction_config=None, progress_callback=None, source_gr
                 corr_report["cache_reason"] = cache_report.get("cache_reason", "missing")
             if "stationary_voxels" in cache_report and bool(corr_report.get("cache_hit", False)):
                 corr_report["stationary_voxels"] = int(cache_report["stationary_voxels"])
-            if bool(corr_report.get("applied", False)) and not bool(corr_report.get("cache_hit", False)):
+            if bool(cfg.write_cache) and bool(corr_report.get("applied", False)) and not bool(corr_report.get("cache_hit", False)):
                 corr_report["cache_written"] = bool(_write_background_phase_corr_cache(
                     group,
                     "corr",
@@ -1334,6 +1457,19 @@ def load_h5_data(path, correction_config=None, progress_callback=None, source_gr
                 target_venc_order=target_venc_order,
                 return_velocity=True,
             )
+            phase_wrapped, _mag_phase, _seg_phase, _venc_phase, _res_phase = reorient(
+                mag,
+                flow_raw,
+                segmask_for_reorient,
+                venc=VENC,
+                resolution=resolution,
+                spatial_order=spatial_order,
+                venc_order=venc_order,
+                target_spatial_order=target_spatial_order,
+                target_venc_order=target_venc_order,
+                return_velocity=False,
+                normalize_mag=False,
+            )
             sigma = _reorient_component_abs(
                 sigma_raw,
                 spatial_order=spatial_order,
@@ -1357,6 +1493,17 @@ def load_h5_data(path, correction_config=None, progress_callback=None, source_gr
                 venc=np.asarray(venc_new, dtype=float),
                 rr=float(rr),
                 sigma=sigma,
+                correction=(
+                    _reorient_component_signed(
+                        corr_report["corr"],
+                        spatial_order=spatial_order,
+                        target_spatial_order=target_spatial_order,
+                        venc_order=venc_order,
+                        target_venc_order=target_venc_order,
+                    )
+                    if isinstance(corr_report, dict) and corr_report.get("corr") is not None else None
+                ),
+                phase_wrapped=np.asarray(phase_wrapped, dtype=np.float32),
                 tke_array=None,
                 metadata=meta,
                 source_format="legacy_h5",
@@ -1394,6 +1541,12 @@ def load_h5_data(path, correction_config=None, progress_callback=None, source_gr
                 flow_raw = np.asarray(img[..., 1:4], dtype=np.float32)
                 flow_is_phase_radians = _flow_looks_like_phase_radians(flow_raw, VENC)
                 layout_name = "combined_img_real"
+            # Preserve the raw phase before reorientation/rescaling.  The helper
+            # below may convert radians to velocity and permute axes, so using
+            # its output to reconstruct ``phase_wrapped`` would double-transform
+            # normalized real inputs.
+            phase_source_raw = np.array(flow_raw, copy=True) if flow_is_phase_radians else None
+            mag_source_raw = np.array(mag_raw, copy=True) if flow_is_phase_radians else None
             flow_raw, mag_raw, segmask_r, venc_new, res_new, sigma_r, tke_array_r = _reorient_real_valued_fields(
                 mag=mag_raw,
                 flow=flow_raw,
@@ -1408,6 +1561,22 @@ def load_h5_data(path, correction_config=None, progress_callback=None, source_gr
                 target_venc_order=target_venc_order,
                 return_velocity=flow_is_phase_radians,
             )
+            phase_wrapped_r = None
+            if flow_is_phase_radians:
+                seg_for_phase = segmask if segmask is not None else np.zeros(np.asarray(mag_raw).shape, dtype=np.int16)
+                phase_wrapped_r, _mp, _sp, _vp, _rp = reorient(
+                    np.asarray(mag_source_raw),
+                    np.asarray(phase_source_raw),
+                    seg_for_phase,
+                    venc=VENC,
+                    resolution=resolution,
+                    spatial_order=spatial_order,
+                    venc_order=venc_order,
+                    target_spatial_order=target_spatial_order,
+                    target_venc_order=target_venc_order,
+                    return_velocity=False,
+                    normalize_mag=False,
+                )
             cached_corr, cache_report = _read_background_phase_corr_cache_from_scopes(
                 scopes,
                 "corr",
@@ -1429,7 +1598,7 @@ def load_h5_data(path, correction_config=None, progress_callback=None, source_gr
                 corr_report["cache_reason"] = cache_report.get("cache_reason", "missing")
             if "stationary_voxels" in cache_report and bool(corr_report.get("cache_hit", False)):
                 corr_report["stationary_voxels"] = int(cache_report["stationary_voxels"])
-            if bool(corr_report.get("applied", False)) and not bool(corr_report.get("cache_hit", False)):
+            if bool(cfg.write_cache) and bool(corr_report.get("applied", False)) and not bool(corr_report.get("cache_hit", False)):
                 corr_report["cache_written"] = bool(_write_background_phase_corr_cache(
                     group,
                     "corr",
@@ -1457,6 +1626,8 @@ def load_h5_data(path, correction_config=None, progress_callback=None, source_gr
                 venc=venc_new,
                 rr=float(rr),
                 sigma=sigma_r,
+                correction=corr_report.get("corr") if isinstance(corr_report, dict) else None,
+                phase_wrapped=phase_wrapped_r,
                 tke_array=tke_array_r,
                 metadata=meta,
                 source_format="normalized_h5",

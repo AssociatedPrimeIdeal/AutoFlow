@@ -1,7 +1,7 @@
 {
   "background_phase_correction": {
     "enabled": false,
-    "method": "msac",
+    "method": "wrls_arto",
     "corr_fit_order": 3,
     "threshold": 0.1,
     "wrls_lambda": 5.0,
@@ -16,8 +16,10 @@
     "wrls_gmm_iterations": 1000,
     "dual_venc_ratio1": 0.0,
     "dual_venc_ratio2": 0.0,
-    "force_recompute": false
+    "force_recompute": false,
+    "write_cache": true
   },
   "dicom_parameter_overrides": {},
-  "dicom_read_workers": 1
+  "dicom_read_workers": 1,
+  "ignore_embedded_segmentation": false
 }

@@ -30,8 +30,14 @@ For grouped multi-label segmentations, AutoFlow now:
 ### GUI
 1. load or create segmentation
 2. click `Generate Skeleton`
-3. inspect grouped skeleton objects in the browser
+3. inspect grouped skeleton points in the browser and 3D view
 4. optionally click `Edit Skeleton` when exactly one segmentation group is active
+
+Edit mode shows only the skeleton in the 3D view and replaces the step buttons
+with operation instructions. Click a point, drag its orange sphere to move it,
+press Delete/Backspace to remove it, then click `Save Changes` to invalidate and
+rebuild dependent graph/path/plane data. `Cancel` or Esc restores the prior
+visibility and discards the edit.
 
 ### CLI
 
@@ -100,6 +106,7 @@ summary = run_case("case.h5", config=AutoFlowConfig(output_dir="./results/case")
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
 | skeleton step is skipped | no segmentation | create or load segmentation first |
+| grouped skeleton is listed in the browser but absent from the 3D view | an older viewer did not resolve grouped `skeleton_<group>` data keys | install the current editable build and run `Generate Skeleton` again |
 | skeleton contains many small branches | noisy segmentation | raise cleanup thresholds or improve segmentation |
 | one grouped vessel disappears | every component in that group fell below the active cleanup threshold | lower `min_cc_volume_mm3` or `cc_rel_min_ratio`, or improve the segmentation |
 | `Edit Skeleton` is unavailable | more than one segmentation group is active | use a single-group case or simplify `configs/labels.json` |

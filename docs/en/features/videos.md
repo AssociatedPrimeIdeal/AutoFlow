@@ -9,7 +9,7 @@
 | GUI | Supported | selective export through `Export > Export Videos...` |
 
 ## What It Does
-Offline video rendering exports rotating or time-resolved MP4 files for planes, WSS, TKE, pressure gradient, relative pressure, and streamlines. In grouped vessel workflows, plane videos color each rendered centerline path with the configured group path color from `configs/labels.json`. Plane rotation videos annotate `planeidx=<index>` by default so the rendered label matches the saved plane index, and `configs/video_exporting.json -> plane_video.label` controls the label prefix, font size, text color, and label background styling.
+Offline video rendering exports rotating or time-resolved MP4 files for planes, WSS, TKE, pressure gradient, relative pressure, and streamlines. In grouped vessel workflows, plane videos color each rendered centerline path with the configured group path color from `configs/labels.json`. Plane rotation videos annotate `planeidx=<index>` by default so the rendered label matches the saved plane index, and `configs/video_exporting.json -> plane_video.label` controls the label prefix, font size, text color, and label background styling. Dynamic exports cache per-timepoint streamlines, tube geometry, and sampled TKE or pressure meshes. Streamline phases are prepared in parallel, identical pressure-support phases share one smoothed surface, and VTK actors stay attached while their mapper input and camera are updated for each frame.
 
 ## When To Use It
 - use it for reports, demos, or review packages
@@ -107,6 +107,7 @@ Use `Export > Export Videos...`, choose an output directory, then select any com
 - offline export writes MP4 only through ImageIO FFmpeg; no GIF fallback is generated when MP4 encoding fails
 - TKE video stays unavailable when TKE is unavailable
 - pathlines are not currently exported as a separate batch video feature
+- dynamic video caches remain alive for the duration of one export, using additional memory and up to eight streamline preparation workers to reduce repeated geometry and sampling work
 
 ## Where To Change Code
 

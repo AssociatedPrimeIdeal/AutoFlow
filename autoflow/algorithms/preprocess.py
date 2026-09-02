@@ -184,6 +184,31 @@ def filter_labeled_components(segmask_labels_3d, resolution, mode="absolute", mi
     return labels
 
 
+def filter_4d_labeled_components(segmask_labels_4d, resolution, mode="absolute", min_volume_mm3=50.0, connectivity=1):
+    """Clean connected components independently for every label and time frame.
+
+    ``absolute`` removes components below ``min_volume_mm3`` and ``largest`` keeps
+    only the largest component for each non-zero label in each frame.
+    """
+    labels = np.asarray(segmask_labels_4d, dtype=np.int16)
+    if labels.ndim != 4:
+        raise ValueError(f"4D labeled mask must be XYZT, got {labels.shape}")
+    out = labels.copy()
+    mode_name = str(mode or "absolute").strip().lower()
+    if mode_name not in {"absolute", "largest"}:
+        raise ValueError(f"unsupported 4D component cleanup mode: {mode!r}")
+    for t in range(labels.shape[3]):
+        frame = labels[..., t]
+        for label_value in sorted(int(x) for x in np.unique(frame) if int(x) != 0):
+            mask = frame == int(label_value)
+            cleaned = filter_connected_components(
+                mask, resolution, mode=mode_name,
+                min_volume_mm3=float(min_volume_mm3), connectivity=connectivity,
+            )
+            out[..., t][mask & ~np.asarray(cleaned, dtype=bool)] = 0
+    return out
+
+
 def _component_bbox(mask):
     idx = np.argwhere(np.asarray(mask, dtype=bool))
     if len(idx) == 0:

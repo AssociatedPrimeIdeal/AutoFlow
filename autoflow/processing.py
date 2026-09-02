@@ -13,15 +13,17 @@ from .algorithms.segmentation import (
     generate_nnunet_auto_segmentation,
     resolve_auto_segmentation_device,
     resolve_nnunet_model_folder,
+    resolve_nnunet_4d_model_folder,
     save_segmentation_file,
     save_segmentation_to_source_h5,
 )
 from .plane_io import (
-    load_plane_positions,
+    load_plane_position_payload,
     project_planes_to_workspace,
     resolve_reuse_plane_file,
     save_plane_positions,
 )
+from .quality import build_quality_report, save_quality_report
 from .rendering import (
     render_plane_rotation_video,
     render_pressure_gradient_video,
@@ -33,7 +35,7 @@ from .rendering import (
 from .reporting import load_metrics_from_output, print_metrics_summary, print_qc_summary
 
 
-DERIVED_METRIC_KEYS = ("pwv", "wss", "tke", "pg")
+DERIVED_METRIC_KEYS = ("pwv", "wss", "tke", "pg", "vortex")
 VIDEO_KEYS = ("plane", "wss", "tke", "pg", "streamlines")
 
 
@@ -66,7 +68,7 @@ def _normalize_requested_items(items, valid_items, *, default=()):
 def _requested_metric_flags(requested_metrics, *, skip_derived=False, skip_wss=False, skip_tke=False, skip_pressure_gradient=False):
     selected = set(_normalize_requested_items(requested_metrics, DERIVED_METRIC_KEYS, default=()))
     if skip_derived:
-        selected.difference_update({"wss", "tke", "pg"})
+        selected.difference_update({"wss", "tke", "pg", "vortex"})
     if skip_wss:
         selected.discard("wss")
     if skip_tke:
@@ -78,6 +80,7 @@ def _requested_metric_flags(requested_metrics, *, skip_derived=False, skip_wss=F
         "wss": "wss" in selected,
         "tke": "tke" in selected,
         "pg": "pg" in selected,
+        "vortex": "vortex" in selected,
     }
 
 
@@ -100,10 +103,25 @@ def _timing_payload(mapping):
     return {str(name): float(seconds) for name, seconds in mapping.items()}
 
 
-def _has_cached_derived_metrics(ws, *, compute_wss=False, compute_tke=False, compute_pressure_gradient=False):
+def _has_cached_derived_metrics(ws, *, compute_wss=False, compute_tke=False,
+                                compute_pressure_gradient=False, compute_vortex=False):
     has_wss = ws.derived.wss_volume is not None and np.size(ws.derived.wss_volume) > 0
     has_pg = ws.derived.pressure_gradient_array is not None and np.size(ws.derived.pressure_gradient_array) > 0
     has_tke = ws.derived.tke_array is not None or ws.derived.tke_volume is not None
+    has_vortex = all(
+        getattr(ws.derived, name, None) is not None
+        and np.size(getattr(ws.derived, name)) > 0
+        for name in (
+            "vorticity_array",
+            "vorticity_magnitude",
+            "vorticity_magnitude_peak",
+            "q_criterion_array",
+            "q_criterion_peak",
+            "swirling_strength_array",
+            "swirling_strength_peak",
+            "vortex_support_mask",
+        )
+    )
     source_tke = ws.source_tke_array
     source_sigma = ws.source_sigma if ws.input_state.capabilities.has_complex_source else None
     need_tke = bool(compute_tke and (source_tke is not None or source_sigma is not None))
@@ -113,15 +131,19 @@ def _has_cached_derived_metrics(ws, *, compute_wss=False, compute_tke=False, com
         return False
     if need_tke and not has_tke:
         return False
-    return bool(compute_wss or compute_pressure_gradient or need_tke)
+    if compute_vortex and not has_vortex:
+        return False
+    return bool(compute_wss or compute_pressure_gradient or need_tke or compute_vortex)
 
 
-def _build_cached_pixelwise_export(ws, *, compute_wss=False, compute_tke=False, compute_pressure_gradient=False):
+def _build_cached_pixelwise_export(ws, *, compute_wss=False, compute_tke=False,
+                                   compute_pressure_gradient=False, compute_vortex=False):
     if not _has_cached_derived_metrics(
         ws,
         compute_wss=compute_wss,
         compute_tke=compute_tke,
         compute_pressure_gradient=compute_pressure_gradient,
+        compute_vortex=compute_vortex,
     ):
         return {}
 
@@ -142,11 +164,29 @@ def _build_cached_pixelwise_export(ws, *, compute_wss=False, compute_tke=False, 
         tke_time = np.asarray(ws.derived.tke_array, dtype=np.float32)
         pixelwise["tke"] = np.asarray(np.max(tke_time, axis=3), dtype=np.float32)
         pixelwise["tke_time"] = tke_time
+    if compute_vortex:
+        pixelwise["vorticity"] = np.asarray(ws.derived.vorticity_array, dtype=np.float32)
+        pixelwise["vorticity_magnitude"] = np.asarray(ws.derived.vorticity_magnitude, dtype=np.float32)
+        pixelwise["vorticity_magnitude_peak"] = np.asarray(ws.derived.vorticity_magnitude_peak, dtype=np.float32)
+        pixelwise["q_criterion"] = np.asarray(ws.derived.q_criterion_array, dtype=np.float32)
+        pixelwise["q_criterion_peak"] = np.asarray(ws.derived.q_criterion_peak, dtype=np.float32)
+        pixelwise["swirling_strength"] = np.asarray(ws.derived.swirling_strength_array, dtype=np.float32)
+        pixelwise["swirling_strength_peak"] = np.asarray(ws.derived.swirling_strength_peak, dtype=np.float32)
+        pixelwise["vortex_support_mask"] = np.asarray(ws.derived.vortex_support_mask, dtype=np.uint8)
     return pixelwise
 
 
 def _format_timing_parts(parts):
     return " ".join(f"{name}={seconds:.2f}s" for name, seconds in parts if seconds is not None)
+
+
+def _save_pixelwise_npz(path, payload):
+    """Write pixelwise arrays without CPU-heavy deflate compression.
+
+    NPZ is still the same NumPy container and preserves every array exactly;
+    callers that need compression can compress the resulting file externally.
+    """
+    np.savez(path, **payload)
 
 
 def _default_segmentation_sidecar_path(ws, out_dir, source="auto"):
@@ -166,6 +206,9 @@ def _make_cli_autoseg_progress_handler():
             return
         stage = str(payload.get("stage", "") or "")
         message = str(payload.get("message", "") or stage or "auto segmentation")
+        fallback_reason = str(payload.get("fallback_reason", "") or "").strip()
+        if fallback_reason:
+            message = f"{message} ({fallback_reason[-400:]})"
         elapsed_sec = payload.get("elapsed_sec")
         if elapsed_sec is not None:
             message = f"{message} | elapsed={float(elapsed_sec):.2f}s"
@@ -178,22 +221,36 @@ def _make_cli_autoseg_progress_handler():
     return _handler
 
 
-def _run_cli_auto_segmentation(ws, out_dir, *, backend, model_folder, checkpoint_name, device, auto_label_map):
+def _run_cli_auto_segmentation(
+    ws,
+    out_dir,
+    *,
+    backend,
+    model_folder,
+    checkpoint_name,
+    folds,
+    device,
+    auto_label_map,
+    write_cache=True,
+):
     if ws.mag_raw is None or ws.flow_raw is None:
         raise ValueError("auto segmentation requires loaded mag and flow data")
-    resolved_model = resolve_nnunet_model_folder(model_folder)
+    is_4d = str(backend or "").strip().lower() in {"nnunet4d", "nnunet_4d", "4d"}
+    resolved_model = resolve_nnunet_4d_model_folder(model_folder) if is_4d else resolve_nnunet_model_folder(model_folder)
     resolved_device = resolve_auto_segmentation_device(device)
     artifact_prefix = os.path.splitext(_default_segmentation_sidecar_path(ws, out_dir, source="auto"))[0]
     print(f"  [autoseg] backend={backend} model={resolved_model} checkpoint={checkpoint_name} device={resolved_device}")
     t_start = time.perf_counter()
+    model_argument = str(model_folder or "") if is_4d and str(model_folder or "").lower().endswith((".sh", ".bash")) else resolved_model
     seg, provenance = generate_nnunet_auto_segmentation(
         mag=ws.mag_raw,
         flow=ws.flow_raw,
         resolution=ws.resolution,
         origin=ws.origin,
-        model_folder=resolved_model,
+        model_folder=model_argument,
         backend=backend,
         checkpoint_name=checkpoint_name,
+        folds=folds,
         device=resolved_device,
         auto_label_map=auto_label_map,
         artifact_prefix=artifact_prefix,
@@ -206,7 +263,7 @@ def _run_cli_auto_segmentation(ws, out_dir, *, backend, model_folder, checkpoint
     ws.activate_segmentation_source("auto")
     cache_target = ""
     t_save = time.perf_counter()
-    if str(ws.input_state.source_format or "").lower().endswith("h5") and str(ws.paths.flow_path or "").lower().endswith((".h5", ".hdf5")):
+    if bool(write_cache) and str(ws.paths.flow_path or "").lower().endswith((".h5", ".hdf5")):
         save_segmentation_to_source_h5(
             ws.paths.flow_path,
             ws.get_active_segmentation(),
@@ -244,13 +301,25 @@ def process_single(
     skip_plane_metrics=False,
     use_multithread=False,
     reuse_planes_path="",
+    plane_import_mode="world",
+    export_planes_path="",
     autoseg=False,
-    autoseg_backend="nnUNet",
-    autoseg_model="",
+    autoseg_backend="nnUNet4D",
+    autoseg_model="/nas-data2/ryy/CMR4DFlow2026/Segdata/scripts/nnunet/4D/run_7020_4d_full_ssd_20260824.sh",
     autoseg_checkpoint="checkpoint_final.pth",
+    autoseg_folds="single",
     autoseg_device="auto",
     autoseg_label_map="",
     segmentation_only=False,
+    phase_unwrap_enabled=False,
+    phase_unwrap_method="none",
+    phase_unwrap_mask="segmentation",
+    phase_unwrap_device="auto",
+    phase_unwrap_tfc=True,
+    phase_unwrap_lap4d_ts=2.0,
+    phase_unwrap_nprs_upsampling_factor=2,
+    phase_unwrap_nprs_pi_unwrap=True,
+    phase_unwrap_nprs_auto_crop=True,
     requested_metrics=None,
     requested_videos=None,
     fps=24,
@@ -321,6 +390,15 @@ def process_single(
     ws.paths.flow_path = case.input_path
     ws.paths.output_dir = out_dir
     ws.derived_params.use_multithread = use_multithread
+    ws.phase_unwrap_params.enabled = bool(phase_unwrap_enabled)
+    ws.phase_unwrap_params.method = str(phase_unwrap_method or "none")
+    ws.phase_unwrap_params.mask_source = str(phase_unwrap_mask or "segmentation")
+    ws.phase_unwrap_params.device = str(phase_unwrap_device or "auto")
+    ws.phase_unwrap_params.tfc = bool(phase_unwrap_tfc)
+    ws.phase_unwrap_params.lap4d_ts = float(phase_unwrap_lap4d_ts)
+    ws.phase_unwrap_params.nprs_upsampling_factor = int(phase_unwrap_nprs_upsampling_factor)
+    ws.phase_unwrap_params.nprs_pi_unwrap = bool(phase_unwrap_nprs_pi_unwrap)
+    ws.phase_unwrap_params.nprs_auto_crop = bool(phase_unwrap_nprs_auto_crop)
     engine = PipelineEngine()
     logger = lambda msg: None
     import time as _time
@@ -347,18 +425,55 @@ def process_single(
             backend=autoseg_backend,
             model_folder=autoseg_model,
             checkpoint_name=autoseg_checkpoint,
+            folds=autoseg_folds,
             device=autoseg_device,
             auto_label_map=autoseg_label_map,
+            write_cache=bool(getattr(ws.segmentation, "write_auto_cache", True)),
         )
         elapsed = _time.perf_counter() - t_stage
         _record_timing(stage_times, "autoseg", elapsed)
         print(f"  -> auto segmentation ready: {segmentation_output} | time={elapsed:.2f}s")
+
+    # Choosing a method is the opt-in switch.  The legacy ``enabled`` field
+    # is still loaded for old configs but is no longer required.
+    if str(getattr(ws.phase_unwrap_params, "method", "") or "").strip().lower() not in {"", "none", "disabled"}:
+        print("[1.75/7] Phase unwrapping...")
+        t_unwrap = _time.perf_counter()
+        unwrap_result = engine.run_step(ws, StepId.UNWRAP_PHASE, logger)
+        _record_timing(stage_times, "phase_unwrap", _time.perf_counter() - t_unwrap)
+        print(f"  -> {unwrap_result.message}")
+        if not unwrap_result.success:
+            raise RuntimeError(unwrap_result.message)
 
     if segmentation_only:
         if ws.segmask_raw is None:
             raise RuntimeError("segmentation-only run finished without an available segmentation")
         total_time_sec = _time.perf_counter() - t_total_start
         provenance = dict(ws.get_active_segmentation_provenance() or {})
+        quality_report = build_quality_report(
+            ws,
+            source_path=case.input_path,
+            run_context={"segmentation_only": True, "stage_times_sec": _timing_payload(stage_times)},
+        )
+        quality_report_path = save_quality_report(
+            ws,
+            os.path.join(out_dir, "quality_report.json"),
+            source_path=case.input_path,
+            report=quality_report,
+        )
+        phase_info = dict(ws.phase_unwrap_result or {})
+        phase_unwrap_file = ""
+        if "flow_unwrapped" in phase_info and bool(getattr(ws.phase_unwrap_params, "write_output", True)):
+            phase_unwrap_file = os.path.join(out_dir, "phase_unwrap.npz")
+            np.savez(
+                phase_unwrap_file,
+                phase_wrapped=np.asarray(ws.phase_wrapped, dtype=np.float32),
+                phase_unwrapped=np.asarray(phase_info["phase_unwrapped"], dtype=np.float32),
+                flow_unwrapped=np.asarray(phase_info["flow_unwrapped"], dtype=np.float32),
+                wrap_count=np.asarray(phase_info["wrap_count"], dtype=np.int16),
+                wrap_mask=np.asarray(phase_info["wrap_mask"], dtype=np.uint8),
+                mask_used=np.asarray(phase_info["mask_used"], dtype=np.uint8),
+            )
         summary = {
             "input": case.input_path,
             "input_kind": case.input_kind,
@@ -371,6 +486,15 @@ def process_single(
             "source_group": ws.input_state.source_group,
             "capabilities": ws.input_state.capabilities.to_dict(),
             "segmentation_only": True,
+            "phase_unwrap": {
+                "method": phase_info.get("method"),
+                "device": phase_info.get("device"),
+                "elapsed_sec": phase_info.get("elapsed_sec"),
+                "statistics": phase_info.get("statistics", {}),
+                "skipped": bool(phase_info.get("skipped", False)),
+                "reason": phase_info.get("reason", ""),
+            },
+            "phase_unwrap_file": phase_unwrap_file,
             "segmentation_source": str(ws.segmentation.active_source or ""),
             "segmentation_output": str(segmentation_output or ""),
             "segmentation_nifti": str(
@@ -383,6 +507,11 @@ def process_single(
             ),
             "force_recompute_seg": bool(getattr(ws.segmentation, "force_recompute_auto_cache", False)),
             "force_recompute_seg_cache_bypassed": bool(auto_seg_cache_bypassed),
+            "ignore_embedded_segmentation": bool(
+                getattr(ws.loader_params, "ignore_embedded_segmentation", False)
+            ),
+            "quality_report_file": quality_report_path,
+            "quality_report": quality_report,
         }
         summary_path = os.path.join(out_dir, "summary.json")
         with open(summary_path, "w", encoding="utf-8") as f:
@@ -411,15 +540,23 @@ def process_single(
     _record_timing(stage_times, "planes", elapsed)
     print(f"  -> {result.message} | time={elapsed:.2f}s")
 
+    plane_import_report = {}
     if reuse_planes_path:
         print(f"[5/8] Reuse Plane Positions: {reuse_planes_path}")
         t_stage = _time.perf_counter()
-        plane_items = load_plane_positions(reuse_planes_path)
-        ws.planes = project_planes_to_workspace(plane_items, ws)
+        plane_payload = load_plane_position_payload(reuse_planes_path)
+        ws.planes, plane_import_report = project_planes_to_workspace(
+            plane_payload,
+            ws,
+            mapping_mode=plane_import_mode,
+            return_report=True,
+        )
         planes_json = engine._save_planes_json(ws)
         elapsed = _time.perf_counter() - t_stage
         _record_timing(stage_times, "reuse_planes", elapsed)
-        print(f"  -> Reused {len(ws.planes)} planes saved={planes_json} | time={elapsed:.2f}s")
+        print(f"  -> Reused {len(ws.planes)} planes mode={plane_import_mode} saved={planes_json} | time={elapsed:.2f}s")
+        for warning in list(plane_import_report.get("warnings", []) or []):
+            print(f"  [WARN] {warning}")
     else:
         print("[5/8] Use generated planes")
 
@@ -473,7 +610,7 @@ def process_single(
     else:
         print("[7/8] Skipped PWV (not requested)")
 
-    if any(metric_flags[key] for key in ("wss", "tke", "pg")):
+    if any(metric_flags[key] for key in ("wss", "tke", "pg", "vortex")):
         if ws.segmask_raw is None:
             print("[8/8] Skipped derived metrics (no segmentation)")
         else:
@@ -484,6 +621,8 @@ def process_single(
                 labels.append("TKE")
             if metric_flags["pg"]:
                 labels.append("Relative Pressure")
+            if metric_flags["vortex"]:
+                labels.append("Vortex Kinematics")
             print(f"[8/8] Compute Derived Metrics ({'/'.join(labels)})...")
             t_step = _time.perf_counter()
             step_parts = []
@@ -492,6 +631,7 @@ def process_single(
                 compute_wss=metric_flags["wss"],
                 compute_tke=metric_flags["tke"],
                 compute_pressure_gradient=metric_flags["pg"],
+                compute_vortex=metric_flags["vortex"],
             )
             if pixelwise_result:
                 ws.derived.pixelwise_export = dict(pixelwise_result)
@@ -505,20 +645,21 @@ def process_single(
                     compute_wss=metric_flags["wss"],
                     compute_tke=metric_flags["tke"],
                     compute_pressure_gradient=metric_flags["pg"],
+                    compute_vortex=metric_flags["vortex"],
                 )
                 step_parts.append(("derived_compute", _time.perf_counter() - t_part))
                 pixelwise_result = dict(ws.derived.pixelwise_export or {})
             pixel_path = os.path.join(out_dir, "derived_metrics_pixelwise.npz")
             if pixelwise_result:
                 t_part = _time.perf_counter()
-                np.savez_compressed(pixel_path, **pixelwise_result)
+                _save_pixelwise_npz(pixel_path, pixelwise_result)
                 step_parts.append(("npz_write", _time.perf_counter() - t_part))
                 print(f"  -> Saved pixelwise: {pixel_path}")
             ws.pipeline.mark_done(StepId.COMPUTE_DERIVED_METRICS)
             tke_suffix = "" if ws.derived.tke_array is not None or ws.derived.tke_volume is not None else " tke=unavailable"
             elapsed = _time.perf_counter() - t_step
             _record_timing(stage_times, "derived_export", elapsed)
-            print(f"  -> Derived: wss={metric_flags['wss']} tke={metric_flags['tke']} pg={metric_flags['pg']}{tke_suffix} | {_format_timing_parts(step_parts + [('total', elapsed)])}")
+            print(f"  -> Derived: wss={metric_flags['wss']} tke={metric_flags['tke']} pg={metric_flags['pg']} vortex={metric_flags['vortex']}{tke_suffix} | {_format_timing_parts(step_parts + [('total', elapsed)])}")
     else:
         print("[8/8] Skipped derived metrics (not requested)")
 
@@ -530,6 +671,10 @@ def process_single(
 
     plane_positions_path = save_plane_positions(ws, os.path.join(out_dir, "plane_positions.json"), source_path=case.input_path)
     print(f"Plane positions saved: {plane_positions_path}")
+    exported_planes_path = plane_positions_path
+    if export_planes_path:
+        exported_planes_path = save_plane_positions(ws, export_planes_path, source_path=case.input_path)
+        print(f"Plane coordinates exported: {exported_planes_path}")
 
     video_paths = {}
 
@@ -709,6 +854,47 @@ def process_single(
         plot_file = str(result.get("plot_file", "") or "")
         if plot_file:
             pwv_plot_files[str(result.get("name", "pwv") or "pwv")] = plot_file
+    quality_report = build_quality_report(
+        ws,
+        source_path=case.input_path,
+        run_context={
+            "requested_metrics": dict(metric_flags),
+            "requested_videos": dict(video_flags),
+            "stage_times_sec": _timing_payload(stage_times),
+            "video_times_sec": _timing_payload(video_times),
+        },
+    )
+    quality_report_path = save_quality_report(
+        ws,
+        os.path.join(out_dir, "quality_report.json"),
+        source_path=case.input_path,
+        report=quality_report,
+    )
+
+    phase_unwrap_file = ""
+    phase_unwrap_summary = {}
+    if ws.phase_unwrap_result:
+        phase_unwrap_summary = {
+            "method": ws.phase_unwrap_result.get("method"),
+            "device": ws.phase_unwrap_result.get("device"),
+            "elapsed_sec": ws.phase_unwrap_result.get("elapsed_sec"),
+            "statistics": ws.phase_unwrap_result.get("statistics", {}),
+            "skipped": bool(ws.phase_unwrap_result.get("skipped", False)),
+            "reason": ws.phase_unwrap_result.get("reason", ""),
+            "error": ws.phase_unwrap_result.get("error", ""),
+        }
+        if "flow_unwrapped" in ws.phase_unwrap_result and bool(getattr(ws.phase_unwrap_params, "write_output", True)):
+            phase_unwrap_file = os.path.join(out_dir, "phase_unwrap.npz")
+            np.savez(
+                phase_unwrap_file,
+                phase_wrapped=np.asarray(ws.phase_wrapped, dtype=np.float32),
+                phase_unwrapped=np.asarray(ws.phase_unwrap_result["phase_unwrapped"], dtype=np.float32),
+                flow_unwrapped=np.asarray(ws.phase_unwrap_result["flow_unwrapped"], dtype=np.float32),
+                wrap_count=np.asarray(ws.phase_unwrap_result["wrap_count"], dtype=np.int16),
+                wrap_mask=np.asarray(ws.phase_unwrap_result["wrap_mask"], dtype=np.uint8),
+                mask_used=np.asarray(ws.phase_unwrap_result["mask_used"], dtype=np.uint8),
+            )
+
     summary = {
         "input": case.input_path,
         "input_kind": case.input_kind,
@@ -720,6 +906,8 @@ def process_single(
         "source_format": ws.input_state.source_format,
         "source_group": ws.input_state.source_group,
         "capabilities": ws.input_state.capabilities.to_dict(),
+        "phase_unwrap": phase_unwrap_summary,
+        "phase_unwrap_file": phase_unwrap_file,
         "requested_metrics": dict(metric_flags),
         "requested_videos": dict(video_flags),
         "total_time_sec": float(total_time_sec),
@@ -735,16 +923,25 @@ def process_single(
         "forks": ws.forks,
         "plane_metrics": ws.derived.plane_metrics,
         "plane_qc": ws.derived.plane_qc,
+        "plane_generation": ws.plane_gen_params.to_dict(),
         "pwv_results": ws.derived.pwv_results,
         "pwv_file": ws.derived.pwv_file,
         "pwv_json_file": ws.derived.pwv_json_file,
         "pwv_h5_file": ws.derived.pwv_h5_file,
         "pwv_plot_files": pwv_plot_files,
         "plane_positions_file": plane_positions_path,
+        "exported_planes_file": exported_planes_path,
         "reused_planes_file": reuse_planes_path,
+        "plane_import_mode": str(plane_import_mode or "world"),
+        "plane_import_report": plane_import_report,
+        "quality_report_file": quality_report_path,
+        "quality_report": quality_report,
         "force_recompute_corr": bool(getattr(ws.loader_params.background_phase_correction, "force_recompute", False)),
         "force_recompute_seg": bool(getattr(ws.segmentation, "force_recompute_auto_cache", False)),
         "force_recompute_seg_cache_bypassed": bool(auto_seg_cache_bypassed),
+        "ignore_embedded_segmentation": bool(
+            getattr(ws.loader_params, "ignore_embedded_segmentation", False)
+        ),
         "videos": video_paths,
         "pixelwise_export": {k: list(np.asarray(v).shape) for k, v in pixelwise_result.items()} if pixelwise_result else {},
         "centerline_pressure_profiles": list(ws.derived.centerline_pressure_profiles or []),
@@ -777,13 +974,17 @@ def collect_input_items(inputs):
 
 def build_base_workspace():
     ws = Workspace()
-    ws.plane_gen_params.plane_mode = globals().get("PLANE_MODE", "count")
-    ws.plane_gen_params.plane_count = globals().get("PLANE_COUNT", 1)
+    ws.plane_gen_params.plane_mode = globals().get("PLANE_MODE", "fixed_step")
+    ws.plane_gen_params.plane_count = globals().get("PLANE_COUNT", 3)
     ws.plane_gen_params.cross_section_distance = globals().get("CROSS_SECTION_DIST", 5.0)
     ws.plane_gen_params.start_distance = globals().get("START_DIST", 0.0)
     ws.plane_gen_params.end_distance = globals().get("END_DIST", 0.0)
-    ws.plane_gen_params.anchor = globals().get("PLANE_ANCHOR", "end")
+    ws.plane_gen_params.anchor = globals().get("PLANE_ANCHOR", "center")
     ws.plane_gen_params.anchor_offset_mm = globals().get("PLANE_OFFSET_MM", 5.0)
+    ws.plane_gen_params.direction = globals().get("PLANE_DIRECTION", "both")
+    ws.plane_gen_params.spacing_mode = globals().get("PLANE_SPACING_MODE", "fraction")
+    ws.plane_gen_params.spacing_ratio = globals().get("PLANE_SPACING_RATIO", 0.25)
+    ws.plane_gen_params.segmentation_filter = globals().get("SEGMENTATION_FILTER", True)
     if globals().get("USE_CENTER_PLANE", None) is False:
         ws.plane_gen_params.plane_mode = "distance"
     elif globals().get("USE_CENTER_PLANE", None) is True:
@@ -796,10 +997,22 @@ def build_base_workspace():
     ws.streamline_params.max_steps = globals().get("MAX_STEPS", 2000)
     ws.streamline_params.min_seeds = globals().get("MIN_SEEDS", 50)
     ws.streamline_params.seed_ratio = globals().get("SEED_RATIO", 0.02)
+    ws.streamline_params.pathline_seed_ratio = globals().get("PATHLINE_SEED_RATIO", 0.2)
+    ws.streamline_params.pathline_max_steps = globals().get("PATHLINE_MAX_STEPS", 200)
+    ws.streamline_params.pathline_min_seeds = globals().get("PATHLINE_MIN_SEEDS", 50)
+    seed_mode = str(globals().get("PATHLINE_SEED_MODE", "fixed") or "fixed").strip().lower()
+    ws.streamline_params.pathline_seed_mode = "ratio" if seed_mode == "ratio" else "fixed"
+    ws.streamline_params.pathline_max_seeds = max(1, int(globals().get("PATHLINE_MAX_SEEDS", 250)))
+    ws.streamline_params.pathline_terminal_speed = globals().get("PATHLINE_TERMINAL_SPEED", 0.01)
+    ws.streamline_params.pathline_rng_seed = globals().get("PATHLINE_RNG_SEED", 0)
+    ws.streamline_params.pathline_tube_radius = globals().get("PATHLINE_TUBE_RADIUS", 0.25)
     ws.streamline_params.terminal_speed = globals().get("TERMINAL_SPEED", 0.01)
     ws.streamline_params.rng_seed = globals().get("RNG_SEED", 0)
     ws.streamline_params.tube_radius = globals().get("TUBE_RADIUS", 0.25)
     ws.streamline_params.pathline_color = globals().get("PATHLINE_COLOR", globals().get("PLANE_PATHLINE_COLOR", "deepskyblue"))
+    color_mode = str(globals().get("PATHLINE_COLOR_MODE", "per_plane") or "per_plane").strip().lower()
+    ws.streamline_params.pathline_color_mode = color_mode if color_mode in {"uniform", "per_plane", "per_group"} else "per_plane"
+    ws.streamline_params.pathline_temporal_cache_mb = max(0.0, float(globals().get("PATHLINE_TEMPORAL_CACHE_MB", 512.0)))
     return ws
 
 

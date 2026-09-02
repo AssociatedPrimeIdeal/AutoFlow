@@ -79,7 +79,7 @@ def _run_phantom_p_case():
         use_multithread=False,
         plane_mode="distance",
         cross_section_dist=PLANE_SPACING_MM,
-        requested_metrics=["pg"],
+        requested_metrics=["pg", "vortex"],
         make_plane_video=False,
         make_wss_video=False,
         make_streamlines_video=False,
@@ -118,6 +118,11 @@ def test_phantom_p_plane_metrics_include_mean_velocity_error_and_valid_distance_
         assert "label_name" in first_plane
         assert first_plane["label_name"][()].decode("utf-8")
         assert "payload_json" in first_plane
+    with np.load(pixelwise_npz_path) as pixelwise:
+        assert pixelwise["vorticity"].shape[-1] == 3
+        assert pixelwise["vorticity_magnitude"].ndim == 4
+        assert pixelwise["q_criterion"].shape == pixelwise["swirling_strength"].shape
+        assert pixelwise["vortex_support_mask"].dtype == np.uint8
 
     planes_json = json.loads((case_dir / "planes.json").read_text(encoding="utf-8"))
     assert len(planes_json) == len(plane_positions)

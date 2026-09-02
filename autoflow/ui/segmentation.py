@@ -103,6 +103,8 @@ class SegmentationConfigDialog(QtWidgets.QDialog):
         self.edit_auto_model = QtWidgets.QLineEdit()
         self.edit_auto_model.setPlaceholderText("Bundled default")
         self.edit_auto_checkpoint = QtWidgets.QLineEdit()
+        self.edit_auto_folds = QtWidgets.QLineEdit()
+        self.edit_auto_folds.setPlaceholderText("single, all, or 0,1,2,3,4")
         self.btn_browse_checkpoint = QtWidgets.QPushButton("Browse...")
         self.btn_browse_checkpoint.clicked.connect(self._browse_checkpoint)
         checkpoint_row = QtWidgets.QHBoxLayout()
@@ -114,11 +116,12 @@ class SegmentationConfigDialog(QtWidgets.QDialog):
         self.edit_auto_label_map = QtWidgets.QPlainTextEdit()
         self.edit_auto_label_map.setPlaceholderText('{"aorta": 1}')
         self.edit_auto_label_map.setMaximumHeight(90)
-        note = QtWidgets.QLabel("Auto backend uses nnUNet model-folder inference when backend is nnUNet.")
+        note = QtWidgets.QLabel("Use nnUNet4D for temporal models; Folds accepts single, all, or an explicit list such as 0,1,2,3,4. A Dataset7020 .sh path is accepted as the model setting.")
         note.setWordWrap(True)
         form.addRow("Backend", self.edit_auto_backend)
         form.addRow("Model", self.edit_auto_model)
         form.addRow("Checkpoint", checkpoint_widget)
+        form.addRow("Folds", self.edit_auto_folds)
         form.addRow("Device", self.edit_auto_device)
         form.addRow("Label Map", self.edit_auto_label_map)
         form.addRow("", note)
@@ -129,7 +132,7 @@ class SegmentationConfigDialog(QtWidgets.QDialog):
             self,
             "Import Segmentation",
             self.edit_import_path.text().strip(),
-            "Segmentation (*.h5 *.hdf5 *.npy *.npz);;All (*)",
+            "Segmentation (*.h5 *.hdf5 *.npy *.npz *.nii *.nii.gz);;All (*)",
         )
         if path:
             self.edit_import_path.setText(path)
@@ -180,6 +183,7 @@ class SegmentationConfigDialog(QtWidgets.QDialog):
         self.edit_auto_backend.setText(seg.auto_backend)
         self.edit_auto_model.setText(seg.auto_model)
         self.edit_auto_checkpoint.setText(seg.auto_checkpoint)
+        self.edit_auto_folds.setText(seg.auto_folds)
         self.edit_auto_device.setText(seg.auto_device)
         self.edit_auto_label_map.setPlainText(seg.auto_label_map)
         self._sync_mode(self.combo_mode.currentText())
@@ -207,6 +211,7 @@ class SegmentationConfigDialog(QtWidgets.QDialog):
             "auto_backend": self.edit_auto_backend.text().strip(),
             "auto_model": self.edit_auto_model.text().strip(),
             "auto_checkpoint": self.edit_auto_checkpoint.text().strip(),
+            "auto_folds": self.edit_auto_folds.text().strip() or "single",
             "auto_device": self.edit_auto_device.text().strip(),
             "auto_label_map": self.edit_auto_label_map.toPlainText().strip(),
         }
@@ -300,13 +305,39 @@ class SegmentationDock(QtWidgets.QWidget):
 
         actions_group = QtWidgets.QGroupBox("Edit")
         actions_layout = QtWidgets.QVBoxLayout(actions_group)
-        self.btn_open_editor = QtWidgets.QPushButton("Open Manual Editor")
-        self.btn_open_editor.setIcon(
+        self.btn_run_auto = QtWidgets.QPushButton("Run Automatic Segmentation")
+        self.btn_run_auto.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPlay)
+        )
+        self.btn_run_auto.setProperty("role", "primary")
+        self.btn_external_editor = QtWidgets.QPushButton("Open in SpatioTemporal Labeler")
+        self.btn_external_editor.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView)
         )
-        self.btn_open_editor.setProperty("role", "primary")
-        actions_layout.addWidget(self.btn_open_editor)
+        self.btn_external_editor.setProperty("role", "primary")
+        self.btn_external_editor.setToolTip(
+            "Export magnitude, flow components, PC-MRA, and segmentation, then open the optional external editor."
+        )
+        actions_layout.addWidget(self.btn_run_auto)
+        actions_layout.addWidget(self.btn_external_editor)
         layout.addWidget(actions_group)
+
+        cleanup_group = QtWidgets.QGroupBox("4D Connected Components")
+        cleanup_form = QtWidgets.QFormLayout(cleanup_group)
+        self.check_cleanup_4d = QtWidgets.QCheckBox("Enable cleanup")
+        self.combo_cleanup_4d_mode = QtWidgets.QComboBox()
+        self.combo_cleanup_4d_mode.addItem("Remove below volume", "absolute")
+        self.combo_cleanup_4d_mode.addItem("Keep largest per label", "largest")
+        self.spin_cleanup_4d_volume = QtWidgets.QDoubleSpinBox()
+        self.spin_cleanup_4d_volume.setRange(0.0, 1e9)
+        self.spin_cleanup_4d_volume.setDecimals(2)
+        self.spin_cleanup_4d_volume.setSuffix(" mm^3")
+        self.btn_apply_cleanup_4d = QtWidgets.QPushButton("Apply / Rebuild")
+        cleanup_form.addRow("Mode", self.combo_cleanup_4d_mode)
+        cleanup_form.addRow("Minimum volume", self.spin_cleanup_4d_volume)
+        cleanup_form.addRow("", self.check_cleanup_4d)
+        cleanup_form.addRow("", self.btn_apply_cleanup_4d)
+        layout.addWidget(cleanup_group)
 
         self.label_status = QtWidgets.QLabel("No active segmentation")
         self.label_status.setWordWrap(True)

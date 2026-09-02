@@ -1,0 +1,3 @@
+[submodule "third_party/SpatioTemporalLabeler"]
+	path = third_party/SpatioTemporalLabeler
+	url = https://github.com/AssociatedPrimeIdeal/SpatioTemporalLabeler.git

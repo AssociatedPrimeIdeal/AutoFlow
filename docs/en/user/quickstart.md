@@ -5,7 +5,7 @@ Use this page when you want the shortest path to a successful AutoFlow run.
 
 ## Install
 
-Full local install for GUI and tests:
+Full local install for GUI, automatic segmentation, and tests:
 
 ```bash
 pip install -e ".[gui,test]"
@@ -15,6 +15,15 @@ CLI-only install:
 
 ```bash
 pip install .
+```
+
+Both normal and editable installs include the bundled nnUNet final checkpoint and its required metadata. The `gui` extra installs both the GUI and nnUNet inference dependencies; there is no separate automatic-segmentation extra.
+
+To enable the optional SpatioTemporal Labeler `v0.4.0` exchange workflow, initialize the pinned source submodule and install its extra:
+
+```bash
+git submodule update --init --recursive
+pip install -e ".[gui,labeler]"
 ```
 
 Known working test environment in this repo:
@@ -47,6 +56,7 @@ Typical outputs under `./results/demo/<case_name>/`:
 - `plane_positions.json`
 - `plane_metrics.json`
 - `plane_qc.json`
+- `quality_report.json`
 - `summary.json`
 - source H5 `segmask` is updated in place for reuse, plus `*_auto_segmentation.nii.gz` and `*_auto_segmentation_feature_*.nii.gz` when auto segmentation runs on an H5 input
 
@@ -95,6 +105,13 @@ autoflow-run ./data/demo_data.h5 \
   --end-dist 0
 ```
 
+### Default center fixed-step planes
+
+Generated planes default to three symmetric planes at 25% of the usable
+centerline length on either side of the center (`fixed_step`, `center`, `both`).
+The segmentation filter is enabled by default; disable it with
+`--no-segmentation-filter` when working with a binary mask.
+
 ### Auto segmentation when no segmentation is present
 
 ```bash
@@ -108,9 +125,11 @@ autoflow-run ./data/demo_data.h5 \
 ```bash
 autoflow-run ./data/demo_data.h5 \
   --output-dir ./results/demo \
-  --with pwv,wss,tke,pg \
+  --with pwv,wss,tke,pg,vortex \
   --video plane,wss,tke,pg
 ```
+
+`vortex` computes whole-volume vorticity, Q-criterion, and swirling strength. It is not a plane-video family, so it is intentionally omitted from `--video`.
 
 ## Next Pages
 

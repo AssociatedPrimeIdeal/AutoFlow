@@ -14,7 +14,15 @@ from ..algorithms import (
     create_uniform_grid,
     sample_volume_on_existing_surface,
 )
-from ..algorithms.streamlines import automatic_streamline_clim
+from ..algorithms.streamlines import (
+    _plane_seeds,
+    automatic_streamline_clim,
+    pathline_prefix_at_phase,
+)
+
+
+_DISPLAY_AXIS_DEFAULTS = ("LR", "AP", "FH")
+_DISPLAY_AXIS_CHOICES = (("LR", "RL"), ("AP", "PA"), ("FH", "HF"))
 
 
 def _parse_indexed_data_key(data_key, prefix):
@@ -85,6 +93,10 @@ class SceneController:
         self._automatic_clim_cache = {}
         self._tracked_actors = {}
         self._saved_camera = None
+        self._display_axis_directions = list(_DISPLAY_AXIS_DEFAULTS)
+        self._display_axis_signs = np.ones(3, dtype=float)
+        self._display_center = None
+        self._display_transform_cache = {}
         self._playback_active = False
         self._highlight_plane_uid = None
         self._highlight_plane_actor = None
@@ -101,13 +113,159 @@ class SceneController:
 
     def initialize(self):
         self.plotter.set_background("white")
-        self.plotter.add_axes(
-            xlabel="LR",
-            ylabel="AP",
-            zlabel="FH",
-            line_width=2,
-        )
+        self._add_orientation_axes()
         self.plotter.reset_camera()
+
+    def _add_orientation_axes(self):
+        try:
+            self.plotter.add_axes(
+                xlabel=self._display_axis_directions[0],
+                ylabel=self._display_axis_directions[1],
+                zlabel=self._display_axis_directions[2],
+                line_width=2,
+            )
+            if not self._axes_shown:
+                self.plotter.hide_axes()
+        except Exception:
+            pass
+
+    def set_display_axis_directions(self, directions):
+        """Set display-only positive axis directions and rebuild rendered actors."""
+        values = [str(value or "").strip().upper() for value in (directions or ())]
+        if len(values) < 3:
+            return False
+        normalized = []
+        for value, choices in zip(values[:3], _DISPLAY_AXIS_CHOICES):
+            normalized.append(value if value in choices else choices[0])
+        signs = np.asarray([1.0 if value == default else -1.0 for value, default in zip(normalized, _DISPLAY_AXIS_DEFAULTS)], dtype=float)
+        if normalized == self._display_axis_directions:
+            return True
+        if self._display_center is None:
+            self._display_center = self._current_scene_center()
+        self._display_axis_directions = normalized
+        self._display_axis_signs = signs
+        self._display_transform_cache.clear()
+        highlighted_plane = self._highlight_plane_uid
+        highlighted_path = self._highlight_path_uid
+        highlighted_path_idx = None
+        if highlighted_path is not None:
+            highlighted_obj = self.workspace.scene_objects.get(highlighted_path)
+            if highlighted_obj is not None:
+                highlighted_path_idx = _parse_indexed_data_key(highlighted_obj.data_key, "smooth_path")
+        self._remove_plane_highlight()
+        self._remove_path_highlight()
+        self._clear_fork_and_context_actors()
+        try:
+            remover = getattr(self.plotter, "_remove_axes_widget", None)
+            if callable(remover):
+                remover()
+            else:
+                self.plotter.hide_axes()
+        except Exception:
+            pass
+        self._add_orientation_axes()
+        self.sync_from_workspace()
+        if highlighted_plane is not None:
+            self.highlight_plane(highlighted_plane)
+        if highlighted_path is not None:
+            self.highlight_path(highlighted_path)
+            if highlighted_path_idx is not None:
+                self.show_forks_for_path(highlighted_path_idx)
+        return True
+
+    def display_axis_directions(self):
+        return tuple(self._display_axis_directions)
+
+    def _current_scene_center(self):
+        try:
+            bounds = np.asarray(tuple(float(value) for value in self.plotter.bounds), dtype=float)
+            if bounds.size == 6 and np.all(np.isfinite(bounds)):
+                extent = bounds[[1, 3, 5]] - bounds[[0, 2, 4]]
+                if np.any(extent > 1e-9):
+                    return bounds.reshape(3, 2).mean(axis=1)
+        except Exception:
+            pass
+        return None
+
+    def _ensure_display_center(self, data=None):
+        if self._display_center is not None:
+            return np.asarray(self._display_center, dtype=float).reshape(3)
+        center = self._current_scene_center()
+        if center is None and data is not None:
+            try:
+                bounds = np.asarray(data.bounds, dtype=float).reshape(3, 2)
+                center = bounds.mean(axis=1)
+            except Exception:
+                center = np.zeros(3, dtype=float)
+        self._display_center = np.asarray(center if center is not None else np.zeros(3), dtype=float).reshape(3)
+        return self._display_center
+
+    def _workspace_scene_center(self):
+        bounds_rows = []
+        for obj in self.workspace.scene_objects.values():
+            if not getattr(obj, "visible", True):
+                continue
+            try:
+                data = self._build_dataset(obj.data_key)
+                bounds = np.asarray(data.bounds, dtype=float).reshape(3, 2) if data is not None else None
+                if bounds is not None and np.all(np.isfinite(bounds)):
+                    bounds_rows.append(bounds)
+            except Exception:
+                continue
+        if not bounds_rows:
+            return None
+        bounds = np.stack(bounds_rows, axis=0)
+        return np.stack([np.min(bounds[:, axis, 0]) for axis in range(3)] + [
+            np.max(bounds[:, axis, 1]) for axis in range(3)
+        ]).reshape(2, 3).mean(axis=0)
+
+    def world_to_display_points(self, points):
+        arr = np.asarray(points, dtype=float)
+        original_shape = arr.shape
+        flat = arr.reshape(-1, 3)
+        if np.all(self._display_axis_signs == 1.0):
+            return arr.copy()
+        center = self._ensure_display_center()
+        return (center + (flat - center) * self._display_axis_signs.reshape(1, 3)).reshape(original_shape)
+
+    def display_to_world_points(self, points):
+        return self.world_to_display_points(points)
+
+    def world_to_display_point(self, point):
+        return self.world_to_display_points(np.asarray(point, dtype=float).reshape(1, 3))[0]
+
+    def display_to_world_point(self, point):
+        return self.display_to_world_points(np.asarray(point, dtype=float).reshape(1, 3))[0]
+
+    def world_to_display_vector(self, vector):
+        value = np.asarray(vector, dtype=float).reshape(3)
+        return value * self._display_axis_signs
+
+    def display_to_world_vector(self, vector):
+        return self.world_to_display_vector(vector)
+
+    def _transform_display_dataset(self, data):
+        if data is None or np.all(self._display_axis_signs == 1.0):
+            return data
+        center = tuple(float(value) for value in self._ensure_display_center(data))
+        key = (id(data), tuple(float(value) for value in self._display_axis_signs), center)
+        cached = self._display_transform_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            matrix = np.eye(4, dtype=float)
+            matrix[:3, :3] = np.diag(self._display_axis_signs)
+            matrix[:3, 3] = np.asarray(center) - self._display_axis_signs * np.asarray(center)
+            transformed = data.copy(deep=True)
+            transformed.transform(matrix, transform_all_input_vectors=True, inplace=True)
+        except Exception:
+            try:
+                transformed = data.copy(deep=True)
+                transformed.points = self.world_to_display_points(np.asarray(data.points, dtype=float))
+            except Exception:
+                transformed = data
+        self._display_transform_cache[key] = transformed
+        return transformed
 
     def reset_scene(self):
         try:
@@ -125,14 +283,20 @@ class SceneController:
         self._display_mesh_cache.clear()
         self._phase_lookup_cache.clear()
         self._automatic_clim_cache.clear()
+        self._display_transform_cache.clear()
         self._active_scalar_bar_uid = None
         self._remove_plane_highlight()
         self._remove_path_highlight()
         self.initialize()
 
+    def reset_display_reference(self):
+        self._display_center = None
+        self._display_transform_cache.clear()
+
     def invalidate_cache(self, prefix=None):
         self._phase_lookup_cache.clear()
         self._automatic_clim_cache.clear()
+        self._display_transform_cache.clear()
         if prefix is None:
             self._mesh_cache.clear()
             self._display_mesh_cache.clear()
@@ -184,6 +348,8 @@ class SceneController:
 
     def sync_from_workspace(self, rebuild_prefixes=None):
         had_rendered_scene = bool(self._tracked_actors)
+        if self._display_center is None and not np.all(self._display_axis_signs == 1.0):
+            self._display_center = self._workspace_scene_center()
         prefixes = None if rebuild_prefixes is None else tuple(str(x) for x in rebuild_prefixes)
         current_uids = set(self.workspace.scene_objects.keys())
         stale = set(self._tracked_actors.keys()) - current_uids
@@ -256,7 +422,10 @@ class SceneController:
             except Exception:
                 cam_before = None
         for obj in self.workspace.scene_objects.values():
-            if obj.dynamic:
+            # Hidden layers can be costly to rebuild (for example TKE,
+            # pressure, streamlines, and 4D segmentation surfaces). Keep the
+            # actor at its last phase and bring it current only when shown.
+            if obj.dynamic and obj.visible:
                 self._update_dynamic_object(obj)
         if self._playback_active and cam_before is not None:
             try:
@@ -284,6 +453,7 @@ class SceneController:
         try:
             self._segmentation_category_metadata(obj, data)
             data_show = self._display_dataset(obj, data)
+            data_show = self._transform_display_dataset(data_show)
             mapper = obj.actor.GetMapper()
             # Preserve PyVista's active-scalar pipeline when swapping phases.
             # Raw VTK SetInputData leaves the mapper's scalar texture connected
@@ -304,6 +474,7 @@ class SceneController:
         data = self._build_dataset(obj.data_key)
         if data is None:
             return False
+        data = self._transform_display_dataset(data)
         actors = [obj.actor]
         if self._highlight_plane_uid == uid:
             actors.append(self._highlight_plane_actor)
@@ -332,6 +503,13 @@ class SceneController:
         if obj.actor is None:
             self._render_object(obj, refresh_scalar_bar=True)
             return
+        was_visible = False
+        try:
+            was_visible = bool(obj.actor.GetVisibility())
+        except Exception:
+            pass
+        if obj.dynamic and obj.visible and not was_visible:
+            self._update_dynamic_object(obj)
         try:
             obj.actor.SetVisibility(1 if obj.visible else 0)
         except Exception:
@@ -369,6 +547,7 @@ class SceneController:
         data = self._build_dataset(obj.data_key)
         if data is None:
             return
+        data = self._transform_display_dataset(data)
         try:
             self._highlight_plane_actor = self.plotter.add_mesh(
                 data, color="magenta", opacity=0.9, line_width=4,
@@ -397,6 +576,7 @@ class SceneController:
         data = self._build_dataset(obj.data_key)
         if data is None:
             return
+        data = self._transform_display_dataset(data)
         try:
             self._highlight_path_actor = self.plotter.add_mesh(
                 data, color="magenta", opacity=1.0, line_width=8,
@@ -440,6 +620,7 @@ class SceneController:
                 poly = _path_polydata(self.workspace.centerline_paths_smooth[int(idx)], org)
                 if poly is None:
                     continue
+                poly = self._transform_display_dataset(poly)
                 try:
                     actor = self.plotter.add_mesh(
                         poly, color=color, opacity=1.0, line_width=8,
@@ -452,6 +633,7 @@ class SceneController:
         if pts:
             try:
                 poly = pv.PolyData(np.asarray(pts, dtype=float).reshape(-1, 3))
+                poly = self._transform_display_dataset(poly)
                 self._highlight_fork_actor = self.plotter.add_mesh(
                     poly, color="magenta", point_size=22, render_points_as_spheres=True,
                     name="__fork_highlight__")
@@ -596,6 +778,7 @@ class SceneController:
         kwargs = self._mesh_kwargs(obj, data)
         try:
             data_show = self._display_dataset(obj, data)
+            data_show = self._transform_display_dataset(data_show)
             obj.actor = self.plotter.add_mesh(data_show, name=obj.uid, **kwargs)
             self._tracked_actors[obj.uid] = obj.actor
             self._apply_basic_properties_only(obj)
@@ -659,6 +842,9 @@ class SceneController:
         if obj.kind.value in ("Graph", "Branch", "Flow", "Aux"):
             kw["line_width"] = obj.line_width
             kw["render_lines_as_tubes"] = True
+        if obj.data_key.startswith("pathline_") and getattr(data, "n_lines", 0) == 0:
+            kw["render_points_as_spheres"] = True
+            kw["point_size"] = max(float(obj.point_size), 6.0)
         if obj.kind == ObjectKind.FLOW and use_scalars:
             # Quantitative streamline colors must match the scalar bar instead
             # of being darkened by the tube surface orientation.
@@ -855,6 +1041,19 @@ class SceneController:
                 return None
             return self._cached(data_key, 0, lambda: build_surface_from_mask3d(ws.segmask_3d, sp, org, smooth_iter=1000))
 
+        if data_key in {"phase_wrap_mask", "phase_wrap_count"}:
+            result = getattr(ws, "phase_unwrap_result", {}) or {}
+            field = result.get("wrap_mask" if data_key == "phase_wrap_mask" else "wrap_count")
+            if field is None:
+                return None
+            arr = np.asarray(field)
+            if arr.ndim == 5:
+                arr = arr[:, :, :, min(max(0, int(t)), arr.shape[3] - 1), :]
+            if arr.ndim == 4:
+                arr = np.any(arr, axis=-1) if data_key == "phase_wrap_mask" else arr[..., 0]
+            mesh = create_uniform_grid(np.asarray(arr), sp, org, name="wrap_mask" if data_key == "phase_wrap_mask" else "wrap_count")
+            return mesh
+
         if isinstance(data_key, str) and data_key.startswith("segmask_group_"):
             group_name = str(data_key[len("segmask_group_"):])
             group_state = ws.multilabel_groups.get(group_name, {})
@@ -974,6 +1173,40 @@ class SceneController:
                     return mask_mesh.sample(tke_grid)
                 return self._cached(data_key, t, _build_tke_t)
             return ws.derived.tke_volume
+
+        vortex_fields = {
+            "vorticity_magnitude_volume": ("vorticity_magnitude", "Vorticity Magnitude"),
+            "q_criterion_volume": ("q_criterion_array", "Q-Criterion"),
+            "swirling_strength_volume": ("swirling_strength_array", "Swirling Strength"),
+        }
+        if data_key in vortex_fields:
+            field_name, scalar_name = vortex_fields[data_key]
+            source = getattr(ws.derived, field_name, None)
+            support_source = ws.derived.vortex_support_mask
+            if source is None or support_source is None:
+                return None
+
+            def _build_vortex_t():
+                arr = np.asarray(source, dtype=np.float32)
+                tidx = min(max(0, int(t)), arr.shape[3] - 1) if arr.ndim == 4 else 0
+                vol_t = arr[..., tidx] if arr.ndim == 4 else arr
+                support = np.asarray(support_source, dtype=bool)
+                if support.ndim == 4:
+                    support_t = support[..., min(max(0, int(t)), support.shape[3] - 1)]
+                else:
+                    support_t = support
+                vol_t = np.where(support_t, vol_t, np.float32(0.0)).astype(np.float32, copy=False)
+                return self._sample_supported_surface(
+                    vol_t,
+                    support_t,
+                    0,
+                    sp,
+                    org,
+                    name=scalar_name,
+                    cache_key=data_key,
+                )
+
+            return self._cached(data_key, int(t), _build_vortex_t)
 
         if data_key == "pressure_gradient_volume":
             if ws.derived.pressure_gradient_magnitude is None:
@@ -1141,7 +1374,7 @@ class SceneController:
             self._phase_lookup_cache[key] = lookup
         return int(lookup[min(max(0, int(t)), len(lookup) - 1)])
 
-    def _sample_supported_surface(self, volume_t, support_4d_or_3d, t, spacing, origin, *, name):
+    def _sample_supported_surface(self, volume_t, support_4d_or_3d, t, spacing, origin, *, name, cache_key=None):
         support = np.asarray(support_4d_or_3d, dtype=bool)
         if support.ndim == 4:
             rep_t = self._representative_phase(support_4d_or_3d, t)
@@ -1150,7 +1383,7 @@ class SceneController:
             rep_t = 0
             support_t = support
         surface = self._cached(
-            "pressure_support_surface",
+            f"{str(cache_key or name)}_support_surface_{id(support_4d_or_3d)}",
             rep_t,
             lambda: build_cell_mask_surface(
                 support_t, spacing, origin=origin, smooth_iter=80
@@ -1186,30 +1419,60 @@ class SceneController:
         ws = self.workspace
         if int(plane_idx) not in ws.active_pathline_plane_indices:
             return None
+        # A pathline is the one-cycle trajectory of particles released at
+        # phase zero. Playback only reveals its cached prefix.
+        launch_time = 0
         plane_cache = ws.pathline_cache.setdefault(int(plane_idx), {})
-        if t in plane_cache:
-            return plane_cache[t]
-        if ws.flow_raw is None or ws.segmask_binary is None:
-            return None
-        if plane_idx < 0 or plane_idx >= len(ws.planes):
-            return None
-        plane = ws.planes[int(plane_idx)]
-        p = ws.streamline_params
-        mask_t = ws.segmask_binary[..., min(max(0, int(t)), ws.segmask_binary.shape[3] - 1)]
-        sl = generate_pathlines_from_plane_at_t(
-            ws.flow_raw, t, plane, ws.resolution, ws.origin,
-            mask_4d=ws.segmask_binary,
-            mask_3d=mask_t,
-            max_steps=p.max_steps,
-            terminal_speed=p.terminal_speed,
-            seed_ratio=p.seed_ratio,
-            min_seeds=p.min_seeds,
-            rng_seed=p.rng_seed,
-            rr=ws.rr,
-            branch_labels_3d=ws.branch_labels,
+        full_pathline = plane_cache.get(launch_time)
+        if full_pathline is None:
+            if ws.flow_raw is None or ws.segmask_binary is None:
+                return None
+            if plane_idx < 0 or plane_idx >= len(ws.planes):
+                return None
+            plane = ws.planes[int(plane_idx)]
+            p = ws.streamline_params
+            mask_t = ws.segmask_binary[..., launch_time]
+            seed_cache = getattr(ws, "pathline_seed_cache", {})
+            seeds = seed_cache.get(int(plane_idx))
+            if seeds is None:
+                seeds = _plane_seeds(
+                    mask_t,
+                    plane,
+                    ws.resolution,
+                    ws.origin,
+                    seed_ratio=p.pathline_seed_ratio,
+                    min_seeds=p.pathline_min_seeds,
+                    max_seeds=getattr(p, "pathline_max_seeds", 250),
+                    rng_seed=p.pathline_rng_seed,
+                    branch_labels_3d=ws.branch_labels,
+                    t=launch_time,
+                    seed_mode=getattr(p, "pathline_seed_mode", "fixed"),
+                )
+                if seeds is not None:
+                    seed_cache[int(plane_idx)] = np.asarray(seeds, dtype=float)
+            full_pathline = generate_pathlines_from_plane_at_t(
+                ws.flow_raw, launch_time, plane, ws.resolution, ws.origin,
+                mask_4d=ws.segmask_binary,
+                mask_3d=mask_t,
+                max_steps=p.pathline_max_steps,
+                terminal_speed=p.pathline_terminal_speed,
+                seed_ratio=p.pathline_seed_ratio,
+                min_seeds=p.pathline_min_seeds,
+                rng_seed=p.pathline_rng_seed,
+                rr=ws.rr,
+                branch_labels_3d=ws.branch_labels,
+                max_seeds=getattr(p, "pathline_max_seeds", 250),
+                seeds=seeds,
+                seed_mode=getattr(p, "pathline_seed_mode", "fixed"),
+            )
+            plane_cache[launch_time] = full_pathline
+        time_count = max(1, int(ws.time_count()))
+        progress = float(np.clip(int(t), 0, time_count - 1)) / float(max(time_count - 1, 1))
+        return self._cached(
+            f"pathline_display_{int(plane_idx)}",
+            int(t),
+            lambda: pathline_prefix_at_phase(full_pathline, progress),
         )
-        plane_cache[t] = sl
-        return sl
 
     def trigger_streamlines(self):
         ws = self.workspace
@@ -1238,7 +1501,7 @@ class SceneController:
                       tube_radius=ws.streamline_params.tube_radius)
         self.sync_from_workspace()
 
-    def trigger_pathlines(self, plane_indices=None):
+    def trigger_pathlines(self, plane_indices=None, *, precomputed=None):
         ws = self.workspace
         if ws.flow_raw is None or ws.segmask_3d is None:
             self.logger("Cannot generate Pathlines: need flow + segmask_3d")
@@ -1249,10 +1512,27 @@ class SceneController:
         if not valid:
             self.logger("Cannot generate Pathlines: no valid planes")
             return
-        ws.clear_pathlines()
-        ws.active_pathline_plane_indices = valid
+
+        # Pathlines are accumulated per launch plane.  In particular, a
+        # single-plane request after an all-plane request must not discard the
+        # already integrated planes or their t=0 trajectory/seed caches.
+        active = {
+            int(idx)
+            for idx in ws.active_pathline_plane_indices
+            if 0 <= int(idx) < len(ws.planes)
+        }
+        active.update(valid)
+        ws.active_pathline_plane_indices = sorted(active)
+        for plane_idx, time_meshes in dict(precomputed or {}).items():
+            plane_idx = int(plane_idx)
+            if plane_idx not in valid:
+                continue
+            plane_cache = ws.pathline_cache.setdefault(plane_idx, {})
+            plane_cache.update({
+                int(time_idx): mesh for time_idx, mesh in dict(time_meshes or {}).items()
+            })
         p = ws.streamline_params
-        self.logger(f"Pathlines enabled for planes {valid}: seed_ratio={p.seed_ratio} min_seeds={p.min_seeds} max_steps={p.max_steps} terminal_speed={p.terminal_speed} rng_seed={p.rng_seed} color={p.pathline_color}")
+        self.logger(f"Pathlines enabled for planes {valid} from t=0: seed_mode={getattr(p, 'pathline_seed_mode', 'fixed')} seed_ratio={p.pathline_seed_ratio} min_seeds={p.pathline_min_seeds} seed_count_or_limit={getattr(p, 'pathline_max_seeds', 250)} max_steps={p.pathline_max_steps} terminal_speed={p.pathline_terminal_speed} rng_seed={p.pathline_rng_seed} color_mode={getattr(p, 'pathline_color_mode', 'per_plane')}")
         for plane_idx in valid:
             group_name = str(getattr(ws.planes[int(plane_idx)], "group_name", "") or "")
             if group_name:
@@ -1261,6 +1541,8 @@ class SceneController:
             else:
                 name = f"pathline {int(plane_idx)}"
                 data_key = f"pathline_{int(plane_idx)}"
+            if any(obj.data_key == data_key for obj in ws.scene_objects.values()):
+                continue
             ws.add_object(
                 name=name,
                 kind=ObjectKind.FLOW,
@@ -1272,14 +1554,13 @@ class SceneController:
                 color=ws.pathline_color_for_plane(plane_idx),
                 dynamic=True,
                 show_scalar_bar=False,
-                tube_radius=ws.streamline_params.tube_radius,
+                tube_radius=ws.streamline_params.pathline_tube_radius,
             )
         self.invalidate_cache("pathline_")
         self.sync_from_workspace()
 
     def trigger_plane_streamlines(self, plane_idx):
-        _ = plane_idx
-        self.trigger_pathlines()
+        self.trigger_pathlines([int(plane_idx)])
 
     def clear_streamlines(self):
         self.workspace.clear_streamlines()
@@ -1300,7 +1581,7 @@ class SceneController:
         ws = self.workspace
         if picked_point is None:
             return None, None
-        picked = np.asarray(picked_point, dtype=float).reshape(3)
+        picked = self.display_to_world_point(picked_point)
         best_uid, best_idx, best_dist = None, None, float("inf")
         org = np.asarray(ws.origin, dtype=float).reshape(3)
         for uid, obj in ws.scene_objects.items():
@@ -1321,7 +1602,7 @@ class SceneController:
         ws = self.workspace
         if picked_point is None:
             return None, None
-        picked = np.asarray(picked_point, dtype=float).reshape(3)
+        picked = self.display_to_world_point(picked_point)
         best_uid, best_idx, best_dist = None, None, float("inf")
         org = np.asarray(ws.origin, dtype=float).reshape(3)
         for uid, obj in ws.scene_objects.items():

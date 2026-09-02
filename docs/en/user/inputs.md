@@ -26,7 +26,7 @@
 - if the root does not directly contain a supported layout, AutoFlow searches nested groups and uses the shallowest group that contains one supported case layout
 - if one H5 file contains multiple recognizable 4D flow data groups at the same shallowest depth, AutoFlow treats them as separate input cases instead of forcing one winner
 - each such case is identified by its H5 data-group path, for example `StudyA/Series1`
-- H5 dataset names are matched case-insensitively for loader keys such as `img_complex`, `img`, `mag`, `flow`, `segmask`, `segmentation`, `Resolution`, `Origin`, `RR`, `VENC`, `SpatialOrder`, and `VENCOrder`
+- H5 dataset names are matched case-insensitively for loader keys such as `img_complex`, `img`, `mag`, `flow`, `segmask`, `segmentation`, `seg`, `Resolution`, `Origin`, `RR`, `VENC`, `SpatialOrder`, and `VENCOrder`
 - `SpatialOrder` and `VENCOrder` can be stored either as a three-item text array such as `["FH", "RL", "PA"]` or as one comma-separated string such as `"FH,RL,PA"`
 - `Resolution`, `Origin`, and `VENC` can be stored as flat triplets, singleton row vectors such as `[[1.2, 1.3, 1.4]]`, or singleton column vectors such as `[[50], [60], [70]]`; AutoFlow flattens these forms during load
 - separators such as `_` and `-` are ignored during key matching, so names like `Spatial_Order` and `venc-order` are accepted
@@ -34,11 +34,22 @@
 
 ## H5 Background Correction Cache
 
+- after the user selects an H5 case group, the GUI inspects that group before loading: an existing `corr` cache (or both `corr_low` and `corr_high` for dual-venc data) enables background correction and skips the correction prompt
+- when the selected H5 case has no correction cache, the GUI first asks whether background correction should run for that load
+- after loading, an embedded `segmask`, `segmentation`, or `seg` is activated without another prompt; when no segmentation is available, the GUI leaves the case unloaded from segmentation work and directs the user to the `Segmentation` stage's explicit `Run Automatic Segmentation` command
+- consequently, a selected H5 group that already contains both correction and segmentation artifacts loads directly after case selection
+- when background phase correction is disabled, the correction stage preserves the same normalized output values while bypassing its extra full-volume copy and synthetic complex conversion
 - when background phase correction is enabled for an H5 input, AutoFlow first looks for a reusable `corr` dataset in the selected H5 data group, then at the file root
-- if no compatible cache is found, AutoFlow runs MSAC background phase correction and writes the resulting correction field back to the original H5 as `corr` when the file is writable
+- if no compatible cache is found, AutoFlow runs the configured background-correction method and writes the resulting correction field back to the original H5 as `corr` when the file is writable
+- WRLS + ARTO is the default; when an H5 correction cache is missing and correction is enabled, the GUI asks the user to select `MSAC` or `WRLS + ARTO`
+- WRLS+ARTO automatically runs its dominant ARTO GMM stage on CUDA when PyTorch and a usable CUDA device are available, with automatic CPU fallback and no device setting
+- the GUI shows its standard progress dialog for enabled H5 background correction, including method-specific fitting and the H5 cache-write stage; closing the dialog only hides progress
 - legacy dual-venc H5 stores separate correction caches as `corr_low` and `corr_high`
+- after a dual-venc correction is applied or reused, the GUI Content selector exposes both normalized low- and high-venc correction components (`Corr Low LR/AP/FH` and `Corr High LR/AP/FH`)
+- when both dual-venc correction fields must be computed, the low- and high-venc correction passes run concurrently; H5 cache writes remain serialized
 - a time-invariant correction cache may use shape `XYZ13`; AutoFlow broadcasts its singleton time dimension across every input time frame
-- cached corrections are reused only when their shape, algorithm version, `corr_fit_order`, and `threshold` match the current load configuration
+- cached corrections are reused only when their shape, method, algorithm version, fit order, and method-specific parameters match the current load configuration
+- cold MSAC correction caches the full-volume polynomial design matrix across its fixed random trials; the random seed, sampled indices, threshold, fit order, correction values, and cache format remain unchanged
 - for multi-group H5 files, untagged root-level `corr` caches are not reused across different data-group paths
 - if the H5 file cannot be opened for writing, loading still succeeds; AutoFlow simply skips writing the cache
 
@@ -47,10 +58,14 @@
 - AutoFlow uses `SpatialOrder` together with `VENCOrder` or `VencOrder` for all supported H5 layouts, including legacy complex H5, normalized `mag` + `flow`, and real-valued `img[..., 0:4]` or `img[0:4, ...]`.
 - for real-valued channel-first `img[0:4, ...]`, AutoFlow first transposes the raw array into internal `XYZT4` or `XYZ4` order before applying the usual spatial-axis and velocity-component normalization.
 - loaded arrays are normalized to internal spatial order `LR, AP, FH` and velocity-component order `LR, AP, FH` before downstream processing.
+- the GUI labels the normalized render axes and ortho views with `LR, AP, FH`; `spatial_order_raw` describes the source layout and must not be interpreted as the post-load array-axis order.
 - opposite-direction labels such as `RL`, `PA`, and `HF` trigger spatial flips and velocity sign flips so the final `flow` stays physically consistent after reordering.
 - for real-valued `img[..., 1:4]`, AutoFlow treats values near the full `[-pi, pi]` phase range as phase radians and rescales them to physical velocity with `flow / pi * VENC` during load.
+- complex single-VENC H5 inputs retain canonical `phase_wrapped` for the optional phase-unwrapping stage; dual-VENC inputs retain low/high wrapped phases for audit but the workflow skips unwrapping.
 - for real-valued H5 inputs, this normalization reorders spatial axes and flow components but does not rescale the stored magnitude values.
 - `LoadedCase.metadata["spatial_order_raw"]` and `LoadedCase.metadata["venc_order_raw"]` preserve the source labels read from the H5 file.
+
+Segmentation imports also accept NIfTI (`.nii` and `.nii.gz`) 3D or 4D label volumes. NIfTI files exported by the GUI use the loaded voxel spacing and origin in the affine and can be round-tripped through external editors.
 
 ## Loader Result Contract
 
@@ -78,6 +93,15 @@ AutoFlow normalizes loaders to `LoadedCase`.
 | `source_format` | loader source format label |
 | `source_group` | selected H5 data-group path when applicable |
 | `capabilities` | explicit downstream capability flags |
+
+### Coordinate contract
+
+- `origin` is the world-space position of local physical coordinate `[0, 0, 0]`.
+- For the current axis-aligned loader contract, voxel index `ijk` maps to local physical millimetres as `ijk * resolution` and to world space as `origin + ijk * resolution`.
+- Workspace centerlines and `PlaneData.center` use local physical millimetres. VTK rendering and slicing add `origin` exactly once at the geometry boundary.
+- Saved plane records use `center` for the local coordinate and `center_world` for the world coordinate.
+- A restored workspace preserves its saved `origin`; changing only `origin` must not change sampled area, flow, WSS, TKE, or pressure values.
+- A full direction-matrix/oblique affine is not yet part of `LoadedCase`; oblique DICOM remains a loader limitation rather than being approximated through `origin`.
 
 ### Capability flags
 

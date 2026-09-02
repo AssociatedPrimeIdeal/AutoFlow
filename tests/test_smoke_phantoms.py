@@ -7,20 +7,36 @@ import h5py
 import numpy as np
 import pytest
 
-from autoflow import AutoFlowConfig, run_batch, run_case
+from autoflow import AutoFlowConfig, build_workspace, run_batch, run_case
 from autoflow.algorithms.data import discover_h5_input_cases, inspect_h5_input_case, load_h5_data
 from autoflow.algorithms.dicom import collect_input_cases
 from autoflow.algorithms.segmentation import default_nnunet_model_folder
 from autoflow.algorithms.pwv import compute_cross_correlation_delay_ms, detect_waveform_foot_time_ms
 from autoflow.algorithms.preprocess import filter_connected_components
-from autoflow.algorithms.metrics import compute_plane_metrics, compute_wss_metrics
+from autoflow.algorithms.metrics import compute_plane_metrics, compute_vortex_metrics, compute_wss_metrics
+from autoflow.algorithms.planes import filter_paths_by_segmentation, generate_planes_from_paths
 from autoflow.algorithms.segmentation import generate_nnunet_auto_segmentation, save_segmentation_to_source_h5
-from autoflow.algorithms.streamlines import automatic_streamline_clim, generate_streamlines_at_t, _plane_seeds
+from autoflow.algorithms.streamlines import (
+    _plane_seeds,
+    automatic_streamline_clim,
+    create_pathline_temporal_source,
+    generate_pathlines_from_plane_at_t,
+    generate_streamlines_at_t,
+    pathline_prefix_at_phase,
+)
 from autoflow.config import bundle_to_autoflow_kwargs
 from autoflow.core.pipeline import PipelineEngine
 from autoflow.core.models import PlaneData, SkeletonParams, StepId, Workspace
-from autoflow.plane_io import build_plane_records, project_planes_to_workspace
+from autoflow.case_types import LoaderCapabilities
+from autoflow.plane_io import (
+    PLANE_POSITION_SCHEMA,
+    build_plane_records,
+    load_plane_position_payload,
+    project_planes_to_workspace,
+    save_plane_positions,
+)
 from autoflow.plane_io import save_pwv_h5
+from autoflow.quality import QUALITY_REPORT_SCHEMA, build_quality_report, save_quality_report
 from autoflow.rendering.videos import _build_union_surface, _path_color, _path_group_name, _write_video, render_plane_rotation_video
 
 
@@ -28,6 +44,41 @@ DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 PHANTOM_CASES = ("phantom_S", "phantom_U", "phantom_Y")
 REL_TOL = 0.05
 PLANE_SPACING_MM = 15.0
+
+
+def test_vortex_kinematics_matches_rigid_rotation_and_rejects_pure_shear():
+    shape = (11, 11, 11, 2)
+    mask = np.ones(shape, dtype=bool)
+    x, y, _z = np.meshgrid(
+        np.arange(shape[0], dtype=np.float32),
+        np.arange(shape[1], dtype=np.float32),
+        np.arange(shape[2], dtype=np.float32),
+        indexing="ij",
+    )
+    omega = 20.0
+    rotation = np.zeros(shape + (3,), dtype=np.float32)
+    rotation[..., 0] = (-omega * y[..., None] * 1e-3) * 100.0
+    rotation[..., 1] = (omega * x[..., None] * 1e-3) * 100.0
+
+    result = compute_vortex_metrics(mask, rotation, (1.0, 1.0, 1.0), support_erosion_iters=1)
+    center = (5, 5, 5, 0)
+    assert result["vortex_support_mask"][center] == 1
+    assert result["vorticity_array"][center] == pytest.approx([0.0, 0.0, 2.0 * omega])
+    assert float(result["q_criterion_array"][center]) == pytest.approx(omega ** 2)
+    assert float(result["swirling_strength_array"][center]) == pytest.approx(omega)
+    assert not np.any(result["vortex_support_mask"][0])
+
+    shear_rate = 30.0
+    shear = np.zeros_like(rotation)
+    shear[..., 0] = (shear_rate * y[..., None] * 1e-3) * 100.0
+    shear_result = compute_vortex_metrics(mask, shear, (1.0, 1.0, 1.0), support_erosion_iters=1)
+    assert float(shear_result["vorticity_magnitude"][center]) == pytest.approx(shear_rate)
+    assert float(shear_result["q_criterion_array"][center]) == pytest.approx(0.0, abs=1e-5)
+    assert float(shear_result["swirling_strength_array"][center]) == pytest.approx(0.0, abs=1e-5)
+
+    no_erosion = compute_vortex_metrics(mask, rotation, (1.0, 1.0, 1.0), support_erosion_iters=0)
+    assert not np.any(no_erosion["vortex_support_mask"][0])
+    assert not np.any(no_erosion["vortex_support_mask"][:, 0])
 
 
 def test_nonzero_origin_preserves_plane_metrics_and_plane_seeds():
@@ -54,12 +105,207 @@ def test_nonzero_origin_preserves_plane_metrics_and_plane_seeds():
     assert np.all(np.min(seeds, axis=0) >= np.array([100.0, 200.0, 300.0]))
 
 
+def test_pathline_seed_modes_support_fixed_count_and_ratio_limits():
+    mask = np.ones((24, 24, 24), dtype=bool)
+    plane = PlaneData(
+        center=np.array([12.0, 12.0, 12.0], dtype=float),
+        normal=np.array([1.0, 0.0, 0.0], dtype=float),
+    )
+    fixed = _plane_seeds(
+        mask, plane, np.ones(3), np.zeros(3),
+        seed_ratio=0.02, min_seeds=1, max_seeds=250, rng_seed=0,
+        seed_mode="fixed",
+    )
+    ratio = _plane_seeds(
+        mask, plane, np.ones(3), np.zeros(3),
+        seed_ratio=0.02, min_seeds=1, max_seeds=250, rng_seed=0,
+        seed_mode="ratio",
+    )
+
+    assert fixed is not None and len(fixed) == 250
+    assert ratio is not None and 1 <= len(ratio) < len(fixed)
+
+
+def test_pathline_temporal_source_reuses_cached_frames_across_planes():
+    flow = np.zeros((20, 4, 4, 3, 3), dtype=np.float32)
+    flow[..., 0] = 0.2
+    mask = np.ones((20, 4, 4, 3), dtype=bool)
+    source = create_pathline_temporal_source(
+        flow, mask, np.ones(3), np.zeros(3), 1, 1000.0,
+        temporal_cache_mb=16.0,
+    )
+
+    meshes = [
+        generate_pathlines_from_plane_at_t(
+            flow, 1, SimpleNamespace(), np.ones(3), np.zeros(3),
+            mask_4d=mask, mask_3d=mask[..., 1], terminal_speed=0.001,
+            rr=1000.0, seeds=np.asarray([[float(x), 1.5, 1.5]]),
+            temporal_source=source,
+        )
+        for x in (2.0, 3.0)
+    ]
+
+    assert source.cache_all_phases is True
+    assert all(mesh is not None and mesh.n_lines == 1 for mesh in meshes)
+    assert len(source._datasets) == 3
+
+
+def test_pathline_color_modes_are_stable_and_preserve_manual_overrides():
+    workspace = Workspace()
+    workspace.group_order = ["aorta", "pulmonary"]
+    workspace.planes = [
+        PlaneData(center=np.zeros(3), normal=np.array([1.0, 0.0, 0.0]), group_name="aorta"),
+        PlaneData(center=np.ones(3), normal=np.array([1.0, 0.0, 0.0]), group_name="aorta"),
+        PlaneData(center=np.full(3, 2.0), normal=np.array([1.0, 0.0, 0.0]), group_name="pulmonary"),
+    ]
+
+    workspace.streamline_params.pathline_color_mode = "per_plane"
+    assert workspace.pathline_color_for_plane(0) != workspace.pathline_color_for_plane(1)
+    workspace.planes.extend([
+        PlaneData(center=np.full(3, float(index)), normal=np.array([1.0, 0.0, 0.0]))
+        for index in range(3, 22)
+    ])
+    assert workspace.pathline_color_for_plane(0) != workspace.pathline_color_for_plane(20)
+
+    workspace.streamline_params.pathline_color_mode = "per_group"
+    assert workspace.pathline_color_for_plane(0) == workspace.pathline_color_for_plane(1)
+    assert workspace.pathline_color_for_plane(0) != workspace.pathline_color_for_plane(2)
+
+    workspace.streamline_params.pathline_color_mode = "uniform"
+    workspace.streamline_params.pathline_color = "deepskyblue"
+    workspace.set_pathline_color_for_plane(1, "#123456")
+    assert workspace.pathline_color_for_plane(0) == "deepskyblue"
+    assert workspace.pathline_color_for_plane(1) == "#123456"
+
+
 def test_workspace_snapshot_restores_nonzero_origin():
     workspace = Workspace()
     workspace.origin = np.array([10.0, 20.0, 30.0], dtype=float)
+    workspace.correction_raw = np.ones((2, 2, 2, 1, 3), dtype=np.float32)
+    workspace.correction_high_raw = np.full((2, 2, 2, 1, 3), 2.0, dtype=np.float32)
     restored = Workspace()
     restored.restore_dict(workspace.snapshot_dict())
     assert np.allclose(restored.origin, workspace.origin)
+    assert np.array_equal(restored.correction_raw, workspace.correction_raw)
+    assert np.array_equal(restored.correction_high_raw, workspace.correction_high_raw)
+
+
+def test_loading_case_preserves_segmentation_cache_settings(monkeypatch):
+    import autoflow.core.pipeline as pipeline_module
+
+    loaded = SimpleNamespace(
+        flow=np.zeros((2, 2, 2, 1, 3), dtype=np.float32),
+        mag=np.ones((2, 2, 2, 1), dtype=np.float32),
+        segmentation=None,
+        resolution=np.ones(3, dtype=float),
+        origin=np.zeros(3, dtype=float),
+        venc=np.full(3, 100.0, dtype=float),
+        rr=1000.0,
+        source_format="normalized_h5",
+        source_group=None,
+        metadata={},
+        capabilities=LoaderCapabilities(
+            has_segmentation=False,
+            has_tke=False,
+            has_complex_source=False,
+            supports_wss=True,
+            supports_plane_metrics=True,
+        ),
+        sigma=None,
+        correction=None,
+        correction_high=None,
+        tke_array=None,
+    )
+    monkeypatch.setattr(pipeline_module, "load_input_data", lambda *_args, **_kwargs: loaded)
+
+    workspace = Workspace()
+    workspace.paths.flow_path = "case.h5"
+    workspace.paths.segmask_path = "case.h5"
+    workspace.segmentation.force_recompute_auto_cache = True
+    workspace.segmentation.write_auto_cache = False
+    workspace.segmentation.auto_backend = "nnUNet4D"
+    workspace.segmentation.auto_folds = "all"
+    workspace.segmentation.cleanup_4d_components = True
+    workspace.segmentation.cleanup_4d_mode = "relative"
+
+    PipelineEngine().load_data(workspace, lambda _message: None)
+
+    assert workspace.segmentation.force_recompute_auto_cache is True
+    assert workspace.segmentation.write_auto_cache is False
+    assert workspace.segmentation.auto_backend == "nnUNet4D"
+    assert workspace.segmentation.auto_folds == "all"
+    assert workspace.segmentation.cleanup_4d_components is True
+    assert workspace.segmentation.cleanup_4d_mode == "relative"
+
+
+def test_plane_modes_support_junction_spacing_count_and_all_count():
+    path = np.column_stack((np.arange(0.0, 31.0, 1.0), np.zeros(31), np.zeros(31)))
+
+    anchored, _ = generate_planes_from_paths(
+        [path],
+        plane_mode="anchored_offset",
+        plane_count=3,
+        cross_section_distance=5.0,
+        start_distance=0.0,
+        end_distance=0.0,
+        anchor="end",
+        anchor_offset_mm=5.0,
+        fork_points=[path[0]],
+        smoothing_window=3,
+        inter_time=1,
+    )
+    assert [plane.distance for plane in anchored] == pytest.approx([5.0, 10.0, 15.0])
+
+    limited, _ = generate_planes_from_paths(
+        [path],
+        plane_mode="distance",
+        plane_count=2,
+        cross_section_distance=10.0,
+        start_distance=0.0,
+        end_distance=0.0,
+        smoothing_window=3,
+        inter_time=1,
+    )
+    assert [plane.distance for plane in limited] == pytest.approx([0.0, 10.0])
+
+    all_fit, _ = generate_planes_from_paths(
+        [path],
+        plane_mode="distance",
+        plane_count=-1,
+        cross_section_distance=10.0,
+        start_distance=0.0,
+        end_distance=0.0,
+        smoothing_window=3,
+        inter_time=1,
+    )
+    assert [plane.distance for plane in all_fit] == pytest.approx([0.0, 10.0, 20.0, 30.0])
+
+    centered, _ = generate_planes_from_paths(
+        [path], plane_mode="fixed_step", plane_count=3, anchor="center",
+        direction="both", spacing_mode="fraction", spacing_ratio=0.25,
+        start_distance=0.0, end_distance=0.0, smoothing_window=3, inter_time=1,
+    )
+    assert [plane.distance for plane in centered] == pytest.approx([7.5, 15.0, 22.5])
+
+    even_symmetric, _ = generate_planes_from_paths(
+        [path], plane_mode="fixed_step", plane_count=4, anchor="center",
+        direction="both", spacing_mode="fraction", spacing_ratio=0.25,
+        start_distance=0.0, end_distance=0.0, smoothing_window=3, inter_time=1,
+    )
+    assert [plane.distance for plane in even_symmetric] == pytest.approx([3.75, 11.25, 18.75, 26.25])
+
+
+def test_segmentation_plane_filter_uses_free_endpoint_run_and_clips_path():
+    labels = np.zeros((30, 3, 3), dtype=np.int16)
+    labels[:8, :, :] = 3       # junction-parent label
+    labels[8:, :, :] = 5       # short branch label
+    path = np.column_stack((np.arange(0.0, 20.0, 1.0), np.ones(20), np.ones(20)))
+    filtered, qc = filter_paths_by_segmentation(
+        [path], labels, path_info=[{"fork_roles": [{"role": "outgoing"}]}], inter_time=1,
+    )
+    assert qc[0]["owner_label"] == 5
+    assert qc[0]["owner_label_source"] == "free_end_of_outgoing"
+    assert float(filtered[0][0, 0]) >= 7.5  # first retained sample rounds to label 5
 
 
 def test_static_masks_reuse_plane_and_wss_geometry(monkeypatch):
@@ -478,7 +724,10 @@ def test_run_case_segmentation_only_stops_before_skeleton(tmp_path, monkeypatch)
     assert summary["segmentation_only"] is True
     assert summary["segmentation_source"] == "original"
     assert summary["stage_times_sec"].keys() == {"load"}
+    assert summary["quality_report"]["overall_status"] == "incomplete"
+    assert summary["quality_report_file"] == str(out_dir / "quality_report.json")
     assert (out_dir / "summary.json").is_file()
+    assert (out_dir / "quality_report.json").is_file()
 
 
 def test_load_h5_data_flattens_singleton_row_and_column_metadata_vectors(tmp_path):
@@ -1434,11 +1683,29 @@ def test_config_dir_reads_feature_render_settings_from_metric_jsons(tmp_path):
         }
     }
     streamlines_payload = {
+        "seed_ratio": 0.03,
+        "max_steps": 333,
+        "min_seeds": 12,
+        "terminal_speed": 0.25,
+        "rng_seed": 7,
+        "tube_radius": 0.4,
         "render": {
             "clim": [4.0, 44.0],
             "show_scalar_bar": False,
             "bar_cfg": {"position_x": 0.66},
         }
+    }
+    pathlines_payload = {
+        "seed_ratio": 0.12,
+        "max_steps": 123,
+        "min_seeds": 11,
+        "seed_mode": "ratio",
+        "seed_count": 123,
+        "terminal_speed": 0.002,
+        "rng_seed": 17,
+        "tube_radius": 0.6,
+        "color_mode": "per_group",
+        "temporal_cache_mb": 321.0,
     }
     (config_dir / "video_exporting.json").write_text(json.dumps(video_exporting_payload), encoding="utf-8")
     (config_dir / "planes.json").write_text(json.dumps(planes_payload), encoding="utf-8")
@@ -1446,6 +1713,7 @@ def test_config_dir_reads_feature_render_settings_from_metric_jsons(tmp_path):
     (config_dir / "tke.json").write_text(json.dumps(tke_payload), encoding="utf-8")
     (config_dir / "pressure_gradient.json").write_text(json.dumps(pressure_gradient_payload), encoding="utf-8")
     (config_dir / "streamlines.json").write_text(json.dumps(streamlines_payload), encoding="utf-8")
+    (config_dir / "pathlines.json").write_text(json.dumps(pathlines_payload), encoding="utf-8")
 
     cfg = AutoFlowConfig.from_config_dir(str(config_dir))
     resolved = bundle_to_autoflow_kwargs({
@@ -1455,6 +1723,7 @@ def test_config_dir_reads_feature_render_settings_from_metric_jsons(tmp_path):
         "tke": tke_payload,
         "pressure_gradient": pressure_gradient_payload,
         "streamlines": streamlines_payload,
+        "pathlines": pathlines_payload,
     })
 
     assert cfg.window_size == (1111, 777)
@@ -1475,9 +1744,40 @@ def test_config_dir_reads_feature_render_settings_from_metric_jsons(tmp_path):
     assert cfg.streamline_bar_cfg["position_x"] == 0.66
     assert resolved["wss_clim"] == (1.0, 9.0)
     assert resolved["streamline_clim"] == (4.0, 44.0)
-    assert cfg.tube_radius == pytest.approx(0.25)
-    assert resolved["tube_radius"] == pytest.approx(0.25)
+    assert cfg.tube_radius == pytest.approx(0.4)
+    assert cfg.seed_ratio == pytest.approx(0.03)
+    assert cfg.pathline_seed_mode == "ratio"
+    assert cfg.pathline_max_seeds == 123
+    assert cfg.pathline_seed_ratio == pytest.approx(0.12)
+    assert cfg.pathline_max_steps == 123
+    assert cfg.pathline_min_seeds == 11
+    assert cfg.pathline_terminal_speed == pytest.approx(0.002)
+    assert cfg.pathline_rng_seed == 17
+    assert cfg.pathline_tube_radius == pytest.approx(0.6)
+    assert cfg.pathline_color_mode == "per_group"
+    assert cfg.pathline_temporal_cache_mb == pytest.approx(321.0)
+    assert resolved["tube_radius"] == pytest.approx(0.4)
+    assert resolved["pathline_seed_mode"] == "ratio"
+    assert resolved["pathline_max_seeds"] == 123
+    assert resolved["pathline_seed_ratio"] == pytest.approx(0.12)
+    assert resolved["pathline_max_steps"] == 123
+    assert resolved["pathline_min_seeds"] == 11
+    assert resolved["pathline_terminal_speed"] == pytest.approx(0.002)
+    assert resolved["pathline_rng_seed"] == 17
+    assert resolved["pathline_tube_radius"] == pytest.approx(0.6)
+    assert resolved["pathline_color_mode"] == "per_group"
+    assert resolved["pathline_temporal_cache_mb"] == pytest.approx(321.0)
     assert resolved["plane_video_cfg"]["label"]["prefix"] == "plane="
+
+    workspace = build_workspace(cfg)
+    assert workspace.streamline_params.seed_ratio == pytest.approx(0.03)
+    assert workspace.streamline_params.max_steps == 333
+    assert workspace.streamline_params.pathline_seed_ratio == pytest.approx(0.12)
+    assert workspace.streamline_params.pathline_max_steps == 123
+    assert workspace.streamline_params.pathline_min_seeds == 11
+    assert workspace.streamline_params.pathline_terminal_speed == pytest.approx(0.002)
+    assert workspace.streamline_params.pathline_rng_seed == 17
+    assert workspace.streamline_params.pathline_tube_radius == pytest.approx(0.6)
 
     auto_resolved = bundle_to_autoflow_kwargs({"streamlines": {"render": {"clim": None}}})
     assert auto_resolved["streamline_clim"] is None
@@ -1765,10 +2065,264 @@ def test_manual_plane_records_reload_without_path_projection():
     assert np.allclose(restored[0].normal, workspace.planes[0].normal)
 
 
+def test_plane_coordinate_file_supports_world_local_and_relative_path_mapping(tmp_path):
+    source = Workspace()
+    source.origin = np.array([10.0, 20.0, 30.0], dtype=float)
+    source.resolution = np.array([1.0, 1.0, 1.0], dtype=float)
+    source.centerline_paths_smooth = [
+        np.array([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]], dtype=float)
+    ]
+    source.path_info = [{"group_name": "aorta"}]
+    source.multilabel_groups = {
+        "aorta": {
+            "path_index_offset": 0,
+            "centerline_paths_smooth": source.centerline_paths_smooth,
+        }
+    }
+    source.planes = [
+        PlaneData(
+            center=np.array([5.0, 0.0, 0.0], dtype=float),
+            normal=np.array([1.0, 0.0, 0.0], dtype=float),
+            path_index=0,
+            distance=5.0,
+            group_name="aorta",
+        )
+    ]
+    coordinate_path = tmp_path / "planes.json"
+    save_plane_positions(source, coordinate_path, source_path="source.h5")
+    payload = load_plane_position_payload(coordinate_path)
+
+    assert payload["schema"] == PLANE_POSITION_SCHEMA
+    assert payload["coordinate_system"] == "autoflow_canonical_world_mm"
+    assert payload["planes"][0]["path_fraction"] == pytest.approx(0.5)
+
+    target = Workspace()
+    target.origin = np.array([100.0, 200.0, 300.0], dtype=float)
+    target.centerline_paths_smooth = [
+        np.array([[0.0, 0.0, 0.0], [20.0, 0.0, 0.0]], dtype=float)
+    ]
+    target.path_info = [{"group_name": "aorta"}]
+    target.multilabel_groups = {
+        "aorta": {
+            "path_index_offset": 0,
+            "centerline_paths_smooth": target.centerline_paths_smooth,
+        }
+    }
+
+    world_planes = project_planes_to_workspace(payload, target, mapping_mode="world")
+    local_planes = project_planes_to_workspace(payload, target, mapping_mode="local")
+    relative_planes, report = project_planes_to_workspace(
+        payload,
+        target,
+        mapping_mode="path_relative",
+        return_report=True,
+    )
+
+    assert np.allclose(world_planes[0].center, [-85.0, -180.0, -270.0])
+    assert np.allclose(local_planes[0].center, [5.0, 0.0, 0.0])
+    assert np.allclose(relative_planes[0].center, [10.0, 0.0, 0.0])
+    assert relative_planes[0].distance == pytest.approx(10.0)
+    assert report["mapping_mode"] == "path_relative"
+    assert report["planes"][0]["mapping_source"] == "group_path_index"
+
+
+def test_quality_report_collects_actionable_pipeline_checks(tmp_path):
+    workspace = Workspace()
+    workspace.data_loaded = True
+    workspace.paths.flow_path = "case.h5"
+    workspace.resolution = np.ones(3, dtype=float)
+    workspace.venc = np.full(3, 150.0, dtype=float)
+    workspace.flow_raw = np.ones((8, 8, 8, 2, 3), dtype=np.float32)
+    workspace.mag_raw = np.ones((8, 8, 8, 2), dtype=np.float32)
+    workspace.segmask_raw = np.ones((8, 8, 8, 2), dtype=np.int16)
+    workspace.segmask_labels = workspace.segmask_raw.copy()
+    workspace.segmask_labels_3d = workspace.segmask_raw[..., 0].copy()
+    workspace.segmask_binary = workspace.segmask_raw.astype(bool)
+    workspace.segmask_3d = workspace.segmask_labels_3d.astype(bool)
+    workspace.graph.points = np.array([[1.0, 4.0, 4.0], [6.0, 4.0, 4.0]], dtype=float)
+    workspace.graph.edges = np.array([[0, 1]], dtype=int)
+    workspace.centerline_paths_smooth = [workspace.graph.points.copy()]
+    workspace.planes = [
+        PlaneData(
+            center=np.array([3.0, 4.0, 4.0], dtype=float),
+            normal=np.array([1.0, 0.0, 0.0], dtype=float),
+            path_index=0,
+            distance=2.0,
+        )
+    ]
+    workspace.derived.plane_metrics = [{"area_mm2": [16.0, 16.0], "path_index": 0}]
+    workspace.derived.plane_qc = {"path_ic": {"0": 1.0}, "fork_ic": {}, "forks": []}
+
+    report = build_quality_report(workspace)
+    report_path = tmp_path / "quality_report.json"
+    save_quality_report(workspace, report_path, report=report)
+
+    assert report["schema"] == QUALITY_REPORT_SCHEMA
+    assert report["overall_status"] == "ready"
+    assert report["status_counts"]["fail"] == 0
+    assert {item["id"] for item in report["checks"]} >= {
+        "input.venc_saturation",
+        "segmentation.availability",
+        "centerline.topology",
+        "planes.geometry",
+        "hemodynamics.flow_consistency",
+    }
+    assert json.loads(report_path.read_text(encoding="utf-8"))["overall_status"] == "ready"
+
+
+def test_pathline_step_uses_per_plane_colors():
+    ws = Workspace()
+    ws.segmask_raw = np.ones((16, 16, 16, 2), dtype=np.int16)
+    ws.flow_raw = np.zeros((16, 16, 16, 2, 3), dtype=np.float32)
+    ws.flow_raw[..., 0] = 10.0
+    ws.planes = [
+        PlaneData(center=np.array([4.0, 8.0, 8.0], dtype=float), normal=np.array([1.0, 0.0, 0.0], dtype=float)),
+        PlaneData(center=np.array([10.0, 8.0, 8.0], dtype=float), normal=np.array([1.0, 0.0, 0.0], dtype=float)),
+    ]
+    ws.streamline_params.pathline_color = "deepskyblue"
+    ws.pathline_colors = {0: "lime", 1: "#ff8800"}
+
+    engine = PipelineEngine()
+    engine.preprocess(ws)
+    result = engine._step_plane_streamlines(ws)
+
+    assert result.success and not result.skipped
+    colors = {
+        obj.data_key: obj.color
+        for obj in ws.scene_objects.values()
+        if obj.data_key.startswith("pathline_")
+    }
+    assert colors == {
+        "pathline_0": "lime",
+        "pathline_1": "#ff8800",
+    }
+
+
+def test_vtk_particle_tracer_pathline_returns_polyline():
+    flow = np.zeros((20, 4, 4, 3, 3), dtype=np.float32)
+    flow[..., 0] = 0.2
+    mask = np.ones((20, 4, 4, 3), dtype=bool)
+    mesh = generate_pathlines_from_plane_at_t(
+        flow,
+        1,
+        SimpleNamespace(),
+        np.ones(3),
+        np.zeros(3),
+        mask_4d=mask,
+        mask_3d=mask[..., 1],
+        terminal_speed=0.001,
+        rr=1000.0,
+        seeds=np.asarray([[2.0, 1.5, 1.5]], dtype=float),
+    )
+    assert mesh is not None
+    assert mesh.n_lines == 1
+    assert mesh.n_points >= 2
+    assert "Velocity" in mesh.point_data
+    assert "PathlinePhase" in mesh.point_data
+    prefix = pathline_prefix_at_phase(mesh, 0.5)
+    assert prefix is not None
+    assert 0 < prefix.n_points <= mesh.n_points
+    assert prefix.n_lines == 1
+
+
+def test_pathline_rejects_invalid_plane_before_vtk_execution():
+    flow = np.zeros((4, 4, 4, 2, 3), dtype=np.float32)
+    mask = np.ones((4, 4, 4, 2), dtype=bool)
+    invalid_plane = SimpleNamespace(
+        center=np.array([2.0, 2.0, 2.0]),
+        normal=np.zeros(3),
+    )
+
+    with pytest.raises(ValueError, match="non-zero normal"):
+        generate_pathlines_from_plane_at_t(
+            flow,
+            0,
+            invalid_plane,
+            np.ones(3),
+            np.zeros(3),
+            mask_4d=mask,
+            mask_3d=mask[..., 0],
+            rr=1000.0,
+        )
+
+
+def test_gui_run_all_scopes_steps_to_the_active_workflow_panel():
+    from autoflow.ui.app import _workflow_run_all_steps
+
+    assert _workflow_run_all_steps("centerline") == [
+        StepId.GENERATE_SKELETON,
+        StepId.GENERATE_GRAPH,
+        StepId.GENERATE_PLANES,
+    ]
+    assert _workflow_run_all_steps("hemodynamics") == [
+        StepId.COMPUTE_PLANE_METRICS,
+        StepId.COMPUTE_DERIVED_METRICS,
+    ]
+    assert _workflow_run_all_steps("review") == []
+
+
+def test_scene_pathlines_accumulate_requested_plane_indices(monkeypatch):
+    from autoflow.ui.viewer import SceneController
+
+    workspace = Workspace()
+    workspace.flow_raw = np.zeros((4, 4, 4, 2, 3), dtype=np.float32)
+    workspace.segmask_3d = np.ones((4, 4, 4), dtype=bool)
+    workspace.planes = [
+        PlaneData(center=np.array([float(index), 1.0, 1.0]), normal=np.array([1.0, 0.0, 0.0]))
+        for index in range(3)
+    ]
+    controller = SceneController(SimpleNamespace(), workspace, lambda _message: None)
+    monkeypatch.setattr(controller, "sync_from_workspace", lambda: None)
+    monkeypatch.setattr(controller, "invalidate_cache", lambda _prefix=None: None)
+
+    controller.trigger_pathlines([0, 2])
+
+    assert workspace.active_pathline_plane_indices == [0, 2]
+    assert sorted(
+        obj.data_key
+        for obj in workspace.scene_objects.values()
+        if obj.data_key.startswith("pathline_")
+    ) == ["pathline_0", "pathline_2"]
+    assert all(
+        obj.dynamic
+        for obj in workspace.scene_objects.values()
+        if obj.data_key.startswith("pathline_")
+    )
+
+    cached = SimpleNamespace(name="already-calculated")
+    workspace.pathline_cache[0] = {0: cached}
+    workspace.pathline_seed_cache[0] = np.array([[0.0, 1.0, 1.0]])
+    controller.trigger_pathlines([1])
+    controller.trigger_pathlines([0])
+
+    assert workspace.active_pathline_plane_indices == [0, 1, 2]
+    assert workspace.pathline_cache[0][0] is cached
+    assert controller._get_pathline_mesh(0, 1) is cached
+    assert np.array_equal(workspace.pathline_seed_cache[0], [[0.0, 1.0, 1.0]])
+    assert sorted(
+        obj.data_key
+        for obj in workspace.scene_objects.values()
+        if obj.data_key.startswith("pathline_")
+    ) == ["pathline_0", "pathline_1", "pathline_2"]
+
+
 def test_default_nnunet_model_folder_prefers_partbalanced():
     model_dir = default_nnunet_model_folder()
     assert model_dir.name == "nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm"
     assert model_dir.is_dir()
+
+
+def test_nnunet_4d_fold_modes_keep_single_and_ensemble_branches(tmp_path):
+    from autoflow.algorithms.segmentation import _resolve_nnunet_folds
+
+    model_dir = tmp_path / "model"
+    (model_dir / "fold_all").mkdir(parents=True)
+    for fold in range(5):
+        (model_dir / f"fold_{fold}").mkdir()
+
+    assert _resolve_nnunet_folds(model_dir, "single") == ["all"]
+    assert _resolve_nnunet_folds(model_dir, "all") == ["0", "1", "2", "3", "4"]
+    assert _resolve_nnunet_folds(model_dir, "0,2,4") == ["0", "2", "4"]
 
 
 def test_empty_nnunet_model_uses_bundled_absolute_path(monkeypatch, tmp_path):
@@ -1786,8 +2340,9 @@ def test_empty_nnunet_model_uses_bundled_absolute_path(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     resolved = Path(resolve_nnunet_model_folder())
 
-    assert SegmentationState().auto_model == ""
-    assert load_config_bundle()["segmentation"]["auto_model"] == ""
+    expected_4d_script = "/nas-data2/ryy/CMR4DFlow2026/Segdata/scripts/nnunet/4D/run_7020_4d_full_ssd_20260824.sh"
+    assert SegmentationState().auto_model == expected_4d_script
+    assert load_config_bundle()["segmentation"]["auto_model"] == expected_4d_script
     assert resolved == default_nnunet_model_folder()
     assert resolved != fake_cwd_model
     assert resolved.is_absolute()
@@ -1918,3 +2473,27 @@ def test_scene_controller_builds_grouped_skeleton_graph_and_forks():
     workspace.graph = graph
     assert controller._build_dataset("skeleton_points").n_points == 3
     assert controller._build_dataset("graph_lines").n_lines == 2
+
+
+def test_scene_display_axis_orientation_mirrors_points_without_mutating_world_data():
+    from autoflow.ui.viewer import SceneController
+
+    class DummyPlotter:
+        bounds = (0.0, 10.0, 0.0, 20.0, 0.0, 30.0)
+
+        def add_axes(self, **_kwargs):
+            return None
+
+        def hide_axes(self):
+            return None
+
+        def render(self):
+            return None
+
+    workspace = Workspace()
+    controller = SceneController(DummyPlotter(), workspace, lambda _message: None)
+    world = np.asarray([[0.0, 10.0, 15.0], [10.0, 10.0, 15.0]], dtype=float)
+    assert controller.set_display_axis_directions(["RL", "AP", "FH"])
+    displayed = controller.world_to_display_points(world)
+    assert np.allclose(displayed, [[10.0, 10.0, 15.0], [0.0, 10.0, 15.0]])
+    assert np.allclose(controller.display_to_world_points(displayed), world)

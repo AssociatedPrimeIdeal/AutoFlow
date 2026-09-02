@@ -100,6 +100,23 @@ def summarize_internal_consistency(plane_metrics, path_info=None, forks=None):
         else:
             ic = 1.0 - float(np.mean(np.abs(arr - mu)) / mu)
         path_ic[str(int(pidx))] = float(np.clip(ic, 0.0, 1.0))
+    # When segmentation filtering is active, expose an additional consistency
+    # view keyed by the numeric segmentation label.  Path consistency remains
+    # available for topology QC and backwards compatibility.
+    by_seg = {}
+    for metric in plane_metrics:
+        label = int(metric.get("segmentation_label", 0) or 0)
+        if label > 0:
+            by_seg.setdefault(label, []).append(abs(float(metric.get("netflow_mL_beat", 0.0))))
+    segmentation_ic = {}
+    for label, values in by_seg.items():
+        arr = np.asarray(values, dtype=float)
+        mu = float(np.mean(arr)) if len(arr) else 0.0
+        if len(arr) <= 1 or mu <= 1e-12:
+            ic = 1.0
+        else:
+            ic = 1.0 - float(np.mean(np.abs(arr - mu)) / mu)
+        segmentation_ic[str(int(label))] = float(np.clip(ic, 0.0, 1.0))
     fork_items = []
     fork_ic = {}
     for fork_id, fork in enumerate(forks or []):
@@ -126,7 +143,8 @@ def summarize_internal_consistency(plane_metrics, path_info=None, forks=None):
             item["left_dirs"] = [path_info[x].get("direction_text", "") for x in left if 0 <= x < len(path_info)]
             item["right_dirs"] = [path_info[x].get("direction_text", "") for x in right if 0 <= x < len(path_info)]
         fork_items.append(item)
-    return {"path_ic": path_ic, "fork_ic": fork_ic, "forks": fork_items}
+    return {"path_ic": path_ic, "segmentation_label_ic": segmentation_ic,
+            "fork_ic": fork_ic, "forks": fork_items}
 
 
 def apply_internal_consistency_to_metrics(plane_metrics, path_info=None, forks=None):
@@ -135,6 +153,8 @@ def apply_internal_consistency_to_metrics(plane_metrics, path_info=None, forks=N
     for metric in metrics:
         pidx = str(int(metric.get("path_index", -1)))
         metric["path_ic"] = float(qc["path_ic"].get(pidx, 1.0))
+        seg_label = str(int(metric.get("segmentation_label", 0) or 0))
+        metric["segmentation_label_ic"] = float(qc.get("segmentation_label_ic", {}).get(seg_label, 1.0))
         rel = []
         for fork in qc.get("forks", []):
             pid = int(metric.get("path_index", -1))
@@ -147,7 +167,7 @@ def apply_internal_consistency_to_metrics(plane_metrics, path_info=None, forks=N
 
 def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes, RR=1000.0,
                           branch_labels_3d=None, path_info=None, forks=None,
-                          paths=None, return_qc=False):
+                          paths=None, return_qc=False, segmentation_labels_3d=None):
     flow = _ensure_flow5d(flow_xyzt3)
     mask = np.asarray(segmask_binary_4d, dtype=bool)
     spacing = np.asarray(spacing, dtype=float).reshape(-1)[:3]
@@ -172,7 +192,7 @@ def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes
         paths_lookup = [np.asarray(p, dtype=float).reshape(-1, 3) for p in paths]
 
     if len(planes) == 0:
-        empty_qc = {"path_ic": {}, "fork_ic": {}, "forks": []}
+        empty_qc = {"path_ic": {}, "segmentation_label_ic": {}, "fork_ic": {}, "forks": []}
         if return_qc:
             return [], empty_qc
         return []
@@ -192,7 +212,7 @@ def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes
         results.append(_compute_single_plane_metric(
             (flow, mask, spacing, origin, plane, Nt, RR,
              branch_grid, target_label, path_info, pp, mask_template, mask_phase_lookup,
-             support_mesh_cache)
+             support_mesh_cache, segmentation_labels_3d)
         ))
 
     results, qc = apply_internal_consistency_to_metrics(results, path_info=path_info, forks=forks)
@@ -1214,6 +1234,169 @@ def compute_centerline_pressure_profiles(relative_pressure_array, centerline_pat
     return profiles
 
 
+def compute_vortex_metrics(mask4d, flow, spacing, *, smoothing_sigma=0.0,
+                           support_erosion_iters=1):
+    """Compute velocity-gradient vortex descriptors inside an eroded lumen mask.
+
+    ``flow`` is the normalized XYZTV velocity field in cm/s and ``spacing`` is
+    in mm.  Calculations are carried out in SI units so vorticity and swirling
+    strength are returned in s^-1 and Q is returned in s^-2.  The public
+    arrays retain the input shape, while ``vortex_support_mask`` records the
+    voxels for which all results are considered valid.
+    """
+    mask4d = _ensure_mask4d(mask4d)
+    flow = _ensure_flow5d(flow)
+    if flow.shape[:3] != mask4d.shape[:3]:
+        raise ValueError(
+            f"flow spatial shape {flow.shape[:3]} does not match mask {mask4d.shape[:3]}"
+        )
+    if flow.shape[3] != mask4d.shape[3]:
+        raise ValueError(f"flow time dimension {flow.shape[3]} does not match mask {mask4d.shape[3]}")
+
+    spatial_shape = tuple(int(value) for value in flow.shape[:3])
+    output_shape = flow.shape[:4]
+    vorticity = np.zeros(flow.shape, dtype=np.float32)
+    vorticity_magnitude = np.zeros(output_shape, dtype=np.float32)
+    q_criterion = np.zeros(output_shape, dtype=np.float32)
+    swirling_strength = np.zeros(output_shape, dtype=np.float32)
+    support = np.zeros(output_shape, dtype=bool)
+
+    # A one-voxel halo is required for the central spatial-difference stencil.
+    # Crop to the vessel extent for predictable memory use on large images.
+    union_mask = np.any(mask4d, axis=3)
+    occupied = np.where(union_mask)
+    if occupied[0].size == 0:
+        return {
+            "vorticity_array": vorticity,
+            "vorticity_magnitude": vorticity_magnitude,
+            "vorticity_magnitude_peak": np.zeros(spatial_shape, dtype=np.float32),
+            "q_criterion_array": q_criterion,
+            "q_criterion_peak": np.zeros(spatial_shape, dtype=np.float32),
+            "swirling_strength_array": swirling_strength,
+            "swirling_strength_peak": np.zeros(spatial_shape, dtype=np.float32),
+            "vortex_support_mask": support.astype(np.uint8),
+        }
+    spatial_slices = tuple(
+        slice(max(int(np.min(axis_values)) - 1, 0), min(int(np.max(axis_values)) + 2, spatial_shape[axis]))
+        for axis, axis_values in enumerate(occupied)
+    )
+    work_mask = np.asarray(mask4d[spatial_slices + (slice(None),)], dtype=bool)
+    work_flow = np.asarray(flow[spatial_slices + (slice(None), slice(None))], dtype=np.float32)
+    if any(size < 3 for size in work_flow.shape[:3]):
+        return {
+            "vorticity_array": vorticity,
+            "vorticity_magnitude": vorticity_magnitude,
+            "vorticity_magnitude_peak": np.zeros(spatial_shape, dtype=np.float32),
+            "q_criterion_array": q_criterion,
+            "q_criterion_peak": np.zeros(spatial_shape, dtype=np.float32),
+            "swirling_strength_array": swirling_strength,
+            "swirling_strength_peak": np.zeros(spatial_shape, dtype=np.float32),
+            "vortex_support_mask": support.astype(np.uint8),
+        }
+
+    # Convert cm/s to m/s before differentiating over meter spacing.
+    velocity = work_flow / 100.0
+    mask_float = work_mask.astype(np.float32)
+    velocity = velocity * mask_float[..., None]
+    sigma = max(float(smoothing_sigma), 0.0)
+    if sigma > 0.0:
+        # Normalize the filtered field by filtered mask weights so a zero
+        # background does not artificially damp values near the valid support.
+        weights = gaussian_filter(mask_float, sigma=(sigma, sigma, sigma, 0.0), mode="nearest")
+        weights = np.maximum(weights, np.float32(1e-6))
+        for component in range(3):
+            velocity[..., component] = (
+                gaussian_filter(velocity[..., component], sigma=(sigma, sigma, sigma, 0.0), mode="nearest")
+                / weights
+            )
+        velocity *= mask_float[..., None]
+
+    support_work = work_mask.copy()
+    erosion_iters = max(int(support_erosion_iters), 0)
+    if erosion_iters > 0:
+        structure = np.ones((3, 3, 3), dtype=bool)
+        for tidx in range(work_mask.shape[3]):
+            support_work[..., tidx] = binary_erosion(
+                work_mask[..., tidx],
+                structure=structure,
+                iterations=erosion_iters,
+                border_value=0,
+            )
+    support_inner = support_work[1:-1, 1:-1, 1:-1, :]
+
+    spacing_m = np.asarray(spacing, dtype=float).reshape(3) / 1000.0
+    dx, dy, dz = [float(max(value, 1e-12)) for value in spacing_m]
+    inner_shape = velocity.shape[:3]
+    jacobian = np.empty((inner_shape[0] - 2, inner_shape[1] - 2, inner_shape[2] - 2, velocity.shape[3], 3, 3), dtype=np.float32)
+    spacings = (dx, dy, dz)
+    for component in range(3):
+        jacobian[..., component, 0] = (
+            velocity[2:, 1:-1, 1:-1, :, component]
+            - velocity[:-2, 1:-1, 1:-1, :, component]
+        ) / (2.0 * spacings[0])
+        jacobian[..., component, 1] = (
+            velocity[1:-1, 2:, 1:-1, :, component]
+            - velocity[1:-1, :-2, 1:-1, :, component]
+        ) / (2.0 * spacings[1])
+        jacobian[..., component, 2] = (
+            velocity[1:-1, 1:-1, 2:, :, component]
+            - velocity[1:-1, 1:-1, :-2, :, component]
+        ) / (2.0 * spacings[2])
+
+    vort_inner = np.empty(jacobian.shape[:-2] + (3,), dtype=np.float32)
+    vort_inner[..., 0] = jacobian[..., 2, 1] - jacobian[..., 1, 2]
+    vort_inner[..., 1] = jacobian[..., 0, 2] - jacobian[..., 2, 0]
+    vort_inner[..., 2] = jacobian[..., 1, 0] - jacobian[..., 0, 1]
+    vortmag_inner = np.sqrt(np.sum(np.square(vort_inner, dtype=np.float32), axis=-1)).astype(np.float32)
+
+    strain = 0.5 * (jacobian + np.swapaxes(jacobian, -1, -2))
+    rotation = 0.5 * (jacobian - np.swapaxes(jacobian, -1, -2))
+    q_inner = 0.5 * (
+        np.sum(np.square(rotation, dtype=np.float32), axis=(-2, -1))
+        - np.sum(np.square(strain, dtype=np.float32), axis=(-2, -1))
+    )
+
+    # λci is the positive imaginary part of the complex-conjugate eigenvalue
+    # pair of the local velocity-gradient tensor.  It is zero for pure shear.
+    flat_jacobian = jacobian.reshape(-1, 3, 3)
+    eigvals = np.linalg.eigvals(flat_jacobian)
+    lambda_ci_inner = np.max(np.abs(np.imag(eigvals)), axis=1).reshape(q_inner.shape).astype(np.float32)
+
+    valid = support_inner.astype(np.float32)
+    vort_inner *= valid[..., None]
+    vortmag_inner *= valid
+    q_inner = np.asarray(q_inner, dtype=np.float32) * valid
+    lambda_ci_inner *= valid
+
+    work_vorticity = np.zeros_like(work_flow, dtype=np.float32)
+    valid_work = np.zeros_like(support_work, dtype=bool)
+    valid_work[1:-1, 1:-1, 1:-1, :] = support_inner
+    work_vorticity[1:-1, 1:-1, 1:-1, :, :] = vort_inner
+    work_vorticity *= valid_work[..., None]
+    work_vortmag = np.zeros(work_mask.shape, dtype=np.float32)
+    work_vortmag[1:-1, 1:-1, 1:-1, :] = vortmag_inner
+    work_q = np.zeros(work_mask.shape, dtype=np.float32)
+    work_q[1:-1, 1:-1, 1:-1, :] = q_inner
+    work_lambda_ci = np.zeros(work_mask.shape, dtype=np.float32)
+    work_lambda_ci[1:-1, 1:-1, 1:-1, :] = lambda_ci_inner
+
+    vorticity[spatial_slices + (slice(None), slice(None))] = work_vorticity
+    vorticity_magnitude[spatial_slices + (slice(None),)] = work_vortmag
+    q_criterion[spatial_slices + (slice(None),)] = work_q
+    swirling_strength[spatial_slices + (slice(None),)] = work_lambda_ci
+    support[spatial_slices + (slice(None),)] = valid_work
+    return {
+        "vorticity_array": vorticity,
+        "vorticity_magnitude": vorticity_magnitude,
+        "vorticity_magnitude_peak": np.max(vorticity_magnitude, axis=3).astype(np.float32),
+        "q_criterion_array": q_criterion,
+        "q_criterion_peak": np.max(q_criterion, axis=3).astype(np.float32),
+        "swirling_strength_array": swirling_strength,
+        "swirling_strength_peak": np.max(swirling_strength, axis=3).astype(np.float32),
+        "vortex_support_mask": support.astype(np.uint8),
+    }
+
+
 def compute_pressure_gradient_metrics(mask4d, flow, spacing, rr, rho=1060.0, viscosity=4.0,
                                       smoothing_sigma=0.0, support_erosion_iters=1, use_convective_acceleration=True,
                                       pressure_method="least_squares", centerline_paths=None,
@@ -1376,6 +1559,7 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
                             pressure_gradient_use_convective_acceleration=True,
                             compute_wss=True, compute_tke=True,
                             compute_pressure_gradient=True,
+                            compute_vortex=False,
                             wss_smoothing_iteration=None,
                             wss_viscosity=None,
                             wss_inward_distance=None,
@@ -1384,6 +1568,8 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
                             tke_rho=None,
                             pressure_gradient_rho=None,
                             pressure_gradient_viscosity=None,
+                            vortex_smoothing_sigma=0.0,
+                            vortex_support_erosion_iters=1,
                             pressure_method="least_squares",
                             centerline_paths=None):
     mask4d = _ensure_mask4d(mask4d)
@@ -1426,6 +1612,15 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
             centerline_paths=centerline_paths,
             origin=origin,
         )
+    vortex = None
+    if compute_vortex:
+        vortex = compute_vortex_metrics(
+            mask4d,
+            flow,
+            spacing,
+            smoothing_sigma=vortex_smoothing_sigma,
+            support_erosion_iters=vortex_support_erosion_iters,
+        )
 
     spacing = np.asarray(spacing, dtype=float).reshape(3)
     origin = np.asarray(origin, dtype=float).reshape(3)
@@ -1449,6 +1644,14 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
         "relative_pressure_display_clim": None if pressure_gradient is None else pressure_gradient["relative_pressure_display_clim"],
         "centerline_pressure_profiles": [] if pressure_gradient is None else pressure_gradient["centerline_pressure_profiles"],
         "pressure_method": None if pressure_gradient is None else pressure_gradient["pressure_method"],
+        "vorticity_array": None if vortex is None else vortex["vorticity_array"],
+        "vorticity_magnitude": None if vortex is None else vortex["vorticity_magnitude"],
+        "vorticity_magnitude_peak": None if vortex is None else vortex["vorticity_magnitude_peak"],
+        "q_criterion_array": None if vortex is None else vortex["q_criterion_array"],
+        "q_criterion_peak": None if vortex is None else vortex["q_criterion_peak"],
+        "swirling_strength_array": None if vortex is None else vortex["swirling_strength_array"],
+        "swirling_strength_peak": None if vortex is None else vortex["swirling_strength_peak"],
+        "vortex_support_mask": None if vortex is None else vortex["vortex_support_mask"],
         "streamlines": [],
         "tube_radius": float(tube_radius),
     }
@@ -1469,6 +1672,15 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
         if tke is not None:
             pixelwise_export["tke"] = np.asarray(tke["tke_peak"], dtype=np.float32)
             pixelwise_export["tke_time"] = np.asarray(tke["tke_array"], dtype=np.float32)
+        if vortex is not None:
+            pixelwise_export["vorticity"] = np.asarray(vortex["vorticity_array"], dtype=np.float32)
+            pixelwise_export["vorticity_magnitude"] = np.asarray(vortex["vorticity_magnitude"], dtype=np.float32)
+            pixelwise_export["vorticity_magnitude_peak"] = np.asarray(vortex["vorticity_magnitude_peak"], dtype=np.float32)
+            pixelwise_export["q_criterion"] = np.asarray(vortex["q_criterion_array"], dtype=np.float32)
+            pixelwise_export["q_criterion_peak"] = np.asarray(vortex["q_criterion_peak"], dtype=np.float32)
+            pixelwise_export["swirling_strength"] = np.asarray(vortex["swirling_strength_array"], dtype=np.float32)
+            pixelwise_export["swirling_strength_peak"] = np.asarray(vortex["swirling_strength_peak"], dtype=np.float32)
+            pixelwise_export["vortex_support_mask"] = np.asarray(vortex["vortex_support_mask"], dtype=np.uint8)
         result["pixelwise_export"] = pixelwise_export
     else:
         result["pixelwise_export"] = {}
@@ -1478,7 +1690,7 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
 def _compute_single_plane_metric(args):
     (flow, mask, spacing, origin, plane, Nt, RR, branch_grid, target_label,
      path_info, path_points, mask_template, mask_phase_lookup,
-     support_mesh_cache) = args
+     support_mesh_cache, segmentation_labels_3d) = args
     normal = np.asarray(plane.normal, dtype=float).reshape(3)
     normal = normal / (np.linalg.norm(normal) + 1e-12)
 
@@ -1501,6 +1713,13 @@ def _compute_single_plane_metric(args):
     for t in range(Nt):
         rep_t = int(mask_phase_lookup[t]) if mask_phase_lookup else int(t)
         mask_t = mask_template if mask_template is not None else mask[..., rep_t]
+        plane_seg_label = int(getattr(plane, "segmentation_label", 0) or 0)
+        if plane_seg_label > 0 and segmentation_labels_3d is not None:
+            seg3d = np.asarray(segmentation_labels_3d)
+            if seg3d.ndim == 4:
+                seg3d = seg3d[..., 0]
+            if seg3d.shape == mask_t.shape[:3]:
+                mask_t = np.asarray(mask_t, dtype=bool) & (seg3d == plane_seg_label)[..., None] if mask_t.ndim == 4 else np.asarray(mask_t, dtype=bool) & (seg3d == plane_seg_label)
         slice_spec = _get_cached_plane_slice_spec(
             slice_cache,
             rep_t,
@@ -1511,7 +1730,7 @@ def _compute_single_plane_metric(args):
             branch_grid=branch_grid,
             target_label=target_label,
             select_connected=True,
-            support_mesh=support_mesh_cache.get(rep_t) if support_mesh_cache is not None else None,
+            support_mesh=(None if plane_seg_label > 0 else (support_mesh_cache.get(rep_t) if support_mesh_cache is not None else None)),
         )
         if slice_spec is None:
             flowrate.append(0.0); flowrate_fwd.append(0.0); flowrate_rev.append(0.0)
@@ -1580,6 +1799,7 @@ def _compute_single_plane_metric(args):
         "center": np.asarray(plane.center, dtype=float).tolist(),
         "normal": normal.tolist(),
         "label": int(plane.label),
+        "segmentation_label": int(getattr(plane, "segmentation_label", 0) or 0),
         "path_index": int(plane.path_index),
         "distance": float(plane.distance),
         "target_branch_label": int(target_label) if target_label is not None else 0,
@@ -1622,7 +1842,8 @@ def _compute_single_plane_metric(args):
 
 def compute_plane_metrics_multithread(flow_xyzt3, segmask_binary_4d, spacing, origin, planes, RR=1000.0,
                                        branch_labels_3d=None, path_info=None, forks=None,
-                                       paths=None, return_qc=False, max_workers=None):
+                                       paths=None, return_qc=False, max_workers=None,
+                                       segmentation_labels_3d=None):
     from concurrent.futures import ThreadPoolExecutor
     flow = _ensure_flow5d(flow_xyzt3)
     mask = np.asarray(segmask_binary_4d, dtype=bool)
@@ -1646,7 +1867,7 @@ def compute_plane_metrics_multithread(flow_xyzt3, segmask_binary_4d, spacing, or
         paths_lookup = [np.asarray(p, dtype=float).reshape(-1, 3) for p in paths]
 
     if len(planes) == 0:
-        empty_qc = {"path_ic": {}, "fork_ic": {}, "forks": []}
+        empty_qc = {"path_ic": {}, "segmentation_label_ic": {}, "fork_ic": {}, "forks": []}
         if return_qc:
             return [], empty_qc
         return []
@@ -1665,7 +1886,7 @@ def compute_plane_metrics_multithread(flow_xyzt3, segmask_binary_4d, spacing, or
                 pp = paths_lookup[pi]
         args_list.append((flow, mask, spacing, origin, plane, Nt, RR,
                           branch_grid, target_label, path_info, pp, mask_template,
-                          mask_phase_lookup, support_mesh_cache))
+                          mask_phase_lookup, support_mesh_cache, segmentation_labels_3d))
     if max_workers is None:
         import os as _os
         # Shared VTK support geometry makes small and medium plane sets faster
@@ -1691,8 +1912,8 @@ def load_metrics_as_table(metrics_json_path, qc_json_path=None):
     with open(metrics_json_path, "r", encoding="utf-8") as f:
         metrics = _json.load(f)
     scalar_keys = [
-        "label", "path_index", "distance", "target_branch_label",
-        "peakv_cm_s", "netflow_mL_beat", "meanv_cm_s", "path_ic",
+        "label", "segmentation_label", "path_index", "distance", "target_branch_label",
+        "peakv_cm_s", "netflow_mL_beat", "meanv_cm_s", "path_ic", "segmentation_label_ic",
         "path_direction",
         "peakv_forward_cm_s", "peakv_reverse_cm_s",
         "meanv_forward_cm_s", "meanv_reverse_cm_s",

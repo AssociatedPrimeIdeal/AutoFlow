@@ -6,6 +6,9 @@
   "tool": "brush",
   "brush_radius": 3,
   "edit_all_timepoints": true,
+  "cleanup_4d_components": false,
+  "cleanup_4d_mode": "absolute",
+  "cleanup_4d_min_volume_mm3": 50.0,
   "mode": "input",
   "input_source": "original",
   "import_path": "",
@@ -19,10 +22,12 @@
   "threshold_min_component_volume_mm3": 0.0,
   "threshold_closing": true,
   "threshold_opening": false,
-  "auto_backend": "nnUNet",
-  "auto_model": "",
+  "auto_backend": "nnUNet4D",
+  "auto_model": "/nas-data2/ryy/CMR4DFlow2026/Segdata/scripts/nnunet/4D/run_7020_4d_full_ssd_20260824.sh",
   "auto_checkpoint": "checkpoint_final.pth",
+  "auto_folds": "single",
   "auto_device": "auto",
   "auto_label_map": "",
-  "force_recompute_auto_cache": false
+  "force_recompute_auto_cache": false,
+  "write_auto_cache": true
 }

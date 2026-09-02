@@ -4,18 +4,20 @@
 
 | Entry point | Status | Notes |
 | --- | --- | --- |
-| GUI | Supported | `Calculate && Save Metrics` step plus live refresh after plane edits |
+| GUI | Supported | `Calculate && Save Metrics`, `Plane Curve`, and automatic refresh after plane edits |
 | CLI | Supported | part of the default batch order |
 | Python API | Supported | through `run_case()` and `run_batch()` |
 
 ## What It Does
-Plane metrics compute time-resolved cross-sectional measurements for each plane and save them into `plane_metrics.json`. The same per-plane payload is also mirrored into `planes.json` and `planes.h5`, so one plane index has one consistent set of geometry and summaries across outputs.
+Plane metrics compute time-resolved cross-sectional measurements for each plane and save them into `plane_metrics.json`. The same per-plane payload is also mirrored into `planes.json` and `planes.h5`, so one plane index has one consistent set of geometry and summaries across outputs. The GUI plane-metric step computes basic flow, area, and velocity without implicitly starting WSS, TKE, or pressure work. If derived arrays already exist, it reuses them. Batch runs compute only the derived fields explicitly requested through `--with` or `requested_metrics`.
+
+For each unique segmentation phase, plane metrics build one thresholded VTK support mesh and reuse it across all planes. Each plane still has its own slice and connectivity selection, while repeated cardiac phases reuse the resulting slice specification. Plane centers remain local physical coordinates and are shifted by `origin` only for VTK slicing.
 
 ## When To Use It
 - use it after planes exist
 - use it when you need per-plane flow, area, and velocity curves
 - use it when you need explicit `plane_index` values that line up with `planes.json`, `planes.h5`, and the plane-rotation video labels
-- add `--with wss,tke,pg` if you also want derived per-plane summaries
+- add `--with wss,tke,pg` if you also want derived per-plane summaries; `--with vortex` computes whole-volume vortex fields and is not a plane summary
 - do not expect it to run without segmentation
 
 ## Quick Use
@@ -24,6 +26,8 @@ Plane metrics compute time-resolved cross-sectional measurements for each plane 
 1. generate planes
 2. click `Calculate && Save Metrics`
 3. inspect the selected plane in the selection panel, ortho viewer, and `Plane Curve` mode
+4. when plane geometry needs correction, use `Edit Plane`; releasing a handle recomputes only that plane and updates the metric and plane records
+5. click `Calculate && Save Metrics` after interactive edits when a fully regenerated `plane_metrics_pixelwise.h5` is required
 
 ### CLI
 
@@ -51,7 +55,7 @@ Use the standard `run_case()` or `run_batch()` flow. Plane metrics run unless `s
 | Parameter | Type | Default | Where set | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
 | `skip_plane_metrics` | bool | `False` | batch config or CLI/API | disable the whole plane-metric export step | `autoflow/processing.py` |
-| `use_multithread` | bool | `True` | `configs/batch.json` | multithread plane metric calculation | `autoflow/core/pipeline.py` |
+| `use_multithread` | bool | `True` | `configs/batch.json` | allow adaptive plane parallelism; sets below 128 planes stay serial because shared VTK geometry is faster without scheduling overhead | `autoflow/core/pipeline.py` |
 
 ## Outputs
 
@@ -60,9 +64,9 @@ Use the standard `run_case()` or `run_batch()` flow. Plane metrics run unless `s
 | `plane_metrics.json` | plane metrics run | one metric record per plane with explicit `plane_index` and time-resolved fields |
 | `plane_qc.json` | plane metrics run | QC for paths and forks |
 | `plane_metrics_pixelwise.h5` | plane metrics run | per-plane slice-cellwise derived samples |
-| `planes.json` | planes exist | geometry, `label_name`, and attached plane summaries |
-| `planes.h5` | planes exist | one root group per plane such as `plane_0000`, with `label_name`, the same per-plane payload, and a `payload_json` mirror |
-| `pwv.json` | PWV is enabled | saved PWV results for configured label groups |
+| `planes.json` | planes exist | geometry, `placement_mode`, `label_name`, and attached plane summaries |
+| `planes.h5` | planes exist | one root group per plane such as `plane_0000`, with `placement_mode`, `label_name`, the same per-plane payload, and a `payload_json` mirror |
+| `pwv.json` | PWV runs successfully | saved PWV results for configured label groups |
 | `pwv_<group>.png` | PWV plotting succeeds | saved PWV plots |
 
 ### Main metric fields
@@ -99,6 +103,10 @@ Use the standard `run_case()` or `run_batch()` flow. Plane metrics run unless `s
 - segmentation is required
 - plane metrics depend on valid plane placement
 - derived summaries attached to planes depend on opting in to the corresponding derived metrics
+- requesting one derived metric does not implicitly compute the others; for example, `--with pg` attaches pressure summaries without running WSS
+- `WSS / TKE / Pressure / Vortex` augments existing GUI plane metrics with WSS, TKE, and pressure summaries after computing missing derived families; vortex fields are whole-volume only and do not add plane summaries
+- interactive plane edits defer the complete pixelwise H5 resampling pass until the explicit metric-save step
+- support-mesh reuse assumes identical mask bytes represent identical geometry; changing segmentation content creates a new support mesh
 
 ## Where To Change Code
 

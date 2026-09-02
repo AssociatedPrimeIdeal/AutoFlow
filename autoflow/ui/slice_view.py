@@ -418,6 +418,17 @@ class SliceView(QtWidgets.QFrame):
         self.overlay_item.setRect(rect)
         self.overlay_item.show()
 
+    def update_image(self, image: np.ndarray, overlay: np.ndarray | None, cursor, fixed_index: int, levels):
+        """Replace pixels during playback without rebuilding static presentation."""
+        self.image_item.setImage(np.asarray(image).T, autoLevels=False, levels=levels)
+        if overlay is None:
+            self.overlay_item.clear()
+            self.overlay_item.hide()
+        else:
+            self.overlay_item.setImage(np.transpose(np.asarray(overlay, dtype=np.uint8), (1, 0, 2)), autoLevels=False)
+            self.overlay_item.show()
+        self.update_cursor(cursor, fixed_index, levels)
+
     def update_cursor(self, cursor, fixed_index: int, levels=None):
         h, v = int(cursor[0]), int(cursor[1])
         self.vertical_line.setPos(h * self._spacing[0])

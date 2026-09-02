@@ -24,6 +24,7 @@ class OrthoViewer(QtWidgets.QWidget):
         self._maximized_view = None
         self._slice_keys = {}
         self._colorbar_state = None
+        self._correction_content_available = None
         self._build_ui()
 
     def _cached(self, group, key, builder, max_items=24):
@@ -48,7 +49,12 @@ class OrthoViewer(QtWidgets.QWidget):
             "Magnitude", "PC-MRA", "Speed (cm/s)",
             "WSS (Pa)", "TKE (J/m³)",
             "Pressure Grad LR (Pa/m)", "Pressure Grad AP (Pa/m)", "Pressure Grad FH (Pa/m)", "|Pressure Grad| (Pa/m)",
-            "Relative Pressure (Pa)"
+            "Relative Pressure (Pa)",
+            "Vorticity Magnitude (s⁻¹)", "Q-Criterion (s⁻²)", "Swirling Strength λci (s⁻¹)",
+            "Corr Low LR (rad)", "Corr Low AP (rad)", "Corr Low FH (rad)",
+            "Corr High LR (rad)", "Corr High AP (rad)", "Corr High FH (rad)"
+            , "Wrap Mask (any component)", "Wrap Count LR", "Wrap Count AP", "Wrap Count FH",
+            "Unwrapped − Wrapped Speed (cm/s)"
         ])
         self.combo_content.setCurrentIndex(4)
         self.combo_content.currentIndexChanged.connect(self._on_content_changed)
@@ -165,8 +171,8 @@ class OrthoViewer(QtWidgets.QWidget):
         self._next_shortcut.activated.connect(lambda: self.timeStepRequested.emit(1))
 
     def set_segmentation_edit_handler(self, handler):
-        # Manual editing now lives in a dedicated window. Keep this method as
-        # a compatibility no-op for callers outside the bundled GUI.
+        # Segmentation editing is handled by the external Labeler exchange.
+        # Keep this method as a compatibility no-op for older callers.
         return None
 
     def set_playback_active(self, active):
@@ -226,6 +232,8 @@ class OrthoViewer(QtWidgets.QWidget):
         self.refresh(update_plane=False)
 
     def update_slider_ranges(self):
+        self._refresh_correction_content_availability()
+        self._refresh_phase_unwrap_content_availability()
         shape = self._get_volume_shape()
         if shape is None:
             return
@@ -273,6 +281,45 @@ class OrthoViewer(QtWidgets.QWidget):
     def _on_content_changed(self, _):
         self._manual_levels = None
         self.refresh(update_plane=False)
+
+    def _refresh_correction_content_availability(self):
+        def valid(field):
+            value = getattr(self.workspace, field, None)
+            return bool(value is not None and np.asarray(value).ndim == 5 and np.asarray(value).shape[-1] == 3)
+
+        low_available = valid("correction_raw")
+        high_available = valid("correction_high_raw")
+        availability = (low_available, high_available)
+        if availability == self._correction_content_available:
+            return
+        self._correction_content_available = availability
+        model = self.combo_content.model()
+        for index, available, name in (
+            (16, low_available, "low-VENC"),
+            (17, low_available, "low-VENC"),
+            (18, low_available, "low-VENC"),
+            (19, high_available, "high-VENC"),
+            (20, high_available, "high-VENC"),
+            (21, high_available, "high-VENC"),
+        ):
+            item = model.item(index) if hasattr(model, "item") else None
+            if item is not None:
+                item.setEnabled(available)
+            tooltip = f"{name} background-phase correction field." if available else "Unavailable: enable background phase correction and reload the input."
+            self.combo_content.setItemData(index, tooltip, QtCore.Qt.ToolTipRole)
+        if not self.combo_content.model().item(int(self.combo_content.currentIndex())).isEnabled():
+            self.combo_content.setCurrentIndex(4)
+
+    def _refresh_phase_unwrap_content_availability(self):
+        available = "wrap_mask" in (getattr(self.workspace, "phase_unwrap_result", {}) or {})
+        model = self.combo_content.model()
+        for index in range(22, 27):
+            item = model.item(index) if hasattr(model, "item") else None
+            if item is not None:
+                item.setEnabled(bool(available))
+            self.combo_content.setItemData(index, "Estimated wrap diagnostics from the selected unwrapping run." if available else "Unavailable: run phase unwrapping first.", QtCore.Qt.ToolTipRole)
+        if not model.item(int(self.combo_content.currentIndex())).isEnabled():
+            self.combo_content.setCurrentIndex(4)
 
     def _reset_views(self):
         self._manual_levels = None
@@ -484,6 +531,44 @@ class OrthoViewer(QtWidgets.QWidget):
         direction = ("LR", "AP", "FH")[int(component)]
         return vol, f"Pressure Grad {direction} (Pa/m)", {"cmap": "RdBu_r", "clim": (-vmax, vmax)}
 
+    def _get_vortex_volume(self, t, field):
+        ws = self.workspace
+        labels = {
+            "vorticity_magnitude": ("Vorticity Magnitude (s⁻¹)", "turbo", False),
+            "q_criterion": ("Q-Criterion (s⁻²)", "RdBu_r", True),
+            "swirling_strength": ("Swirling Strength λci (s⁻¹)", "turbo", False),
+        }
+        title, cmap, signed = labels[field]
+        source_name = {
+            "vorticity_magnitude": "vorticity_magnitude",
+            "q_criterion": "q_criterion_array",
+            "swirling_strength": "swirling_strength_array",
+        }[field]
+        source = getattr(ws.derived, source_name, None)
+        if source is None:
+            return None, f"{title} (no data)", {"cmap": cmap, "clim": None}
+        arr = np.asarray(source, dtype=np.float32)
+        if arr.ndim != 4:
+            return None, f"{title} (no data)", {"cmap": cmap, "clim": None}
+        tidx = min(max(0, int(t)), arr.shape[3] - 1)
+        support_source = ws.derived.vortex_support_mask
+        support = None if support_source is None else np.asarray(support_source, dtype=bool)
+        if support is not None and support.shape == arr.shape:
+            key = (id(source), id(support_source), int(tidx))
+            vol = self._cached(
+                "scalar_volume",
+                ("vortex", field) + key,
+                lambda: np.where(support[..., tidx], arr[..., tidx], np.float32(0.0)).astype(np.float32, copy=False),
+            )
+            finite = vol[support[..., tidx] & np.isfinite(vol)]
+        else:
+            vol = np.asarray(arr[..., tidx], dtype=np.float32)
+            finite = vol[np.isfinite(vol)]
+        upper = float(np.percentile(np.abs(finite), 99.0)) if finite.size else 1.0
+        upper = max(upper, 1e-6)
+        clim = (-upper, upper) if signed else (0.0, upper)
+        return np.asarray(vol, dtype=np.float32), title, {"cmap": cmap, "clim": clim}
+
     def _get_scalar_slice(self, t):
         ws = self.workspace
         content_idx = self.combo_content.currentIndex()
@@ -535,6 +620,53 @@ class OrthoViewer(QtWidgets.QWidget):
             return self._get_pressure_gradient_volume(t, component=None)
         if content_idx == 12:
             return self._get_relative_pressure_volume(t)
+        if content_idx == 13:
+            return self._get_vortex_volume(t, "vorticity_magnitude")
+        if content_idx == 14:
+            return self._get_vortex_volume(t, "q_criterion")
+        if content_idx == 15:
+            return self._get_vortex_volume(t, "swirling_strength")
+        if content_idx in range(16, 22):
+            is_high = content_idx >= 19
+            corr = getattr(ws, "correction_high_raw" if is_high else "correction_raw", None)
+            corr = None if corr is None else np.asarray(corr)
+            if corr is not None and corr.ndim == 5 and corr.shape[-1] == 3:
+                component = int(content_idx - (19 if is_high else 16))
+                vol = np.asarray(corr[..., min(int(t), corr.shape[3] - 1), component], dtype=np.float32)
+                finite = vol[np.isfinite(vol)]
+                vmax = max(float(np.percentile(np.abs(finite), 99.0)) if finite.size else 0.0, 1e-6)
+                direction = ("LR", "AP", "FH")[component]
+                venc_name = "High" if is_high else "Low"
+                return vol, f"Corr {venc_name} {direction} (rad)", {"cmap": "RdBu_r", "clim": (-vmax, vmax)}
+        if content_idx == 22:
+            result = getattr(ws, "phase_unwrap_result", {}) or {}
+            mask = result.get("wrap_mask")
+            if mask is None:
+                return None, "Wrap Mask (no unwrapping)", {"cmap": "gray", "clim": (0, 1)}
+            vol = np.any(np.asarray(mask)[..., min(int(t), np.asarray(mask).shape[3]-1), :], axis=-1).astype(np.float32)
+            return vol, "Wrap Mask (any component)", {"cmap": "Reds", "clim": (0, 1)}
+        if content_idx in {23, 24, 25}:
+            result = getattr(ws, "phase_unwrap_result", {}) or {}
+            count = result.get("wrap_count")
+            comp = content_idx - 23
+            if count is None:
+                return None, "Wrap Count (no unwrapping)", {"cmap": "RdBu_r", "clim": (-1, 1)}
+            arr = np.asarray(count)
+            vol = arr[..., min(int(t), arr.shape[3]-1), comp].astype(np.float32)
+            lim = max(1.0, float(np.max(np.abs(vol))))
+            direction = ("LR", "AP", "FH")[comp]
+            return vol, f"Wrap Count {direction}", {"cmap": "RdBu_r", "clim": (-lim, lim)}
+        if content_idx == 26:
+            result = getattr(ws, "phase_unwrap_result", {}) or {}
+            flow_u = result.get("flow_unwrapped")
+            flow_w = result.get("flow_wrapped")
+            if flow_u is None or flow_w is None:
+                return None, "Unwrapped − Wrapped Speed (no unwrapping)", {"cmap": "gray", "clim": None}
+            du = np.linalg.norm(np.asarray(flow_u)[..., min(int(t), np.asarray(flow_u).shape[3]-1), :], axis=-1)
+            dw = np.linalg.norm(np.asarray(flow_w)[..., min(int(t), np.asarray(flow_w).shape[3]-1), :], axis=-1)
+            vol = (du - dw).astype(np.float32)
+            lim = max(1e-6, float(np.nanmax(np.abs(vol))))
+            return vol, "Unwrapped − Wrapped Speed (cm/s)", {"cmap": "RdBu_r", "clim": (-lim, lim)}
         return None, "", {"cmap": "gray", "clim": None}
 
     def _get_mask_3d(self):
@@ -657,6 +789,8 @@ class OrthoViewer(QtWidgets.QWidget):
             self._updating_colorbar = False
 
     def refresh(self, update_plane=True):
+        self._refresh_correction_content_availability()
+        self._refresh_phase_unwrap_content_availability()
         ws = self.workspace
         t = int(ws.current_t)
         if update_plane:
@@ -698,8 +832,23 @@ class OrthoViewer(QtWidgets.QWidget):
             for plane, (image, labels, cursor, fixed) in slices.items():
                 spec = PLANE_SPECS[plane]
                 slice_key = (int(self.combo_content.currentIndex()), int(t), int(fixed))
-                if self._slice_keys.get(plane) == slice_key:
+                previous_key = self._slice_keys.get(plane)
+                if previous_key == slice_key:
                     self.slice_views[plane].update_cursor(cursor, fixed, clim)
+                elif (
+                    self._playback_active
+                    and previous_key is not None
+                    and previous_key[0] == slice_key[0]
+                    and previous_key[2] == slice_key[2]
+                ):
+                    self.slice_views[plane].update_image(
+                        image,
+                        self._label_overlay(labels),
+                        cursor,
+                        fixed,
+                        clim,
+                    )
+                    self._slice_keys[plane] = slice_key
                 else:
                     self.slice_views[plane].set_slice(
                         image,

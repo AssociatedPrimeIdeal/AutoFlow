@@ -35,7 +35,7 @@ def _available_torch_cuda():
 
 
 def _normalize_correction_method(method):
-    value = str(method or "msac").strip().lower().replace("-", "_").replace("+", "_")
+    value = str(method or "wrls_arto").strip().lower().replace("-", "_").replace("+", "_")
     aliases = {"wrls": "wrls_arto", "arto": "wrls_arto", "wrlsarto": "wrls_arto"}
     value = aliases.get(value, value)
     if value not in _CORRECTION_ALGORITHM_VERSION:
@@ -574,12 +574,17 @@ def _gmm_arto_torch(
     max_iterations=1000,
     initial_means=None,
 ):
-    values = torch.as_tensor(
-        np.asarray(epsilon, dtype=np.float64).reshape(-1),
-        dtype=torch.float64,
-        device="cuda",
-    )
-    values = torch.sort(values[torch.isfinite(values)]).values
+    if isinstance(epsilon, torch.Tensor):
+        values = epsilon.to(device="cuda", dtype=torch.float64).reshape(-1)
+    else:
+        values = torch.as_tensor(
+            np.asarray(epsilon, dtype=np.float64).reshape(-1),
+            dtype=torch.float64,
+            device="cuda",
+        )
+    # EM does not require sorted samples.  Sorting the full residual vector
+    # was an O(N log N) pass and dominated large-volume CUDA runs.
+    values = values[torch.isfinite(values)]
     value_count = int(values.numel())
     if value_count < 3:
         raise ValueError(f"not enough finite ARTO residuals: {value_count}")
@@ -588,17 +593,22 @@ def _gmm_arto_torch(
     if not np.isfinite(overall_std) or overall_std <= np.finfo(np.float64).eps:
         return 0.0, max(overall_std, np.finfo(np.float64).eps), np.array([-1.0, 0.0, 1.0]), np.ones(3), np.array([0.25, 0.5, 0.25]), 0, "cuda"
 
-    means = (
-        np.array([-float(delta) * overall_std, 0.0, float(delta) * overall_std], dtype=np.float64)
-        if initial_means is None
-        else np.asarray(initial_means, dtype=np.float64).reshape(3).copy()
-    )
-    means[int(np.argmin(means))] = max(float(np.min(means)), float(values[0].item()))
-    means[int(np.argmax(means))] = min(float(np.max(means)), float(values[-1].item()))
-    gamma = np.full(3, overall_std / 2.0, dtype=np.float64)
-    probability = np.array(
-        [(1.0 - float(central_probability)) / 2.0, float(central_probability), (1.0 - float(central_probability)) / 2.0],
-        dtype=np.float64,
+    means = torch.as_tensor(
+        ([-float(delta) * overall_std, 0.0, float(delta) * overall_std]
+         if initial_means is None else np.asarray(initial_means, dtype=np.float64).reshape(3)),
+        dtype=torch.float64, device="cuda",
+    ).clone()
+    min_value = torch.amin(values)
+    max_value = torch.amax(values)
+    left = torch.argmin(means)
+    right = torch.argmax(means)
+    means[left] = torch.maximum(means[left], min_value)
+    means[right] = torch.minimum(means[right], max_value)
+    gamma = torch.full((3,), overall_std / 2.0, dtype=torch.float64, device="cuda")
+    probability = torch.as_tensor(
+        [(1.0 - float(central_probability)) / 2.0, float(central_probability),
+         (1.0 - float(central_probability)) / 2.0],
+        dtype=torch.float64, device="cuda",
     )
     tolerance = variance * 1e-4
     gamma_floor = overall_std / 50.0
@@ -606,16 +616,13 @@ def _gmm_arto_torch(
     central_index = 1
 
     for iteration in range(max(0, int(max_iterations))):
-        previous_means = means.copy()
-        gamma = np.maximum(gamma, gamma_floor)
-        means_gpu = torch.as_tensor(means, dtype=torch.float64, device="cuda")
-        gamma_gpu = torch.as_tensor(gamma, dtype=torch.float64, device="cuda")
-        probability_gpu = torch.as_tensor(probability, dtype=torch.float64, device="cuda")
-        scaled = (values[:, None] - means_gpu[None, :]) / gamma_gpu[None, :]
+        previous_means = means.clone()
+        gamma = torch.clamp(gamma, min=gamma_floor)
+        scaled = (values[:, None] - means[None, :]) / gamma[None, :]
         weighted_pdf = (
             torch.exp(-0.5 * scaled * scaled)
-            / (gamma_gpu[None, :] * np.sqrt(2.0 * np.pi))
-        ) * probability_gpu[None, :]
+            / (gamma[None, :] * np.sqrt(2.0 * np.pi))
+        ) * probability[None, :]
         denominator = torch.sum(weighted_pdf, dim=1)
         positive = denominator > 0.0
         replacement = torch.min(
@@ -644,20 +651,28 @@ def _gmm_arto_torch(
         updated_means = torch.stack(updated_means)
         second_moments = torch.stack(second_moments)
         updated_gamma = torch.sqrt(torch.clamp(second_moments - updated_means * updated_means, min=0.0))
-        means = updated_means.detach().cpu().numpy()
-        gamma = updated_gamma.detach().cpu().numpy()
-        probability = (weights / float(value_count)).detach().cpu().numpy()
+        means = updated_means
+        gamma = updated_gamma
+        probability = weights / float(value_count)
 
-        left_index = int(np.argmin(means))
-        right_index = int(np.argmax(means))
+        left_index = int(torch.argmin(means).item())
+        right_index = int(torch.argmax(means).item())
         central_index = int(({0, 1, 2} - {left_index, right_index}).pop())
-        means[left_index] = min(means[left_index], -gamma[central_index] * float(delta))
-        means[right_index] = max(means[right_index], gamma[central_index] * float(delta))
-        probability[central_index] = max(probability[central_index], float(central_probability))
-        if np.all(np.abs(means - previous_means) < tolerance):
-            return means[central_index], gamma[central_index], means, gamma, probability, iteration + 1, "cuda"
+        means[left_index] = torch.minimum(means[left_index], -gamma[central_index] * float(delta))
+        means[right_index] = torch.maximum(means[right_index], gamma[central_index] * float(delta))
+        probability[central_index] = torch.maximum(
+            probability[central_index], torch.as_tensor(float(central_probability), device="cuda", dtype=torch.float64)
+        )
+        if bool(torch.all(torch.abs(means - previous_means) < tolerance).item()):
+            means_cpu = means.detach().cpu().numpy()
+            gamma_cpu = gamma.detach().cpu().numpy()
+            probability_cpu = probability.detach().cpu().numpy()
+            return means_cpu[central_index], gamma_cpu[central_index], means_cpu, gamma_cpu, probability_cpu, iteration + 1, "cuda"
 
-    return means[central_index], gamma[central_index], means, gamma, probability, int(max_iterations), "cuda"
+    means_cpu = means.detach().cpu().numpy()
+    gamma_cpu = gamma.detach().cpu().numpy()
+    probability_cpu = probability.detach().cpu().numpy()
+    return means_cpu[central_index], gamma_cpu[central_index], means_cpu, gamma_cpu, probability_cpu, int(max_iterations), "cuda"
 
 
 def _gmm_arto(*args, **kwargs):
@@ -819,6 +834,156 @@ def _execute_wrls_arto_impl(
     return np.asarray(correction_nvtzyx, dtype=np.float32), stationary_zyx, diag
 
 
+def _wrls_fit_torch(phi, sigma, fit_mask, basis, order, lam, fista_iterations, torch):
+    exponent_count = len(_polynomial_exponents_3d(order))
+    fit_basis = basis[:exponent_count]
+    flat_indices = torch.nonzero(fit_mask.reshape(-1), as_tuple=False).reshape(-1)
+    if int(flat_indices.numel()) < exponent_count:
+        raise ValueError(
+            f"not enough WRLS candidates for order {order}: {int(flat_indices.numel())} < {exponent_count}"
+        )
+    phi_flat = phi.reshape(-1).to(dtype=torch.float64)
+    sigma_flat = sigma.reshape(-1).to(dtype=torch.float64)
+    design = fit_basis[:, flat_indices].transpose(0, 1)
+    inverse_sigma = torch.reciprocal(sigma_flat[flat_indices])
+    weighted_design = design * inverse_sigma[:, None]
+    weighted_phi = phi_flat[flat_indices] * inverse_sigma
+    gram = weighted_design.transpose(0, 1) @ weighted_design
+    rhs = weighted_design.transpose(0, 1) @ weighted_phi
+    try:
+        initial = torch.linalg.solve(gram, rhs)
+    except RuntimeError:
+        initial = torch.linalg.lstsq(gram, rhs).solution
+
+    x = initial.clone()
+    y = x.clone()
+    t_value = torch.ones((), dtype=torch.float64, device=gram.device)
+    largest_eigenvalue = torch.linalg.eigvalsh(gram).amax()
+    lipschitz = 2.05 * largest_eigenvalue
+    if not bool(torch.isfinite(lipschitz).item()) or float(lipschitz.item()) <= np.finfo(np.float64).eps:
+        coefficients = x
+    else:
+        shrink_threshold = float(lam) / lipschitz
+        for _ in range(max(0, int(fista_iterations))):
+            alpha = y - (2.0 / lipschitz) * (gram @ y - rhs)
+            x_new = torch.sign(alpha) * torch.clamp(torch.abs(alpha) - shrink_threshold, min=0.0)
+            t_new = (1.0 + torch.sqrt(1.0 + 4.0 * t_value * t_value)) / 2.0
+            y = x_new + ((t_value - 1.0) / t_new) * (x_new - x)
+            x = x_new
+            t_value = t_new
+        coefficients = x
+    correction = (coefficients @ fit_basis).reshape(phi.shape)
+    return phi - correction, correction
+
+
+def _execute_wrls_arto_gpu(
+    im,
+    corr_fit_order=3,
+    lam=5.0,
+    magnitude_threshold=0.04,
+    mid_fov_fraction=0.5,
+    mid_slice_fraction=0.65,
+    arto_iterations=2,
+    tau=3.0,
+    delta=2.0,
+    central_probability=0.5,
+    fista_iterations=5000,
+    gmm_iterations=1000,
+    progress_callback=None,
+):
+    torch, reason = _available_torch_cuda()
+    if torch is None:
+        raise RuntimeError(f"CUDA unavailable: {reason}")
+    raw = torch.as_tensor(np.asarray(im), dtype=torch.complex128, device="cuda")
+    if raw.ndim != 5 or raw.shape[0] < 4:
+        raise ValueError(f"expected NVTZYX with at least 4 encodes, got shape={tuple(raw.shape)}")
+    if raw.shape[1] < 2:
+        raise ValueError("WRLS+ARTO requires at least two time frames for temporal sigma")
+    if int(arto_iterations) < 1:
+        raise ValueError("WRLS+ARTO requires at least one ARTO iteration")
+    if not 0.0 < float(central_probability) < 1.0:
+        raise ValueError("wrls_central_probability must be between 0 and 1")
+
+    reference = raw[0]
+    magnitude_xyz = torch.abs(reference).mean(dim=0).permute(2, 1, 0).to(torch.float64)
+    slice_max = magnitude_xyz.amax(dim=(0, 1), keepdim=True)
+    magnitude_mask = magnitude_xyz > (float(magnitude_threshold) * slice_max)
+    if not bool(torch.any(magnitude_mask).item()):
+        raise ValueError("no WRLS magnitude mask candidates")
+
+    shape_xyz = tuple(int(v) for v in magnitude_xyz.shape)
+    basis_np = _build_normalized_polynomial_basis(shape_xyz, max(1, int(corr_fit_order)))
+    basis = torch.as_tensor(basis_np, dtype=torch.float64, device="cuda")
+    initial_region_np = _middle_fov_mask(
+        shape_xyz,
+        mid_fov_fraction=float(mid_fov_fraction),
+        mid_slice_fraction=float(mid_slice_fraction),
+    )
+    initial_region = torch.as_tensor(initial_region_np, dtype=torch.bool, device="cuda")
+    corrections_xyz = torch.zeros((3,) + shape_xyz, dtype=torch.float64, device="cuda")
+    direction_masks = []
+    gmm_iteration_counts = []
+    gmm_devices = []
+    total_fits = 3 * (1 + int(arto_iterations))
+    completed_fits = 0
+
+    for direction in range(3):
+        phase_txyz = torch.angle(raw[direction + 1] * torch.conj(reference)).permute(3, 2, 1, 0) / np.pi
+        phi = phase_txyz.mean(dim=3).to(torch.float64)
+        sigma = phase_txyz.std(dim=3, correction=1).to(torch.float64)
+        valid = magnitude_mask & torch.isfinite(phi) & torch.isfinite(sigma) & (sigma > np.finfo(np.float32).eps)
+        fit_mask = valid & initial_region
+        phi_corrected, correction = _wrls_fit_torch(
+            phi, sigma, fit_mask, basis, order=1, lam=float(lam),
+            fista_iterations=int(fista_iterations), torch=torch,
+        )
+        completed_fits += 1
+        _emit_progress(progress_callback, "background_phase_fit", current=completed_fits, total=total_fits,
+                       message=f"WRLS+ARTO direction {direction + 1}/3 initialization")
+
+        initial_means = None
+        final_mask = fit_mask
+        for arto_index in range(int(arto_iterations)):
+            epsilon = phi_corrected[valid] / sigma[valid]
+            mu_center, gamma_center, means, _gamma, _probability, gmm_count, gmm_device = _gmm_arto_torch(
+                torch, epsilon, delta=float(delta), central_probability=float(central_probability),
+                max_iterations=int(gmm_iterations), initial_means=initial_means,
+            )
+            gmm_iteration_counts.append(int(gmm_count))
+            gmm_devices.append(str(gmm_device))
+            weighted_residual = torch.full_like(phi, float("nan"), dtype=torch.float64)
+            weighted_residual[valid] = phi_corrected[valid] / sigma[valid]
+            lower = mu_center - float(tau) * gamma_center
+            upper = mu_center + float(tau) * gamma_center
+            final_mask = valid & (weighted_residual > lower) & (weighted_residual < upper)
+            phi_corrected, correction = _wrls_fit_torch(
+                phi, sigma, final_mask, basis, order=int(corr_fit_order), lam=float(lam),
+                fista_iterations=int(fista_iterations), torch=torch,
+            )
+            initial_means = means
+            completed_fits += 1
+            _emit_progress(progress_callback, "background_phase_fit", current=completed_fits, total=total_fits,
+                           message=f"WRLS+ARTO direction {direction + 1}/3 ARTO {arto_index + 1}/{arto_iterations}")
+        corrections_xyz[direction] = correction * np.pi
+        direction_masks.append(final_mask)
+
+    stationary_xyz = torch.stack(direction_masks, dim=0).all(dim=0)
+    correction_nvtzyx = corrections_xyz.permute(0, 3, 2, 1).unsqueeze(1)
+    stationary_zyx = stationary_xyz.permute(2, 1, 0)
+    torch.cuda.synchronize()
+    diag = {
+        "applied": True, "compute_device": "cuda", "corr_fit_order": int(corr_fit_order),
+        "stationary_voxels": int(stationary_zyx.sum().item()), "skipped_reason": "",
+        "wrls_lambda": float(lam), "wrls_magnitude_threshold": float(magnitude_threshold),
+        "wrls_mid_fov_fraction": float(mid_fov_fraction), "wrls_mid_slice_fraction": float(mid_slice_fraction),
+        "wrls_arto_iterations": int(arto_iterations), "wrls_tau": float(tau), "wrls_delta": float(delta),
+        "wrls_central_probability": float(central_probability), "wrls_fista_iterations": int(fista_iterations),
+        "wrls_gmm_iterations": int(gmm_iterations), "stationary_voxels_by_direction": [int(m.sum().item()) for m in direction_masks],
+        "gmm_iteration_counts": gmm_iteration_counts, "gpu_accelerated_stages": ["phase_statistics", "wrls_fit", "arto_gmm"],
+    }
+    return correction_nvtzyx.detach().cpu().numpy().astype(np.float32), stationary_zyx.detach().cpu().numpy(), diag
+
+
 def execute_wrls_arto(
     im,
     corr_fit_order=3,
@@ -848,6 +1013,12 @@ def execute_wrls_arto(
         "gmm_iterations": gmm_iterations,
         "progress_callback": progress_callback,
     }
+    torch, _reason = _available_torch_cuda()
+    if torch is not None:
+        try:
+            return _execute_wrls_arto_gpu(im, **kwargs)
+        except Exception:
+            torch.cuda.empty_cache()
     return _execute_wrls_arto_impl(im, **kwargs)
 
 

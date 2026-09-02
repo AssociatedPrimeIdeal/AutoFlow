@@ -1577,6 +1577,7 @@ def load_input_data(
     parameter_overrides=None,
     dicom_read_workers=1,
     force_recompute_seg=False,
+    ignore_embedded_segmentation=False,
 ):
     case = resolve_input_case(input_source)
     if case.input_kind == "h5":
@@ -1586,11 +1587,20 @@ def load_input_data(
             progress_callback=progress_callback,
             source_group=case.source_group,
             force_recompute_seg=force_recompute_seg,
+            ignore_embedded_segmentation=ignore_embedded_segmentation,
         )
-    return load_dicom_case(
+    loaded = load_dicom_case(
         case,
         correction_config=correction_config,
         progress_callback=progress_callback,
         parameter_overrides=parameter_overrides,
         dicom_read_workers=dicom_read_workers,
     )
+    if ignore_embedded_segmentation and loaded.segmentation is not None:
+        # DICOM loaders may expose an imported/embedded mask in future. Keep
+        # the bypass semantics consistent with H5 without touching the source.
+        loaded.segmentation = None
+        loaded.capabilities.has_segmentation = False
+        loaded.metadata = dict(loaded.metadata or {})
+        loaded.metadata["ignore_embedded_segmentation"] = True
+    return loaded

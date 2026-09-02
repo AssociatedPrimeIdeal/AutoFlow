@@ -1,10 +1,13 @@
 import json
+import hashlib
+import importlib.util
 import os
 import re
 import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -30,6 +33,16 @@ _AUTOFLOW_INTERNAL_VENC_ORDER = ("LR", "AP", "FH")
 _NNUNET_TARGET_SPATIAL_ORDER = ("HF", "AP", "RL")
 _NNUNET_TARGET_VENC_ORDER = ("HF", "AP", "RL")
 _NNUNET_GPU_PREPROCESSING_ENV = "AUTOFLOW_NNUNET_GPU_PREPROCESSING"
+_NNUNET_4D_BACKENDS = {"nnunet4d", "nnunet_4d", "4d"}
+_NNUNET_4D_PIPELINE_DEFAULT = Path(
+    "/nas-data2/ryy/CMR4DFlow2026/Segdata/scripts/nnunet/4D/"
+    "run_7020_4d_full_ssd_20260824.sh"
+)
+_NNUNET_4D_RESULTS_DEFAULT = Path("/nas-data/ryy_rawdata/aorta_seg/nnres")
+_NNUNET_4D_DATASET_DEFAULT = "Dataset7020_Aorta_4DTemporalFT"
+_NNUNET_4D_TRAINER_DEFAULT = "nnUNetTrainerPartBalancedTversky"
+_NNUNET_4D_PLANS_DEFAULT = "nnUNetPlansIso1mm"
+_NNUNET_4D_CONFIGURATION_DEFAULT = "3d_fullres"
 
 
 def segmentation_timestamp():
@@ -100,7 +113,9 @@ def _load_segmentation_from_h5(path):
 
 
 def load_segmentation_file(path, spatial_shape=None, time_count=1):
-    ext = os.path.splitext(path)[1].lower()
+    path = str(path)
+    lower_path = path.lower()
+    ext = ".nii.gz" if lower_path.endswith(".nii.gz") else os.path.splitext(path)[1].lower()
     dataset_name = ""
     if ext == ".npy":
         arr = np.asarray(np.load(path), dtype=np.int16)
@@ -119,6 +134,13 @@ def load_segmentation_file(path, spatial_shape=None, time_count=1):
             arr = np.asarray(payload[keys[0]], dtype=np.int16)
     elif ext in (".h5", ".hdf5"):
         arr, dataset_name = _load_segmentation_from_h5(path)
+    elif ext in (".nii", ".nii.gz"):
+        image = nib.load(path)
+        arr = np.asarray(image.get_fdata(), dtype=np.float32)
+        if arr.ndim not in (3, 4):
+            raise ValueError(f"NIfTI segmentation must be 3D or 4D, got shape={arr.shape}")
+        arr = np.rint(arr).astype(np.int16)
+        dataset_name = "nifti"
     else:
         raise ValueError(f"unsupported segmentation file type: {path}")
 
@@ -282,12 +304,27 @@ def generate_threshold_segmentation(
 
 def save_segmentation_file(path, segmentation, resolution=None, origin=None, provenance=None):
     arr = np.asarray(segmentation, dtype=np.int16)
-    ext = os.path.splitext(path)[1].lower()
+    path = str(path)
+    lower_path = path.lower()
+    ext = ".nii.gz" if lower_path.endswith(".nii.gz") else os.path.splitext(path)[1].lower()
     if ext == ".npy":
         np.save(path, arr)
         return path
     if ext == ".npz":
         np.savez_compressed(path, segmentation=arr)
+        return path
+    if ext in (".nii", ".nii.gz"):
+        spacing = np.asarray(resolution if resolution is not None else (1.0, 1.0, 1.0), dtype=float).reshape(-1)
+        spacing = np.where(np.isfinite(spacing[:3]) & (spacing[:3] > 0), spacing[:3], 1.0)
+        translation = np.asarray(origin if origin is not None else (0.0, 0.0, 0.0), dtype=float).reshape(-1)
+        translation = np.where(np.isfinite(translation[:3]), translation[:3], 0.0)
+        affine = np.eye(4, dtype=float)
+        affine[:3, :3] = np.diag(spacing)
+        affine[:3, 3] = translation
+        image = nib.Nifti1Image(arr, affine)
+        if provenance:
+            image.header["descrip"] = str(json.dumps(provenance, ensure_ascii=False))[:79]
+        nib.save(image, path)
         return path
     if ext not in (".h5", ".hdf5"):
         raise ValueError(f"unsupported segmentation save type: {path}")
@@ -300,6 +337,22 @@ def save_segmentation_file(path, segmentation, resolution=None, origin=None, pro
         if provenance:
             f.attrs["provenance_json"] = json.dumps(provenance, ensure_ascii=False)
     return path
+
+
+def save_nifti_volume(path, volume, resolution=None, origin=None):
+    """Write a scalar image sequence for external editors such as SpatioTemporal Labeler."""
+    arr = np.asarray(volume)
+    if arr.ndim not in (3, 4):
+        raise ValueError(f"NIfTI volume must be 3D or 4D, got shape={arr.shape}")
+    spacing = np.asarray(resolution if resolution is not None else (1.0, 1.0, 1.0), dtype=float).reshape(-1)
+    spacing = np.where(np.isfinite(spacing[:3]) & (spacing[:3] > 0), spacing[:3], 1.0)
+    translation = np.asarray(origin if origin is not None else (0.0, 0.0, 0.0), dtype=float).reshape(-1)
+    translation = np.where(np.isfinite(translation[:3]), translation[:3], 0.0)
+    affine = np.eye(4, dtype=float)
+    affine[:3, :3] = np.diag(spacing)
+    affine[:3, 3] = translation
+    nib.save(nib.Nifti1Image(np.asarray(arr, dtype=np.float32), affine), str(path))
+    return str(path)
 
 
 def save_segmentation_to_source_h5(path, segmentation, resolution=None, origin=None, provenance=None, dataset_name="segmask", source_spatial_order=None, source_group=None):
@@ -359,10 +412,12 @@ def _nnunet_normalize_channel_name(name):
         "flow_y_mean": "flow_y_mean_xyz",
         "flow_z_mean": "flow_z_mean_xyz",
         "flow_mag_mean": "flow_mag_mean_xyz",
+        "flow_speed_mean": "flow_mag_mean_xyz",
         "flow_x_std": "flow_x_std_xyz",
         "flow_y_std": "flow_y_std_xyz",
         "flow_z_std": "flow_z_std_xyz",
         "flow_mag_std": "flow_mag_std_xyz",
+        "flow_speed_std": "flow_mag_std_xyz",
     }
     return aliases.get(token, token)
 
@@ -506,7 +561,7 @@ def _load_nnunet_model_metadata(model_folder):
 
 def _gpu_preprocessing_enabled(device, environ=None):
     environment = os.environ if environ is None else environ
-    token = str(environment.get(_NNUNET_GPU_PREPROCESSING_ENV, "auto") or "auto").strip().lower()
+    token = str(environment.get(_NNUNET_GPU_PREPROCESSING_ENV, "cuda") or "cuda").strip().lower()
     if token in {"0", "false", "no", "off", "cpu", "disabled"}:
         return False
     return str(device or "").strip().lower() == "cuda"
@@ -555,12 +610,18 @@ def _prepare_nnunet_gpu_model_folder(model_path, target_path, folds, checkpoint_
             ]
         configuration["resampling_fn_data"] = "resample_torch_fornnunet"
         configuration["resampling_fn_data_kwargs"] = gpu_kwargs
+        if "resampling_fn_probabilities" in configuration:
+            probability_kwargs = dict(gpu_kwargs)
+            probability_kwargs.update({"is_seg": False, "mode": "linear"})
+            configuration["resampling_fn_probabilities"] = "resample_torch_fornnunet"
+            configuration["resampling_fn_probabilities_kwargs"] = probability_kwargs
         changed += 1
     if changed == 0:
         raise ValueError(f"nnUNet plans do not define an input resampler: {model_path / 'plans.json'}")
     plans["autoflow_gpu_input_resampling"] = {
         "enabled": True,
         "function": "resample_torch_fornnunet",
+        "probabilities_function": "resample_torch_fornnunet",
         "device": "cuda",
         "mode": "linear",
     }
@@ -661,6 +722,9 @@ def _nnunet_channel_volumes(channel_names, mag, flow):
         "pcmra_std_xyz",
     }
     if requested.intersection(speed_keys):
+        # Compute the norm once.  The 4D model requests several speed/PCMRA
+        # channels and recalculating this volume for each channel is a large
+        # avoidable allocation for clinical-size inputs.
         speed = np.linalg.norm(flow, axis=-1)
         if "flow_mag_mean_xyz" in requested:
             channels["flow_mag_mean_xyz"] = np.mean(speed, axis=3)
@@ -674,6 +738,88 @@ def _nnunet_channel_volumes(channel_names, mag, flow):
                 channels["pcmra_std_xyz"] = np.std(pcmra, axis=3)
 
     return [np.asarray(channels[token], dtype=np.float32) for token in tokens]
+
+
+def _parse_nnunet_temporal_channel(name):
+    """Return ``(offset, feature)`` for a temporal channel name.
+
+    Dataset7020 names channels as ``tm2_flow_x``, ``tp1_mag`` and ``tp0_pcmra``.
+    The parser also accepts ``t-2_*``/``t+1_*`` forms so exported datasets can
+    use a more readable spelling without changing the predictor.
+    """
+    token = str(name or "").strip().lower()
+    match = re.match(r"^t([mp])(\d+)_(flow_[xyz]|mag|pcmra)$", token)
+    if match:
+        offset = int(match.group(2)) * (-1 if match.group(1) == "m" else 1)
+        return offset, match.group(3)
+    match = re.match(r"^t([+-]?\d+)_(flow_[xyz]|mag|pcmra)$", token)
+    if match:
+        return int(match.group(1)), match.group(2)
+    return None
+
+
+def _nnunet_4d_channel_volumes(
+    channel_names, mag, flow, frame_index, global_by_name=None, temporal_cache=None
+):
+    """Build one 4D-model sample from a circular temporal neighbourhood."""
+    mag = np.asarray(mag, dtype=np.float32)
+    flow = np.asarray(flow, dtype=np.float32)
+    if mag.ndim != 4 or flow.ndim != 5 or flow.shape[:4] != mag.shape:
+        raise ValueError(
+            f"4D nnUNet inputs must be mag XYZT and flow XYZT3, got {mag.shape} and {flow.shape}"
+        )
+    nt = int(mag.shape[3])
+    if nt < 1:
+        raise ValueError("4D nnUNet input has no time frames")
+    # Cache all full-cycle statistics once per case.  Every frame shares these
+    # twelve channels; only the temporal window changes.
+    global_names = [
+        "mag_std_xyz", "mag_mean_xyz", "pcmra_std_xyz", "pcmra_mean_xyz",
+        "flow_x_mean_xyz", "flow_y_mean_xyz", "flow_z_mean_xyz", "flow_mag_mean_xyz",
+        "flow_x_std_xyz", "flow_y_std_xyz", "flow_z_std_xyz", "flow_mag_std_xyz",
+    ]
+    if global_by_name is None:
+        global_channels = _nnunet_channel_volumes(global_names, mag, flow)
+        global_by_name = dict(zip(global_names, global_channels))
+    speed = None
+    pcmra = None
+    result = []
+    for index, raw_name in enumerate(channel_names):
+        name = _nnunet_normalize_channel_name(raw_name)
+        if name in global_by_name:
+            result.append(global_by_name[name])
+            continue
+        parsed = _parse_nnunet_temporal_channel(name)
+        if parsed is None:
+            # Preserve the existing positional aliases for old 12-channel
+            # models, while producing a useful error for a malformed 4D spec.
+            if index < len(global_names):
+                result.append(global_by_name[global_names[index]])
+                continue
+            raise ValueError(f"unsupported 4D nnUNet channel '{raw_name}'")
+        offset, feature = parsed
+        frame = (int(frame_index) + int(offset)) % nt
+        if feature == "mag":
+            result.append(
+                mag[..., frame] if temporal_cache is None else temporal_cache["mag"][..., frame]
+            )
+        elif feature == "pcmra":
+            if temporal_cache is not None:
+                pcmra = temporal_cache["pcmra"]
+            elif pcmra is None:
+                if speed is None:
+                    speed = np.linalg.norm(flow, axis=-1)
+                pcmra = mag * speed
+            result.append(pcmra[..., frame])
+        else:
+            if feature == "flow_x": component = 0
+            elif feature == "flow_y": component = 1
+            else: component = 2
+            value = flow[..., frame, component]
+            if temporal_cache is not None:
+                value = temporal_cache[f"flow_{feature[-1]}"][..., frame]
+            result.append(value)
+    return [np.asarray(value, dtype=np.float32) for value in result]
 
 
 def _nnunet_channel_volume(channel_name, mag, flow, channel_index=0):
@@ -799,9 +945,14 @@ def _nnunet_inference_command(
     num_processes_segmentation_export,
     step_size,
     disable_tta,
+    python_executable=None,
+    bootstrap_resampler_path=None,
 ):
     command = [
-        *_nnunet_predict_command(),
+        *_nnunet_predict_command(
+            python_executable=python_executable,
+            bootstrap_resampler_path=bootstrap_resampler_path,
+        ),
         "-i", str(input_dir),
         "-o", str(output_dir),
         "-m", str(model_path),
@@ -871,19 +1022,512 @@ def resolve_nnunet_model_folder(model_folder=""):
     )
 
 
-def _nnunet_predict_command():
+def default_nnunet_4d_pipeline_script():
+    """Return the optional local Dataset7020 training/prediction script."""
+    return str(_NNUNET_4D_PIPELINE_DEFAULT)
+
+
+def _model_folder_from_4d_pipeline_script(script_path):
+    """Resolve a Dataset7020 model directory from its shell configuration.
+
+    The supplied ``run_7020_4d_full_ssd_20260824.sh`` is a training/prediction
+    orchestrator rather than an inference executable.  Parsing its stable
+    ``NNUNET_RESULTS`` and ``DATASET`` assignments lets callers point
+    ``auto_model`` at that script while AutoFlow still invokes nnUNet once per
+    4D case.  Missing or non-standard assignments simply fall back to the
+    documented Dataset7020 defaults.
+    """
+    path = Path(script_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"4D nnUNet pipeline script not found: {path}")
+    text = path.read_text(encoding="utf-8", errors="replace")
+
+    def assignment(name, fallback):
+        match = re.search(rf"^\s*{re.escape(name)}=\"([^\"]+)\"", text, flags=re.MULTILINE)
+        return match.group(1) if match else fallback
+
+    # Reuse the same local shell-assignment expansion used for the child
+    # predictor environment, so ``NNUNET_RESULTS="${SSD_ROOT}/nnres"`` is
+    # resolved before constructing the model folder.
+    assignments = _nnunet_4d_pipeline_assignments(path)
+    results_root = Path(
+        assignments.get("NNUNET_RESULTS", assignment("NNUNET_RESULTS", str(_NNUNET_4D_RESULTS_DEFAULT)))
+    ).expanduser()
+    dataset = assignments.get("DATASET", assignment("DATASET", _NNUNET_4D_DATASET_DEFAULT))
+    trainer = _NNUNET_4D_TRAINER_DEFAULT
+    plans = _NNUNET_4D_PLANS_DEFAULT
+    configuration = _NNUNET_4D_CONFIGURATION_DEFAULT
+    model = results_root / dataset / f"{trainer}__{plans}__{configuration}"
+    return model.resolve()
+
+
+def _python_from_4d_pipeline_script(script_path):
+    path = Path(script_path).expanduser().resolve()
+    if not path.is_file():
+        return ""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    match = re.search(r"PYTHON_BIN=\"\$\{PYTHON_BIN:-([^}]+)\}\"", text)
+    candidate = str(match.group(1)).strip() if match else ""
+    return candidate if candidate and Path(candidate).is_file() else ""
+
+
+def _nnunet_4d_pipeline_assignments(script_path):
+    """Read stable environment assignments from the Dataset7020 shell script."""
+    path = Path(script_path).expanduser().resolve()
+    if not path.is_file():
+        return {}
+    text = path.read_text(encoding="utf-8", errors="replace")
+    values = {}
+    for name in ("SSD_ROOT", "NNUNET_RAW", "NNUNET_PREPROCESSED", "NNUNET_RESULTS", "DATASET"):
+        match = re.search(rf"^\s*{re.escape(name)}=\"([^\"]+)\"", text, flags=re.MULTILINE)
+        if match:
+            values[name] = match.group(1)
+    # The shell script intentionally derives cache paths from SSD_ROOT. Expand
+    # only the local assignments so ${SSD_ROOT} never leaks into child env.
+    for name, value in list(values.items()):
+        for _ in range(4):
+            replaced = re.sub(
+                r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)",
+                lambda match: values.get(match.group(1) or match.group(2), match.group(0)),
+                value,
+            )
+            if replaced == value:
+                break
+            value = replaced
+        values[name] = value
+    return values
+
+
+def _nnunet_4d_subprocess_env(pipeline_script, model_path):
+    """Build an isolated nnUNet environment for the external 4D predictor."""
+    env = os.environ.copy()
+    script_path = Path(pipeline_script).expanduser().resolve() if pipeline_script else None
+    if script_path is not None and script_path.is_file():
+        # The training script imports project helpers and custom trainer modules
+        # from both scripts/ and scripts/nnunet/. Keep the parent process env
+        # untouched while making those imports available to the child.
+        roots = [script_path.parent, script_path.parent.parent]
+        existing = [item for item in str(env.get("PYTHONPATH", "")).split(os.pathsep) if item]
+        env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys([*(str(root) for root in roots), *existing]))
+        assignments = _nnunet_4d_pipeline_assignments(script_path)
+        if assignments.get("NNUNET_RAW"):
+            env["nnUNet_raw"] = assignments["NNUNET_RAW"]
+        if assignments.get("NNUNET_PREPROCESSED"):
+            env["nnUNet_preprocessed"] = assignments["NNUNET_PREPROCESSED"]
+        if assignments.get("NNUNET_RESULTS"):
+            env["nnUNet_results"] = assignments["NNUNET_RESULTS"]
+    if model_path:
+        # A model folder is always .../nnUNet_results/Dataset/TrainerConfig.
+        # This fallback also handles scripts with a non-standard variable name.
+        model_root = Path(model_path).expanduser().resolve().parent.parent
+        env["nnUNet_results"] = str(model_root)
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    env.setdefault("OMP_NUM_THREADS", "1")
+    env.setdefault("MKL_NUM_THREADS", "1")
+    env.setdefault("OPENBLAS_NUM_THREADS", "1")
+    return env
+
+
+def _load_4d_pipeline_module(script_path):
+    """Load the external grouped-preprocessing helpers when available."""
+    path = Path(script_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"4D pipeline script not found: {path}")
+    # ``run_seg2nndata_all.py`` discovers its project root from the
+    # ``scripts/`` directory (which contains both ``methods/`` and
+    # ``nnunet/``).  The 4D runner lives below ``scripts/nnunet/4D``.
+    scripts_root = path.parent.parent.parent
+    for root in (scripts_root, path.parent.parent, path.parent):
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+    module_path = path.parent / "run_4dflow.py"
+    if not module_path.is_file():
+        raise FileNotFoundError(f"grouped 4D runner not found: {module_path}")
+    module_name = "autoflow_external_4dflow_" + hashlib.sha1(str(module_path).encode("utf-8")).hexdigest()[:12]
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return module
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"could not load grouped 4D runner: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    # run_seg2nndata_all.py discovers its project root from cwd at import time.
+    # Import it from the Dataset7020 scripts root, then restore AutoFlow's cwd.
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(scripts_root)
+        spec.loader.exec_module(module)
+    finally:
+        os.chdir(old_cwd)
+    return module
+
+
+def _install_nnunet_4d_resampler(script_path):
+    """Install the Dataset7020 GPU resampler into the active nnUNet package."""
+    path = Path(script_path).expanduser().resolve()
+    scripts_root = path.parent.parent.parent
+    source_file = scripts_root / "nnunet" / "gpu_resampling.py"
+    if not source_file.is_file():
+        raise FileNotFoundError(f"Dataset7020 GPU resampler not found: {source_file}")
+    import nnunetv2
+
+    target_dir = Path(nnunetv2.__file__).resolve().parent / "preprocessing" / "resampling"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_file = target_dir / "gpu_resampling.py"
+    if not target_file.exists() or target_file.read_bytes() != source_file.read_bytes():
+        shutil.copy2(source_file, target_file)
+    importlib.invalidate_caches()
+    return target_file
+
+
+def _nnunet_4d_temporal_radius(channel_names):
+    offsets = [parsed[0] for name in channel_names if (parsed := _parse_nnunet_temporal_channel(name))]
+    if not offsets:
+        raise ValueError("4D nnUNet model does not define temporal channels")
+    radius = max(abs(int(value)) for value in offsets)
+    expected = 12 + 5 * (2 * radius + 1)
+    if len(channel_names) != expected:
+        raise ValueError(
+            f"4D nnUNet channel layout has {len(channel_names)} channels; "
+            f"expected {expected} for temporal radius {radius}"
+        )
+    return radius
+
+
+def _nnunet_4d_grouped_requested(runner=None):
+    """Return whether the direct grouped predictor should be attempted."""
+    token = str(os.environ.get("AUTOFLOW_NNUNET4D_GROUPED", "auto") or "auto").strip().lower()
+    if token in {"0", "false", "no", "off", "standard", "subprocess"}:
+        return False
+    # A test/custom runner intentionally exercises the subprocess contract.
+    return runner is None
+
+
+def _generate_nnunet_4d_grouped(
+    mag_nnunet,
+    flow_nnunet,
+    resolution_nnunet,
+    model_path,
+    dataset_json,
+    selected_folds,
+    checkpoint_name,
+    resolved_device,
+    label_map,
+    safe_case_id,
+    affine,
+    pipeline_script,
+    num_processes_segmentation_export,
+    artifact_prefix,
+    progress_callback,
+    t_total_start,
+):
+    """Predict all temporal samples with one common crop and shared resampling."""
+    pipeline = _load_4d_pipeline_module(pipeline_script)
+    # Dataset7020 plans may reference the project GPU resampler by name. The
+    # grouped runner already owns the installer used by its batch workflow;
+    # install it before PlansManager resolves the resampling function.
+    if str(resolved_device).strip().lower() == "cuda":
+        _install_nnunet_4d_resampler(pipeline_script)
+    channel_names = _ordered_mapping_values(dataset_json.get("channel_names") or dataset_json.get("modality") or {})
+    radius = _nnunet_4d_temporal_radius(channel_names)
+    nt = int(mag_nnunet.shape[3])
+    if nt < 1:
+        raise ValueError("4D nnUNet input has no time frames")
+
+    global_names = [
+        "mag_std_xyz", "mag_mean_xyz", "pcmra_std_xyz", "pcmra_mean_xyz",
+        "flow_x_mean_xyz", "flow_y_mean_xyz", "flow_z_mean_xyz", "flow_mag_mean_xyz",
+        "flow_x_std_xyz", "flow_y_std_xyz", "flow_z_std_xyz", "flow_mag_std_xyz",
+    ]
+    global_values = _nnunet_channel_volumes(global_names, mag_nnunet, flow_nnunet)
+    global_by_name = dict(zip(global_names, global_values))
+    speed = np.linalg.norm(flow_nnunet, axis=-1).astype(np.float32, copy=False)
+    pcmra = (mag_nnunet * speed).astype(np.float32, copy=False)
+
+    with TemporaryDirectory(prefix="autoflow_nnunet4d_grouped_") as tmp_root:
+        tmp_root = Path(tmp_root)
+        input_dir = tmp_root / "input"
+        output_dir = tmp_root / "output"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        source_paths = {}
+        source_volumes = {}
+        samples = []
+        for frame in range(nt):
+            sample_id = f"{safe_case_id}__t{frame:03d}"
+            samples.append({"sample_id": sample_id, "frame": frame, "label": None})
+            for source_key in pipeline.temporal_source_keys(frame, nt, radius):
+                source_paths.setdefault(source_key, None)
+
+        temporal_features = (
+            flow_nnunet[..., 0], flow_nnunet[..., 1], flow_nnunet[..., 2],
+            mag_nnunet, pcmra,
+        )
+        for source_key in source_paths:
+            kind, feature_index, frame = source_key
+            if kind == "global":
+                source_volumes[source_key] = global_values[int(feature_index)]
+            else:
+                source_volumes[source_key] = temporal_features[int(feature_index)][..., int(frame)]
+
+        def _write_source(item):
+            index, (source_key, volume) = item
+            kind, feature_index, frame = source_key
+            frame_token = "global" if kind == "global" else f"t{int(frame):03d}"
+            path = input_dir / f"source_{kind}_{int(feature_index):02d}_{frame_token}_{index:03d}.nii.gz"
+            _write_nifti_volume(volume, affine, path)
+            return source_key, path
+
+        _emit_progress(
+            progress_callback,
+            stage="autoseg_prepare_inputs",
+            message=(
+                f"Preparing grouped 4D inputs ({len(source_paths)} unique maps, "
+                f"{nt} temporal samples)..."
+            ),
+            current=2,
+            total=5,
+            elapsed_sec=time.perf_counter() - t_total_start,
+            detail_current=0,
+            detail_total=len(source_paths),
+            grouped_preprocessing=True,
+            temporal_radius=radius,
+        )
+        items = list(zip(source_paths.keys(), source_volumes.values()))
+        worker_count = min(4, max(1, len(items)))
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="autoflow-nnunet4d-source") as executor:
+            written = list(executor.map(_write_source, enumerate(items)))
+        for source_key, path in written:
+            source_paths[source_key] = path
+
+        import torch
+        from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+
+        torch_device = torch.device(str(resolved_device))
+        predictor = nnUNetPredictor(
+            tile_step_size=0.5,
+            use_gaussian=True,
+            use_mirroring=False,
+            perform_everything_on_device=torch_device.type == "cuda",
+            device=torch_device,
+            verbose=False,
+            verbose_preprocessing=False,
+            allow_tqdm=False,
+        )
+        predictor.initialize_from_trained_model_folder(
+            str(model_path), use_folds=tuple(selected_folds), checkpoint_name=checkpoint_name
+        )
+        if torch_device.type != "cuda":
+            # Dataset7020's persisted plan points at a project CUDA resampler.
+            # Keep CPU inference usable by changing only this in-memory plan;
+            # the source model metadata remains untouched.  The grouped path
+            # invokes this function directly, so it cannot rely on nnUNet's
+            # subprocess fallback to make the same adjustment.
+            configuration = getattr(predictor.configuration_manager, "configuration", None)
+            if isinstance(configuration, dict):
+                configuration["resampling_fn_data"] = "resample_data_or_seg_to_shape"
+                configuration["resampling_fn_data_kwargs"] = {
+                    "is_seg": False,
+                    "order": 3,
+                    "order_z": 0,
+                    "force_separate_z": None,
+                }
+                if "resampling_fn_probabilities" in configuration:
+                    configuration["resampling_fn_probabilities"] = "resample_data_or_seg_to_shape"
+                    configuration["resampling_fn_probabilities_kwargs"] = {
+                        "is_seg": False,
+                        "order": 3,
+                        "order_z": 0,
+                        "force_separate_z": None,
+                    }
+        _emit_progress(
+            progress_callback,
+            stage="autoseg_run_inference",
+            message=f"Running grouped 4D nnUNet inference on {resolved_device}...",
+            current=3,
+            total=5,
+            elapsed_sec=time.perf_counter() - t_total_start,
+            grouped_preprocessing=True,
+            temporal_radius=radius,
+            unique_source_maps=len(source_paths),
+        )
+        raw_iterator = pipeline.iter_grouped_temporal_preprocessed_samples_from_source_paths(
+            samples,
+            source_paths,
+            predictor.plans_manager,
+            predictor.configuration_manager,
+            predictor.dataset_json,
+            radius,
+        )
+        import torch
+
+        def _predictor_iterator():
+            for sample, data, segmentation, properties in raw_iterator:
+                if segmentation is not None:
+                    raise RuntimeError(f"{sample['sample_id']}: prediction input unexpectedly has a segmentation")
+                yield {
+                    "data": torch.from_numpy(np.ascontiguousarray(data, dtype=np.float32)),
+                    "data_properties": properties,
+                    "ofile": str(output_dir / str(sample["sample_id"])),
+                }
+
+        predictor.predict_from_data_iterator(
+            _predictor_iterator(),
+            save_probabilities=False,
+            num_processes_segmentation_export=max(1, int(num_processes_segmentation_export or 1)),
+        )
+
+        _emit_progress(
+            progress_callback,
+            stage="autoseg_read_prediction",
+            message="Reading grouped 4D nnUNet predictions...",
+            current=4,
+            total=5,
+            elapsed_sec=time.perf_counter() - t_total_start,
+            grouped_preprocessing=True,
+        )
+        predictions = []
+        for frame in range(nt):
+            prediction_path = output_dir / f"{safe_case_id}__t{frame:03d}.nii.gz"
+            if not prediction_path.is_file():
+                raise FileNotFoundError(f"grouped 4D nnUNet prediction not found: {prediction_path}")
+            predictions.append(_read_nifti_segmentation(prediction_path))
+        seg_nnunet = _apply_label_map(np.stack(predictions, axis=3), label_map)
+        artifact_prediction = None
+        if artifact_prefix:
+            artifact_prediction = Path(f"{artifact_prefix}.nii.gz")
+            artifact_prediction.parent.mkdir(parents=True, exist_ok=True)
+            _write_nifti_segmentation(seg_nnunet, affine, artifact_prediction)
+        seg_4d = _restore_autoflow_segmentation(seg_nnunet)
+        elapsed_total = time.perf_counter() - t_total_start
+        _emit_progress(
+            progress_callback,
+            stage="autoseg_finalize",
+            message="Finalizing grouped 4D auto segmentation volume...",
+            current=5,
+            total=5,
+            elapsed_sec=elapsed_total,
+            grouped_preprocessing=True,
+        )
+        provenance = {
+            "source": "auto",
+            "backend": "nnUNet4D",
+            "model_folder": str(model_path),
+            "pipeline_script": str(pipeline_script or ""),
+            "python_executable": str(_python_from_4d_pipeline_script(pipeline_script) or sys.executable),
+            "checkpoint": str(checkpoint_name),
+            "device": str(resolved_device),
+            "folds": list(selected_folds),
+            "fold_mode": "grouped",
+            "channel_names": list(channel_names),
+            "time_count": nt,
+            "temporal_radius": radius,
+            "grouped_preprocessing": True,
+            "unique_source_maps": len(source_paths),
+            "label_map": {str(k): int(v) for k, v in label_map.items()},
+            "case_id": str(safe_case_id),
+            "created_at": segmentation_timestamp(),
+            "command": [],
+            "preprocessing_device": "model",
+            "feature_files": [],
+            "segmentation_nifti": "" if artifact_prediction is None else str(artifact_prediction),
+            "prediction_file": "" if artifact_prediction is None else str(artifact_prediction),
+            "elapsed_sec": float(elapsed_total),
+        }
+        return np.asarray(seg_4d, dtype=np.int16), provenance
+
+
+def resolve_nnunet_4d_model_folder(model_folder=""):
+    """Resolve a 4D model folder or a Dataset7020 orchestration script path."""
+    candidate = str(model_folder or "").strip()
+    if candidate.lower().endswith((".sh", ".bash")):
+        return str(_model_folder_from_4d_pipeline_script(candidate))
+    if candidate:
+        return str(_resolve_bundled_relative_path(candidate))
+    model = _model_folder_from_4d_pipeline_script(_NNUNET_4D_PIPELINE_DEFAULT)
+    if model.is_dir():
+        return str(model)
+    raise FileNotFoundError(
+        "4D nnUNet model folder is missing: "
+        f"{model}. Set an explicit 4D model folder or pipeline script via auto_model."
+    )
+
+
+def _resolve_nnunet_checkpoint(model_path, checkpoint_name, folds):
+    """Use a requested checkpoint, falling back to ``checkpoint_best.pth``."""
+    requested = str(checkpoint_name or "checkpoint_final.pth")
+    candidates = [requested]
+    if requested == "checkpoint_final.pth":
+        candidates.append("checkpoint_best.pth")
+    for candidate in candidates:
+        if all((Path(model_path) / f"fold_{fold}" / candidate).is_file() for fold in folds):
+            return candidate
+    return requested
+
+
+def _resolve_nnunet_folds(model_path, folds=None):
+    """Resolve ``single``, ``all`` or an explicit fold list deterministically."""
+    model_path = Path(model_path)
+    detected = _detect_nnunet_folds(model_path)
+    has_fold_all = (model_path / "fold_all").is_dir()
+    if folds is None or str(folds).strip().lower() in {"", "auto"}:
+        return detected
+    if isinstance(folds, str):
+        token = folds.strip().lower()
+        if token in {"all", "ensemble", "5fold", "fivefold"}:
+            return detected
+        if token in {"single", "one"}:
+            # ``fold_all`` is the full-data single-model checkpoint.  Keep it
+            # as the explicit single branch even when five numeric folds are
+            # also present for a future ensemble run.
+            return ["all"] if has_fold_all else [detected[0]]
+        values = [part.strip().lower().removeprefix("fold_") for part in folds.split(",") if part.strip()]
+    else:
+        values = [str(value).strip().lower().removeprefix("fold_") for value in folds if str(value).strip()]
+    if not values:
+        return detected
+    valid = set(detected)
+    unknown = [value for value in values if value not in valid]
+    if unknown:
+        raise FileNotFoundError(f"requested nnUNet folds are unavailable: {unknown}; found {detected}")
+    return list(dict.fromkeys(values))
+
+
+def _nnunet_predict_command(python_executable=None, bootstrap_resampler_path=None):
     if getattr(sys, "frozen", False):
         return [sys.executable, "--autoflow-internal-nnunet-predict"]
+    code = (
+        "from nnunetv2.inference.predict_from_raw_data import "
+        "predict_entry_point_modelfolder as main; main()"
+    )
+    if bootstrap_resampler_path:
+        source = repr(str(Path(bootstrap_resampler_path).expanduser().resolve()))
+        code = (
+            "from pathlib import Path; import shutil, importlib, nnunetv2; "
+            f"_src=Path({source}); _dst=Path(nnunetv2.__file__).resolve().parent/'preprocessing'/'resampling'/'gpu_resampling.py'; "
+            "_dst.parent.mkdir(parents=True, exist_ok=True); "
+            "shutil.copy2(_src, _dst) if _src.is_file() else None; importlib.invalidate_caches(); "
+            "from nnunetv2.inference.predict_from_raw_data import "
+            "predict_entry_point_modelfolder as main; main()"
+        )
+    if python_executable and Path(str(python_executable)).is_file():
+        return [
+            str(python_executable),
+            "-c",
+            code,
+        ]
     executable = shutil.which("nnUNetv2_predict_from_modelfolder")
     if executable:
+        if bootstrap_resampler_path:
+            # The console entry point cannot execute the bootstrap prelude;
+            # use the active interpreter so the child can install the helper.
+            return [sys.executable, "-c", code]
         return [executable]
     return [
         sys.executable,
         "-c",
-        (
-            "from nnunetv2.inference.predict_from_raw_data import "
-            "predict_entry_point_modelfolder as main; main()"
-        ),
+        code,
     ]
 
 
@@ -910,18 +1554,37 @@ def generate_nnunet_auto_segmentation(
     *,
     backend="nnUNet",
     checkpoint_name="checkpoint_final.pth",
+    folds=None,
     device="cpu",
     auto_label_map="",
     case_id="autoflow_case",
     step_size=0.5,
     disable_tta=True,
-    num_processes_preprocessing=3,
+    num_processes_preprocessing=0,
     num_processes_segmentation_export=1,
     artifact_prefix="",
     runner=None,
     progress_callback=None,
 ):
     if str(backend or "").strip().lower() != "nnunet":
+        if str(backend or "").strip().lower() in _NNUNET_4D_BACKENDS:
+            return generate_nnunet_4d_auto_segmentation(
+                mag,
+                flow,
+                resolution,
+                origin,
+                model_folder,
+                checkpoint_name=checkpoint_name,
+                folds=folds,
+                device=device,
+                auto_label_map=auto_label_map,
+                case_id=case_id,
+                num_processes_preprocessing=num_processes_preprocessing,
+                num_processes_segmentation_export=num_processes_segmentation_export,
+                artifact_prefix=artifact_prefix,
+                runner=runner,
+                progress_callback=progress_callback,
+            )
         raise ValueError(f"unsupported auto segmentation backend: {backend}")
 
     t_total_start = time.perf_counter()
@@ -937,6 +1600,7 @@ def generate_nnunet_auto_segmentation(
 
     model_folder = resolve_nnunet_model_folder(model_folder)
     resolved_device = resolve_auto_segmentation_device(device)
+    effective_num_processes_preprocessing = int(num_processes_preprocessing or (1 if resolved_device == "cuda" else 3))
     mag, flow = _ensure_nnunet_mag_flow(mag, flow)
     time_count = int(flow.shape[3])
     mag_nnunet, flow_nnunet, resolution_nnunet = _prepare_nnunet_inputs(mag, flow, resolution)
@@ -948,7 +1612,8 @@ def generate_nnunet_auto_segmentation(
     if not file_ending.startswith("."):
         file_ending = f".{file_ending}"
     label_map = _parse_nnunet_label_map(auto_label_map, dataset_json.get("labels", {}))
-    folds = _detect_nnunet_folds(model_path)
+    folds = _resolve_nnunet_folds(model_path, folds)
+    checkpoint_name = _resolve_nnunet_checkpoint(model_path, checkpoint_name, folds)
     affine = _nnunet_spatial_affine(resolution_nnunet, mag_nnunet.shape[:3])
     artifact_feature_paths, artifact_prediction_path = _nnunet_artifact_paths(
         artifact_prefix,
@@ -986,11 +1651,19 @@ def generate_nnunet_auto_segmentation(
             detail_total=len(channel_names),
         )
         channel_volumes = _nnunet_channel_volumes(channel_names, mag_nnunet, flow_nnunet)
-        for idx, (channel_name, volume) in enumerate(zip(channel_names, channel_volumes)):
+        def _write_channel(item):
+            idx, volume = item
             input_path = input_dir / f"{case_id}_{idx:04d}{file_ending}"
             _write_nifti_volume(volume, affine, input_path)
             if idx < len(artifact_feature_paths):
                 _link_or_copy_file(input_path, artifact_feature_paths[idx])
+
+        # NIfTI compression is independent per channel and releases the GIL;
+        # overlap the twelve feature writes while preserving deterministic data.
+        worker_count = min(4, max(1, len(channel_volumes)))
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="autoflow-nnunet-nifti") as executor:
+            list(executor.map(_write_channel, enumerate(channel_volumes)))
+        for idx, channel_name in enumerate(channel_names):
             _emit_progress(
                 progress_callback,
                 stage="autoseg_prepare_inputs",
@@ -1035,7 +1708,7 @@ def generate_nnunet_auto_segmentation(
             folds,
             checkpoint_name,
             resolved_device,
-            num_processes_preprocessing,
+            effective_num_processes_preprocessing,
             num_processes_segmentation_export,
             step_size,
             disable_tta,
@@ -1068,7 +1741,7 @@ def generate_nnunet_auto_segmentation(
                 folds,
                 checkpoint_name,
                 resolved_device,
-                num_processes_preprocessing,
+                effective_num_processes_preprocessing,
                 num_processes_segmentation_export,
                 step_size,
                 disable_tta,
@@ -1102,6 +1775,7 @@ def generate_nnunet_auto_segmentation(
                 f"stdout:\n{stdout}\n"
                 f"stderr:\n{stderr}"
             )
+
 
         prediction_path = output_dir / f"{case_id}{file_ending}"
         if not prediction_path.is_file() and file_ending == ".nii.gz":
@@ -1166,3 +1840,288 @@ def generate_nnunet_auto_segmentation(
             "elapsed_sec": float(elapsed_total),
         }
         return seg_4d, provenance
+
+
+def generate_nnunet_4d_auto_segmentation(
+    mag,
+    flow,
+    resolution,
+    origin,
+    model_folder="",
+    *,
+    checkpoint_name="checkpoint_final.pth",
+    folds="single",
+    device="auto",
+    auto_label_map="",
+    case_id="autoflow_case",
+    num_processes_preprocessing=0,
+    num_processes_segmentation_export=1,
+    artifact_prefix="",
+    runner=None,
+    progress_callback=None,
+):
+    """Run the Dataset7020 temporal model for every frame in one invocation.
+
+    The Dataset7020 checkpoint is still a regular nnUNet model; its temporal
+    context is encoded in the channel names (``tm2_*`` through ``tp2_*``).
+    AutoFlow therefore writes one sample per frame, invokes nnUNet once, then
+    stacks the frame predictions back into an ``XYZT`` segmentation.  ``folds``
+    accepts ``single`` (``fold_all`` or the first available fold), ``all`` for
+    an ensemble, or a comma-separated explicit list.
+    """
+    t_total_start = time.perf_counter()
+    total_stages = 5
+    _emit_progress(
+        progress_callback,
+        stage="autoseg_start",
+        message="Resolving 4D nnUNet model and input metadata...",
+        current=0,
+        total=total_stages,
+        elapsed_sec=0.0,
+    )
+    pipeline_script = ""
+    if str(model_folder or "").lower().endswith((".sh", ".bash")):
+        pipeline_script = str(Path(model_folder).expanduser().resolve())
+    model_path = Path(resolve_nnunet_4d_model_folder(model_folder))
+    resolved_device = resolve_auto_segmentation_device(device)
+    mag, flow = _ensure_nnunet_mag_flow(mag, flow)
+    time_count = int(flow.shape[3])
+    mag_nnunet, flow_nnunet, resolution_nnunet = _prepare_nnunet_inputs(mag, flow, resolution)
+    model_path, dataset_json = _load_nnunet_model_metadata(model_path)
+    channel_names = _ordered_mapping_values(dataset_json.get("channel_names") or dataset_json.get("modality") or {})
+    if not channel_names:
+        raise ValueError(f"4D model folder does not define any channel names: {model_path}")
+    if not any(_parse_nnunet_temporal_channel(name) for name in channel_names):
+        raise ValueError(
+            f"4D nnUNet model has no temporal channels: {model_path / 'dataset.json'}"
+        )
+    file_ending = str(dataset_json.get("file_ending", ".nii.gz"))
+    if not file_ending.startswith("."):
+        file_ending = f".{file_ending}"
+    label_map = _parse_nnunet_label_map(auto_label_map, dataset_json.get("labels", {}))
+    selected_folds = _resolve_nnunet_folds(model_path, folds)
+    checkpoint_name = _resolve_nnunet_checkpoint(model_path, checkpoint_name, selected_folds)
+    affine = _nnunet_spatial_affine(resolution_nnunet, mag_nnunet.shape[:3])
+    _emit_progress(
+        progress_callback,
+        stage="autoseg_model_ready",
+        message=f"Resolved 4D nnUNet model: {model_path.name} | folds={','.join(selected_folds)} | device={resolved_device}",
+        current=1,
+        total=total_stages,
+        elapsed_sec=time.perf_counter() - t_total_start,
+        backend="nnUNet4D",
+        device=str(resolved_device),
+        checkpoint=str(checkpoint_name),
+        folds=list(selected_folds),
+        model_folder=str(model_path),
+    )
+
+    safe_case_id = _sanitize_nnunet_artifact_token(case_id, default="autoflow_case")
+    grouped_script = pipeline_script
+    grouped_fallback_reason = ""
+    if not grouped_script and _NNUNET_4D_PIPELINE_DEFAULT.is_file():
+        grouped_script = str(_NNUNET_4D_PIPELINE_DEFAULT)
+        # Use the default script for subprocess bootstrap as well, not only for
+        # grouped preprocessing. This keeps custom resampling available when a
+        # caller leaves the model setting empty.
+        pipeline_script = grouped_script
+    if _nnunet_4d_grouped_requested(runner) and grouped_script:
+        try:
+            return _generate_nnunet_4d_grouped(
+                mag_nnunet,
+                flow_nnunet,
+                resolution_nnunet,
+                model_path,
+                dataset_json,
+                selected_folds,
+                checkpoint_name,
+                resolved_device,
+                label_map,
+                safe_case_id,
+                affine,
+                grouped_script,
+                num_processes_segmentation_export,
+                artifact_prefix,
+                progress_callback,
+                t_total_start,
+            )
+        except Exception as exc:
+            grouped_fallback_reason = f"{type(exc).__name__}: {exc}"
+            token = str(os.environ.get("AUTOFLOW_NNUNET4D_GROUPED", "auto") or "auto").strip().lower()
+            if token in {"1", "true", "yes", "on", "required"}:
+                raise
+            _emit_progress(
+                progress_callback,
+                stage="autoseg_grouped_fallback",
+                message="Grouped 4D preprocessing failed; retrying with standard nnUNet input files...",
+                current=2,
+                total=total_stages,
+                elapsed_sec=time.perf_counter() - t_total_start,
+                grouped_preprocessing=False,
+                fallback_reason=grouped_fallback_reason,
+            )
+
+    with TemporaryDirectory(prefix="autoflow_nnunet4d_") as tmp_root:
+        tmp_root = Path(tmp_root)
+        input_dir = tmp_root / "input"
+        output_dir = tmp_root / "output"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        global_names = [
+            "mag_std_xyz", "mag_mean_xyz", "pcmra_std_xyz", "pcmra_mean_xyz",
+            "flow_x_mean_xyz", "flow_y_mean_xyz", "flow_z_mean_xyz", "flow_mag_mean_xyz",
+            "flow_x_std_xyz", "flow_y_std_xyz", "flow_z_std_xyz", "flow_mag_std_xyz",
+        ]
+        global_by_name = dict(zip(global_names, _nnunet_channel_volumes(global_names, mag_nnunet, flow_nnunet)))
+        temporal_speed = np.linalg.norm(flow_nnunet, axis=-1).astype(np.float32, copy=False)
+        temporal_cache = {
+            "mag": mag_nnunet,
+            "pcmra": (mag_nnunet * temporal_speed).astype(np.float32, copy=False),
+            "flow_x": flow_nnunet[..., 0],
+            "flow_y": flow_nnunet[..., 1],
+            "flow_z": flow_nnunet[..., 2],
+        }
+        _emit_progress(
+            progress_callback,
+            stage="autoseg_prepare_inputs",
+            message=f"Preparing {time_count} temporal nnUNet samples ({len(channel_names)} channels each)...",
+            current=2,
+            total=total_stages,
+            elapsed_sec=time.perf_counter() - t_total_start,
+            detail_current=0,
+            detail_total=time_count,
+        )
+
+        def _write_frame(frame_index):
+            volumes = _nnunet_4d_channel_volumes(
+                channel_names,
+                mag_nnunet,
+                flow_nnunet,
+                frame_index,
+                global_by_name=global_by_name,
+                temporal_cache=temporal_cache,
+            )
+            frame_id = f"{safe_case_id}_t{int(frame_index):03d}"
+            for channel_index, volume in enumerate(volumes):
+                path = input_dir / f"{frame_id}_{channel_index:04d}{file_ending}"
+                _write_nifti_volume(volume, affine, path)
+            return frame_id
+
+        # NIfTI encoding is independent per phase and releases the GIL.  A
+        # small pool avoids serial gzip overhead without competing with nnUNet.
+        worker_count = min(4, max(1, time_count))
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="autoflow-nnunet4d-nifti") as executor:
+            list(executor.map(_write_frame, range(time_count)))
+        for frame_index in range(time_count):
+            _emit_progress(
+                progress_callback,
+                stage="autoseg_prepare_inputs",
+                message=f"Writing 4D frame {frame_index + 1}/{time_count}",
+                current=2,
+                total=total_stages,
+                elapsed_sec=time.perf_counter() - t_total_start,
+                detail_current=frame_index + 1,
+                detail_total=time_count,
+            )
+
+        command = _nnunet_inference_command(
+            input_dir,
+            output_dir,
+            model_path,
+            selected_folds,
+            checkpoint_name,
+            resolved_device,
+            int(num_processes_preprocessing or (1 if resolved_device == "cuda" else 3)),
+            num_processes_segmentation_export,
+            0.5,
+            True,
+            python_executable=_python_from_4d_pipeline_script(pipeline_script),
+            bootstrap_resampler_path=(
+                Path(pipeline_script).expanduser().resolve().parent.parent.parent
+                / "nnunet" / "gpu_resampling.py"
+                if pipeline_script
+                else None
+            ),
+        )
+        _emit_progress(
+            progress_callback,
+            stage="autoseg_run_inference",
+            message=f"Running 4D nnUNet inference on {resolved_device}...",
+            current=3,
+            total=total_stages,
+            elapsed_sec=time.perf_counter() - t_total_start,
+            command=[str(x) for x in command],
+            preprocessing_device="model",
+        )
+        subprocess_env = _nnunet_4d_subprocess_env(pipeline_script, model_path)
+        result = _run_subprocess(command, env=subprocess_env, runner=runner)
+        if getattr(result, "returncode", 0) != 0:
+            raise RuntimeError(
+                "4D nnUNet inference failed\n"
+                f"command: {' '.join(map(str, command))}\n"
+                f"stdout:\n{getattr(result, 'stdout', '') or ''}\n"
+                f"stderr:\n{getattr(result, 'stderr', '') or ''}"
+            )
+
+        _emit_progress(
+            progress_callback,
+            stage="autoseg_read_prediction",
+            message="Reading 4D nnUNet predictions...",
+            current=4,
+            total=total_stages,
+            elapsed_sec=time.perf_counter() - t_total_start,
+        )
+        predictions = []
+        for frame_index in range(time_count):
+            prediction_path = output_dir / f"{safe_case_id}_t{frame_index:03d}{file_ending}"
+            if not prediction_path.is_file() and file_ending == ".nii.gz":
+                prediction_path = output_dir / f"{safe_case_id}_t{frame_index:03d}.nii.gz"
+            if not prediction_path.is_file():
+                raise FileNotFoundError(f"4D nnUNet prediction not found: {prediction_path}")
+            predictions.append(_read_nifti_segmentation(prediction_path))
+        shape = tuple(np.asarray(predictions[0]).shape)
+        if any(tuple(np.asarray(item).shape) != shape for item in predictions):
+            raise ValueError("4D nnUNet predictions have inconsistent spatial shapes")
+        seg_nnunet = np.stack(predictions, axis=3)
+        seg_nnunet = _apply_label_map(seg_nnunet, label_map)
+        if artifact_prefix:
+            artifact_prediction = Path(f"{artifact_prefix}.nii.gz")
+            artifact_prediction.parent.mkdir(parents=True, exist_ok=True)
+            _write_nifti_segmentation(seg_nnunet, affine, artifact_prediction)
+        else:
+            artifact_prediction = None
+        seg_4d = _restore_autoflow_segmentation(seg_nnunet)
+        elapsed_total = time.perf_counter() - t_total_start
+        _emit_progress(
+            progress_callback,
+            stage="autoseg_finalize",
+            message="Finalizing 4D auto segmentation volume...",
+            current=5,
+            total=total_stages,
+            elapsed_sec=elapsed_total,
+        )
+        provenance = {
+            "source": "auto",
+            "backend": "nnUNet4D",
+            "model_folder": str(model_path),
+            "pipeline_script": pipeline_script,
+            "python_executable": str(_python_from_4d_pipeline_script(pipeline_script) or sys.executable),
+            "checkpoint": str(checkpoint_name),
+            "device": str(resolved_device),
+            "folds": list(selected_folds),
+            "fold_mode": str(folds),
+            "channel_names": list(channel_names),
+            "time_count": int(time_count),
+            "label_map": {str(k): int(v) for k, v in label_map.items()},
+            "case_id": str(case_id),
+            "created_at": segmentation_timestamp(),
+            "command": [str(x) for x in command],
+            "preprocessing_device": "model",
+            "grouped_preprocessing": False,
+            "grouped_fallback_reason": grouped_fallback_reason,
+            "feature_files": [],
+            "segmentation_nifti": "" if artifact_prediction is None else str(artifact_prediction),
+            "prediction_file": "" if artifact_prediction is None else str(artifact_prediction),
+            "elapsed_sec": float(elapsed_total),
+        }
+        return np.asarray(seg_4d, dtype=np.int16), provenance

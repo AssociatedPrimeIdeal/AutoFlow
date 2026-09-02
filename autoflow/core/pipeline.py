@@ -19,6 +19,7 @@ from ..algorithms import (
     save_pwv_results,
     segmentation_timestamp,
 )
+from ..algorithms.phase_unwrapping import unwrap_phase
 from ..plane_io import build_plane_records, save_planes_h5, save_planes_json, save_pwv_h5
 
 
@@ -26,6 +27,7 @@ _DERIVED_ALGORITHM_VERSIONS = {
     "wss": "wss-geometry-cache-v1",
     "tke": "tke-v1",
     "pressure": "pressure-periodic-time-v1",
+    "vortex": "vortex-kinematics-v1",
 }
 
 
@@ -213,7 +215,15 @@ class PipelineEngine:
         return specs
 
     def _register_derived_scene_objects(self, ws):
-        for dk in ["wss_surface_live", "tke_volume", "pressure_gradient_volume", "relative_pressure_volume"]:
+        for dk in [
+            "wss_surface_live",
+            "tke_volume",
+            "pressure_gradient_volume",
+            "relative_pressure_volume",
+            "vorticity_magnitude_volume",
+            "q_criterion_volume",
+            "swirling_strength_volume",
+        ]:
             ws.remove_object_by_data_key(dk)
         render_cfg = dict(getattr(ws, "render_settings", {}) or {})
         wss_max = float(np.nanmax(ws.derived.wss_volume)) if ws.derived.wss_volume is not None and np.size(ws.derived.wss_volume) else 0.0
@@ -250,6 +260,37 @@ class PipelineEngine:
                           scalars="RelativePressure", cmap="RdBu_r", clim=relative_pressure_clim, dynamic=True,
                           show_scalar_bar=bool(render_cfg.get("relative_pressure_show_scalar_bar", render_cfg.get("pressure_gradient_show_scalar_bar", True))), scalar_bar_title="Relative Pressure (Pa)",
                           scalar_bar_cfg=dict(render_cfg.get("relative_pressure_bar_cfg", render_cfg.get("pressure_gradient_bar_cfg", {}) or {}) or {}))
+
+        vortex_specs = (
+            ("vorticity_magnitude_volume", "Vorticity Magnitude", "vorticity_magnitude", "Vorticity Magnitude (s^-1)", "turbo", False),
+            ("q_criterion_volume", "Q-Criterion", "q_criterion_array", "Q-Criterion (s^-2)", "RdBu_r", True),
+            ("swirling_strength_volume", "Swirling Strength", "swirling_strength_array", "Swirling Strength λci (s⁻¹)", "turbo", False),
+        )
+        vortex_support = ws.derived.vortex_support_mask
+        for data_key, name, field_name, scalar_bar_title, cmap, signed in vortex_specs:
+            values = getattr(ws.derived, field_name, None)
+            if values is None or vortex_support is None or np.size(values) == 0:
+                continue
+            values = np.asarray(values, dtype=float)
+            support = np.asarray(vortex_support, dtype=bool)
+            finite = values[support & np.isfinite(values)] if support.shape == values.shape else values[np.isfinite(values)]
+            upper = float(np.percentile(np.abs(finite), 99.0)) if finite.size else 1.0
+            upper = max(upper, 1e-6)
+            clim = (-upper, upper) if signed else (0.0, upper)
+            ws.add_object(
+                name=name,
+                kind=ObjectKind.METRIC,
+                data_key=data_key,
+                visible=False,
+                opacity=0.5,
+                scalars=name,
+                cmap=cmap,
+                clim=clim,
+                dynamic=True,
+                show_scalar_bar=True,
+                scalar_bar_title=scalar_bar_title,
+                scalar_bar_cfg=dict(render_cfg.get("shared_colorbar_bar_cfg", {}) or {}),
+            )
 
 
     def _missing_segmentation_message(self, ws, action):
@@ -289,6 +330,9 @@ class PipelineEngine:
         load_kwargs = {
             "correction_config": ws.loader_params.background_phase_correction,
             "force_recompute_seg": bool(getattr(ws.segmentation, "force_recompute_auto_cache", False)),
+            "ignore_embedded_segmentation": bool(
+                getattr(ws.loader_params, "ignore_embedded_segmentation", False)
+            ),
         }
         dicom_overrides = ws.loader_params.dicom_parameter_overrides.to_loader_kwargs()
         if dicom_overrides:
@@ -306,7 +350,48 @@ class PipelineEngine:
         mag = np.asarray(data.mag, dtype=np.float32)
         seg = None if data.segmentation is None else np.asarray(data.segmentation, dtype=np.int16)
 
+        # Loading a new case clears the active source, but must retain the
+        # segmentation configuration supplied by the caller.  In particular,
+        # read-only benchmarks rely on ``write_auto_cache=False`` and the
+        # force/ignore flags must survive this reset as well.
+        segmentation_settings = {
+            name: getattr(ws.segmentation, name)
+            for name in (
+                "visible",
+                "opacity",
+                "active_label",
+                "label_names",
+                "label_colors",
+                "editing_enabled",
+                "tool",
+                "brush_radius",
+                "edit_all_timepoints",
+                "mode",
+                "input_source",
+                "import_path",
+                "threshold_scalar",
+                "threshold_value",
+                "threshold_keep_largest_cc",
+                "threshold_min_component_volume_mm3",
+                "threshold_closing",
+                "threshold_opening",
+                "force_recompute_auto_cache",
+                "write_auto_cache",
+                "auto_backend",
+                "auto_model",
+                "auto_checkpoint",
+                "auto_folds",
+                "auto_device",
+                "auto_label_map",
+                "cleanup_4d_components",
+                "cleanup_4d_mode",
+                "cleanup_4d_min_volume_mm3",
+            )
+            if hasattr(ws.segmentation, name)
+        }
         ws.segmentation = ws.segmentation.__class__()
+        for name, value in segmentation_settings.items():
+            setattr(ws.segmentation, name, value)
         ws.segmask_raw = None
         if seg is not None:
             ws.set_segmentation_source(
@@ -329,12 +414,28 @@ class PipelineEngine:
         ws.rr = float(data.rr)
         ws.current_t = 0
         ws.flow_raw = flow
+        ws.flow_input = np.array(flow, copy=True)
+        phase_loaded = getattr(data, "phase_wrapped", None)
+        if phase_loaded is None and str(data.source_format or "").lower().startswith("dicom"):
+            # Direct DICOM loaders expose velocity rather than raw phase.  The
+            # encoded velocity is periodic at ±VENC, so reconstruct a wrapped
+            # phase representation for the optional unwrap stage.
+            venc_arr = np.asarray(data.venc, dtype=np.float32).reshape(1, 1, 1, 1, -1)
+            phase_loaded = np.angle(np.exp(1j * flow * np.pi / np.maximum(venc_arr, 1e-6))).astype(np.float32)
+        ws.phase_wrapped = None if phase_loaded is None else np.asarray(phase_loaded, dtype=np.float32)
+        ws.phase_wrapped_high = None if getattr(data, "phase_wrapped_high", None) is None else np.asarray(data.phase_wrapped_high, dtype=np.float32)
+        ws.phase_unwrap_result = {}
         ws.mag_raw = mag
         ws.input_state.source_format = str(data.source_format or "")
         ws.input_state.source_group = data.source_group
         ws.input_state.metadata = dict(data.metadata or {})
         ws.input_state.capabilities = data.capabilities
+        if ws.phase_wrapped is not None:
+            ws.input_state.capabilities.has_wrapped_phase = True
+            ws.input_state.capabilities.supports_phase_unwrap = True
         ws.source_sigma = None if data.sigma is None else np.asarray(data.sigma, dtype=np.float32)
+        ws.correction_raw = None if getattr(data, "correction", None) is None else np.asarray(data.correction, dtype=np.float32)
+        ws.correction_high_raw = None if getattr(data, "correction_high", None) is None else np.asarray(data.correction_high, dtype=np.float32)
         ws.source_tke_array = None if data.tke_array is None else np.asarray(data.tke_array, dtype=np.float32)
         ws.derived.tke_array = None
         ws.derived.tke_volume = None
@@ -349,6 +450,14 @@ class PipelineEngine:
         ws.derived.relative_pressure_peak = None
         ws.derived.relative_pressure_display_clim = None
         ws.derived.centerline_pressure_profiles = []
+        ws.derived.vorticity_array = None
+        ws.derived.vorticity_magnitude = None
+        ws.derived.vorticity_magnitude_peak = None
+        ws.derived.q_criterion_array = None
+        ws.derived.q_criterion_peak = None
+        ws.derived.swirling_strength_array = None
+        ws.derived.swirling_strength_peak = None
+        ws.derived.vortex_support_mask = None
         ws.derived.wss_surfaces = []
         ws.derived.wss_volume = None
         ws.derived.pixelwise_export = {}
@@ -362,7 +471,11 @@ class PipelineEngine:
         ws.data_loaded = True
         ws._preprocess_signature = None
 
-        for data_key in ["segmask_raw_surface", "segmask_pre_surface", "wss_surface_live", "tke_volume", "pressure_gradient_volume", "relative_pressure_volume"]:
+        for data_key in [
+            "segmask_raw_surface", "segmask_pre_surface", "wss_surface_live", "tke_volume",
+            "pressure_gradient_volume", "relative_pressure_volume", "vorticity_magnitude_volume",
+            "q_criterion_volume", "swirling_strength_volume", "phase_wrap_mask", "phase_wrap_count",
+        ]:
             ws.remove_object_by_data_key(data_key)
         ws.remove_object_by_data_key("pwv_planes")
         if ws.segmask_raw is not None:
@@ -395,7 +508,7 @@ class PipelineEngine:
     def preprocess(self, ws):
         if ws.segmask_raw is None:
             raise ValueError("segmask_raw is None")
-        from ..algorithms.preprocess import majority_vote_labels_3d, filter_connected_components, filter_labeled_components
+        from ..algorithms.preprocess import majority_vote_labels_3d, filter_connected_components, filter_labeled_components, filter_4d_labeled_components
 
         signature = (
             id(ws.segmask_raw),
@@ -403,6 +516,9 @@ class PipelineEngine:
             tuple(float(x) for x in np.asarray(ws.resolution, dtype=float).reshape(-1)[:3]),
             int(ws.time_count()),
             json.dumps(ws.skeleton_params.to_dict(), sort_keys=True, default=str),
+            bool(getattr(getattr(ws, "segmentation", None), "cleanup_4d_components", False)),
+            str(getattr(getattr(ws, "segmentation", None), "cleanup_4d_mode", "absolute")),
+            float(getattr(getattr(ws, "segmentation", None), "cleanup_4d_min_volume_mm3", 50.0)),
         )
         if (
             getattr(ws, "_preprocess_signature", None) == signature
@@ -415,6 +531,13 @@ class PipelineEngine:
         ws._pressure_support_surface_cache = {}
         previous_groups = dict(ws.multilabel_groups or {})
         ws.segmask_labels = filter_segmask_labels(ws.segmask_raw)
+        if bool(getattr(getattr(ws, "segmentation", None), "cleanup_4d_components", False)) and np.asarray(ws.segmask_labels).ndim == 4:
+            ws.segmask_labels = filter_4d_labeled_components(
+                ws.segmask_labels,
+                ws.resolution,
+                mode=str(getattr(getattr(ws, "segmentation", None), "cleanup_4d_mode", "absolute")),
+                min_volume_mm3=float(getattr(getattr(ws, "segmentation", None), "cleanup_4d_min_volume_mm3", 50.0)),
+            )
         voted_labels_3d = majority_vote_labels_3d(ws.segmask_labels)
         if ws.skeleton_params.remove_small_cc:
             voted_labels_3d = filter_labeled_components(
@@ -445,7 +568,15 @@ class PipelineEngine:
                     min_volume_mm3=group_params.min_cc_volume_mm3,
                     rel_min_ratio=group_params.cc_rel_min_ratio,
                 )
-            group_binary = self._repeat_mask_to_time(group_mask_3d, time_count)
+            # Keep the temporal prediction for phase-dependent metrics.  The
+            # voted 3D mask above remains the stable topology input for
+            # skeleton/graph generation, while WSS, pressure and plane flow
+            # use the actual per-frame lumen where a 4D segmentation exists.
+            if np.asarray(ws.segmask_labels).ndim == 4:
+                group_binary = np.isin(ws.segmask_labels, labels).astype(bool)
+                group_binary &= np.asarray(group_mask_3d, dtype=bool)[..., None]
+            else:
+                group_binary = self._repeat_mask_to_time(group_mask_3d, time_count)
             processed_mask_3d = preprocess_mask_for_skeleton(group_mask_3d, group_params, resolution=ws.resolution)
             previous_state = dict(previous_groups.get(group_name, {})) if isinstance(previous_groups.get(group_name, {}), dict) else {}
             global_binary |= np.asarray(group_binary, dtype=bool)
@@ -492,6 +623,7 @@ class PipelineEngine:
 
     def run_step(self, ws, step, log):
         dispatch = {
+            StepId.UNWRAP_PHASE: self._step_unwrap_phase,
             StepId.GENERATE_SKELETON: self._step_generate_skeleton,
             StepId.EDIT_SKELETON: self._step_edit_skeleton,
             StepId.GENERATE_GRAPH: self._step_generate_graph,
@@ -505,6 +637,109 @@ class PipelineEngine:
             StepId.COMPUTE_DERIVED_METRICS: self._step_compute_derived_metrics,
         }
         return dispatch[step](ws)
+
+    def _step_unwrap_phase(self, ws):
+        """Optional traditional phase unwrapping with explicit diagnostics."""
+        cfg = getattr(ws, "phase_unwrap_params", None)
+        method = str(getattr(cfg, "method", "") or "").strip()
+        # Method selection is the single enable switch.  ``enabled`` and the
+        # old ``none`` method are accepted only for backwards-compatible
+        # workspace/config loading and no longer control the GUI.
+        if cfg is None or method.lower() in {"", "none", "disabled"}:
+            ws.phase_unwrap_result = {"skipped": True, "reason": "disabled"}
+            ws.pipeline.mark_done(StepId.UNWRAP_PHASE, skipped=True)
+            return StepResult(StepId.UNWRAP_PHASE, True, True, "Phase unwrapping skipped: disabled")
+        metadata = dict(ws.input_state.metadata or {})
+        dual = bool(metadata.get("dual_venc", {}).get("enabled", False)) or str(ws.input_state.source_format).lower() == "legacy_h5_dual_venc"
+        if dual:
+            ws.phase_unwrap_result = {"skipped": True, "reason": "dual_venc"}
+            ws.pipeline.mark_done(StepId.UNWRAP_PHASE, skipped=True)
+            return StepResult(StepId.UNWRAP_PHASE, True, True, "Phase unwrapping skipped: dual-VENC input")
+        if ws.phase_wrapped is None:
+            ws.phase_unwrap_result = {"skipped": True, "reason": "wrapped_phase_unavailable"}
+            ws.pipeline.mark_done(StepId.UNWRAP_PHASE, skipped=True)
+            return StepResult(StepId.UNWRAP_PHASE, True, True, "Phase unwrapping skipped: wrapped phase unavailable")
+        mask_source = str(getattr(cfg, "mask_source", "segmentation") or "segmentation").lower()
+        if mask_source == "all":
+            mask = np.ones(np.asarray(ws.phase_wrapped).shape[:4], dtype=bool)
+        else:
+            mask = ws.segmask_raw
+            if mask is None:
+                ws.phase_unwrap_result = {"skipped": True, "reason": "segmentation_unavailable"}
+                ws.pipeline.mark_done(StepId.UNWRAP_PHASE, skipped=True)
+                return StepResult(StepId.UNWRAP_PHASE, True, True, "Phase unwrapping skipped: segmentation mask unavailable")
+            mask = np.asarray(mask) > 0
+        if not np.any(mask):
+            ws.phase_unwrap_result = {"skipped": True, "reason": "empty_mask"}
+            ws.pipeline.mark_done(StepId.UNWRAP_PHASE, skipped=True)
+            return StepResult(StepId.UNWRAP_PHASE, True, True, "Phase unwrapping skipped: mask is empty")
+        params = {
+            "tfc": bool(getattr(cfg, "tfc", True)),
+            "lap4d_ts": float(getattr(cfg, "lap4d_ts", 2.0)),
+            "nprs_upsampling_factor": int(getattr(cfg, "nprs_upsampling_factor", 2)),
+            "nprs_pi_unwrap": bool(getattr(cfg, "nprs_pi_unwrap", True)),
+            "nprs_auto_crop": bool(getattr(cfg, "nprs_auto_crop", True)),
+        }
+        try:
+            result = unwrap_phase(
+                ws.phase_wrapped, mask, ws.venc, str(cfg.method),
+                params=params, device=str(getattr(cfg, "device", "auto")),
+            )
+        except Exception as exc:
+            ws.phase_unwrap_result = {"skipped": False, "error": str(exc)}
+            ws.pipeline.completed.pop(StepId.UNWRAP_PHASE.value, None)
+            ws.pipeline.skipped.pop(StepId.UNWRAP_PHASE.value, None)
+            return StepResult(StepId.UNWRAP_PHASE, False, False, f"Phase unwrapping failed: {exc}")
+        if ws.flow_input is None:
+            ws.flow_input = np.array(ws.flow_raw, copy=True) if ws.flow_raw is not None else None
+        ws.flow_raw = np.asarray(result["flow_unwrapped"], dtype=np.float32)
+        ws.phase_unwrap_result = result
+        # Invalidate all flow-dependent downstream products.
+        ws.skeleton_points = None; ws.skeleton_mask = None; ws.graph = GraphData()
+        ws.branch_labels = None; ws.centerline_paths = []; ws.centerline_node_paths = []
+        ws.centerline_paths_smooth = []; ws.path_info = []; ws.forks = []; ws.planes = []
+        ws.clear_streamlines(); ws.clear_pathlines(); ws.derived = type(ws.derived)()
+        for downstream in (
+            StepId.GENERATE_SKELETON, StepId.EDIT_SKELETON, StepId.GENERATE_GRAPH,
+            StepId.EDIT_GRAPH, StepId.GENERATE_PLANES, StepId.EDIT_PLANES,
+            StepId.COMPUTE_PWV, StepId.GENERATE_STREAMLINES, StepId.PLANE_STREAMLINES,
+            StepId.COMPUTE_PLANE_METRICS, StepId.COMPUTE_DERIVED_METRICS,
+        ):
+            ws.pipeline.completed.pop(downstream.value, None)
+            ws.pipeline.skipped.pop(downstream.value, None)
+        ws.remove_object_by_data_key("phase_wrap_mask")
+        ws.remove_object_by_data_key("phase_wrap_count")
+        ws.add_object(name="Estimated Wrap Locations", kind=ObjectKind.AUX, data_key="phase_wrap_mask", visible=False,
+                      opacity=0.65, scalars="wrap_mask", cmap="Reds", clim=(0, 1), dynamic=True)
+        ws.add_object(name="Phase Wrap Count", kind=ObjectKind.AUX, data_key="phase_wrap_count", visible=False,
+                      opacity=0.7, scalars="wrap_count", cmap="coolwarm", clim=(-2, 2), dynamic=True)
+        ws.pipeline.mark_done(StepId.UNWRAP_PHASE)
+        stats = result.get("statistics", {})
+        msg = (f"Phase unwrapping: method={result.get('method')} device={result.get('device')} "
+               f"wrapped_voxels={stats.get('wrapped_voxels_any', 0)} max|k|={stats.get('max_abs_k', 0)} "
+               f"elapsed={result.get('elapsed_sec', 0.0):.2f}s")
+        return StepResult(StepId.UNWRAP_PHASE, True, False, msg)
+
+    def revert_phase_unwrap(self, ws):
+        """Restore loaded flow without discarding wrap diagnostics for review."""
+        if ws.flow_input is None or "flow_unwrapped" not in (ws.phase_unwrap_result or {}):
+            return StepResult(StepId.UNWRAP_PHASE, True, True, "Revert skipped: no active phase-unwrapping result")
+        ws.flow_raw = np.asarray(ws.flow_input, dtype=np.float32).copy()
+        ws.skeleton_points = None; ws.skeleton_mask = None; ws.graph = GraphData()
+        ws.branch_labels = None; ws.centerline_paths = []; ws.centerline_node_paths = []
+        ws.centerline_paths_smooth = []; ws.path_info = []; ws.forks = []; ws.planes = []
+        ws.clear_streamlines(); ws.clear_pathlines(); ws.derived = type(ws.derived)()
+        for downstream in (
+            StepId.GENERATE_SKELETON, StepId.EDIT_SKELETON, StepId.GENERATE_GRAPH,
+            StepId.EDIT_GRAPH, StepId.GENERATE_PLANES, StepId.EDIT_PLANES,
+            StepId.COMPUTE_PWV, StepId.GENERATE_STREAMLINES, StepId.PLANE_STREAMLINES,
+            StepId.COMPUTE_PLANE_METRICS, StepId.COMPUTE_DERIVED_METRICS,
+        ):
+            ws.pipeline.completed.pop(downstream.value, None)
+            ws.pipeline.skipped.pop(downstream.value, None)
+        ws.pipeline.completed.pop(StepId.UNWRAP_PHASE.value, None)
+        ws.pipeline.skipped.pop(StepId.UNWRAP_PHASE.value, None)
+        return StepResult(StepId.UNWRAP_PHASE, True, False, "Restored loaded flow; wrap diagnostics retained")
 
     def _step_generate_skeleton(self, ws):
         if ws.segmask_raw is None:
@@ -728,6 +963,14 @@ class PipelineEngine:
                     "method": str(dp.pressure_method),
                 },
             }),
+            "vortex": _payload_fingerprint({
+                **common,
+                "algorithm": _DERIVED_ALGORITHM_VERSIONS["vortex"],
+                "params": {
+                    "smoothing_sigma": float(dp.vortex_smoothing_sigma),
+                    "support_erosion_iters": int(dp.vortex_support_erosion_iters),
+                },
+            }),
         }
 
     @staticmethod
@@ -742,6 +985,16 @@ class PipelineEngine:
                 "pressure_gradient_support_mask",
                 "relative_pressure",
                 "relative_pressure_peak",
+            },
+            "vortex": {
+                "vorticity",
+                "vorticity_magnitude",
+                "vorticity_magnitude_peak",
+                "q_criterion",
+                "q_criterion_peak",
+                "swirling_strength",
+                "swirling_strength_peak",
+                "vortex_support_mask",
             },
         }[family]
         for key in keys:
@@ -765,6 +1018,23 @@ class PipelineEngine:
                 and np.size(ws.derived.pressure_gradient_array) > 0
                 and stored.get("pressure") == signatures["pressure"]
             ),
+            "vortex": (
+                all(
+                    getattr(ws.derived, name, None) is not None
+                    and np.size(getattr(ws.derived, name)) > 0
+                    for name in (
+                        "vorticity_array",
+                        "vorticity_magnitude",
+                        "vorticity_magnitude_peak",
+                        "q_criterion_array",
+                        "q_criterion_peak",
+                        "swirling_strength_array",
+                        "swirling_strength_peak",
+                        "vortex_support_mask",
+                    )
+                )
+                and stored.get("vortex") == signatures["vortex"]
+            ),
         }
 
     def _ensure_derived_metrics(
@@ -775,6 +1045,7 @@ class PipelineEngine:
         compute_wss=True,
         compute_tke=True,
         compute_pressure_gradient=True,
+        compute_vortex=False,
     ):
         self.preprocess(ws)
         signatures = self._derived_artifact_signatures(ws)
@@ -782,6 +1053,7 @@ class PipelineEngine:
         has_wss = validity["wss"]
         has_pg = validity["pressure"]
         has_tke = validity["tke"]
+        has_vortex = validity["vortex"]
         source_tke = ws.source_tke_array
         source_sigma = ws.source_sigma if ws.input_state.capabilities.has_complex_source else None
         request_tke = bool(compute_tke and (source_tke is not None or source_sigma is not None))
@@ -792,13 +1064,16 @@ class PipelineEngine:
             self._drop_stale_pixelwise_family(pixelwise, "pressure")
         if request_tke and not has_tke:
             self._drop_stale_pixelwise_family(pixelwise, "tke")
+        if compute_vortex and not has_vortex:
+            self._drop_stale_pixelwise_family(pixelwise, "vortex")
         need_wss = bool(compute_wss and (not has_wss or (save_pixelwise and "wss" not in pixelwise)))
         need_pg = bool(
             compute_pressure_gradient
             and (not has_pg or (save_pixelwise and "pressure_gradient" not in pixelwise))
         )
         need_tke = bool(request_tke and (not has_tke or (save_pixelwise and "tke_time" not in pixelwise)))
-        if not (need_wss or need_pg or need_tke):
+        need_vortex = bool(compute_vortex and (not has_vortex or (save_pixelwise and "q_criterion" not in pixelwise)))
+        if not (need_wss or need_pg or need_tke or need_vortex):
             if refresh_scene_objects:
                 self._register_derived_scene_objects(ws)
             return ws.derived
@@ -828,6 +1103,7 @@ class PipelineEngine:
             compute_wss=need_wss,
             compute_tke=need_tke,
             compute_pressure_gradient=need_pg,
+            compute_vortex=need_vortex,
             wss_smoothing_iteration=dp.wss_smoothing_iteration,
             wss_viscosity=dp.wss_viscosity,
             wss_inward_distance=dp.wss_inward_distance,
@@ -836,6 +1112,8 @@ class PipelineEngine:
             tke_rho=dp.tke_rho,
             pressure_gradient_rho=dp.pressure_gradient_rho,
             pressure_gradient_viscosity=dp.pressure_gradient_viscosity,
+            vortex_smoothing_sigma=dp.vortex_smoothing_sigma,
+            vortex_support_erosion_iters=dp.vortex_support_erosion_iters,
         )
         if need_wss:
             ws.derived.wss_surfaces = result["wss_surfaces"]
@@ -860,6 +1138,16 @@ class PipelineEngine:
             ws.derived.relative_pressure_display_clim = result.get("relative_pressure_display_clim")
             ws.derived.centerline_pressure_profiles = list(result.get("centerline_pressure_profiles", []) or [])
             ws.derived.artifact_signatures["pressure"] = signatures["pressure"]
+        if need_vortex:
+            ws.derived.vorticity_array = result.get("vorticity_array")
+            ws.derived.vorticity_magnitude = result.get("vorticity_magnitude")
+            ws.derived.vorticity_magnitude_peak = result.get("vorticity_magnitude_peak")
+            ws.derived.q_criterion_array = result.get("q_criterion_array")
+            ws.derived.q_criterion_peak = result.get("q_criterion_peak")
+            ws.derived.swirling_strength_array = result.get("swirling_strength_array")
+            ws.derived.swirling_strength_peak = result.get("swirling_strength_peak")
+            ws.derived.vortex_support_mask = result.get("vortex_support_mask")
+            ws.derived.artifact_signatures["vortex"] = signatures["vortex"]
         ws.derived.streamlines = []
         result_pixelwise = dict(result.get("pixelwise_export", {}) or {})
         if result_pixelwise:
@@ -908,13 +1196,13 @@ class PipelineEngine:
                 ws.flow_raw, ws.segmask_binary, ws.resolution, ws.origin, ws.planes,
                 RR=ws.rr, branch_labels_3d=ws.branch_labels,
                 path_info=ws.path_info, forks=ws.forks, paths=paths_for_tangent,
-                return_qc=True)
+                return_qc=True, segmentation_labels_3d=ws.segmask_labels_3d)
         else:
             metrics, qc = compute_plane_metrics(
                 ws.flow_raw, ws.segmask_binary, ws.resolution, ws.origin, ws.planes,
                 RR=ws.rr, branch_labels_3d=ws.branch_labels,
                 path_info=ws.path_info, forks=ws.forks, paths=paths_for_tangent,
-                return_qc=True)
+                return_qc=True, segmentation_labels_3d=ws.segmask_labels_3d)
         if include_derived:
             metrics, plane_pixelwise = augment_plane_metrics_with_derived(
                 metrics, ws.planes, ws.segmask_binary, ws.resolution, ws.origin,
@@ -943,6 +1231,15 @@ class PipelineEngine:
                     }
                 )
         ws.derived.plane_metrics = metrics
+        layout_qc = dict(ws.derived.plane_qc or {}).get("paths") if isinstance(ws.derived.plane_qc, dict) else None
+        if layout_qc is not None:
+            qc = dict(qc or {})
+            qc["plane_layout"] = {
+                "paths": layout_qc,
+                "requested_plane_count": int(getattr(ws.plane_gen_params, "plane_count", 0)),
+                "actual_plane_count": int(len(ws.planes)),
+                "segmentation_filter": bool(getattr(ws.plane_gen_params, "segmentation_filter", True)),
+            }
         ws.derived.plane_qc = qc
         for i, metric in enumerate(metrics):
             if i < len(ws.planes):
@@ -989,12 +1286,17 @@ class PipelineEngine:
         ws.remove_objects_by_prefix("plane_")
         planes = []
         smooth_paths = []
+        plane_layout_qc = {"paths": [], "requested_plane_count": int(pgp.plane_count)}
         ws.clear_pathlines()
         ws.pathline_colors = {}
         for group_name in ws.group_order:
             group_state = ws.multilabel_groups.get(group_name, {})
             local_paths = list(group_state.get("centerline_paths", []))
-            local_planes, local_smooth_paths = generate_planes_from_paths(
+            fork_points = [
+                fork.get("crosspoint") for fork in list(group_state.get("forks", []))
+                if isinstance(fork, dict) and fork.get("crosspoint") is not None
+            ]
+            local_planes, local_smooth_paths, local_filter_qc = generate_planes_from_paths(
                 local_paths,
                 cross_section_distance=pgp.cross_section_distance,
                 start_distance=pgp.start_distance,
@@ -1006,9 +1308,25 @@ class PipelineEngine:
                 plane_count=pgp.plane_count,
                 anchor=pgp.anchor,
                 anchor_offset_mm=pgp.anchor_offset_mm,
+                direction=getattr(pgp, "direction", "both"),
+                spacing_mode=getattr(pgp, "spacing_mode", "fraction"),
+                spacing_ratio=getattr(pgp, "spacing_ratio", 0.25),
+                segmentation_labels=ws.segmask_labels_3d,
+                segmentation_filter=bool(getattr(pgp, "segmentation_filter", True)),
+                path_info=group_state.get("path_info", []),
+                segmentation_spacing=ws.resolution,
+                segmentation_origin=ws.origin,
+                return_qc=True,
+                fork_points=fork_points,
             )
             path_offset = int(group_state.get("path_index_offset", 0))
             plane_offset = len(planes)
+            for local_path_idx, raw_q in enumerate(local_filter_qc):
+                q = dict(raw_q or {})
+                q["path_index"] = int(path_offset + local_path_idx)
+                q["requested_plane_count"] = int(pgp.plane_count)
+                q["actual_plane_count"] = int(sum(1 for p in local_planes if int(p.path_index) == int(local_path_idx)))
+                plane_layout_qc["paths"].append(q)
             adjusted_smooth_paths = [np.asarray(path, dtype=float) for path in local_smooth_paths]
             adjusted_planes = []
             for local_idx, plane in enumerate(local_planes):
@@ -1049,6 +1367,9 @@ class PipelineEngine:
             planes.extend(adjusted_planes)
         ws.planes = planes
         ws.centerline_paths_smooth = smooth_paths
+        plane_layout_qc["actual_plane_count"] = int(len(ws.planes))
+        plane_layout_qc["segmentation_filter"] = bool(getattr(pgp, "segmentation_filter", True))
+        ws.derived.plane_qc = plane_layout_qc
 
         planes_path = self._save_planes_json(ws)
         ws.pipeline.mark_done(StepId.GENERATE_PLANES)
@@ -1118,24 +1439,33 @@ class PipelineEngine:
             return StepResult(StepId.PLANE_STREAMLINES, True, True, "Pathlines skipped: no planes")
         self.preprocess(ws)
         active_indices = list(range(len(ws.planes)))
-        ws.clear_pathlines()
-        ws.active_pathline_plane_indices = active_indices
+        ws.active_pathline_plane_indices = sorted({
+            *(
+                int(idx)
+                for idx in ws.active_pathline_plane_indices
+                if 0 <= int(idx) < len(ws.planes)
+            ),
+            *active_indices,
+        })
         for plane_idx in active_indices:
             group_name = self._plane_group_name(ws, plane_idx)
+            data_key = self._plane_data_key("pathline", ws, plane_idx)
+            if any(obj.data_key == data_key for obj in ws.scene_objects.values()):
+                continue
             ws.add_object(
                 name=self._indexed_object_name("pathline", plane_idx), kind=ObjectKind.FLOW,
-                data_key=self._plane_data_key("pathline", ws, plane_idx), group_name=group_name,
+                data_key=data_key, group_name=group_name,
                 browser_color=ws.skeleton_params.browser_color_for_group(group_name) if group_name else "",
                 visible=True, opacity=1.0,
                 color=ws.pathline_color_for_plane(plane_idx), dynamic=True,
-                show_scalar_bar=False, tube_radius=ws.streamline_params.tube_radius)
+                show_scalar_bar=False, tube_radius=ws.streamline_params.pathline_tube_radius)
         ws.pipeline.mark_done(StepId.PLANE_STREAMLINES)
         p = ws.streamline_params
         return StepResult(
             StepId.PLANE_STREAMLINES,
             True,
             False,
-            f"Pathlines enabled for {len(active_indices)} planes: seed_ratio={p.seed_ratio} min_seeds={p.min_seeds} max_steps={p.max_steps} terminal_speed={p.terminal_speed} rng_seed={p.rng_seed} color={p.pathline_color}",
+            f"Pathlines enabled for {len(active_indices)} planes from t=0: seed_mode={getattr(p, 'pathline_seed_mode', 'fixed')} seed_ratio={p.pathline_seed_ratio} min_seeds={p.pathline_min_seeds} seed_count_or_limit={getattr(p, 'pathline_max_seeds', 250)} max_steps={p.pathline_max_steps} terminal_speed={p.pathline_terminal_speed} rng_seed={p.pathline_rng_seed} color_mode={getattr(p, 'pathline_color_mode', 'per_plane')}",
         )
 
     def _step_compute_plane_metrics(self, ws):
@@ -1177,7 +1507,12 @@ class PipelineEngine:
                 StepId.COMPUTE_DERIVED_METRICS, True, True,
                 self._missing_segmentation_message(ws, "Derived metrics"),
             )
-        self._ensure_derived_metrics(ws, save_pixelwise=False, refresh_scene_objects=True)
+        self._ensure_derived_metrics(
+            ws,
+            save_pixelwise=False,
+            refresh_scene_objects=True,
+            compute_vortex=True,
+        )
         augmented_planes = 0
         if len(ws.planes) > 0 and len(ws.derived.plane_metrics) == len(ws.planes):
             metrics, plane_pixelwise = augment_plane_metrics_with_derived(
@@ -1215,6 +1550,8 @@ class PipelineEngine:
         msg = f"Derived: Nt={len(ws.derived.wss_surfaces)}"
         if not has_tke:
             msg += " tke=unavailable"
+        if ws.derived.q_criterion_array is not None:
+            msg += " vortex=ready"
         if augmented_planes:
             msg += f" plane_summaries={augmented_planes}"
         ws.pipeline.mark_done(StepId.COMPUTE_DERIVED_METRICS)

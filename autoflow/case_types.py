@@ -12,6 +12,8 @@ class LoaderCapabilities:
     has_complex_source: bool = False
     supports_wss: bool = False
     supports_plane_metrics: bool = False
+    has_wrapped_phase: bool = False
+    supports_phase_unwrap: bool = False
 
     def to_dict(self):
         return {
@@ -20,6 +22,8 @@ class LoaderCapabilities:
             "has_complex_source": bool(self.has_complex_source),
             "supports_wss": bool(self.supports_wss),
             "supports_plane_metrics": bool(self.supports_plane_metrics),
+            "has_wrapped_phase": bool(self.has_wrapped_phase),
+            "supports_phase_unwrap": bool(self.supports_phase_unwrap),
         }
 
     @staticmethod
@@ -30,13 +34,15 @@ class LoaderCapabilities:
             has_complex_source=bool(d.get("has_complex_source", False)),
             supports_wss=bool(d.get("supports_wss", False)),
             supports_plane_metrics=bool(d.get("supports_plane_metrics", False)),
+            has_wrapped_phase=bool(d.get("has_wrapped_phase", False)),
+            supports_phase_unwrap=bool(d.get("supports_phase_unwrap", False)),
         )
 
 
 @dataclass
 class BackgroundPhaseCorrectionConfig:
     enabled: bool = True
-    method: str = "msac"
+    method: str = "wrls_arto"
     corr_fit_order: int = 3
     threshold: float = 0.1
     wrls_lambda: float = 5.0
@@ -52,6 +58,8 @@ class BackgroundPhaseCorrectionConfig:
     dual_venc_ratio1: float = 0.0
     dual_venc_ratio2: float = 0.0
     force_recompute: bool = False
+    # Keep normal cache reuse fast, but allow read-only cold-start profiling.
+    write_cache: bool = True
 
     def to_dict(self):
         return {
@@ -72,6 +80,7 @@ class BackgroundPhaseCorrectionConfig:
             "dual_venc_ratio1": float(self.dual_venc_ratio1),
             "dual_venc_ratio2": float(self.dual_venc_ratio2),
             "force_recompute": bool(self.force_recompute),
+            "write_cache": bool(self.write_cache),
         }
 
     @staticmethod
@@ -79,7 +88,9 @@ class BackgroundPhaseCorrectionConfig:
         payload = d or {}
         return BackgroundPhaseCorrectionConfig(
             enabled=bool(payload.get("enabled", False)),
-            method=str(payload.get("method", "msac") or "msac").strip().lower(),
+            # A bare legacy dict historically meant MSAC; fully specified config
+            # bundles use WRLS+ARTO as the new default.
+            method=str(payload.get("method", "msac" if "method" not in payload else "wrls_arto") or "wrls_arto").strip().lower(),
             corr_fit_order=int(payload.get("corr_fit_order", 3)),
             threshold=float(payload.get("threshold", 0.1)),
             wrls_lambda=float(payload.get("wrls_lambda", 5.0)),
@@ -95,6 +106,63 @@ class BackgroundPhaseCorrectionConfig:
             dual_venc_ratio1=float(payload.get("dual_venc_ratio1", 0.0)),
             dual_venc_ratio2=float(payload.get("dual_venc_ratio2", 0.0)),
             force_recompute=bool(payload.get("force_recompute", False)),
+            write_cache=bool(payload.get("write_cache", True)),
+        )
+
+
+@dataclass
+class PhaseUnwrappingConfig:
+    """Optional traditional phase-unwrapping workflow settings."""
+    # Retained only so workspaces written by older AutoFlow versions can be
+    # loaded.  Selecting ``method`` is now the sole user-facing opt-in.
+    enabled: bool = False
+    method: str = "none"
+    mask_source: str = "segmentation"
+    device: str = "auto"
+    tfc: bool = True
+    lap4d_ts: float = 2.0
+    nprs_upsampling_factor: int = 2
+    nprs_pi_unwrap: bool = True
+    nprs_auto_crop: bool = True
+    write_output: bool = True
+
+    def to_dict(self):
+        return {
+            "method": str(self.method),
+            "mask_source": str(self.mask_source),
+            "device": str(self.device),
+            "tfc": bool(self.tfc),
+            "lap4d_ts": float(self.lap4d_ts),
+            "nprs_upsampling_factor": int(self.nprs_upsampling_factor),
+            "nprs_pi_unwrap": bool(self.nprs_pi_unwrap),
+            "nprs_auto_crop": bool(self.nprs_auto_crop),
+            "write_output": bool(self.write_output),
+        }
+
+    @staticmethod
+    def from_dict(d):
+        payload = dict(d or {})
+        method = str(payload.get("method", "none") or "none").strip()
+        aliases = {"gc3d": "gc3D", "lap4d": "lap4D"}
+        method = aliases.get(method.lower(), method)
+        if method not in {"none", "gc3D", "lap4D", "nprs"}:
+            method = "none"
+        mask_source = str(payload.get("mask_source", "segmentation") or "segmentation").strip().lower()
+        if mask_source in {"active_segmentation", "seg", "mask"}:
+            mask_source = "segmentation"
+        if mask_source not in {"segmentation", "all"}:
+            mask_source = "segmentation"
+        return PhaseUnwrappingConfig(
+            enabled=bool(payload.get("enabled", False)),
+            method=method,
+            mask_source=mask_source,
+            device=str(payload.get("device", "auto") or "auto"),
+            tfc=bool(payload.get("tfc", True)),
+            lap4d_ts=float(payload.get("lap4d_ts", 2.0)),
+            nprs_upsampling_factor=max(1, int(payload.get("nprs_upsampling_factor", 2) or 2)),
+            nprs_pi_unwrap=bool(payload.get("nprs_pi_unwrap", True)),
+            nprs_auto_crop=bool(payload.get("nprs_auto_crop", True)),
+            write_output=bool(payload.get("write_output", True)),
         )
 
 
@@ -109,6 +177,10 @@ class LoadedCase:
     segmentation: Optional[np.ndarray] = None
     tke_array: Optional[np.ndarray] = None
     sigma: Optional[np.ndarray] = None
+    correction: Optional[np.ndarray] = None
+    correction_high: Optional[np.ndarray] = None
+    phase_wrapped: Optional[np.ndarray] = None
+    phase_wrapped_high: Optional[np.ndarray] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     source_format: str = ""
     source_group: Optional[str] = None

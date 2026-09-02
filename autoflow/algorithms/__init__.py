@@ -45,6 +45,7 @@ from .preprocess import (
     component_volume_threshold_mm3,
     filter_connected_components,
     filter_labeled_components,
+    filter_4d_labeled_components,
     remove_small_cc_from_binary_mask,
     _component_bbox,
     _preprocess_single_component,
@@ -82,6 +83,7 @@ from .branch import (
 )
 
 from .planes import (
+    filter_paths_by_segmentation,
     generate_planes_from_paths,
 )
 
@@ -113,7 +115,11 @@ from .segmentation import (
     compute_reference_scalar,
     generate_threshold_segmentation,
     generate_nnunet_auto_segmentation,
+    generate_nnunet_4d_auto_segmentation,
+    resolve_nnunet_4d_model_folder,
+    default_nnunet_4d_pipeline_script,
     save_segmentation_file,
+    save_nifti_volume,
     save_segmentation_to_source_h5,
 )
 
@@ -123,6 +129,7 @@ from .streamlines import (
     generate_streamlines_at_t,
     generate_streamlines_from_plane_at_t,
     generate_pathlines_from_plane_at_t,
+    create_pathline_temporal_source,
 )
 
 from .metrics import (
@@ -137,6 +144,7 @@ from .metrics import (
     compute_tke_array_from_sigma,
     compute_tke_metrics,
     compute_wss_metrics,
+    compute_vortex_metrics,
     compute_pressure_gradient_metrics,
     compute_derived_metrics,
     augment_plane_metrics_with_derived,
@@ -177,6 +185,7 @@ __all__ = [
     "component_volume_threshold_mm3",
     "filter_connected_components",
     "filter_labeled_components",
+    "filter_4d_labeled_components",
     "remove_small_cc_from_binary_mask",
     "preprocess_mask_for_skeleton",
     "largest_connected_component",
@@ -190,6 +199,7 @@ __all__ = [
     "find_path_forks",
     "build_path_info",
     "segment_vessels_from_graph_and_mask",
+    "filter_paths_by_segmentation",
     "generate_planes_from_paths",
     "build_multilabel_surface",
     "build_multilabel_surface_t",
@@ -206,7 +216,11 @@ __all__ = [
     "compute_reference_scalar",
     "generate_threshold_segmentation",
     "generate_nnunet_auto_segmentation",
+    "generate_nnunet_4d_auto_segmentation",
+    "resolve_nnunet_4d_model_folder",
+    "default_nnunet_4d_pipeline_script",
     "save_segmentation_file",
+    "save_nifti_volume",
     "save_segmentation_to_source_h5",
     "extract_plane_cross_section",
     "create_uniform_field_grid",
@@ -218,6 +232,7 @@ __all__ = [
     "generate_streamlines_at_t",
     "generate_streamlines_from_plane_at_t",
     "generate_pathlines_from_plane_at_t",
+    "create_pathline_temporal_source",
     "extract_vectors",
     "get_orthogonal_vectors",
     "get_vector_magnitude",
@@ -229,6 +244,7 @@ __all__ = [
     "compute_tke_array_from_sigma",
     "compute_tke_metrics",
     "compute_wss_metrics",
+    "compute_vortex_metrics",
     "compute_pressure_gradient_metrics",
     "compute_derived_metrics",
     "augment_plane_metrics_with_derived",

@@ -12,10 +12,10 @@ It currently supports:
 - normalized H5 input
 - nested-group H5 input when one case payload lives below the root and loader keys vary by case
 - direct DICOM directory input
-- segmentation from embedded masks, imported masks, thresholding, and nnUNet auto segmentation
+- segmentation from embedded masks, imported masks, thresholding, static nnUNet, and temporal nnUNet4D auto segmentation
 - grouped multi-label segmentation with config-driven label maps, per-group preprocessing, and grouped visualization
 - skeleton, graph, branch, path, and plane generation
-- plane metrics, config-driven PWV, WSS, optional TKE, pressure-gradient fields, relative-pressure maps, centerline pressure-drop analysis, streamlines, and GUI pathlines
+- plane metrics, config-driven PWV, WSS, optional TKE, pressure-gradient fields, relative-pressure maps, vortex kinematics (vorticity, Q-criterion, and swirling strength), centerline pressure-drop analysis, streamlines, and GUI pathlines
 - offline result export to JSON, NPZ, H5, PNG, and video
 
 ![Demo](https://github.com/user-attachments/assets/e2c17a9e-6a47-4f85-ba0d-c35b622802b1)
@@ -30,23 +30,20 @@ cd AutoFlow
 pip install .
 ```
 
-GUI install:
+GUI install, including automatic segmentation:
 
 ```bash
 pip install ".[gui]"
 ```
 
-Test dependencies:
+Install the optional SpatioTemporal Labeler bridge as well:
 
 ```bash
-pip install -e ".[test]"
+git submodule update --init --recursive
+pip install ".[gui,labeler]"
 ```
 
-Known working pytest environment in this repo:
-
-```bash
-~/miniconda3/envs/ryy/bin/python -m pytest tests/test_smoke_phantoms.py tests/test_pressure_gradient_phantom.py -q
-```
+Normal and editable installs include the bundled nnUNet `dataset.json`, `plans.json`, and final checkpoint as package data. The `gui` extra also installs the nnUNet inference runtime; no separate automatic-segmentation extra or model download is required. The `labeler` extra installs the pinned SpatioTemporal Labeler `v0.4.0` interface; its upstream source remains a separate GPL-3.0 submodule.
 
 ## Quick Start
 
@@ -61,7 +58,7 @@ Optional metrics and videos are opt-in:
 ```bash
 autoflow-run ./data/demo_data.h5 \
   --output-dir ./results/demo \
-  --with pwv,wss,pg \
+  --with pwv,wss,pg,vortex \
   --video plane,wss,pg
 ```
 
@@ -74,7 +71,7 @@ This runs the standard batch order:
 3. generate graph
 4. generate planes
 5. calculate plane metrics
-6. optionally calculate PWV, WSS, TKE, pressure gradient, relative pressure, and centerline pressure drop when requested
+6. optionally calculate PWV, WSS, TKE, pressure gradient, relative pressure, vortex kinematics, and centerline pressure drop when requested
 7. optionally export requested videos
 
 Typical outputs under `./results/demo/<case_name>/`:
@@ -84,10 +81,19 @@ Typical outputs under `./results/demo/<case_name>/`:
 - `plane_positions.json`
 - `plane_metrics.json`
 - `plane_qc.json`
-- `pwv.json` when PWV is enabled
+- `quality_report.json` with staged input, segmentation, topology, plane, flow-consistency, and PWV checks
+- `pwv.json` when PWV runs
 - `pwv_<group>.png` when PWV plotting succeeds
 - `summary.json` with `stage_times_sec`, `video_times_sec`, and request flags
 - source H5 `segmask` is updated in place for reuse, plus `*_auto_segmentation.nii.gz` and `*_auto_segmentation_feature_*.nii.gz` when `--autoseg` runs on an H5 input
+
+The shipped automatic-segmentation config uses the Dataset7020 temporal
+`nnUNet4D` model (`run_7020_4d_full_ssd_20260824.sh`). Use
+`--autoseg-folds single` for the current `fold_all` checkpoint, or `all` / an
+explicit list such as `0,1,2,3,4` when five folds are available. For a
+read-only cold benchmark, use `tools/benchmark_pipeline.py`, which defaults to
+the registered DV validation H5 and ignores embedded correction and segmentation
+caches.
 
 GUI:
 
@@ -96,6 +102,7 @@ autoflow-gui
 ```
 
 Use `Export > Export Videos...` for interactive selective export of `plane`, `wss`, `tke`, `pg`, and `streamlines` videos.
+The GUI is organized as `Input & QC`, `Segmentation`, `Phase Unwrapping`, `Centerline & Planes`, `Hemodynamics`, and `Review & Export`. Phase unwrapping is optional and dual-VENC inputs skip it automatically. Use the top-level `Settings` menu to configure the display-only 3D axis orientation.
 
 Python API:
 
@@ -120,11 +127,13 @@ AutoFlow keeps default hyperparameters in per-module JSON files under `configs/`
 - `labels.json`
 - `planes.json`
 - `streamlines.json`
+- `pathlines.json`
 - `derived.json`
 - `fluid.json`
 - `wss.json`
 - `tke.json`
 - `pressure_gradient.json`
+- `vortex.json`
 - `pwv.json`
 - `segmentation.json`
 - `colorbar.json`
@@ -140,8 +149,10 @@ Metric config split:
 - `tke.json -> render` owns TKE display range and optional colorbar settings for GUI and offline videos.
 - `pressure_gradient.json` owns pressure-analysis parameters: pressure-gradient estimation, relative-pressure reconstruction, and centerline pressure-drop sampling inputs.
 - `pressure_gradient.json -> render` owns pressure-gradient display settings, plus optional `relative_pressure_*` overrides for the reconstructed relative-pressure map.
+- `vortex.json` owns spatial smoothing and valid-support erosion for vorticity, Q-criterion, and swirling-strength calculations.
 - `planes.json -> render` owns GUI plane color and opacity. `video_exporting.json -> plane_video` owns plane-video skeleton, plane size, plane color, plane opacity, and label styling.
-- `streamlines.json -> render` owns streamline display range; metric-specific `bar_cfg` values can still override the shared GUI colorbar defaults and are also used by offline videos.
+- `streamlines.json -> render` owns streamline display range; `clim: null` automatically uses the all-phase P99 segmented velocity so isolated dual-VENC outliers do not flatten the useful color range, while two numeric limits select a fixed range. Metric-specific `bar_cfg` values can still override the shared GUI colorbar defaults and are also used by offline videos.
+- `pathlines.json` owns GUI pathline launch, color, tube, and temporal-cache defaults. It is separate from `streamlines.json`, which remains responsible for live streamline and video settings.
 - `colorbar.json` owns the shared GUI colorbar visibility, size, position, and font defaults.
 - `derived.json` is now just a legacy compatibility placeholder.
 - `video_exporting.json` stays the central place for shared video sizing, rotation, camera, and output toggles.
@@ -194,13 +205,17 @@ Detailed documentation now lives under `docs/en/`.
 
 **Feature Guides**
 
+- [Background Phase Correction](docs/en/features/background-phase-correction.md)
 - [Segmentation](docs/en/features/segmentation.md)
+- [Phase Unwrapping](docs/en/features/phase-unwrapping.md)
 - [Skeleton](docs/en/features/skeleton.md)
 - [Graph and Paths](docs/en/features/graph-paths.md)
 - [Planes](docs/en/features/planes.md)
 - [Plane Metrics](docs/en/features/metrics.md)
+- [Quality Control](docs/en/features/quality-control.md)
 - [PWV](docs/en/features/pwv.md)
 - [WSS, TKE, Pressure Gradient, and Relative Pressure](docs/en/features/wss-tke-pressure.md)
+- [Vortex Kinematics](docs/en/features/vortex-kinematics.md)
 - [Streamlines and Pathlines](docs/en/features/streamlines.md)
 - [Videos](docs/en/features/videos.md)
 
@@ -221,8 +236,9 @@ Detailed documentation now lives under `docs/en/`.
 - TKE is optional; mag/flow-only inputs must not synthesize fake TKE
 - auto segmentation is currently executable in both CLI and GUI when the nnUNet backend and model folder are available
 - the GUI Browser can show and hide a whole segmentation group at once, and group title colors come from `configs/labels.json`
-- when PWV is enabled, the GUI uses one `Analysis` dock for PWV, plane cardiac-phase curves, and path/branch internal consistency, and still exposes PWV planes as one `PWV planes` browser item
-- `Run All` in the GUI runs `Generate Skeleton -> Generate Graph -> Generate Planes -> Calculate && Save Metrics -> Compute PWV -> WSS / TKE / Pressure`
+- the GUI Browser supports Ctrl/Shift multi-selection of planes; the main `Pathlines` action runs all planes, while a plane context menu can target one plane or the selected subset
+- after `Compute PWV` runs, the GUI uses one `Analysis` dock for PWV, plane cardiac-phase curves, and path/branch internal consistency, and still exposes PWV planes as one `PWV planes` browser item
+- GUI `Run All` is stage-scoped: Centerline runs skeleton, graph, and planes; Hemodynamics runs plane metrics, derived metrics, live streamlines, and all-plane pathlines. `Compute PWV` remains explicit.
 - offline videos can be exported from CLI, Python batch, or GUI `Export > Export Videos...`; CLI and Python remain the repeatable batch path
 
 ## Documentation Checklist For PRs

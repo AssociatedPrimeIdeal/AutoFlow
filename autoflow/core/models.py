@@ -1,10 +1,32 @@
+import colorsys
 import copy, json, uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
-from ..case_types import BackgroundPhaseCorrectionConfig, InputState, LoadedCase, LoaderCapabilities
+from ..case_types import BackgroundPhaseCorrectionConfig, PhaseUnwrappingConfig, InputState, LoadedCase, LoaderCapabilities
+
+
+PATHLINE_CATEGORICAL_COLORS = (
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+    "#393b79", "#637939", "#8c6d31", "#843c39", "#7b4173",
+    "#3182bd", "#31a354", "#756bb1", "#e6550d", "#636363",
+)
+
+
+def pathline_categorical_color(index):
+    """Return a stable categorical color without repeating after 20 planes."""
+    color_index = max(0, int(index))
+    if color_index < len(PATHLINE_CATEGORICAL_COLORS):
+        return PATHLINE_CATEGORICAL_COLORS[color_index]
+    extended_index = color_index - len(PATHLINE_CATEGORICAL_COLORS)
+    hue = (0.13 + extended_index * 0.618033988749895) % 1.0
+    saturation = 0.62 + 0.10 * (extended_index % 2)
+    value = 0.78 + 0.12 * ((extended_index // 2) % 2)
+    red, green, blue = colorsys.hsv_to_rgb(hue, saturation, value)
+    return f"#{round(red * 255):02x}{round(green * 255):02x}{round(blue * 255):02x}"
 
 
 class ObjectKind(Enum):
@@ -19,6 +41,7 @@ class ObjectKind(Enum):
 
 
 class StepId(Enum):
+    UNWRAP_PHASE = "step_unwrap_phase"
     GENERATE_SKELETON = "step_skeleton"
     EDIT_SKELETON = "step_edit_skeleton"
     GENERATE_GRAPH = "step_graph"
@@ -34,6 +57,7 @@ class StepId(Enum):
     @property
     def label(self):
         return {
+            StepId.UNWRAP_PHASE: "Unwrap Phase",
             StepId.GENERATE_SKELETON: "Generate Skeleton",
             StepId.EDIT_SKELETON: "Edit Skeleton",
             StepId.GENERATE_GRAPH: "Generate Graph",
@@ -44,12 +68,13 @@ class StepId(Enum):
             StepId.GENERATE_STREAMLINES: "Generate Streamlines",
             StepId.PLANE_STREAMLINES: "Pathlines",
             StepId.COMPUTE_PLANE_METRICS: "Calculate && Save Metrics",
-            StepId.COMPUTE_DERIVED_METRICS: "WSS / TKE / Relative Pressure",
+            StepId.COMPUTE_DERIVED_METRICS: "WSS / TKE / Pressure / Vortex",
         }[self]
 
     @staticmethod
     def top_row_steps():
         return [
+            StepId.UNWRAP_PHASE,
             StepId.GENERATE_SKELETON,
             StepId.GENERATE_GRAPH,
             StepId.GENERATE_PLANES,
@@ -240,26 +265,34 @@ class SkeletonParams:
 
 @dataclass
 class PlaneGenerationParams:
-    plane_mode: str = "count"
-    plane_count: int = 1
+    plane_mode: str = "fixed_step"
+    plane_count: int = 3
     cross_section_distance: float = 5.0
-    start_distance: float = 5.0
+    start_distance: float = 0.0
     end_distance: float = 0.0
-    anchor: str = "end"
+    anchor: str = "center"
     anchor_offset_mm: float = 5.0
+    direction: str = "both"
+    spacing_mode: str = "fraction"
+    spacing_ratio: float = 0.25
+    segmentation_filter: bool = True
     smoothing_window: int = 15
     smoothing_polyorder: int = 2
     inter_time: int = 10
 
     def to_dict(self):
         return {
-            "plane_mode": str(self.plane_mode or "count"),
+            "plane_mode": str(self.plane_mode or "fixed_step"),
             "plane_count": int(self.plane_count),
             "cross_section_distance": float(self.cross_section_distance),
             "start_distance": float(self.start_distance),
             "end_distance": float(self.end_distance),
             "anchor": str(self.anchor or "end"),
             "anchor_offset_mm": float(self.anchor_offset_mm),
+            "direction": str(self.direction or "both"),
+            "spacing_mode": str(self.spacing_mode or "fraction"),
+            "spacing_ratio": float(self.spacing_ratio),
+            "segmentation_filter": bool(self.segmentation_filter),
             "smoothing_window": int(self.smoothing_window),
             "smoothing_polyorder": int(self.smoothing_polyorder),
             "inter_time": int(self.inter_time),
@@ -269,13 +302,21 @@ class PlaneGenerationParams:
     def from_dict(d):
         payload = dict(d or {})
         plane_mode = str(payload.get("plane_mode", "") or "").strip().lower()
-        if plane_mode not in {"count", "distance", "anchored_offset"}:
+        if plane_mode not in {"count", "distance", "anchored_offset", "uniform", "fixed_step"}:
             use_center_plane = payload.get("use_center_plane", None)
             plane_mode = "count" if bool(True if use_center_plane is None else use_center_plane) else "distance"
-        plane_count = max(1, int(payload.get("plane_count", 1) or 1))
-        anchor = str(payload.get("anchor", "end") or "end").strip().lower()
-        if anchor not in {"start", "end"}:
-            anchor = "end"
+        plane_count = int(payload.get("plane_count", 3) or 3)
+        if plane_count != -1:
+            plane_count = max(1, plane_count)
+        anchor = str(payload.get("anchor", "center") or "center").strip().lower()
+        if anchor not in {"start", "center", "end", "junction"}:
+            anchor = "center"
+        direction = str(payload.get("direction", "both") or "both").strip().lower()
+        if direction not in {"toward_start", "toward_end", "both", "start", "end"}:
+            direction = "both"
+        spacing_mode = str(payload.get("spacing_mode", "fraction") or "fraction").strip().lower()
+        if spacing_mode not in {"distance", "fraction"}:
+            spacing_mode = "fraction"
         return PlaneGenerationParams(
             plane_mode=plane_mode,
             plane_count=plane_count,
@@ -284,6 +325,10 @@ class PlaneGenerationParams:
             end_distance=float(payload.get("end_distance", 0.0)),
             anchor=anchor,
             anchor_offset_mm=float(payload.get("anchor_offset_mm", 5.0)),
+            direction=direction,
+            spacing_mode=spacing_mode,
+            spacing_ratio=float(payload.get("spacing_ratio", 0.25)),
+            segmentation_filter=bool(payload.get("segmentation_filter", True)),
             smoothing_window=int(payload.get("smoothing_window", 15)),
             smoothing_polyorder=int(payload.get("smoothing_polyorder", 2)),
             inter_time=int(payload.get("inter_time", 10)),
@@ -298,7 +343,18 @@ class StreamlineParams:
     terminal_speed: float = 0.01
     rng_seed: int = 0
     tube_radius: float = 0.25
+
+    pathline_seed_ratio: float = 0.2
+    pathline_max_steps: int = 200
+    pathline_min_seeds: int = 50
+    pathline_seed_mode: str = "fixed"
+    pathline_max_seeds: int = 250
+    pathline_terminal_speed: float = 0.01
+    pathline_rng_seed: int = 0
+    pathline_tube_radius: float = 0.25
     pathline_color: str = "deepskyblue"
+    pathline_color_mode: str = "per_plane"
+    pathline_temporal_cache_mb: float = 512.0
 
     def to_dict(self):
         return {
@@ -308,7 +364,17 @@ class StreamlineParams:
             "terminal_speed": self.terminal_speed,
             "rng_seed": self.rng_seed,
             "tube_radius": self.tube_radius,
+            "pathline_seed_ratio": self.pathline_seed_ratio,
+            "pathline_max_steps": self.pathline_max_steps,
+            "pathline_min_seeds": self.pathline_min_seeds,
+            "pathline_seed_mode": str(self.pathline_seed_mode),
+            "pathline_max_seeds": self.pathline_max_seeds,
+            "pathline_terminal_speed": self.pathline_terminal_speed,
+            "pathline_rng_seed": self.pathline_rng_seed,
+            "pathline_tube_radius": self.pathline_tube_radius,
             "pathline_color": str(self.pathline_color),
+            "pathline_color_mode": str(self.pathline_color_mode),
+            "pathline_temporal_cache_mb": float(self.pathline_temporal_cache_mb),
         }
 
     @staticmethod
@@ -320,7 +386,17 @@ class StreamlineParams:
             terminal_speed=float(d.get("terminal_speed", 0.01)),
             rng_seed=int(d.get("rng_seed", 0)),
             tube_radius=float(d.get("tube_radius", 0.25)),
+            pathline_seed_ratio=float(d.get("pathline_seed_ratio", d.get("seed_ratio", 0.2))),
+            pathline_max_steps=int(d.get("pathline_max_steps", d.get("max_steps", 200))),
+            pathline_min_seeds=int(d.get("pathline_min_seeds", d.get("min_seeds", 50))),
+            pathline_seed_mode=("ratio" if str(d.get("pathline_seed_mode", "fixed") or "fixed").strip().lower() == "ratio" else "fixed"),
+            pathline_max_seeds=max(1, int(d.get("pathline_max_seeds", 250))),
+            pathline_terminal_speed=float(d.get("pathline_terminal_speed", d.get("terminal_speed", 0.01))),
+            pathline_rng_seed=int(d.get("pathline_rng_seed", d.get("rng_seed", 0))),
+            pathline_tube_radius=float(d.get("pathline_tube_radius", d.get("tube_radius", 0.25))),
             pathline_color=str(d.get("pathline_color", d.get("plane_pathline_color", "deepskyblue")) or "deepskyblue"),
+            pathline_color_mode=(str(d.get("pathline_color_mode", "per_plane") or "per_plane").strip().lower() if str(d.get("pathline_color_mode", "per_plane") or "per_plane").strip().lower() in {"uniform", "per_plane", "per_group"} else "per_plane"),
+            pathline_temporal_cache_mb=max(0.0, float(d.get("pathline_temporal_cache_mb", 512.0))),
         )
 
 
@@ -340,6 +416,8 @@ class DerivedMetricsParams:
     relative_pressure_layer_opacity: float = 0.6
     pressure_gradient_use_convective_acceleration: bool = True
     pressure_method: str = "least_squares"
+    vortex_smoothing_sigma: float = 0.0
+    vortex_support_erosion_iters: int = 1
     step_size: int = 5
     tube_radius: float = 0.1
     use_multithread: bool = False
@@ -360,6 +438,8 @@ class DerivedMetricsParams:
             "relative_pressure_layer_opacity": self.relative_pressure_layer_opacity,
             "pressure_gradient_use_convective_acceleration": self.pressure_gradient_use_convective_acceleration,
             "pressure_method": str(self.pressure_method),
+            "vortex_smoothing_sigma": self.vortex_smoothing_sigma,
+            "vortex_support_erosion_iters": self.vortex_support_erosion_iters,
             "step_size": self.step_size,
             "tube_radius": self.tube_radius,
             "use_multithread": self.use_multithread,
@@ -394,6 +474,8 @@ class DerivedMetricsParams:
             relative_pressure_layer_opacity=float(payload.get("relative_pressure_layer_opacity", 0.6)),
             pressure_gradient_use_convective_acceleration=bool(payload.get("pressure_gradient_use_convective_acceleration", True)),
             pressure_method=pressure_method,
+            vortex_smoothing_sigma=max(float(payload.get("vortex_smoothing_sigma", 0.0)), 0.0),
+            vortex_support_erosion_iters=max(int(payload.get("vortex_support_erosion_iters", 1)), 0),
             step_size=int(payload.get("step_size", 5)),
             tube_radius=float(payload.get("tube_radius", 0.1)),
             use_multithread=bool(payload.get("use_multithread", False)),
@@ -736,12 +818,17 @@ class LoaderParams:
         default_factory=lambda: DicomParameterOverrides()
     )
     dicom_read_workers: int = 1
+    # Explicitly bypass segmentation embedded in an input file.  This is
+    # useful for cold-start benchmarks and for forcing the model/threshold
+    # segmentation branch without changing the source file.
+    ignore_embedded_segmentation: bool = False
 
     def to_dict(self):
         return {
             "background_phase_correction": self.background_phase_correction.to_dict(),
             "dicom_parameter_overrides": self.dicom_parameter_overrides.to_dict(),
             "dicom_read_workers": int(self.dicom_read_workers),
+            "ignore_embedded_segmentation": bool(self.ignore_embedded_segmentation),
         }
 
     @staticmethod
@@ -755,6 +842,7 @@ class LoaderParams:
                 payload.get("dicom_parameter_overrides", {})
             ),
             dicom_read_workers=int(payload.get("dicom_read_workers", 1) or 1),
+            ignore_embedded_segmentation=bool(payload.get("ignore_embedded_segmentation", False)),
         )
 
 
@@ -815,6 +903,7 @@ class PlaneData:
     label: int = 1
     path_index: int = 0
     distance: float = 0.0
+    segmentation_label: int = 0
     group_name: str = ""
     metrics: Dict[str, Any] = field(default_factory=dict)
 
@@ -844,6 +933,14 @@ class DerivedResults:
     relative_pressure_peak: Optional[np.ndarray] = None
     relative_pressure_display_clim: Optional[Tuple[float, float]] = None
     centerline_pressure_profiles: List[Dict[str, Any]] = field(default_factory=list)
+    vorticity_array: Optional[np.ndarray] = None
+    vorticity_magnitude: Optional[np.ndarray] = None
+    vorticity_magnitude_peak: Optional[np.ndarray] = None
+    q_criterion_array: Optional[np.ndarray] = None
+    q_criterion_peak: Optional[np.ndarray] = None
+    swirling_strength_array: Optional[np.ndarray] = None
+    swirling_strength_peak: Optional[np.ndarray] = None
+    vortex_support_mask: Optional[np.ndarray] = None
     streamlines: List[Any] = field(default_factory=list)
     pixelwise_export: Dict[str, Any] = field(default_factory=dict)
     plane_pixelwise_file: str = ""
@@ -907,12 +1004,17 @@ class SegmentationState:
     threshold_min_component_volume_mm3: float = 0.0
     threshold_closing: bool = True
     threshold_opening: bool = False
-    auto_backend: str = "nnUNet"
-    auto_model: str = ""
+    auto_backend: str = "nnUNet4D"
+    auto_model: str = "/nas-data2/ryy/CMR4DFlow2026/Segdata/scripts/nnunet/4D/run_7020_4d_full_ssd_20260824.sh"
     auto_checkpoint: str = "checkpoint_final.pth"
+    auto_folds: str = "single"
     auto_device: str = "auto"
     auto_label_map: str = ""
     force_recompute_auto_cache: bool = False
+    write_auto_cache: bool = True
+    cleanup_4d_components: bool = False
+    cleanup_4d_mode: str = "absolute"
+    cleanup_4d_min_volume_mm3: float = 50.0
 
     @staticmethod
     def _coerce_threshold_value(value):
@@ -966,9 +1068,14 @@ class SegmentationState:
             "auto_backend": self.auto_backend,
             "auto_model": self.auto_model,
             "auto_checkpoint": self.auto_checkpoint,
+            "auto_folds": str(self.auto_folds),
             "auto_device": self.auto_device,
             "auto_label_map": self.auto_label_map,
             "force_recompute_auto_cache": bool(self.force_recompute_auto_cache),
+            "write_auto_cache": bool(self.write_auto_cache),
+            "cleanup_4d_components": bool(self.cleanup_4d_components),
+            "cleanup_4d_mode": str(self.cleanup_4d_mode),
+            "cleanup_4d_min_volume_mm3": float(self.cleanup_4d_min_volume_mm3),
         }
 
     @staticmethod
@@ -1005,12 +1112,17 @@ class SegmentationState:
             threshold_min_component_volume_mm3=float(payload.get("threshold_min_component_volume_mm3", 0.0)),
             threshold_closing=bool(payload.get("threshold_closing", True)),
             threshold_opening=bool(payload.get("threshold_opening", False)),
-            auto_backend=str(payload.get("auto_backend", "nnUNet")),
-            auto_model=str(payload.get("auto_model", "")),
+            auto_backend=str(payload.get("auto_backend", "nnUNet4D")),
+            auto_model=str(payload.get("auto_model", "/nas-data2/ryy/CMR4DFlow2026/Segdata/scripts/nnunet/4D/run_7020_4d_full_ssd_20260824.sh")),
             auto_checkpoint=str(payload.get("auto_checkpoint", "checkpoint_final.pth")),
+            auto_folds=str(payload.get("auto_folds", "single") or "single"),
             auto_device=str(payload.get("auto_device", "auto")),
             auto_label_map=str(payload.get("auto_label_map", "")),
             force_recompute_auto_cache=bool(payload.get("force_recompute_auto_cache", False)),
+            write_auto_cache=bool(payload.get("write_auto_cache", True)),
+            cleanup_4d_components=bool(payload.get("cleanup_4d_components", False)),
+            cleanup_4d_mode=str(payload.get("cleanup_4d_mode", "absolute") or "absolute"),
+            cleanup_4d_min_volume_mm3=float(payload.get("cleanup_4d_min_volume_mm3", 50.0) or 50.0),
         )
 
 
@@ -1019,6 +1131,7 @@ class Workspace:
     paths: PathsState = field(default_factory=PathsState)
     pipeline: PipelineFlags = field(default_factory=PipelineFlags)
     loader_params: LoaderParams = field(default_factory=LoaderParams)
+    phase_unwrap_params: PhaseUnwrappingConfig = field(default_factory=PhaseUnwrappingConfig)
     preprocess_params: PreprocessParams = field(default_factory=PreprocessParams)
     skeleton_params: SkeletonParams = field(default_factory=SkeletonParams)
     label_params: LabelParams = field(default_factory=LabelParams)
@@ -1047,6 +1160,8 @@ class Workspace:
     mag_raw: Optional[np.ndarray] = None
     source_sigma: Optional[np.ndarray] = None
     source_tke_array: Optional[np.ndarray] = None
+    correction_raw: Optional[np.ndarray] = None
+    correction_high_raw: Optional[np.ndarray] = None
 
     skeleton_points: Optional[np.ndarray] = None
     skeleton_mask: Optional[np.ndarray] = None
@@ -1061,10 +1176,15 @@ class Workspace:
     planes: List[PlaneData] = field(default_factory=list)
 
     flow_raw: Optional[np.ndarray] = None
+    flow_input: Optional[np.ndarray] = None
+    phase_wrapped: Optional[np.ndarray] = None
+    phase_wrapped_high: Optional[np.ndarray] = None
+    phase_unwrap_result: Dict[str, Any] = field(default_factory=dict)
     streamline_seeds: Optional[np.ndarray] = None
     streamline_cache: Dict[int, Any] = field(default_factory=dict)
     streamline_active: bool = False
     pathline_cache: Dict[int, Dict[int, Any]] = field(default_factory=dict)
+    pathline_seed_cache: Dict[int, np.ndarray] = field(default_factory=dict)
     active_pathline_plane_indices: List[int] = field(default_factory=list)
     pathline_colors: Dict[int, str] = field(default_factory=dict)
     derived: DerivedResults = field(default_factory=DerivedResults)
@@ -1213,6 +1333,7 @@ class Workspace:
 
     def clear_pathlines(self):
         self.pathline_cache.clear()
+        self.pathline_seed_cache.clear()
         self.active_pathline_plane_indices = []
         self.remove_objects_by_prefix("pathline_")
 
@@ -1221,7 +1342,19 @@ class Workspace:
         color = str(self.pathline_colors.get(plane_idx, "") or "")
         if color:
             return color
-        return str(self.streamline_params.pathline_color or "deepskyblue")
+        mode = str(getattr(self.streamline_params, "pathline_color_mode", "per_plane") or "per_plane").strip().lower()
+        if mode == "uniform":
+            return str(self.streamline_params.pathline_color or "deepskyblue")
+        if mode == "per_group":
+            plane_groups = [str(getattr(plane, "group_name", "") or "Global") for plane in self.planes]
+            group_order = list(dict.fromkeys(
+                [str(name or "Global") for name in self.group_order] + plane_groups
+            ))
+            group_name = plane_groups[plane_idx] if 0 <= plane_idx < len(plane_groups) else "Global"
+            color_index = group_order.index(group_name) if group_name in group_order else 0
+        else:
+            color_index = plane_idx
+        return pathline_categorical_color(color_index)
 
     def set_pathline_color_for_plane(self, plane_idx, color):
         self.pathline_colors[int(plane_idx)] = str(color or self.streamline_params.pathline_color or "deepskyblue")
@@ -1252,6 +1385,8 @@ class Workspace:
         self.planes = []
         self.selected_path_index = -1
         self.pipeline.reset()
+        # Keep loaded flow and phase data intact; unwrapping is an independent
+        # optional stage and can be rerun after segmentation edits.
         self.clear_streamlines()
         self.clear_pathlines()
         self.derived = DerivedResults()
@@ -1281,6 +1416,7 @@ class Workspace:
             ("paths", PathsState()),
             ("pipeline", PipelineFlags()),
             ("loader_params", LoaderParams()),
+            ("phase_unwrap_params", PhaseUnwrappingConfig()),
             ("preprocess_params", PreprocessParams()),
             ("skeleton_params", SkeletonParams()),
             ("label_params", LabelParams()),
@@ -1297,8 +1433,9 @@ class Workspace:
         self.venc = np.array([1., 1., 1.])
         self.rr = 1000.0
         for attr in ["segmask_raw", "segmask_labels", "segmask_labels_3d", "segmask_binary", "segmask_3d",
-                      "skeleton_points", "skeleton_mask", "branch_labels", "flow_raw",
-                      "streamline_seeds", "mag_raw", "source_sigma", "source_tke_array"]:
+                      "skeleton_points", "skeleton_mask", "branch_labels", "flow_raw", "flow_input",
+                      "phase_wrapped", "phase_wrapped_high",
+                      "streamline_seeds", "mag_raw", "source_sigma", "source_tke_array", "correction_raw", "correction_high_raw"]:
             setattr(self, attr, None)
         self.group_order = []
         self.multilabel_groups = {}
@@ -1312,6 +1449,7 @@ class Workspace:
         self.streamline_cache = {}
         self.streamline_active = False
         self.pathline_cache = {}
+        self.pathline_seed_cache = {}
         self.active_pathline_plane_indices = []
         self.pathline_colors = {}
         self.derived = DerivedResults()
@@ -1321,6 +1459,7 @@ class Workspace:
         self.ortho_cursor = np.array([0, 0, 0], dtype=int)
         self.selected_path_index = -1
         self._preprocess_signature = None
+        self.phase_unwrap_result = {}
 
     def snapshot_dict(self):
         def arr(v):
@@ -1348,6 +1487,7 @@ class Workspace:
                 "path_info": copy.deepcopy(state.get("path_info", [])),
                 "forks": copy.deepcopy(state.get("forks", [])),
                 "planes": [{"center": arr(p.center), "normal": arr(p.normal), "label": int(p.label),
+                            "segmentation_label": int(getattr(p, "segmentation_label", 0) or 0),
                             "path_index": int(p.path_index), "distance": float(p.distance), "group_name": str(p.group_name),
                             "metrics": copy.deepcopy(p.metrics)} for p in state.get("planes", [])],
                 "path_index_offset": int(state.get("path_index_offset", 0)),
@@ -1358,6 +1498,7 @@ class Workspace:
                       "workspace_path": self.paths.workspace_path, "output_dir": self.paths.output_dir},
             "pipeline": {"completed": dict(self.pipeline.completed), "skipped": dict(self.pipeline.skipped)},
             "loader_params": self.loader_params.to_dict(),
+            "phase_unwrap_params": self.phase_unwrap_params.to_dict(),
             "preprocess_params": self.preprocess_params.to_dict(),
             "skeleton_params": self.skeleton_params.to_dict(),
             "label_params": self.label_params.to_dict(),
@@ -1382,6 +1523,8 @@ class Workspace:
             "mag_raw": arr(self.mag_raw),
             "source_sigma": arr(self.source_sigma),
             "source_tke_array": arr(self.source_tke_array),
+            "correction_raw": arr(self.correction_raw),
+            "correction_high_raw": arr(self.correction_high_raw),
             "skeleton_points": arr(self.skeleton_points),
             "skeleton_mask": arr(self.skeleton_mask),
             "graph": {"points": arr(self.graph.points), "edges": arr(self.graph.edges)},
@@ -1392,9 +1535,17 @@ class Workspace:
             "path_info": copy.deepcopy(self.path_info),
             "forks": copy.deepcopy(self.forks),
             "planes": [{"center": arr(p.center), "normal": arr(p.normal), "label": int(p.label),
+                        "segmentation_label": int(getattr(p, "segmentation_label", 0) or 0),
                         "path_index": int(p.path_index), "distance": float(p.distance),
                         "group_name": str(p.group_name), "metrics": copy.deepcopy(p.metrics)} for p in self.planes],
             "flow_raw": arr(self.flow_raw),
+            "flow_input": arr(self.flow_input),
+            "phase_wrapped": arr(self.phase_wrapped),
+            "phase_wrapped_high": arr(self.phase_wrapped_high),
+            "phase_unwrap_result": {
+                str(k): (arr(v) if isinstance(v, np.ndarray) else copy.deepcopy(v))
+                for k, v in dict(self.phase_unwrap_result or {}).items()
+            },
             "streamline_seeds": arr(self.streamline_seeds),
             "streamline_active": self.streamline_active,
             "active_pathline_plane_indices": [int(x) for x in self.active_pathline_plane_indices],
@@ -1433,6 +1584,7 @@ class Workspace:
         self.pipeline = PipelineFlags(completed=dict(d.get("pipeline", {}).get("completed", {})),
                                       skipped=dict(d.get("pipeline", {}).get("skipped", {})))
         self.loader_params = LoaderParams.from_dict(d.get("loader_params", {}))
+        self.phase_unwrap_params = PhaseUnwrappingConfig.from_dict(d.get("phase_unwrap_params", {}))
         self.preprocess_params = PreprocessParams.from_dict(d.get("preprocess_params", {}))
         self.skeleton_params = SkeletonParams.from_dict(d.get("skeleton_params", {}))
         self.label_params = LabelParams.from_dict(d.get("label_params", {}))
@@ -1467,6 +1619,7 @@ class Workspace:
                     center=np.asarray(p.get("center", [0.0, 0.0, 0.0]), dtype=float),
                     normal=np.asarray(p.get("normal", [1.0, 0.0, 0.0]), dtype=float),
                     label=int(p.get("label", 1)),
+                    segmentation_label=int(p.get("segmentation_label", 0) or 0),
                     path_index=int(p.get("path_index", 0)),
                     distance=float(p.get("distance", 0.0)),
                     group_name=str(p.get("group_name", group_name) or group_name),
@@ -1502,6 +1655,8 @@ class Workspace:
         self.mag_raw = nparr("mag_raw")
         self.source_sigma = nparr("source_sigma")
         self.source_tke_array = nparr("source_tke_array")
+        self.correction_raw = nparr("correction_raw", np.float32)
+        self.correction_high_raw = nparr("correction_high_raw", np.float32)
         self.skeleton_points = nparr("skeleton_points")
         self.skeleton_mask = nparr("skeleton_mask")
         gd = d.get("graph", {})
@@ -1518,14 +1673,19 @@ class Workspace:
         for p in d.get("planes", []):
             self.planes.append(PlaneData(
                 center=np.asarray(p["center"], dtype=float), normal=np.asarray(p["normal"], dtype=float),
-                label=int(p.get("label", 1)), path_index=int(p.get("path_index", 0)),
+                label=int(p.get("label", 1)), segmentation_label=int(p.get("segmentation_label", 0) or 0), path_index=int(p.get("path_index", 0)),
                 distance=float(p.get("distance", 0.0)), group_name=str(p.get("group_name", "") or ""),
                 metrics=copy.deepcopy(p.get("metrics", {}))))
         self.flow_raw = nparr("flow_raw")
+        self.flow_input = nparr("flow_input")
+        self.phase_wrapped = nparr("phase_wrapped", np.float32)
+        self.phase_wrapped_high = nparr("phase_wrapped_high", np.float32)
+        self.phase_unwrap_result = copy.deepcopy(d.get("phase_unwrap_result", {}))
         self.streamline_seeds = nparr("streamline_seeds")
         self.streamline_cache = {}
         self.streamline_active = bool(d.get("streamline_active", False))
         self.pathline_cache = {}
+        self.pathline_seed_cache = {}
         self.active_pathline_plane_indices = [int(x) for x in d.get("active_pathline_plane_indices", [])]
         self.pathline_colors = {int(k): str(v) for k, v in d.get("pathline_colors", {}).items()}
         derived_state = d.get("derived", {}) if isinstance(d.get("derived", {}), dict) else {}

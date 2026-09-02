@@ -31,7 +31,6 @@ CAMERA_PRESETS = {
     "inferior": (0.0, -89.9),
 }
 
-
 def _offscreen_mode():
     mode = str(os.environ.get("AUTOFLOW_OFFSCREEN_MODE", "local")).strip().lower()
     if mode in {"display", "x11", "onscreen"}:

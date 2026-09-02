@@ -32,6 +32,9 @@ gui = [
   "nnunetv2==2.5.2",
   "nibabel",
 ]
+labeler = [
+  "spatiotemporal-labeler @ git+https://github.com/AssociatedPrimeIdeal/SpatioTemporalLabeler.git@b1301f249645cf4c0e885d08388887ba5482ba0e",
+]
 [project.scripts]
 autoflow-run = "autoflow.cli:main"
 autoflow-gui = "autoflow.ui.launcher:main"

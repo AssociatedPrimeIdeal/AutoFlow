@@ -33,7 +33,7 @@ For each PWV group, AutoFlow:
 ### GUI
 1. load a case with segmentation and flow
 2. open `PWV Parameters` in the main parameter panel
-3. enable PWV, define one or more groups, and adjust spacing or waveform settings if needed
+3. define one or more groups, and adjust spacing or waveform settings if needed
 4. run `Calculate && Save Metrics`, then `Compute PWV`
 5. inspect `Analysis -> PWV` and the grouped `PWV planes` browser item
 
@@ -65,7 +65,7 @@ summary = run_case("case.h5", config=config)
 
 | Parameter | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `enabled` | bool | `False` | `configs/pwv.json` or GUI `PWV Parameters` | enable or disable PWV computation | `autoflow/core/pipeline.py` |
+| `enabled` | bool | `False` | `configs/pwv.json` (CLI/API compatibility) | legacy batch gate; the GUI `Compute PWV` action enables the step for the current workspace | `autoflow/core/pipeline.py` |
 | `groups` | list | `[]` | `configs/pwv.json` or GUI `PWV Parameters` | each item defines one PWV label combination | `autoflow/core/models.py` |
 | `groups[].name` | string | generated name | `configs/pwv.json` or GUI `PWV Parameters` | display name in results and GUI | `autoflow/core/models.py` |
 | `groups[].labels` | list[int or symbol] | required per group | `configs/pwv.json` or GUI `PWV Parameters` | labels merged into one PWV mask | `autoflow/core/models.py` |
@@ -95,7 +95,7 @@ summary = run_case("case.h5", config=config)
 
 | Output file or object | Created when | Meaning |
 | --- | --- | --- |
-| `pwv.json` | PWV is enabled and PWV runs | one result block per PWV group |
+| `pwv.json` | PWV runs successfully | one result block per PWV group |
 | `pwv_<group>.png` | plotting succeeds | per-group two-panel plot with PWV fit plus all plane flowrate waveforms |
 | `summary.json -> pwv_results` | summary export runs | PWV result summary |
 | `PWV planes` scene object | GUI or pipeline PWV succeeds | one grouped browser item that controls all PWV planes |
@@ -122,6 +122,6 @@ summary = run_case("case.h5", config=config)
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
-| no PWV result is written | PWV is disabled or no groups are configured in `configs/pwv.json` or the GUI `PWV Parameters` panel | enable PWV and define groups |
+| no PWV result is written | no groups are configured, or the CLI/API compatibility gate is disabled | define groups; for CLI/API set `configs/pwv.json -> enabled=true` |
 | a PWV group is skipped | the grouped mask is empty or too few valid planes survived | check segmentation labels and waveform quality |
 | PWV planes do not appear individually in the browser | expected behavior | use the single `PWV planes` browser item to control visibility |

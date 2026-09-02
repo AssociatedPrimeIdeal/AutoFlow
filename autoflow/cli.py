@@ -12,7 +12,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory containing per-module JSON configs used to build CLI defaults. When omitted, AutoFlow uses repo-level configs/ if present.",
     )
     parser.add_argument("--output-dir", default=None, help="Root output directory. Overrides configs/batch.json.")
-    parser.add_argument("--reuse-planes", default=None, help="Plane positions file or directory to reuse.")
+    parser.add_argument(
+        "--import-planes",
+        "--reuse-planes",
+        dest="reuse_planes",
+        default=None,
+        help="Import a plane coordinate JSON file, or a directory containing per-case plane_positions.json files.",
+    )
+    parser.add_argument(
+        "--plane-import-mode",
+        choices=["world", "local", "path_relative"],
+        default=None,
+        help="Map imported planes by canonical world-mm coordinates, local physical coordinates, or relative centerline position.",
+    )
+    parser.add_argument(
+        "--export-planes",
+        default=None,
+        help="Also export plane coordinates to this JSON file. For a multi-case run, provide a directory.",
+    )
 
     parser.add_argument("--skip-derived", action="store_true", help="Skip all WSS/TKE/relative-pressure derived metrics.")
     parser.add_argument("--skip-wss", action="store_true", help="Skip WSS computation, export, and derived summaries.")
@@ -25,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--bgc-method",
         choices=["msac", "wrls_arto"],
         default=None,
-        help="Background phase correction algorithm. MSAC remains the default.",
+        help="Background phase correction algorithm. WRLS + ARTO is the default.",
     )
     parser.add_argument(
         "--bgc-fit-order",
@@ -70,16 +87,29 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Ignore reusable H5 background phase correction caches and recompute them before optionally overwriting the cache.",
     )
+    parser.add_argument(
+        "--no-cache-write",
+        dest="background_phase_write_cache",
+        action="store_false",
+        help="Do not write newly computed correction or automatic-segmentation caches back to the input H5 (useful for read-only benchmarks).",
+    )
     parser.add_argument("--dicom-read-workers", type=int, default=None, help="Worker count for direct DICOM loading; use 0 to pick an automatic thread count.")
     parser.set_defaults(use_multithread=None)
     parser.set_defaults(background_phase_correction=None)
+    parser.set_defaults(background_phase_write_cache=None)
 
-    parser.add_argument("--plane-mode", choices=["count", "distance", "anchored_offset"], default=None, help="Plane placement mode.")
-    parser.add_argument("--plane-count", type=int, default=None, help="Number of evenly spaced planes when using count mode. count=1 is the center-plane default.")
-    parser.add_argument("--plane-anchor", choices=["start", "end"], default=None, help="Anchor used by anchored_offset mode.")
-    parser.add_argument("--plane-offset-mm", type=float, default=None, help="Offset in mm from the selected anchor when using anchored_offset mode.")
+    parser.add_argument("--plane-mode", choices=["uniform", "fixed_step", "count", "distance", "anchored_offset"], default=None, help="Plane placement mode.")
+    parser.add_argument("--plane-count", type=int, default=None, help="Plane count; -1 places every position that fits. Symmetric even counts omit the center plane.")
+    parser.add_argument("--plane-anchor", choices=["start", "center", "end", "junction"], default=None, help="Anchor for fixed_step placement.")
+    parser.add_argument("--plane-direction", choices=["toward_start", "toward_end", "both"], default=None, help="Direction from the anchor.")
+    parser.add_argument("--plane-spacing-mode", choices=["distance", "fraction"], default=None, help="Interpret fixed-step spacing as millimetres or a fraction of path length.")
+    parser.add_argument("--plane-spacing-ratio", type=float, default=None, help="Fixed-step spacing as a fraction of path length (for fraction mode).")
+    parser.add_argument("--segmentation-filter", dest="segmentation_filter", action="store_true", help="Restrict each path and its planes/metrics to its topology-aware segmentation label (default).")
+    parser.add_argument("--no-segmentation-filter", dest="segmentation_filter", action="store_false", help="Disable topology-aware segmentation path filtering.")
+    parser.set_defaults(segmentation_filter=None)
+    parser.add_argument("--plane-offset-mm", type=float, default=None, help="First distance in mm from a graph junction in anchored_offset mode.")
     parser.add_argument("--plane-by-distance", dest="use_center_plane", action="store_false", help="Deprecated compatibility flag. Equivalent to --plane-mode distance.")
-    parser.add_argument("--cross-section-dist", type=float, default=None, help="Plane spacing in mm when using distance mode.")
+    parser.add_argument("--cross-section-dist", type=float, default=None, help="Plane spacing in mm when using distance spacing mode.")
     parser.add_argument("--start-dist", type=float, default=None, help="Distance from path start before the first plane.")
     parser.add_argument("--end-dist", type=float, default=None, help="Distance from path end to stop placing planes.")
     parser.set_defaults(use_center_plane=None)
@@ -102,6 +132,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--autoseg-backend", default=None, help="Auto segmentation backend. Default comes from configs/segmentation.json or falls back to nnUNet.")
     parser.add_argument("--autoseg-model", default=None, help="Auto segmentation model folder. If omitted, AutoFlow uses the bundled default nnUNet model when present.")
     parser.add_argument("--autoseg-checkpoint", default=None, help="Auto segmentation checkpoint name.")
+    parser.add_argument(
+        "--autoseg-folds",
+        default=None,
+        help="Auto segmentation folds: single, all (ensemble), or comma-separated fold IDs (default: single).",
+    )
     parser.add_argument("--autoseg-device", default=None, help="Auto segmentation device: auto, cpu, or cuda.")
     parser.add_argument("--autoseg-label-map", default=None, help="Optional JSON label remap passed to auto segmentation.")
     parser.add_argument(
@@ -110,16 +145,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ignore H5 auto-segmentation caches tagged as AutoFlow-generated and rerun auto segmentation. Original or imported segmentations are not bypassed.",
     )
     parser.add_argument(
+        "--ignore-embedded-segmentation",
+        action="store_true",
+        help="Ignore any segmentation embedded in the input (including original labels) without modifying the source file.",
+    )
+    parser.add_argument(
         "--segmentation-only",
         action="store_true",
         help="Stop after loading or generating segmentation; skip skeleton, planes, metrics, and videos.",
     )
+    parser.add_argument("--phase-unwrap-method", choices=["none", "gc3D", "lap4D", "nprs"], default=None, help="Optional traditional phase-unwrapping method (disabled by default).")
+    parser.add_argument("--phase-unwrap-mask", choices=["segmentation", "all"], default=None, help="Mask used for phase unwrapping.")
+    parser.add_argument("--phase-unwrap-device", choices=["auto", "cpu", "cuda"], default=None, help="Device for phase unwrapping; lap4D uses CUDA when available.")
 
     parser.add_argument(
         "--with",
         dest="requested_metrics",
         default=None,
-        help="Comma-separated optional computations to enable. Supported: pwv,wss,tke,pg. Default computes only plane metrics.",
+        help="Comma-separated optional computations to enable. Supported: pwv,wss,tke,pg,vortex. Default computes only plane metrics.",
     )
     parser.add_argument(
         "--video",
@@ -152,6 +195,8 @@ def main() -> None:
     overrides = {
         "output_dir": args.output_dir,
         "reuse_planes": args.reuse_planes,
+        "plane_import_mode": args.plane_import_mode,
+        "export_planes": args.export_planes,
         "use_multithread": args.use_multithread,
         "background_phase_correction": args.background_phase_correction,
         "background_phase_method": args.bgc_method,
@@ -170,6 +215,10 @@ def main() -> None:
         "dual_venc_ratio1": args.dual_venc_ratio1,
         "dual_venc_ratio2": args.dual_venc_ratio2,
         "force_recompute_corr": args.force_recompute_corr,
+        "background_phase_write_cache": args.background_phase_write_cache,
+        "write_segmentation_cache": (
+            False if args.background_phase_write_cache is False else None
+        ),
         "dicom_read_workers": args.dicom_read_workers,
         "plane_mode": args.plane_mode,
         "plane_count": args.plane_count,
@@ -179,6 +228,10 @@ def main() -> None:
         "end_dist": args.end_dist,
         "plane_anchor": args.plane_anchor,
         "plane_offset_mm": args.plane_offset_mm,
+        "plane_direction": args.plane_direction,
+        "plane_spacing_mode": args.plane_spacing_mode,
+        "plane_spacing_ratio": args.plane_spacing_ratio,
+        "segmentation_filter": args.segmentation_filter,
         "min_cc_volume": args.min_cc_volume,
         "cc_filter_mode": args.cc_filter_mode,
         "cc_rel_min_ratio": args.cc_rel_min_ratio,
@@ -188,10 +241,16 @@ def main() -> None:
         "autoseg_backend": args.autoseg_backend,
         "autoseg_model": args.autoseg_model,
         "autoseg_checkpoint": args.autoseg_checkpoint,
+        "autoseg_folds": args.autoseg_folds,
         "autoseg_device": args.autoseg_device,
         "autoseg_label_map": args.autoseg_label_map,
         "force_recompute_seg": args.force_recompute_seg,
+        "ignore_embedded_segmentation": args.ignore_embedded_segmentation,
         "segmentation_only": args.segmentation_only,
+        "phase_unwrap_enabled": (None if args.phase_unwrap_method is None else args.phase_unwrap_method != "none"),
+        "phase_unwrap_method": args.phase_unwrap_method,
+        "phase_unwrap_mask": args.phase_unwrap_mask,
+        "phase_unwrap_device": args.phase_unwrap_device,
         "requested_metrics": [] if args.requested_metrics is None else [args.requested_metrics],
         "requested_videos": [] if args.requested_videos is None else [args.requested_videos],
         "fps": args.fps,

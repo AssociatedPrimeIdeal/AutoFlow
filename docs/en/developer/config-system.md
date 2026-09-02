@@ -9,10 +9,12 @@ AutoFlow stores repo-level defaults in per-module JSON files and applies them to
 | --- | --- |
 | `configs/batch.json` | output, skip behavior, multithreading, plane reuse |
 | `configs/loader.json` | background phase correction, dual-venc loader ratios, and DICOM read settings |
+| `configs/phase_unwrapping.json` | optional traditional phase-unwrapping method, mask, device, and algorithm parameters |
 | `configs/skeleton.json` | skeleton cleanup and morphology defaults |
 | `configs/labels.json` | label maps, label groups, browser colors, and per-group preprocessing overrides |
 | `configs/planes.json` | plane generation defaults |
-| `configs/streamlines.json` | streamline and pathline defaults |
+| `configs/streamlines.json` | live-streamline defaults and video render settings |
+| `configs/pathlines.json` | GUI pathline launch, rendering, color, and temporal-cache defaults |
 | `configs/derived.json` | legacy compatibility placeholder for older derived config keys |
 | `configs/fluid.json` | shared fluid properties such as `rho` and `viscosity` |
 | `configs/wss.json` | WSS compute defaults |
@@ -80,6 +82,30 @@ AutoFlow stores repo-level defaults in per-module JSON files and applies them to
 | `single_label_browser_color` | string | `#d9480f` | `configs/labels.json` | fallback browser title color for single-group inputs | `autoflow/core/models.py` |
 | `default_group_browser_color` | string | `#1c7ed6` | `configs/labels.json` | browser title color for groups without explicit color | `autoflow/core/models.py` |
 
+## Background Phase Correction Config
+
+| Parameter | Type | Default | Where configured | Effect | Code owner |
+| --- | --- | --- | --- | --- | --- |
+| `background_phase_correction.enabled` | bool | `False` | `configs/loader.json` | enable correction during input loading | `autoflow/algorithms/data.py` |
+| `background_phase_correction.method` | string | `wrls_arto` | `configs/loader.json`, GUI method dropdown | choose `msac` or `wrls_arto` | `autoflow/algorithms/phase_correction.py`, `autoflow/ui/app.py` |
+| `background_phase_correction.corr_fit_order` | int | `3` | `configs/loader.json` | polynomial correction order | `autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.threshold` | float | `0.1` | `configs/loader.json` | MSAC stationary-tissue threshold | `autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.wrls_lambda` | float | `5.0` | `configs/loader.json` | WRLS L1 regularization strength | `autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.wrls_magnitude_threshold` | float | `0.04` | `configs/loader.json` | per-slice reference-magnitude fraction | `autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.wrls_mid_fov_fraction` | float | `0.5` | `configs/loader.json` | initialization in-plane FOV fraction | `autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.wrls_mid_slice_fraction` | float | `0.65` | `configs/loader.json` | initialization through-plane fraction | `autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.wrls_arto_iterations` | int | `2` | `configs/loader.json` | ARTO exclusion and refit count | `autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.wrls_tau` | float | `3.0` | `configs/loader.json` | central-Gaussian inclusion width | `autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.wrls_delta` | float | `2.0` | `configs/loader.json` | minimum side-Gaussian separation | `autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.wrls_central_probability` | float | `0.5` | `configs/loader.json` | minimum central-Gaussian prior | `autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.wrls_fista_iterations` | int | `5000` | `configs/loader.json` | maximum FISTA iterations per fit | `autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.wrls_gmm_iterations` | int | `1000` | `configs/loader.json` | maximum GMM EM iterations per ARTO pass | `autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.dual_venc_ratio1` | float | `0.0` | `configs/loader.json` | first dual-venc alias window ratio | `autoflow/algorithms/data.py` |
+| `background_phase_correction.dual_venc_ratio2` | float | `0.0` | `configs/loader.json` | second dual-venc alias window ratio | `autoflow/algorithms/data.py` |
+| `background_phase_correction.force_recompute` | bool | `False` | `configs/loader.json` | ignore a compatible H5 correction cache | `autoflow/algorithms/data.py` |
+
+GPU selection is intentionally not part of the config contract. WRLS+ARTO probes PyTorch CUDA internally for the ARTO GMM stage and falls back to CPU after an unavailable or failed CUDA attempt.
+
 ## PWV Config
 
 | Parameter | Type | Default | Where configured | Effect | Code owner |
@@ -123,9 +149,11 @@ AutoFlow stores repo-level defaults in per-module JSON files and applies them to
 | `rho` | float | shared from `configs/fluid.json` | `configs/tke.json` | optional TKE-specific density override | `autoflow/algorithms/metrics.py` |
 | `rho` | float | shared from `configs/fluid.json` | `configs/pressure_gradient.json` | optional pressure-analysis density override | `autoflow/algorithms/metrics.py` |
 | `viscosity` | float | shared from `configs/fluid.json` | `configs/pressure_gradient.json` | optional pressure-analysis viscosity override | `autoflow/algorithms/metrics.py` |
-| `method` | string | `least_squares` | `configs/pressure_gradient.json` | choose `least_squares` or `ppe` relative-pressure reconstruction; both use SciPy sparse solvers | `autoflow/algorithms/metrics.py` |
+| `method` | string | `least_squares` | `configs/pressure_gradient.json` | choose `least_squares` or `ppe`; large least-squares systems use a cached PyAMG preconditioner with a Jacobi fallback | `autoflow/algorithms/metrics.py` |
 | `smoothing_sigma` | float | `0.0` | `configs/pressure_gradient.json` | optional smoothing before pressure-gradient estimation | `autoflow/algorithms/metrics.py` |
 | `use_convective_acceleration` | bool | `True` | `configs/pressure_gradient.json` | include convective acceleration in pressure-gradient computation | `autoflow/algorithms/metrics.py` |
+| `smoothing_sigma` | float | `0.0` | `configs/vortex.json` | optional spatial Gaussian smoothing before vorticity, Q-criterion, and swirling-strength derivatives; time is not smoothed | `autoflow/algorithms/metrics.py` |
+| `support_erosion_iters` | int | `1` | `configs/vortex.json` | inward lumen-mask erosion defining valid vortex-derivative voxels; does not edit the segmentation | `autoflow/algorithms/metrics.py` |
 
 ## Rendering Config
 
@@ -151,21 +179,32 @@ AutoFlow stores repo-level defaults in per-module JSON files and applies them to
 | `add_plane_idx` | bool | `True` | `configs/video_exporting.json` | show or hide plane index labels in the plane video | `autoflow/rendering/videos.py` |
 | `wss.render.clim` | list[float, float] | `[0.0, 10.0]` | `configs/wss.json` | WSS color range for GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
 | `wss.render.show_scalar_bar` | bool | `True` | `configs/wss.json` | show or hide the WSS colorbar in GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
-| `wss.render.bar_cfg` | object | built-in default | `configs/wss.json` | WSS scalar-bar placement and font settings | `autoflow/rendering/videos.py`, `autoflow/ui/viewer.py` |
+| `wss.render.bar_cfg` | object | built-in default | `configs/wss.json` | WSS scalar-bar placement and font settings for offline video | `autoflow/rendering/videos.py` |
 | `tke.render.clim` | list[float, float] | `[0.0, 100.0]` | `configs/tke.json` | TKE color range for GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
 | `tke.render.show_scalar_bar` | bool | `True` | `configs/tke.json` | show or hide the TKE colorbar in GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
-| `tke.render.bar_cfg` | object | built-in default | `configs/tke.json` | TKE scalar-bar placement and font settings | `autoflow/rendering/videos.py`, `autoflow/ui/viewer.py` |
+| `tke.render.bar_cfg` | object | built-in default | `configs/tke.json` | TKE scalar-bar placement and font settings for offline video | `autoflow/rendering/videos.py` |
 | `pressure_gradient.render.clim` | list[float, float] or `null` | `null` | `configs/pressure_gradient.json` | pressure-gradient color range for GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
 | `pressure_gradient.render.show_scalar_bar` | bool | `True` | `configs/pressure_gradient.json` | show or hide the pressure-gradient colorbar in GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
-| `pressure_gradient.render.bar_cfg` | object | built-in default | `configs/pressure_gradient.json` | pressure-gradient scalar-bar placement and font settings | `autoflow/rendering/videos.py`, `autoflow/ui/viewer.py` |
+| `pressure_gradient.render.bar_cfg` | object | built-in default | `configs/pressure_gradient.json` | pressure-gradient scalar-bar placement and font settings for offline video | `autoflow/rendering/videos.py` |
 | `pressure_gradient.render.relative_pressure_clim` | list[float, float] or `null` | `null` | `configs/pressure_gradient.json` | relative-pressure color range for GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
 | `pressure_gradient.render.relative_pressure_show_scalar_bar` | bool | `True` | `configs/pressure_gradient.json` | show or hide the relative-pressure colorbar in GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
-| `pressure_gradient.render.relative_pressure_bar_cfg` | object | built-in default | `configs/pressure_gradient.json` | relative-pressure scalar-bar placement and font settings | `autoflow/rendering/videos.py`, `autoflow/ui/viewer.py` |
-| `streamlines.render.clim` | list[float, float] | `[0.0, 1.0]` | `configs/streamlines.json` | streamline velocity color range for GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
+| `pressure_gradient.render.relative_pressure_bar_cfg` | object | built-in default | `configs/pressure_gradient.json` | relative-pressure scalar-bar placement and font settings for offline video | `autoflow/rendering/videos.py` |
+| `streamlines.render.clim` | list[float, float] or `null` | `null` | `configs/streamlines.json` | explicit streamline velocity range; `null` uses `0` to the P99 finite segmented velocity across all phases in GUI and video | `autoflow/algorithms/streamlines.py`, `autoflow/ui/viewer.py`, `autoflow/rendering/videos.py` |
 | `streamlines.render.show_scalar_bar` | bool | `True` | `configs/streamlines.json` | show or hide the streamline colorbar in GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
-| `streamlines.render.bar_cfg` | object | built-in default | `configs/streamlines.json` | streamline scalar-bar placement and font settings for offline videos and optional per-layer GUI overrides | `autoflow/rendering/videos.py`, `autoflow/ui/viewer.py` |
+| `streamlines.render.bar_cfg` | object | built-in default | `configs/streamlines.json` | streamline scalar-bar placement and font settings for offline video | `autoflow/rendering/videos.py` |
+| `pathlines.seed_ratio` | float | `0.2` | `configs/pathlines.json` | cross-section sampling ratio in pathline ratio mode | `autoflow/algorithms/streamlines.py` |
+| `pathlines.min_seeds` | int | `50` | `configs/pathlines.json` | minimum pathline seed count in ratio mode | `autoflow/algorithms/streamlines.py` |
+| `pathlines.seed_mode` | string | `fixed` | `configs/pathlines.json` | choose fixed or cross-section-ratio pathline seed selection | `autoflow/core/models.py` |
+| `pathlines.seed_count` | int | `250` | `configs/pathlines.json` | fixed seed count or ratio-mode upper bound | `autoflow/algorithms/streamlines.py` |
+| `pathlines.max_steps` | int | `200` | `configs/pathlines.json` | maximum VTK cardiac-frame updates per pathline | `autoflow/algorithms/streamlines.py`, `autoflow/ui/app.py` |
+| `pathlines.terminal_speed` | float | `0.01` | `configs/pathlines.json` | VTK pathline stopping threshold in m/s | `autoflow/algorithms/streamlines.py` |
+| `pathlines.rng_seed` | int | `0` | `configs/pathlines.json` | deterministic pathline seed selection | `autoflow/algorithms/streamlines.py` |
+| `pathlines.tube_radius` | float | `0.25` | `configs/pathlines.json` | GUI pathline tube radius in mm | `autoflow/ui/viewer.py` |
+| `pathlines.color` | string | `deepskyblue` | `configs/pathlines.json` | uniform pathline color | `autoflow/core/models.py` |
+| `pathlines.color_mode` | string | `per_plane` | `configs/pathlines.json` | automatic uniform, per-plane, or per-group color mode | `autoflow/core/models.py` |
+| `pathlines.temporal_cache_mb` | float | `512.0` | `configs/pathlines.json` | capped VTK all-frame cache for all-plane jobs | `autoflow/algorithms/streamlines.py` |
 | `colorbar.show` | bool | `True` | `configs/colorbar.json` | show or hide the shared GUI colorbar slot | `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
-| `colorbar.bar_cfg` | object | built-in default | `configs/colorbar.json` | shared GUI colorbar placement and font settings used by segmentation labels and as the fallback for other GUI scalar layers | `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
+| `colorbar.bar_cfg` | object | built-in default | `configs/colorbar.json` | shared GUI colorbar placement and font settings used by every live scalar layer | `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
 
 ## Runtime Notes
 
@@ -178,4 +217,4 @@ AutoFlow stores repo-level defaults in per-module JSON files and applies them to
 
 ## Current Caveat
 
-The CLI auto-segmentation public config fields are owned by `AutoFlowConfig`. The GUI auto-segmentation dialog is initialized from the segmentation config bundle. Keep this distinction explicit when documenting or refactoring.
+The CLI auto-segmentation public config fields are owned by `AutoFlowConfig`. The GUI auto-segmentation dialog is initialized from the segmentation config bundle. Both use an empty model path to select the bundled model, which is resolved from the installed package rather than the current working directory. Keep this distinction explicit when documenting or refactoring.
