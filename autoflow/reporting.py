@@ -37,7 +37,8 @@ def print_metrics_summary(table_rows):
             mv = row.get("meanv_cm_s", 0.0)
         refl = row.get("reflux_fraction", 0.0)
         ic = row.get("path_ic", 1.0)
-        print(f"  {pidx:>6} {path:>5} {nf:>18.4f} " f"{pv_:>20.3f} {mv:>20.3f} {refl:>7.3f} {ic:>6.3f}")
+        ic_text = "undef" if ic is None else f"{float(ic):.3f}"
+        print(f"  {pidx:>6} {path:>5} {nf:>18.4f} " f"{pv_:>20.3f} {mv:>20.3f} {refl:>7.3f} {ic_text:>6}")
 
 
 def _format_path_group(v):
@@ -137,5 +138,9 @@ def print_qc_summary(qc_data, forks=None):
     print(f"  {'Fork':>6} {'Internal Consistency':>24} {'Left':>24} {'Right':>24}")
     print(f"  {'-'*6} {'-'*24} {'-'*24} {'-'*24}")
     for fork_idx, ic, left_txt, right_txt in rows:
-        ic_str = f"{float(ic):.6f}" if np.isfinite(ic) else "nan"
+        try:
+            ic_value = float(ic)
+            ic_str = f"{ic_value:.6f}" if np.isfinite(ic_value) else "nan"
+        except (TypeError, ValueError):
+            ic_str = "undefined"
         print(f"  {str(fork_idx):>6} {ic_str:>24} {left_txt:>24} {right_txt:>24}")

@@ -1,0 +1,43 @@
+name: Documentation
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install documentation tools
+        run: python -m pip install -e ".[docs]"
+      - name: Build site
+        run: mkdocs build --strict
+      - name: Check out organization Pages repository
+        uses: actions/checkout@v4
+        with:
+          repository: AssociatedPrimeIdeal/AssociatedPrimeIdeal.github.io
+          token: ${{ secrets.DOCS_REPO_TOKEN }}
+          path: pages-repository
+      - name: Sync AutoFlow site into docs/autoflow
+        run: |
+          mkdir -p pages-repository/autoflow-docs
+          find pages-repository/autoflow-docs -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+          cp -a site/. pages-repository/autoflow-docs/
+      - name: Commit and push documentation
+        working-directory: pages-repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add autoflow-docs
+          git diff --cached --quiet || git commit -m "docs: publish AutoFlow site"
+          git push

@@ -114,8 +114,18 @@ def filter_paths_by_segmentation(paths, segmentation_labels, spacing=(1, 1, 1), 
             continue
         info = infos[idx] if idx < len(infos) and isinstance(infos[idx], dict) else {}
         roles = {str(item.get("role", "")) for item in info.get("fork_roles", []) if isinstance(item, dict)}
-        # Incoming paths end at a fork; outgoing paths start at one.
-        if "incoming" in roles and "outgoing" not in roles:
+        junction_endpoint = str(info.get("junction_endpoint", "") or "").strip().lower()
+        # Incoming paths end at a fork; outgoing paths start at one.  The
+        # topology-only pre-pass does not have reliable roles yet, so use the
+        # endpoint attached to a degree-based junction as a direction-neutral
+        # free-end hint.
+        if not roles and junction_endpoint == "end":
+            candidates = [r for r in runs if r[1] <= len(dense) * 0.5]
+            source = "free_start_of_topology_junction"
+        elif not roles and junction_endpoint == "start":
+            candidates = [r for r in runs if r[2] >= len(dense) * 0.5]
+            source = "free_end_of_topology_junction"
+        elif "incoming" in roles and "outgoing" not in roles:
             candidates = [r for r in runs if r[1] <= len(dense) * 0.5]
             source = "free_start_of_incoming"
         elif "outgoing" in roles and "incoming" not in roles:
@@ -297,6 +307,7 @@ def generate_planes_from_paths(
     segmentation_origin=(0, 0, 0),
     return_qc=False,
     fork_points=None,
+    forks=None,
 ):
     if use_center_plane is not None:
         plane_mode = "count" if bool(use_center_plane) else "distance"
@@ -311,7 +322,7 @@ def generate_planes_from_paths(
     if segmentation_filter:
         paths_input, filter_qc = filter_paths_by_segmentation(
             paths_input, segmentation_labels, spacing=segmentation_spacing,
-            origin=segmentation_origin, path_info=path_info, forks=None, inter_time=inter_time)
+            origin=segmentation_origin, path_info=path_info, forks=forks, inter_time=inter_time)
     else:
         filter_qc = [{"segmentation_filter": False} for _ in paths_input]
 

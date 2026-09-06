@@ -129,6 +129,8 @@ launch_gui(config_dir="./configs")
 | `plane_anchor` | string | `center` | `start`, `center`, `end`, or `junction` placement anchor | `autoflow/algorithms/planes.py` |
 | `plane_offset_mm` | float | `5.0` | first offset from the graph junction in anchored-offset mode | `autoflow/algorithms/planes.py` |
 | `remove_small_cc` | bool | `True` | drop small components before skeletonization | `autoflow/algorithms/preprocess.py` |
+| `separate_special_label_contacts` | bool | `True` | separate contacts only between configured special labels (default: `RBCT`, `CCA`, `LBCT`) | `autoflow/algorithms/preprocess.py` |
+| `special_contact_labels` | list[str] | `["RBCT", "CCA", "LBCT"]` | names of labels whose pairwise contacts are separated | `autoflow/core/models.py` |
 | `min_cc_volume` | float | `50.0` | absolute component threshold in mm^3 | `autoflow/algorithms/preprocess.py` |
 | `cc_filter_mode` | string | `hybrid` | choose `absolute`, `relative`, `hybrid`, or `largest` component filtering | `autoflow/algorithms/preprocess.py` |
 | `cc_rel_min_ratio` | float | `0.01` | relative threshold against the largest component for `relative` and `hybrid` filtering | `autoflow/algorithms/preprocess.py` |

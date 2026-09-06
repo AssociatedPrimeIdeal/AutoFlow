@@ -13,6 +13,15 @@ Plane metrics compute time-resolved cross-sectional measurements for each plane 
 
 For each unique segmentation phase, plane metrics build one thresholded VTK support mesh and reuse it across all planes. Each plane still has its own slice and connectivity selection, while repeated cardiac phases reuse the resulting slice specification. Plane centers remain local physical coordinates and are shifted by `origin` only for VTK slicing.
 
+Generated planes are filtered before metric integration when their requested
+branch has no cells in the segmentation-filtered cross-section. The exclusion
+criterion is missing geometric support (`area_mm2 == 0` after branch
+selection), not a zero numerical flow value. This keeps real low-flow or
+forward/reverse-cancelling planes. A path with no remaining valid planes stays
+in the graph topology but has no path metric; its path IC is `null`/undefined,
+and a fork that is missing a path metric is also reported as incomplete rather
+than treating the missing path as zero flow.
+
 ## When To Use It
 - use it after planes exist
 - use it when you need per-plane flow, area, and velocity curves
@@ -84,7 +93,7 @@ Use the standard `run_case()` or `run_batch()` flow. Plane metrics run unless `s
 | `meanv_cm_s`, `meanv_cm_s_t` | cm/s | mean through-plane velocity summary and its per-timepoint curve | `plane_metrics.json`, ortho viewer, `Plane Curve` mode, `planes.h5` |
 | `flowrate_forward_mL_s`, `flowrate_reverse_mL_s` | arrays, mL/s | forward and reverse components after AutoFlow resolves the forward direction along the local path | `plane_metrics.json`, `Plane Curve` mode, `planes.h5` |
 | `meanv_signed_cm_s`, `meanv_signed_cm_s_t` | cm/s | signed mean velocity aligned to the resolved forward direction | `plane_metrics.json`, `planes.h5` |
-| `path_ic`, `fork_ic` | unitless | internal-consistency checks along a path and across forks | `plane_metrics.json`, `plane_qc.json`, GUI `Internal Consistency` mode |
+| `path_ic`, `fork_ic` | unitless or `null` | internal-consistency checks along a path and across forks; paths with fewer than two valid planes and forks missing a path metric are reported as `null`/undefined rather than a misleading perfect score or zero | `plane_metrics.json`, `plane_qc.json`, GUI `Internal Consistency` mode |
 | `forward_sign`, `forward_sign_source` | int and string | how the forward direction was resolved for the plane | `plane_metrics.json`, `planes.h5` |
 | `local_path_tangent`, `local_path_direction`, `normal_tangent_cos` | vector, text, scalar | relationship between the plane normal and the local centerline tangent | `plane_metrics.json`, `planes.h5` |
 | `tke_*` | J/m^3 | derived TKE summaries; present only when TKE is available and requested | `plane_metrics.json`, `planes.h5`, `Plane Curve` mode |

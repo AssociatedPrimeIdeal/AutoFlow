@@ -94,12 +94,21 @@ def summarize_internal_consistency(plane_metrics, path_info=None, forks=None):
         mu = float(np.mean(arr)) if len(arr) else 0.0
         by_path_mean[pidx] = mu
         if len(arr) <= 1:
-            ic = 1.0
+            # A path with zero or one usable plane has no consistency
+            # comparison to make.  Report it as undefined instead of
+            # presenting a vacuous perfect score.
+            ic = None
         elif mu <= 1e-12:
             ic = 1.0 if float(np.max(arr)) <= 1e-12 else 0.0
         else:
             ic = 1.0 - float(np.mean(np.abs(arr - mu)) / mu)
-        path_ic[str(int(pidx))] = float(np.clip(ic, 0.0, 1.0))
+        path_ic[str(int(pidx))] = None if ic is None else float(np.clip(ic, 0.0, 1.0))
+    # Keep topology paths with no usable plane metrics visible in QC as
+    # undefined.  They must not silently disappear or be interpreted as zero
+    # flow by fork consistency calculations.
+    if path_info is not None:
+        for pidx in range(len(path_info)):
+            path_ic.setdefault(str(int(pidx)), None)
     # When segmentation filtering is active, expose an additional consistency
     # view keyed by the numeric segmentation label.  Path consistency remains
     # available for topology QC and backwards compatibility.
@@ -124,12 +133,29 @@ def summarize_internal_consistency(plane_metrics, path_info=None, forks=None):
         right = [int(x) for x in fork.get("right", [])]
         sum_left = float(np.sum([abs(by_path_mean.get(x, 0.0)) for x in left]))
         sum_right = float(np.sum([abs(by_path_mean.get(x, 0.0)) for x in right]))
-        denom = sum_left + sum_right
-        if denom <= 1e-12:
-            ic = 1.0
+        # A topology fork with no incoming or no outgoing path has no
+        # meaningful conservation comparison.  This can happen when local
+        # flow orientation is ambiguous; report it as undefined instead of
+        # manufacturing an IC of zero (or one for an empty fork).
+        missing_left = [x for x in left if x not in by_path_mean]
+        missing_right = [x for x in right if x not in by_path_mean]
+        if not left or not right:
+            ic = None
+            status = "one_sided_topology"
+        elif missing_left or missing_right:
+            # A missing path means no plane supplied a measurable flow for
+            # that side.  Treating it as numerical zero would bias the fork
+            # conservation score, so report the comparison as incomplete.
+            ic = None
+            status = "missing_path_metrics"
         else:
-            ic = 1.0 - 2.0 * abs(sum_left - sum_right) / denom
-        ic = float(np.clip(ic, 0.0, 1.0))
+            denom = sum_left + sum_right
+            if denom <= 1e-12:
+                ic = 1.0
+            else:
+                ic = 1.0 - 2.0 * abs(sum_left - sum_right) / denom
+            ic = float(np.clip(ic, 0.0, 1.0))
+            status = "ok"
         fork_ic[str(int(fork_id))] = ic
         item = {
             "fork_id": int(fork_id),
@@ -138,6 +164,7 @@ def summarize_internal_consistency(plane_metrics, path_info=None, forks=None):
             "crosspoint": fork.get("crosspoint", [0.0, 0.0, 0.0]),
             "node": int(fork.get("node", -1)),
             "ic": ic,
+            "status": status,
         }
         if path_info is not None:
             item["left_dirs"] = [path_info[x].get("direction_text", "") for x in left if 0 <= x < len(path_info)]
@@ -152,7 +179,8 @@ def apply_internal_consistency_to_metrics(plane_metrics, path_info=None, forks=N
     qc = summarize_internal_consistency(metrics, path_info=path_info, forks=forks)
     for metric in metrics:
         pidx = str(int(metric.get("path_index", -1)))
-        metric["path_ic"] = float(qc["path_ic"].get(pidx, 1.0))
+        path_ic = qc["path_ic"].get(pidx, None)
+        metric["path_ic"] = None if path_ic is None else float(path_ic)
         seg_label = str(int(metric.get("segmentation_label", 0) or 0))
         metric["segmentation_label_ic"] = float(qc.get("segmentation_label_ic", {}).get(seg_label, 1.0))
         rel = []
@@ -160,7 +188,12 @@ def apply_internal_consistency_to_metrics(plane_metrics, path_info=None, forks=N
             pid = int(metric.get("path_index", -1))
             if pid in fork.get("left", []) or pid in fork.get("right", []):
                 role = "incoming" if pid in fork.get("left", []) else "outgoing"
-                rel.append({"fork_id": int(fork.get("fork_id", -1)), "role": role, "ic": float(fork.get("ic", 1.0))})
+                fork_ic_value = fork.get("ic", 1.0)
+                rel.append({
+                    "fork_id": int(fork.get("fork_id", -1)),
+                    "role": role,
+                    "ic": None if fork_ic_value is None else float(fork_ic_value),
+                })
         metric["fork_ic"] = rel
     return metrics, qc
 
@@ -287,6 +320,131 @@ def _build_plane_support_mesh_cache(mask4d, mask_phase_lookup, spacing, origin):
     for rep_t in sorted({int(x) for x in mask_phase_lookup}):
         cache[rep_t] = _build_plane_support_mesh(mask4d[..., rep_t], spacing, origin)
     return cache
+
+
+def filter_planes_by_branch_support(
+    planes,
+    mask4d,
+    spacing,
+    origin,
+    branch_labels_3d=None,
+    segmentation_labels_3d=None,
+    *,
+    branch_label_offset=0,
+    support_cache=None,
+):
+    """Drop generated planes whose requested branch has no slice support.
+
+    A zero numerical flow value is not sufficient evidence that a plane is
+    invalid: a real vessel can have low or cancelling flow.  This helper only
+    rejects a plane when its branch-filtered cross-section has no cells in any
+    representative mask phase.  The returned QC keeps the original local
+    plane index so callers can report stable diagnostics without renumbering
+    graph paths.
+    """
+    planes = list(planes or [])
+    mask = _ensure_mask4d(mask4d)
+    if not planes:
+        return [], []
+    # Without a branch volume there is no safe way to decide ownership.  Keep
+    # all planes and make the reason explicit for callers that want to expose
+    # QC details.
+    branch_array = None if branch_labels_3d is None else np.asarray(branch_labels_3d)
+    if branch_array is None or branch_array.shape != mask.shape[:3] or not np.any(branch_array > 0):
+        reason = "branch_labels_unavailable" if branch_array is None else "branch_labels_empty_or_mismatched"
+        return list(planes), [
+            {
+                "plane_index": int(i),
+                "path_index": int(getattr(plane, "path_index", -1)),
+                "valid": True,
+                "reason": reason,
+                "supported_phase_count": 0,
+                "max_cell_count": 0,
+            }
+            for i, plane in enumerate(planes)
+        ]
+
+    cache = support_cache if isinstance(support_cache, dict) else {}
+    branch_grid = cache.get("branch_grid")
+    phase_lookup = cache.get("phase_lookup")
+    support_mesh_cache = cache.get("support_mesh_cache")
+    if branch_grid is None:
+        branch_grid = _build_branch_grid(branch_array, spacing, origin)
+        cache["branch_grid"] = branch_grid
+    if phase_lookup is None:
+        phase_lookup = _build_mask_phase_lookup(mask)
+        cache["phase_lookup"] = phase_lookup
+    # Plane eligibility only needs to know whether the branch is supported in
+    # at least one cardiac phase.  A single union probe mask is sufficient and
+    # avoids constructing one VTK mesh per temporal phase during generation;
+    # the metric stage still performs the exact per-phase sampling later.
+    probe_mask = cache.get("probe_mask")
+    if probe_mask is None:
+        probe_mask = np.any(mask, axis=3)
+        cache["probe_mask"] = np.asarray(probe_mask, dtype=bool)
+    probe_mesh = cache.get("probe_mesh")
+    if probe_mesh is None:
+        probe_mesh = _build_plane_support_mesh(probe_mask, spacing, origin)
+        cache["probe_mesh"] = probe_mesh
+    segmentation_mesh_cache = cache.setdefault("segmentation_mesh_cache", {})
+    seg3d = None
+    if segmentation_labels_3d is not None:
+        seg3d = np.asarray(segmentation_labels_3d)
+        if seg3d.ndim == 4:
+            seg3d = seg3d[..., 0]
+        if seg3d.shape != mask.shape[:3]:
+            seg3d = None
+
+    valid_planes = []
+    qc = []
+    for plane_index, plane in enumerate(planes):
+        path_index = int(getattr(plane, "path_index", -1))
+        target_label = int(getattr(plane, "label", 0) or 0)
+        if int(branch_label_offset) and path_index >= 0:
+            target_label = path_index + 1 + int(branch_label_offset)
+        plane_seg_label = int(getattr(plane, "segmentation_label", 0) or 0)
+        supported_phase_count = 0
+        max_cell_count = 0
+        mask_t = np.asarray(probe_mask, dtype=bool)
+        if plane_seg_label > 0 and seg3d is not None:
+            mask_t = mask_t & (seg3d == plane_seg_label)
+            mesh_key = int(plane_seg_label)
+            if mesh_key not in segmentation_mesh_cache:
+                segmentation_mesh_cache[mesh_key] = _build_plane_support_mesh(
+                    mask_t, spacing, origin
+                )
+            support_mesh = segmentation_mesh_cache.get(mesh_key)
+        else:
+            support_mesh = probe_mesh
+        spec = _build_plane_slice_spec(
+            mask_t,
+            plane,
+            spacing,
+            origin,
+            branch_grid=branch_grid,
+            target_label=target_label,
+            select_connected=True,
+            support_mesh=support_mesh,
+        )
+        cell_count = int(len(spec.get("cell_ids", []))) if spec is not None else 0
+        max_cell_count = cell_count
+        supported_phase_count = 1 if cell_count > 0 else 0
+        valid = supported_phase_count > 0
+        record = {
+            "plane_index": int(plane_index),
+            "path_index": int(path_index),
+            "branch_label": int(target_label),
+            "segmentation_label": int(plane_seg_label),
+            "valid": bool(valid),
+            "reason": "" if valid else "no_branch_support",
+            "supported_phase_count": int(supported_phase_count),
+            "phase_count": int(len(set(phase_lookup))),
+            "max_cell_count": int(max_cell_count),
+        }
+        qc.append(record)
+        if valid:
+            valid_planes.append(plane)
+    return valid_planes, qc
 
 
 def _build_plane_slice_spec(

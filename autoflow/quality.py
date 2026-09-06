@@ -342,22 +342,47 @@ def build_quality_report(workspace, source_path="", run_context=None):
                 empty_planes.append(int(plane_index))
             elif float(np.mean(finite_areas)) > 0.0:
                 area_cvs.append(float(np.std(finite_areas) / np.mean(finite_areas)))
-        metric_status = "fail" if empty_planes else ("warn" if area_cvs and max(area_cvs) > 0.20 else "pass")
+        plane_qc = dict(getattr(getattr(ws, "derived", None), "plane_qc", {}) or {})
+        layout_qc = dict(plane_qc.get("plane_layout", {}) or {})
+        dropped_plane_items = [
+            item for item in list(layout_qc.get("planes", []) or [])
+            if isinstance(item, dict) and not bool(item.get("valid", True))
+        ]
+        no_valid_paths = [
+            item for item in list(layout_qc.get("paths", []) or [])
+            if isinstance(item, dict) and str(item.get("path_status", "")) == "no_valid_planes"
+        ]
+        metric_status = "fail" if empty_planes else ("warn" if (
+            (area_cvs and max(area_cvs) > 0.20) or dropped_plane_items or no_valid_paths
+        ) else "pass")
         checks.append(_check(
             "hemodynamics.plane_metrics",
             "Hemodynamics",
             metric_status,
             "Plane sampling",
-            f"metrics={len(metrics)}, empty planes={len(empty_planes)}, max area CV={max(area_cvs) if area_cvs else 0.0:.2%}",
-            value={"metric_count": len(metrics), "empty_plane_indices": empty_planes, "max_area_cv": max(area_cvs) if area_cvs else 0.0},
+            f"metrics={len(metrics)}, empty planes={len(empty_planes)}, dropped planes={len(dropped_plane_items)}, "
+            f"paths without valid planes={len(no_valid_paths)}, max area CV={max(area_cvs) if area_cvs else 0.0:.2%}",
+            value={
+                "metric_count": len(metrics),
+                "empty_plane_indices": empty_planes,
+                "dropped_plane_count": len(dropped_plane_items),
+                "no_valid_path_count": len(no_valid_paths),
+                "max_area_cv": max(area_cvs) if area_cvs else 0.0,
+            },
             threshold="no empty plane slices; warn when temporal area CV >20%",
             action="Inspect empty slices and phases with abrupt cross-sectional area changes." if metric_status != "pass" else "",
         ))
 
-        plane_qc = dict(getattr(getattr(ws, "derived", None), "plane_qc", {}) or {})
-        ic_values = [float(value) for value in dict(plane_qc.get("path_ic", {}) or {}).values()]
-        ic_values.extend(float(value) for value in dict(plane_qc.get("segmentation_label_ic", {}) or {}).values())
-        ic_values.extend(float(value) for value in dict(plane_qc.get("fork_ic", {}) or {}).values())
+        ic_values = []
+        for collection in (
+            dict(plane_qc.get("path_ic", {}) or {}).values(),
+            dict(plane_qc.get("segmentation_label_ic", {}) or {}).values(),
+            dict(plane_qc.get("fork_ic", {}) or {}).values(),
+        ):
+            ic_values.extend(
+                float(value) for value in collection
+                if value is not None and np.isfinite(float(value))
+            )
         if ic_values:
             min_ic = float(min(ic_values))
             ic_status = "pass" if min_ic >= 0.8 else ("warn" if min_ic >= 0.6 else "fail")

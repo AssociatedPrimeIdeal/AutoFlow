@@ -415,6 +415,7 @@ class SliceView(QtWidgets.QFrame):
             )
         rgba = np.asarray(overlay, dtype=np.uint8)
         self.overlay_item.setImage(np.transpose(rgba, (1, 0, 2)), autoLevels=False)
+        self.overlay_item.setOpacity(float(np.max(rgba[..., 3])) / 255.0)
         self.overlay_item.setRect(rect)
         self.overlay_item.show()
 
@@ -425,7 +426,9 @@ class SliceView(QtWidgets.QFrame):
             self.overlay_item.clear()
             self.overlay_item.hide()
         else:
-            self.overlay_item.setImage(np.transpose(np.asarray(overlay, dtype=np.uint8), (1, 0, 2)), autoLevels=False)
+            rgba = np.asarray(overlay, dtype=np.uint8)
+            self.overlay_item.setImage(np.transpose(rgba, (1, 0, 2)), autoLevels=False)
+            self.overlay_item.setOpacity(float(np.max(rgba[..., 3])) / 255.0)
             self.overlay_item.show()
         self.update_cursor(cursor, fixed_index, levels)
 

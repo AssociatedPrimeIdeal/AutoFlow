@@ -137,6 +137,8 @@ DEFAULT_SKELETON_LABEL_MAP = {
     "RIJV": 32,
 }
 
+DEFAULT_SPECIAL_CONTACT_LABELS = ["RBCT", "CCA", "LBCT"]
+
 DEFAULT_SKELETON_LABEL_GROUPS = {
     "aorta_systemic_branches": {
         "labels": ["AAO", "ARCH", "DAO", "RBCT", "CCA", "LBCT", "HA", "SMA", "LRA", "RRA"],
@@ -232,6 +234,9 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "use_multithread": True,
         "reuse_planes": "",
     },
+    "ui": {
+        "background_color": "#000000",
+    },
     "loader": {
         "background_phase_correction": {
             "enabled": False,
@@ -269,6 +274,8 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
     },
     "skeleton": {
         "remove_small_cc": True,
+        "separate_special_label_contacts": True,
+        "special_contact_labels": list(DEFAULT_SPECIAL_CONTACT_LABELS),
         "min_cc_volume_mm3": 50.0,
         "cc_filter_mode": "hybrid",
         "cc_rel_min_ratio": 0.01,
@@ -850,6 +857,8 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
         "segmentation_filter": bool(plane_cfg.get("segmentation_filter", True)),
         "use_center_plane": plane_cfg.get("use_center_plane", None),
         "remove_small_cc": bool(skeleton_cfg.get("remove_small_cc", True)),
+        "separate_special_label_contacts": bool(skeleton_cfg.get("separate_special_label_contacts", skeleton_cfg.get("separate_label_contacts", True))),
+        "special_contact_labels": copy.deepcopy(skeleton_cfg.get("special_contact_labels", DEFAULT_SPECIAL_CONTACT_LABELS)),
         "min_cc_volume": float(skeleton_cfg.get("min_cc_volume_mm3", 50.0)),
         "cc_filter_mode": str(skeleton_cfg.get("cc_filter_mode", "hybrid") or "hybrid"),
         "cc_rel_min_ratio": float(skeleton_cfg.get("cc_rel_min_ratio", 0.01)),

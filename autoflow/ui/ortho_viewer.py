@@ -60,6 +60,16 @@ class OrthoViewer(QtWidgets.QWidget):
         self.combo_content.currentIndexChanged.connect(self._on_content_changed)
         ctrl.addWidget(QtWidgets.QLabel("Content:"))
         ctrl.addWidget(self.combo_content, 1)
+        ctrl.addWidget(QtWidgets.QLabel("Overlay:"))
+        self.slider_overlay_opacity = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.slider_overlay_opacity.setRange(0, 100)
+        self.slider_overlay_opacity.setFixedWidth(78)
+        self.slider_overlay_opacity.setToolTip("Segmentation overlay opacity")
+        self.slider_overlay_opacity.valueChanged.connect(self._on_overlay_opacity_changed)
+        ctrl.addWidget(self.slider_overlay_opacity)
+        self.label_overlay_opacity = QtWidgets.QLabel("35%")
+        self.label_overlay_opacity.setMinimumWidth(34)
+        ctrl.addWidget(self.label_overlay_opacity)
         self.btn_reset_views = QtWidgets.QPushButton()
         self.btn_reset_views.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_BrowserReload)
@@ -281,6 +291,28 @@ class OrthoViewer(QtWidgets.QWidget):
     def _on_content_changed(self, _):
         self._manual_levels = None
         self.refresh(update_plane=False)
+
+    def _on_overlay_opacity_changed(self, value):
+        opacity = float(np.clip(float(value) / 100.0, 0.0, 1.0))
+        self.workspace.segmentation.opacity = opacity
+        self.label_overlay_opacity.setText(f"{int(value)}%")
+        for view in self.slice_views.values():
+            view.overlay_item.setOpacity(opacity)
+        # Keep the 3-D segmentation surface in sync with the 2-D overlay.
+        for obj in self.workspace.scene_objects.values():
+            if str(getattr(obj, "data_key", "")) == "segmask_raw_surface":
+                obj.opacity = opacity
+                scene = getattr(self.parent(), "scene", None)
+                if scene is not None:
+                    scene.apply_object_properties(obj, render=False, refresh_scalar_bar=False)
+        self.refresh(update_plane=False)
+
+    def _sync_overlay_opacity_control(self):
+        value = int(round(float(np.clip(getattr(self.workspace.segmentation, "opacity", 0.35), 0.0, 1.0)) * 100.0))
+        self.slider_overlay_opacity.blockSignals(True)
+        self.slider_overlay_opacity.setValue(value)
+        self.slider_overlay_opacity.blockSignals(False)
+        self.label_overlay_opacity.setText(f"{value}%")
 
     def _refresh_correction_content_availability(self):
         def valid(field):
@@ -792,6 +824,7 @@ class OrthoViewer(QtWidgets.QWidget):
         self._refresh_correction_content_availability()
         self._refresh_phase_unwrap_content_availability()
         ws = self.workspace
+        self._sync_overlay_opacity_control()
         t = int(ws.current_t)
         if update_plane:
             self._slice_keys.clear()

@@ -7,7 +7,7 @@ from .paths import _vector_orientation_text, inter_points
 
 def _orient_node_paths_by_flow(node_paths, graph_points, flow_xyzt3=None, segmask_binary_4d=None,
                                spacing=(1.0, 1.0, 1.0), origin=(0.0, 0.0, 0.0),
-                               confidence_eps=0.05):
+                               confidence_eps=0.05, sample_paths=None):
     if flow_xyzt3 is None or segmask_binary_4d is None:
         return [list(map(int, p)) for p in node_paths]
     flow = np.asarray(flow_xyzt3, dtype=np.float32)
@@ -17,12 +17,20 @@ def _orient_node_paths_by_flow(node_paths, graph_points, flow_xyzt3=None, segmas
     if mask.ndim == 3:
         mask = np.repeat(mask[..., np.newaxis], flow.shape[3], axis=3)
     out = []
-    for nodes in node_paths:
+    for path_index, nodes in enumerate(node_paths):
         nodes = list(map(int, nodes))
         if len(nodes) < 2:
             out.append(nodes)
             continue
-        pts = np.asarray(graph_points[nodes], dtype=float)
+        # Direction is estimated on the segmentation-filtered geometry when
+        # available.  The graph-node path is retained as the output geometry;
+        # ``sample_paths`` only controls the flow score used to orient it.
+        sampled_path = None
+        if sample_paths is not None and path_index < len(sample_paths):
+            candidate = np.asarray(sample_paths[path_index], dtype=float).reshape(-1, 3)
+            if len(candidate) >= 2:
+                sampled_path = candidate
+        pts = sampled_path if sampled_path is not None else np.asarray(graph_points[nodes], dtype=float)
         vox = np.rint((pts - origin.reshape(1, 3)) / (spacing.reshape(1, 3) + 1e-12)).astype(int)
         for k in range(3):
             vox[:, k] = np.clip(vox[:, k], 0, flow.shape[k] - 1)
@@ -53,7 +61,12 @@ def _orient_node_paths_by_flow(node_paths, graph_points, flow_xyzt3=None, segmas
     return out
 
 
-def find_path_forks(node_paths, node_points):
+def _find_endpoint_forks(node_paths, node_points):
+    """Legacy endpoint-matching fork detection.
+
+    Kept as a compatibility fallback for callers that do not provide the
+    source graph.  The pipeline uses topology-based detection below.
+    """
     forks = []
     seen = set()
     for i, path in enumerate(node_paths):
@@ -83,11 +96,58 @@ def find_path_forks(node_paths, node_points):
     return forks
 
 
+def find_path_forks(node_paths, node_points, graph=None):
+    """Find forks from graph topology, independent of path orientation.
+
+    A fork is a graph node with degree >= 3.  ``left`` and ``right`` retain
+    their historical meaning (paths ending at the node versus paths starting
+    at it), but an empty side is allowed when flow-based path orientation is
+    locally ambiguous.  This keeps the topological fork visible while leaving
+    direction assignment to the flow/orientation stage.
+
+    ``graph`` is optional for backwards compatibility; callers using the old
+    two-argument form retain the previous endpoint-matching behavior.
+    """
+    if graph is None:
+        return _find_endpoint_forks(node_paths, node_points)
+    G = graph_to_networkx(graph)
+    points = np.asarray(node_points, dtype=float)
+    forks = []
+    for node, degree in sorted(G.degree(), key=lambda item: int(item[0])):
+        if int(degree) < 3:
+            continue
+        left = [
+            int(index) for index, path in enumerate(node_paths)
+            if len(path) > 0 and int(path[-1]) == int(node)
+        ]
+        right = [
+            int(index) for index, path in enumerate(node_paths)
+            if len(path) > 0 and int(path[0]) == int(node)
+        ]
+        incident = sorted(set(left + right))
+        # A malformed decomposition can omit an edge from the path list.  Do
+        # not manufacture an orphan fork marker, but preserve degree-based
+        # detection whenever at least two path arms are represented.
+        if len(incident) < 2:
+            continue
+        point = points[int(node)].tolist() if 0 <= int(node) < len(points) else [0.0, 0.0, 0.0]
+        forks.append({
+            "left": sorted(set(left)),
+            "right": sorted(set(right)),
+            "crosspoint": point,
+            "node": int(node),
+            "topology": "degree",
+            "degree": int(degree),
+        })
+    return forks
+
+
 def build_path_info(node_paths, graph_points, forks=None):
     path_to_forks = {}
     path_to_roles = {}
     path_to_incoming = {}
     path_to_outgoing = {}
+    path_to_junction_endpoints = {}
     for fork_id, fork in enumerate(forks or []):
         left = [int(pid) for pid in fork.get("left", [])]
         right = [int(pid) for pid in fork.get("right", [])]
@@ -96,11 +156,13 @@ def build_path_info(node_paths, graph_points, forks=None):
             path_to_roles.setdefault(pid, []).append({"fork_id": int(fork_id), "role": "incoming"})
             path_to_incoming.setdefault(pid, set()).update(x for x in left if x != pid)
             path_to_outgoing.setdefault(pid, set()).update(right)
+            path_to_junction_endpoints.setdefault(pid, set()).add("end")
         for pid in right:
             path_to_forks.setdefault(pid, []).append(int(fork_id))
             path_to_roles.setdefault(pid, []).append({"fork_id": int(fork_id), "role": "outgoing"})
             path_to_incoming.setdefault(pid, set()).update(left)
             path_to_outgoing.setdefault(pid, set()).update(x for x in right if x != pid)
+            path_to_junction_endpoints.setdefault(pid, set()).add("start")
     infos = []
     for i, nodes in enumerate(node_paths):
         pts = np.asarray(graph_points[nodes], dtype=float) if len(nodes) else np.empty((0, 3), dtype=float)
@@ -108,6 +170,15 @@ def build_path_info(node_paths, graph_points, forks=None):
         nd = d / (np.linalg.norm(d) + 1e-12) if np.linalg.norm(d) > 0 else np.zeros(3, dtype=float)
         incoming_ids = sorted(int(x) for x in path_to_incoming.get(int(i), set()) if int(x) != int(i))
         outgoing_ids = sorted(int(x) for x in path_to_outgoing.get(int(i), set()) if int(x) != int(i))
+        junction_endpoints = path_to_junction_endpoints.get(int(i), set())
+        if junction_endpoints == {"start"}:
+            junction_endpoint = "start"
+        elif junction_endpoints == {"end"}:
+            junction_endpoint = "end"
+        elif junction_endpoints == {"start", "end"}:
+            junction_endpoint = "both"
+        else:
+            junction_endpoint = "none"
         infos.append({
             "path_index": int(i),
             "start_node": int(nodes[0]) if len(nodes) else -1,
@@ -120,12 +191,14 @@ def build_path_info(node_paths, graph_points, forks=None):
             "fork_roles": path_to_roles.get(int(i), []),
             "incoming_path_ids": incoming_ids,
             "outgoing_path_ids": outgoing_ids,
+            "junction_endpoint": junction_endpoint,
         })
     return infos
 
 
 def segment_vessels_from_graph_and_mask(segmask_3d, graph, resolution, flow_xyzt3=None,
-                                        segmask_binary_4d=None, origin=(0, 0, 0)):
+                                        segmask_binary_4d=None, origin=(0, 0, 0),
+                                        segmentation_labels=None):
     mask3d = np.asarray(segmask_3d, dtype=bool)
     G = graph_to_networkx(graph)
     if G.number_of_nodes() == 0:
@@ -163,14 +236,42 @@ def segment_vessels_from_graph_and_mask(segmask_3d, graph, resolution, flow_xyzt
 
             if curr in keynodes:
                 node_paths.append(path)
+    graph_points = np.asarray(graph.points, dtype=float)
+    raw_point_paths = [graph_points[np.asarray(nodes, dtype=int)] for nodes in node_paths]
+
+    # Build a direction-independent topology view first.  It supplies the
+    # junction endpoint hint needed to clip each path to its free-end label
+    # before flow orientation is estimated.
+    topology_forks = find_path_forks(node_paths, graph_points, graph=graph)
+    topology_info = build_path_info(node_paths, graph_points, topology_forks)
+    for item in topology_info:
+        # Roles in this provisional view depend on the arbitrary traversal
+        # order.  Keep only the endpoint hint for the first segmentation pass.
+        item["fork_roles"] = []
+        item["incoming_path_ids"] = []
+        item["outgoing_path_ids"] = []
+    filtered_paths = raw_point_paths
+    if segmentation_labels is not None:
+        from .planes import filter_paths_by_segmentation
+
+        filtered_paths, _ = filter_paths_by_segmentation(
+            raw_point_paths,
+            segmentation_labels,
+            spacing=resolution,
+            origin=origin,
+            path_info=topology_info,
+            forks=topology_forks,
+            inter_time=10,
+        )
+
     node_paths = _orient_node_paths_by_flow(
-        node_paths, np.asarray(graph.points, dtype=float),
+        node_paths, graph_points,
         flow_xyzt3=flow_xyzt3, segmask_binary_4d=segmask_binary_4d,
-        spacing=resolution, origin=origin,
+        spacing=resolution, origin=origin, sample_paths=filtered_paths,
     )
-    point_paths = [np.asarray(graph.points[np.asarray(nodes, dtype=int)], dtype=float) for nodes in node_paths]
-    forks = find_path_forks(node_paths, np.asarray(graph.points, dtype=float))
-    path_info = build_path_info(node_paths, np.asarray(graph.points, dtype=float), forks)
+    point_paths = [graph_points[np.asarray(nodes, dtype=int)] for nodes in node_paths]
+    forks = find_path_forks(node_paths, graph_points, graph=graph)
+    path_info = build_path_info(node_paths, graph_points, forks)
 
     labels = np.zeros(mask3d.shape, dtype=np.int16)
     if len(point_paths) == 0:

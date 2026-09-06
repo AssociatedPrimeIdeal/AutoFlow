@@ -35,6 +35,11 @@ Segmentation gives AutoFlow the lumen mask needed for skeletons, graphs, planes,
 
 The right dock opens on `Segmentation`. Its first `Source` section contains active-source switching, visibility, opacity, provenance, `Configure...`, `Import...`, and `Save...`; its `Edit` section contains the explicit `Run Automatic Segmentation` command. The top menu bar does not duplicate these commands in a separate `Segmentation` menu.
 
+The right ortho viewer's `Overlay` slider controls the opacity of the
+segmentation label overlay on the `Content` slices. The 3-D Browser has a
+separate per-object opacity control for segmentation surfaces and other scene
+layers such as planes and streamlines.
+
 During a manual stroke, only the active slice overlay is redrawn. Linked views refresh when the stroke ends, and the label browser uses incrementally maintained counts instead of repeatedly scanning the complete XYZT label array.
 
 ### CLI

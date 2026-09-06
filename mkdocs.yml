@@ -1,0 +1,118 @@
+site_name: AutoFlow · 4D Flow MRI
+site_description: 面向 4D Flow MRI 的加载、分割、血流分析与质量控制文档
+site_author: AutoFlow contributors
+site_url: https://associatedprimeideal.github.io/autoflow-docs/
+repo_url: https://github.com/AssociatedPrimeIdeal/AutoFlow
+repo_name: AssociatedPrimeIdeal/AutoFlow
+edit_uri: edit/main/docs/
+docs_dir: docs
+site_dir: site
+copyright: Copyright © AutoFlow contributors
+
+theme:
+  name: material
+  language: zh
+  logo: assets/logo.svg
+  favicon: assets/logo.svg
+  font: false
+  features:
+    - announce.dismiss
+    - content.code.annotate
+    - content.code.copy
+    - content.tabs.link
+    - navigation.footer
+    - navigation.indexes
+    - navigation.sections
+    - navigation.tabs
+    - navigation.top
+    - search.highlight
+    - search.suggest
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: 切换到深色模式
+      primary: custom
+      accent: teal
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: 切换到浅色模式
+      primary: custom
+      accent: teal
+
+extra_css:
+  - assets/stylesheets/extra.css
+
+extra_javascript:
+  - assets/javascripts/mermaid-init.js
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - pymdownx.details
+  - pymdownx.emoji
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.magiclink
+  - pymdownx.smartsymbols
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - 首页: index.md
+  - 中文:
+      - 用户指南: zh/user-guide.md
+      - 示例：主动脉 H5: zh/example.md
+      - 输入与输出: zh/input-output.md
+      - 功能清单: en/features/index.md
+  - English:
+      - User Guide: en/user-guide.md
+      - "Example: Aorta H5": en/example.md
+      - Input & Output: en/input-output.md
+      - Feature Map: en/features/index.md
+  - 开发者:
+      - 架构: en/developer/architecture.md
+      - 功能到代码: en/developer/feature-to-code-map.md
+      - 配置系统: en/developer/config-system.md
+      - 修改配方: en/developer/change-recipes.md
+      - 测试: en/developer/testing.md
+  - Reference:
+      - GUI details: en/user/gui.md
+      - CLI details: en/user/cli.md
+      - Python API details: en/user/python-api.md
+      - Segmentation: en/features/segmentation.md
+      - Planes and metrics: en/features/planes.md
+      - WSS, TKE and pressure: en/features/wss-tke-pressure.md
+      - Streamlines and pathlines: en/features/streamlines.md
+      - Videos: en/features/videos.md
+      - Troubleshooting: en/user/troubleshooting.md
+
+plugins:
+  - search
+
+validation:
+  omitted_files: ignore
+  absolute_links: warn
+  unrecognized_links: warn

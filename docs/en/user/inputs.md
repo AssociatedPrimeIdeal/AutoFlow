@@ -1,5 +1,45 @@
 # Inputs
 
+## 先从“软件需要什么”开始
+
+AutoFlow 不把一份 4D Flow 检查简单地当成一张图片。它至少需要四类信息：
+
+1. **解剖信号**：`mag`，用于看血管和构造 PC-MRA。
+2. **速度编码**：`flow`，或 legacy complex 数据中可转换得到的三方向速度。
+3. **空间几何**：`Resolution`、`Origin` 和空间轴方向，否则 mm、法向量和压力梯度都可能错位。
+4. **时间与速度标尺**：`RR`、时间帧数和 `VENC`，否则 phase 间隔和速度量级无法正确解释。
+
+分割 `seg` 是后续血管分析的空间范围；校正缓存 `corr` 是可复用的背景相位校正结果。**二者都是可选输入，但不应被混为一谈**：没有 `seg` 时要先准备分割，没有 `corr` 时可在冷启动流程中显式运行背景相位校正。
+
+## 推荐的冷启动思路
+
+如果你要验证 AutoFlow 本身，而不是验证某次历史处理结果，请使用没有 `corr`、没有 `segmask`/`segmentation` 的工作副本：
+
+```bash
+autoflow-run case_without_cache.h5 \
+  --output-dir ./results/cold_start \
+  --bgc \
+  --autoseg
+```
+
+原始文件不要直接删除字段；先备份或复制工作副本。完整演示见[冷启动示例](demo-case.md)。
+
+## 用 H5 浏览器快速检查
+
+在 Python 中可以先不运行分析，只检查数据集名称和维度：
+
+```python
+import h5py
+
+with h5py.File("case.h5", "r") as handle:
+    def show(name, value):
+        if isinstance(value, h5py.Dataset):
+            print(name, value.shape, value.dtype)
+    handle.visititems(show)
+```
+
+看到 `img_complex` 或 `img` 后，再核对它是否有 4 个通道；看到 `mag` 和 `flow` 时，核对 `flow` 最后一个维度是否为 3。不要只看文件扩展名判断格式。
+
 ## Supported Inputs
 
 | Input type | Supported | Typical entry points | Notes |

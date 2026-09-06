@@ -30,12 +30,31 @@ In grouped multi-label workflows, every plane keeps the group name of the path i
 4. drag the cyan center handle to move it; generated planes stay on their associated path, while manually added planes can move anywhere
 5. drag the orange or yellow in-plane-axis handle to rotate the plane around the other local axis
 6. click `Finish Plane Edit`; the ortho view, active pathline, metrics, and saved plane outputs are updated after the interaction ends
-7. use `Export -> Export Plane Coordinates...` to export selected Browser planes, or all planes when none are selected
+7. adjust a selected plane's `Opacity` with the Browser slider (or its context menu), then use `Export -> Export Plane Coordinates...` to export selected Browser planes, or all planes when none are selected
 8. load a target case, use `File -> Import Plane Coordinates...`, then choose world, local, or relative-centerline mapping and Replace or Append
 
 The Generate Planes panel exposes `Plane Mode`, `Plane Count`, `Anchor`,
 `Direction`, `Spacing Mode`, `Spacing Ratio`, and the enabled-by-default
 `Segmentation Filter` checkbox.
+
+With the filter enabled, each graph path is densified and sampled against the
+majority-voted 3-D label volume.  Non-zero samples are grouped into contiguous
+physical-length runs. Graph forks are established from nodes with degree
+`>= 3`; flow is then sampled on the filtered path geometry to orient the path.
+For a path marked `outgoing` at a fork, runs on the free end half are
+considered; for an `incoming` path, runs on the free start half are considered.
+The longest eligible run becomes `owner_label`, the path is clipped to that
+run, and plane metrics are masked to the same numeric label. This is a
+path/plane selection rule, not a skeleton edit, and it cannot correct a source
+segmentation that labels a branch as its parent vessel.
+
+After plane placement, generated planes are checked against the rasterized
+branch volume. A plane with no cells for its requested branch is omitted from
+the plane list and recorded in `plane_qc.json` with
+`reason=no_branch_support`. This check uses geometric cell support, not a
+numeric flow threshold, so genuinely low-flow planes are not discarded. Path
+and graph topology are retained even when all planes for a path are omitted;
+the path is reported with `path_status=no_valid_planes`.
 
 ### CLI
 
@@ -107,7 +126,7 @@ summary = run_case("case.h5", config=config)
 | `planes.json` | planes exist | serialized plane geometry, `segmentation_label`, `placement_mode`, and attached summaries when metrics exist |
 | `planes.h5` | planes exist | one root group per plane with geometry, `placement_mode`, `label_name`, path metadata, metrics, and `payload_json` |
 | `plane_positions.json` | planes exist | v2 portable coordinate file containing world/local centers and relative path mapping hints |
-| `plane_qc.json` | plane generation or metrics run | owner label, confidence, original/retained path lengths, and requested/actual plane counts |
+| `plane_qc.json` | plane generation or metrics run | owner label, confidence, original/retained path lengths, requested/actual counts, and per-plane branch-support decisions |
 | plane scene objects | GUI or pipeline plane step succeeds | grouped plane objects with stable internal keys such as `plane_aorta_systemic_branches_5`, shown in the browser as `plane 5` |
 
 `PlaneData.center` and the saved `center` field are local physical millimetres. `center_world` is `center + origin`. Sampling converts local centers to world space only when calling VTK, so a non-zero image origin changes placement in the world scene without changing the sampled cross-section.
@@ -118,6 +137,7 @@ For cross-case import, `world` preserves `center_world_mm` and requires register
 - depends on graph and path quality
 - distance-plane placement is only meaningful when path geometry is stable
 - segmentation filtering cannot infer a vessel identity if the source segmentation labels the entire short branch as its parent vessel; inspect `plane_qc.json` for low owner-label confidence
+- planes with no branch-supported cross-section are intentionally omitted; if every plane on a path is omitted, the graph path remains for topology but has no plane metrics
 - junction-spacing uses the closest graph fork attached to the path; paths without a fork use the configured fallback endpoint
 - plane editing is GUI-only
 - generated plane centers remain constrained to their associated path; use `Add Plane` for unrestricted placement

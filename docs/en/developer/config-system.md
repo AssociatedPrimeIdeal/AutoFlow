@@ -23,6 +23,7 @@ AutoFlow stores repo-level defaults in per-module JSON files and applies them to
 | `configs/pwv.json` | PWV groups, plane spacing, waveform selection, and plot styling |
 | `configs/segmentation.json` | segmentation dock and segmentation-run defaults |
 | `configs/colorbar.json` | shared GUI colorbar defaults |
+| `configs/ui.json` | 3-D viewport display defaults such as background color |
 | `configs/video_exporting.json` | shared video and camera defaults |
 
 ## Main Code
@@ -54,6 +55,8 @@ AutoFlow stores repo-level defaults in per-module JSON files and applies them to
 | Parameter | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
 | `remove_small_cc` | bool | `True` | `configs/skeleton.json` | remove small connected components before grouped preprocessing | `autoflow/core/models.py` |
+| `separate_special_label_contacts` | bool | `True` | `configs/skeleton.json`, GUI, CLI `--separate-special-label-contacts` | separate contacts only between the configured special labels | `autoflow/algorithms/preprocess.py` |
+| `special_contact_labels` | list[str] | `["RBCT", "CCA", "LBCT"]` | `configs/skeleton.json` | label names whose pairwise contacts are separated | `autoflow/core/models.py` |
 | `min_cc_volume_mm3` | float | `50.0` | `configs/skeleton.json` | component-volume threshold | `autoflow/core/models.py` |
 | `cc_filter_mode` | string | `hybrid` | `configs/skeleton.json` | choose `absolute`, `relative`, `hybrid`, or `largest` component filtering | `autoflow/core/models.py` |
 | `cc_rel_min_ratio` | float | `0.01` | `configs/skeleton.json` | relative threshold against the largest component for `relative` and `hybrid` filtering | `autoflow/core/models.py` |

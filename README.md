@@ -103,6 +103,9 @@ autoflow-gui
 
 Use `Export > Export Videos...` for interactive selective export of `plane`, `wss`, `tke`, `pg`, and `streamlines` videos.
 The GUI is organized as `Input & QC`, `Segmentation`, `Phase Unwrapping`, `Centerline & Planes`, `Hemodynamics`, and `Review & Export`. Phase unwrapping is optional and dual-VENC inputs skip it automatically. Use the top-level `Settings` menu to configure the display-only 3D axis orientation.
+The 3-D Browser also provides a phase-resolved 4D PC-MRA volume backdrop and
+per-object opacity controls; the ortho viewer has an independent
+segmentation-overlay opacity slider.
 
 Python API:
 
@@ -191,10 +194,41 @@ Override rules:
 
 Detailed documentation now lives under `docs/en/`.
 
+### Build the Material for MkDocs site
+
+Install the documentation extra and start a local site:
+
+```bash
+pip install -e ".[docs]"
+mkdocs serve
+```
+
+The site entry point is `mkdocs.yml`; the landing page is `docs/index.md`.
+The site provides Chinese and English user guides. The Aorta example uses a
+real H5 path for demonstration but stores only derived documentation images,
+not the medical source file.
+
+The published site is intended to live at:
+
+```text
+https://associatedprimeideal.github.io/autoflow-docs
+```
+
+The workflow in `.github/workflows/docs.yml` builds the site and syncs it to
+`AssociatedPrimeIdeal/AssociatedPrimeIdeal.github.io/autoflow-docs`. Configure
+a repository secret named `DOCS_REPO_TOKEN` with write access to that Pages
+repository before enabling the cross-repository publish job.
+
 ### English
 
 **User Guide**
 
+- [中文用户指南 / Chinese User Guide](docs/zh/user-guide.md)
+- [English User Guide](docs/en/user-guide.md)
+- [中文示例 / Chinese Example](docs/zh/example.md)
+- [English Example](docs/en/example.md)
+- [中文输入与输出 / Chinese Input & Output](docs/zh/input-output.md)
+- [English Input & Output](docs/en/input-output.md)
 - [Quickstart](docs/en/user/quickstart.md)
 - [CLI](docs/en/user/cli.md)
 - [GUI](docs/en/user/gui.md)
@@ -217,6 +251,7 @@ Detailed documentation now lives under `docs/en/`.
 - [WSS, TKE, Pressure Gradient, and Relative Pressure](docs/en/features/wss-tke-pressure.md)
 - [Vortex Kinematics](docs/en/features/vortex-kinematics.md)
 - [Streamlines and Pathlines](docs/en/features/streamlines.md)
+- [PC-MRA Volume Rendering](docs/en/features/pcmra-volume-rendering.md)
 - [Videos](docs/en/features/videos.md)
 
 **Developer Guide**

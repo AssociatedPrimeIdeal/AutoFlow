@@ -12,8 +12,13 @@ from autoflow.algorithms.data import discover_h5_input_cases, inspect_h5_input_c
 from autoflow.algorithms.dicom import collect_input_cases
 from autoflow.algorithms.segmentation import default_nnunet_model_folder
 from autoflow.algorithms.pwv import compute_cross_correlation_delay_ms, detect_waveform_foot_time_ms
-from autoflow.algorithms.preprocess import filter_connected_components
-from autoflow.algorithms.metrics import compute_plane_metrics, compute_vortex_metrics, compute_wss_metrics
+from autoflow.algorithms.preprocess import filter_connected_components, separate_longitudinal_label_contacts
+from autoflow.algorithms.metrics import (
+    compute_plane_metrics,
+    compute_vortex_metrics,
+    compute_wss_metrics,
+    filter_planes_by_branch_support,
+)
 from autoflow.algorithms.planes import filter_paths_by_segmentation, generate_planes_from_paths
 from autoflow.algorithms.segmentation import generate_nnunet_auto_segmentation, save_segmentation_to_source_h5
 from autoflow.algorithms.streamlines import (
@@ -26,7 +31,7 @@ from autoflow.algorithms.streamlines import (
 )
 from autoflow.config import bundle_to_autoflow_kwargs
 from autoflow.core.pipeline import PipelineEngine
-from autoflow.core.models import PlaneData, SkeletonParams, StepId, Workspace
+from autoflow.core.models import GraphData, PlaneData, SkeletonParams, StepId, Workspace
 from autoflow.case_types import LoaderCapabilities
 from autoflow.plane_io import (
     PLANE_POSITION_SCHEMA,
@@ -44,6 +49,134 @@ DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 PHANTOM_CASES = ("phantom_S", "phantom_U", "phantom_Y")
 REL_TOL = 0.05
 PLANE_SPACING_MM = 15.0
+
+
+def test_separate_longitudinal_label_contacts_preserves_end_to_end_transition():
+    from scipy.ndimage import label as ndi_label
+
+    labels = np.zeros((40, 20, 20), dtype=np.int16)
+    labels[2:20, 5:8, 5:8] = 1
+    labels[20:38, 5:8, 5:8] = 2
+    sequential = separate_longitudinal_label_contacts(labels > 0, labels, [1, 2], [1.0, 1.0, 1.0])
+    assert np.array_equal(sequential, labels > 0)
+    forced = separate_longitudinal_label_contacts(
+        labels > 0, labels, [1, 2], [1.0, 1.0, 1.0], force_pairs=[(1, 2)]
+    )
+    assert ndi_label(forced, structure=np.ones((3, 3, 3), dtype=bool))[1] == 2
+
+    labels[:, :, :] = 0
+    labels[2:38, 5:8, 5:8] = 1
+    labels[2:38, 8:11, 5:8] = 2
+    side_by_side = separate_longitudinal_label_contacts(labels > 0, labels, [1, 2], [1.0, 1.0, 1.0])
+    assert np.count_nonzero(side_by_side) < np.count_nonzero(labels)
+
+
+def test_topology_fork_detection_is_independent_of_path_orientation():
+    from autoflow.algorithms.branch import find_path_forks
+
+    points = np.asarray([
+        [2.0, 2.0, 2.0],
+        [1.0, 2.0, 2.0],
+        [3.0, 2.0, 2.0],
+        [2.0, 3.0, 2.0],
+    ])
+    graph = GraphData(
+        points=points,
+        edges=np.asarray([[0, 1], [0, 2], [0, 3]], dtype=int),
+    )
+    # All three paths happen to start at the branch node.  Endpoint matching
+    # alone would miss this junction; graph degree must still expose it.
+    forks = find_path_forks([[0, 1], [0, 2], [0, 3]], points, graph=graph)
+    assert len(forks) == 1
+    assert forks[0]["node"] == 0
+    assert forks[0]["degree"] == 3
+    assert forks[0]["left"] == []
+    assert forks[0]["right"] == [0, 1, 2]
+
+
+def test_flow_orientation_uses_segmentation_filtered_path_geometry():
+    from autoflow.algorithms.branch import _orient_node_paths_by_flow
+
+    flow = np.zeros((11, 1, 1, 1, 3), dtype=np.float32)
+    flow[..., 0] = 1.0
+    mask = np.ones((11, 1, 1, 1), dtype=bool)
+    graph_points = np.asarray([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]])
+    raw_paths = [[0, 1]]
+    filtered_paths = [np.asarray([[10.0, 0.0, 0.0], [0.0, 0.0, 0.0]])]
+
+    oriented = _orient_node_paths_by_flow(
+        raw_paths,
+        graph_points,
+        flow_xyzt3=flow,
+        segmask_binary_4d=mask,
+        sample_paths=filtered_paths,
+    )
+    assert oriented == [[1, 0]]
+
+
+def test_fork_internal_consistency_is_undefined_for_one_sided_topology_fork():
+    from autoflow.algorithms.metrics import apply_internal_consistency_to_metrics
+
+    metrics, qc = apply_internal_consistency_to_metrics(
+        [
+            {"path_index": 0, "netflow_mL_beat": 2.0},
+            {"path_index": 1, "netflow_mL_beat": 1.0},
+        ],
+        path_info=[{}, {}],
+        forks=[{"node": 10, "left": [], "right": [0, 1]}],
+    )
+    assert qc["fork_ic"] == {"0": None}
+    assert qc["forks"][0]["ic"] is None
+    assert metrics[0]["fork_ic"] == [{"fork_id": 0, "role": "outgoing", "ic": None}]
+
+
+def test_plane_branch_support_drops_only_unmatched_planes():
+    mask = np.ones((5, 5, 5, 1), dtype=bool)
+    branch_labels = np.ones((5, 5, 5), dtype=np.int16)
+    segmentation_labels = np.ones((5, 5, 5), dtype=np.int16)
+    planes = [
+        PlaneData(
+            center=np.asarray([2.0, 2.0, 2.0]),
+            normal=np.asarray([1.0, 0.0, 0.0]),
+            label=1,
+            path_index=0,
+            segmentation_label=1,
+        ),
+        PlaneData(
+            center=np.asarray([2.0, 2.0, 2.0]),
+            normal=np.asarray([1.0, 0.0, 0.0]),
+            label=2,
+            path_index=1,
+            segmentation_label=1,
+        ),
+    ]
+    kept, qc = filter_planes_by_branch_support(
+        planes,
+        mask,
+        spacing=(1.0, 1.0, 1.0),
+        origin=(0.0, 0.0, 0.0),
+        branch_labels_3d=branch_labels,
+        segmentation_labels_3d=segmentation_labels,
+    )
+    assert kept == [planes[0]]
+    assert qc[0]["valid"] is True
+    assert qc[1]["valid"] is False
+    assert qc[1]["reason"] == "no_branch_support"
+
+
+def test_internal_consistency_marks_missing_path_metrics_undefined():
+    from autoflow.algorithms.metrics import apply_internal_consistency_to_metrics
+
+    metrics, qc = apply_internal_consistency_to_metrics(
+        [{"path_index": 0, "netflow_mL_beat": 2.0}],
+        path_info=[{}, {}],
+        forks=[{"node": 10, "left": [0], "right": [1]}],
+    )
+    assert qc["path_ic"]["0"] is None
+    assert qc["path_ic"]["1"] is None
+    assert qc["fork_ic"] == {"0": None}
+    assert qc["forks"][0]["status"] == "missing_path_metrics"
+    assert metrics[0]["path_ic"] is None
 
 
 def test_vortex_kinematics_matches_rigid_rotation_and_rejects_pure_shear():

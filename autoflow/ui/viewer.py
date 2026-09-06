@@ -93,6 +93,7 @@ class SceneController:
         self._automatic_clim_cache = {}
         self._tracked_actors = {}
         self._saved_camera = None
+        self._background_color = "#000000"
         self._display_axis_directions = list(_DISPLAY_AXIS_DEFAULTS)
         self._display_axis_signs = np.ones(3, dtype=float)
         self._display_center = None
@@ -110,11 +111,353 @@ class SceneController:
         self._path_pick_callback = None
         self._shared_pick_obs_id = None
         self._active_scalar_bar_uid = None
+        self._volume_range_cache = {}
+        self._volume_wl_observer_ids = []
+        self._volume_wl_active = False
+        self._volume_wl_pending_event = None
+        self._volume_wl_uid = None
+        self._volume_wl_start = None
+        self._volume_wl_base = None
+        self._interaction_last_position = None
+        self._volume_wl_user_callback = None
+        self._qt_mouse_filter = None
+
+    @staticmethod
+    def _is_volume_object(obj):
+        """Return whether *obj* should be drawn with VTK volume rendering."""
+        return str(getattr(obj, "data_key", "")) == "pcmra_volume"
+
+    def _volume_scalar_range(self, obj, data, respect_clim=True):
+        """Resolve the PC-MRA window from the current frame foreground."""
+        if respect_clim and getattr(obj, "clim", None) is not None:
+            lo, hi = (float(x) for x in obj.clim)
+        else:
+            if self._is_volume_object(obj) and self.workspace.mag_raw is not None and self.workspace.flow_raw is not None:
+                key = (id(self.workspace.mag_raw), id(self.workspace.flow_raw), int(self.workspace.current_t))
+                cached = self._volume_range_cache.get(key)
+                if cached is not None:
+                    return cached
+                try:
+                    mag_arr = np.asarray(self.workspace.mag_raw, dtype=np.float32)
+                    flow_arr = np.asarray(self.workspace.flow_raw, dtype=np.float32)
+                    mag_arr = mag_arr[..., None] if mag_arr.ndim == 3 else mag_arr
+                    nt = min(int(mag_arr.shape[3]), int(flow_arr.shape[3]))
+                    frame = min(max(0, int(self.workspace.current_t)), max(0, nt - 1))
+                    values_t = mag_arr[..., frame] * np.linalg.norm(flow_arr[..., frame, :], axis=-1)
+                    finite_t = np.asarray(values_t, dtype=float)
+                    finite_t = finite_t[np.isfinite(finite_t) & (finite_t > 0.0)]
+                except Exception:
+                    finite_t = np.empty(0)
+                if finite_t.size:
+                    lo = float(np.percentile(finite_t, 5.0))
+                    hi = float(np.percentile(finite_t, 99.0))
+                else:
+                    lo, hi = 0.0, 1.0
+                result = (lo, float(hi if np.isfinite(hi) and hi > lo else lo + 1.0))
+                self._volume_range_cache[key] = result
+                return result
+            values = None
+            name = str(getattr(obj, "scalars", "") or "PC-MRA")
+            try:
+                if name in data.cell_data:
+                    values = np.asarray(data.cell_data[name], dtype=float)
+                elif name in data.point_data:
+                    values = np.asarray(data.point_data[name], dtype=float)
+            except Exception:
+                values = None
+            finite = values[np.isfinite(values)] if values is not None else np.empty(0)
+            lo = 0.0
+            hi = float(np.percentile(finite, 99.5)) if finite.size else 1.0
+        if not np.isfinite(lo):
+            lo = 0.0
+        if not np.isfinite(hi) or hi <= lo:
+            hi = lo + 1.0
+        return float(lo), float(hi)
+
+    def _set_volume_opacity(self, obj, data=None):
+        """Apply the browser opacity to a volume's scalar opacity transfer function."""
+        actor = getattr(obj, "actor", None)
+        if actor is None or not self._is_volume_object(obj):
+            return
+        try:
+            prop = actor.GetProperty()
+            transfer = prop.GetScalarOpacity(0)
+            if transfer is None:
+                return
+            if data is None:
+                data = self._build_dataset(obj.data_key)
+            if data is None:
+                return
+            lo, hi = self._volume_scalar_range(obj, data)
+            mapper = actor.GetMapper()
+            try:
+                mapper.scalar_range = (lo, hi)
+            except Exception:
+                pass
+            try:
+                prop.SetInterpolationTypeToNearest()
+                prop.SetScalarOpacityUnitDistance(max(float(np.mean(np.asarray(self.workspace.resolution, dtype=float))), 0.1))
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def initialize(self):
-        self.plotter.set_background("white")
+        self.plotter.set_background(self._background_color)
         self._add_orientation_axes()
+        self._ensure_volume_window_level_interaction()
+        self._ensure_native_qt_mouse_bridge()
         self.plotter.reset_camera()
+
+    def _visible_volume_object(self):
+        for obj in reversed(list(self.workspace.scene_objects.values())):
+            if self._is_volume_object(obj) and bool(getattr(obj, "visible", False)) and getattr(obj, "actor", None) is not None:
+                return obj
+        return None
+
+    def _ensure_native_qt_mouse_bridge(self):
+        """Intercept only Shift+left window/level gestures.
+
+        All other native Qt mouse events are left to QVTK's normal event
+        handler so ``vtkInteractorStyleTrackballCamera`` owns the camera
+        gestures.
+        """
+        if self._qt_mouse_filter is not None or hasattr(self.plotter, "_plotter"):
+            return
+        widget = self.plotter
+        if not callable(getattr(widget, "installEventFilter", None)):
+            return
+        try:
+            from PySide6 import QtCore
+        except Exception:
+            return
+        try:
+            interactor = widget.iren
+        except Exception:
+            return
+
+        controller = self
+
+        class _MouseBridge(QtCore.QObject):
+            def eventFilter(self, watched, event):  # noqa: N802
+                event_type = event.type()
+                mouse_move = event_type == QtCore.QEvent.Type.MouseMove
+                button_press = event_type == QtCore.QEvent.Type.MouseButtonPress
+                button_release = event_type == QtCore.QEvent.Type.MouseButtonRelease
+                if not (mouse_move or button_press or button_release):
+                    return False
+                try:
+                    position = event.position()
+                    x, y = int(round(position.x())), int(round(position.y()))
+                except Exception:
+                    try:
+                        x, y = int(event.x()), int(event.y())
+                    except Exception:
+                        return False
+                try:
+                    modifiers = event.modifiers()
+                    ctrl = int(bool(modifiers & QtCore.Qt.KeyboardModifier.ControlModifier))
+                    shift = int(bool(modifiers & QtCore.Qt.KeyboardModifier.ShiftModifier))
+                    widget._setEventInformation(x, y, ctrl, shift, chr(0), 0, None)
+                    interactor.SetAltKey(
+                        int(bool(modifiers & QtCore.Qt.KeyboardModifier.AltModifier))
+                    )
+                except Exception:
+                    return False
+                if mouse_move:
+                    shift_left = controller._volume_wl_active
+                elif button_press:
+                    shift_left = bool(
+                        event.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier
+                    ) and event.button() == QtCore.Qt.MouseButton.LeftButton and (
+                        controller._visible_volume_object() is not None
+                    )
+                else:
+                    shift_left = (
+                        controller._volume_wl_active
+                        and event.button() == QtCore.Qt.MouseButton.LeftButton
+                    )
+                if not shift_left:
+                    return False
+                if mouse_move:
+                    controller._dispatch_volume_window_level_event("move")
+                elif button_press:
+                    controller._dispatch_volume_window_level_event("press")
+                elif button_release:
+                    controller._dispatch_volume_window_level_event("release")
+                return True
+
+        try:
+            self._qt_mouse_filter = _MouseBridge(widget)
+            widget.installEventFilter(self._qt_mouse_filter)
+        except Exception:
+            self._qt_mouse_filter = None
+
+    @staticmethod
+    def _event_position(interactor):
+        try:
+            x, y = interactor.GetEventPosition()
+            return float(x), float(y)
+        except Exception:
+            return None
+
+    def _ensure_volume_window_level_interaction(self):
+        """Add Shift+left window/level without changing VTK camera gestures."""
+        if self._volume_wl_observer_ids:
+            return
+        try:
+            interactor = self.plotter.iren
+        except Exception:
+            return
+        try:
+            style = interactor.GetInteractorStyle()
+            if style is not None:
+                style.SetEnabled(1)
+        except Exception:
+            pass
+
+        def _on_press():
+            pos = self._event_position(interactor)
+            if pos is None:
+                return
+            volume = self._visible_volume_object()
+            if volume is not None:
+                data = self._build_dataset(volume.data_key)
+                if data is None:
+                    return
+                self._volume_wl_active = True
+                try:
+                    self.plotter._autoflow_window_level_active = True
+                except Exception:
+                    pass
+                self._volume_wl_uid = volume.uid
+                self._volume_wl_start = pos
+                self._volume_wl_base = self._volume_scalar_range(volume, data)
+                self._interaction_last_position = None
+                return
+
+        def _on_move(_obj, _event):
+            pos = self._event_position(interactor)
+            if pos is None:
+                return
+            # Native Qt and the bridge can both report the same move.  Avoid
+            # applying a camera/WL step twice for one screen position.
+            if self._interaction_last_position == pos:
+                return
+            self._interaction_last_position = pos
+            if self._volume_wl_active:
+                volume = self.workspace.scene_objects.get(self._volume_wl_uid)
+                if volume is None or not self._is_volume_object(volume):
+                    return
+                if self._volume_wl_start is None or self._volume_wl_base is None:
+                    return
+                dx = float(pos[0] - self._volume_wl_start[0])
+                dy = float(pos[1] - self._volume_wl_start[1])
+                base_low, base_high = self._volume_wl_base
+                base_width = max(float(base_high - base_low), 1e-6)
+                base_level = (float(base_low) + float(base_high)) * 0.5
+                width = max(base_width * 0.01, base_width * float(np.exp(dx * 0.012)))
+                level = base_level - dy * width * 0.004
+                self._apply_volume_window_level(
+                    volume, (level - width * 0.5, level + width * 0.5), render=True
+                )
+                return
+            return
+
+        def _on_release():
+            if self._volume_wl_active:
+                self._volume_wl_active = False
+                self._volume_wl_uid = None
+                self._volume_wl_start = None
+                self._volume_wl_base = None
+                try:
+                    self.plotter._autoflow_window_level_active = False
+                except Exception:
+                    pass
+            return
+
+        def _on_native_left_press(_obj, _event):
+            if interactor.GetShiftKey() and self._visible_volume_object() is not None:
+                _on_press()
+
+        def _on_native_left_release(_obj, _event):
+            if self._volume_wl_active:
+                _on_release()
+
+        def _on_user_event(_obj, _event):
+            event_name = self._volume_wl_pending_event
+            self._volume_wl_pending_event = None
+            if event_name == "press":
+                _on_press()
+            elif event_name == "move":
+                _on_move(_obj, _event)
+            elif event_name == "release":
+                _on_release()
+
+        try:
+            self._volume_wl_user_callback = _on_user_event
+            self._volume_wl_observer_ids = [
+                interactor.AddObserver("UserEvent", _on_user_event, 1.0),
+                interactor.AddObserver("MouseMoveEvent", _on_move, 1.0),
+                interactor.AddObserver("LeftButtonPressEvent", _on_native_left_press, 1.0),
+                interactor.AddObserver("LeftButtonReleaseEvent", _on_native_left_release, 1.0),
+            ]
+            self.plotter._autoflow_window_level_dispatch = (
+                self._dispatch_volume_window_level_event
+            )
+        except Exception:
+            self._volume_wl_observer_ids = []
+
+    def _dispatch_volume_window_level_event(self, event_name):
+        self._volume_wl_pending_event = str(event_name)
+        try:
+            callback = self._volume_wl_user_callback
+            if callback is not None:
+                callback(self.plotter.iren, "UserEvent")
+            else:
+                self.plotter.iren.InvokeEvent("UserEvent")
+        except Exception:
+            self._volume_wl_pending_event = None
+
+    def _apply_volume_window_level(self, obj, clim, *, render=True):
+        if not self._is_volume_object(obj):
+            return
+        low, high = (float(value) for value in clim)
+        if not np.isfinite(low) or not np.isfinite(high):
+            return
+        if high <= low:
+            high = low + 1e-6
+        obj.clim = (low, high)
+        actor = getattr(obj, "actor", None)
+        if actor is not None:
+            try:
+                transfer = actor.GetProperty().GetRGBTransferFunction(0)
+                transfer.RemoveAllPoints()
+                for fraction in (0.0, 0.18, 0.42, 0.68, 1.0):
+                    value = low + (high - low) * fraction
+                    transfer.AddRGBPoint(value, fraction, fraction, fraction)
+                self._set_volume_opacity(obj)
+                actor.GetProperty().Modified()
+            except Exception:
+                pass
+        if render:
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
+
+    def reset_volume_window_level(self):
+        """Restore the automatic current-frame PC-MRA window and level."""
+        obj = self._visible_volume_object()
+        if obj is None:
+            return False
+        obj.clim = None
+        self.readd_object(obj, refresh_scalar_bar=False)
+        try:
+            self.plotter.render()
+        except Exception:
+            pass
+        return True
 
     def _add_orientation_axes(self):
         try:
@@ -283,6 +626,7 @@ class SceneController:
         self._display_mesh_cache.clear()
         self._phase_lookup_cache.clear()
         self._automatic_clim_cache.clear()
+        self._volume_range_cache.clear()
         self._display_transform_cache.clear()
         self._active_scalar_bar_uid = None
         self._remove_plane_highlight()
@@ -296,6 +640,7 @@ class SceneController:
     def invalidate_cache(self, prefix=None):
         self._phase_lookup_cache.clear()
         self._automatic_clim_cache.clear()
+        self._volume_range_cache.clear()
         self._display_transform_cache.clear()
         if prefix is None:
             self._mesh_cache.clear()
@@ -308,7 +653,8 @@ class SceneController:
             }
 
     def set_background(self, color):
-        self.plotter.set_background(color)
+        self._background_color = str(color or "#000000")
+        self.plotter.set_background(self._background_color)
         self.render_all()
 
     def toggle_axes(self):
@@ -450,6 +796,9 @@ class SceneController:
         if obj.actor is None:
             self._render_object(obj, refresh_scalar_bar=False)
             return
+        if self._is_volume_object(obj):
+            self.readd_object(obj, refresh_scalar_bar=False)
+            return
         try:
             self._segmentation_category_metadata(obj, data)
             data_show = self._display_dataset(obj, data)
@@ -460,6 +809,8 @@ class SceneController:
             # to the previous dataset and renders much of the new mesh black.
             mapper.dataset = data_show
             mapper.Update()
+            if self._is_volume_object(obj):
+                self._set_volume_opacity(obj, data_show)
         except Exception:
             self.readd_object(obj, refresh_scalar_bar=False)
 
@@ -514,6 +865,16 @@ class SceneController:
             obj.actor.SetVisibility(1 if obj.visible else 0)
         except Exception:
             pass
+        if self._is_volume_object(obj):
+            self._set_volume_opacity(obj)
+            if refresh_scalar_bar:
+                self._refresh_shared_scalar_bar(render=False)
+            if render:
+                try:
+                    self.plotter.render()
+                except Exception:
+                    pass
+            return
         try:
             prop = obj.actor.GetProperty()
             prop.SetOpacity(float(obj.opacity))
@@ -779,7 +1140,15 @@ class SceneController:
         try:
             data_show = self._display_dataset(obj, data)
             data_show = self._transform_display_dataset(data_show)
-            obj.actor = self.plotter.add_mesh(data_show, name=obj.uid, **kwargs)
+            if self._is_volume_object(obj):
+                obj.actor = self.plotter.add_volume(data_show, name=obj.uid, **kwargs)
+                try:
+                    obj.actor.PickableOff()
+                except Exception:
+                    pass
+                self._set_volume_opacity(obj, data_show)
+            else:
+                obj.actor = self.plotter.add_mesh(data_show, name=obj.uid, **kwargs)
             self._tracked_actors[obj.uid] = obj.actor
             self._apply_basic_properties_only(obj)
         except Exception as e:
@@ -792,6 +1161,9 @@ class SceneController:
             obj.actor.SetVisibility(1 if obj.visible else 0)
         except Exception:
             pass
+        if self._is_volume_object(obj):
+            self._set_volume_opacity(obj)
+            return
         try:
             prop = obj.actor.GetProperty()
             prop.SetOpacity(float(obj.opacity))
@@ -801,6 +1173,22 @@ class SceneController:
             pass
 
     def _mesh_kwargs(self, obj, data):
+        if self._is_volume_object(obj):
+            return {
+                "scalars": str(obj.scalars or "PC-MRA"),
+                "cmap": str(obj.cmap or "gray"),
+                "clim": self._volume_scalar_range(obj, data),
+                "opacity": "linear",
+                "ambient": 0.35,
+                "diffuse": 0.65,
+                "specular": 0.05,
+                "specular_power": 8.0,
+                "shade": False,
+                "blending": "composite",
+                "mapper": "fixed_point",
+                "opacity_unit_distance": max(float(np.mean(np.asarray(self.workspace.resolution, dtype=float))), 0.1),
+                "show_scalar_bar": False,
+            }
         kw = {"opacity": float(obj.opacity), "show_scalar_bar": False}
         use_scalars = False
         if obj.scalars:
@@ -1023,6 +1411,36 @@ class SceneController:
         t = ws.current_t
         sp = ws.resolution
         org = ws.origin
+
+        if data_key == "pcmra_volume":
+            if ws.mag_raw is None or ws.flow_raw is None:
+                return None
+            mag = np.asarray(ws.mag_raw, dtype=np.float32)
+            flow = np.asarray(ws.flow_raw, dtype=np.float32)
+            if flow.ndim != 5 or mag.ndim not in (3, 4):
+                return None
+            cache_key = f"pcmra_volume_{id(ws.mag_raw)}_{id(ws.flow_raw)}"
+            def _build_pcmra():
+                mag_t = mag[..., None] if mag.ndim == 3 else mag
+                if mag_t.shape[:3] != flow.shape[:3]:
+                    return None
+                nt = min(int(mag_t.shape[3]), int(flow.shape[3]))
+                if nt <= 0:
+                    return None
+                tidx = min(max(0, int(t)), nt - 1)
+                values = mag_t[..., tidx] * np.linalg.norm(flow[..., tidx, :], axis=-1)
+                values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+                grid = pv.ImageData(
+                    dimensions=tuple((np.asarray(values.shape, dtype=int) + 1).tolist()),
+                    spacing=tuple(np.asarray(sp, dtype=float).reshape(-1)[:3].tolist()),
+                    origin=tuple(np.asarray(org, dtype=float).reshape(-1)[:3].tolist()),
+                )
+                grid.cell_data["PC-MRA"] = values.flatten(order="F")
+                # Volume mappers consume point scalars.  Convert once here so
+                # timeline updates can swap mapper input directly instead of
+                # recreating the VTK volume actor for every cardiac frame.
+                return grid.cell_data_to_point_data(pass_cell_data=False)
+            return self._cached(cache_key, int(t), _build_pcmra)
 
         if data_key == "segmask_raw_surface":
             seg_display = ws.segmentation_display_4d()
@@ -1625,7 +2043,7 @@ class SceneController:
         if self._shared_pick_obs_id is not None:
             return
         try:
-            iren = self.plotter.iren.interactor
+            iren = self.plotter.iren
         except Exception:
             return
         picker = pv._vtk.vtkCellPicker()

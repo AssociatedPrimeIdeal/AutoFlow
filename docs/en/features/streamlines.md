@@ -24,7 +24,7 @@ Streamlines show instantaneous flow trajectories. Pathlines show time-resolved p
 1. load a segmented case
 2. click `Generate Streamlines` for live streamlines, or use `Hemodynamics -> Run All` to include it after metrics
 3. click `Pathlines` to generate all planes, or use a plane context menu for one plane or a selected subset; generated plane pathlines accumulate, and repeated requests skip integration for existing planes. Fixed seed mode launches the configured count (default `250`) per plane, while Ratio mode uses `Seed Ratio` with the configured count as a ceiling. Repeating a one-plane request selects the existing pathline in the Browser. `Hemodynamics -> Run All` also generates pathlines for every available plane after enabling live streamlines.
-4. use the left browser to show or hide a whole group of pathlines, or right-click an individual pathline and use `Set Pathline Color` to change only that pathline
+4. use the left browser to show or hide a whole group of pathlines, adjust the selected object's `Opacity`, or right-click an individual pathline and use `Set Pathline Color` to change only that pathline
 5. drag the timeline to inspect image and other dynamic layers; pathlines reveal the cached trajectory prefix reached by particles released at `t=0`, without reintegrating them
 
 Pathline generation always releases particles at `t=0` and integrates their

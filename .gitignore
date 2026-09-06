@@ -28,6 +28,7 @@ AGENTS.md
 app.png
 autoflow_mri.egg-info/
 build/
+site/
 /scripts/
 data/phantom_*.h5
 

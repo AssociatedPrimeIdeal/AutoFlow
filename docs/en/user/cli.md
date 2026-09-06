@@ -253,6 +253,7 @@ WSS, TKE, and pressure-analysis compute defaults are now split by metric:
 | CLI flag | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
 | `--remove-small-cc` | bool | `True` in config defaults | `configs/skeleton.json` | remove small connected components before skeletonization | `autoflow/algorithms/preprocess.py` |
+| `--separate-special-label-contacts` / `--no-separate-special-label-contacts` | bool | `True` | `configs/skeleton.json` | enable/disable contact separation for the configured special labels (default: `RBCT`, `CCA`, `LBCT`) | `autoflow/algorithms/preprocess.py` |
 | `--min-cc-volume` | float mm^3 | `50.0` | `configs/skeleton.json` | component-volume threshold | `autoflow/algorithms/preprocess.py` |
 | `--cc-filter-mode` | string | `hybrid` | `configs/skeleton.json` | choose `absolute`, `relative`, `hybrid`, or `largest` component filtering | `autoflow/algorithms/preprocess.py` |
 | `--cc-rel-min-ratio` | float | `0.01` | `configs/skeleton.json` | relative threshold against the largest component for `relative` and `hybrid` filtering | `autoflow/algorithms/preprocess.py` |

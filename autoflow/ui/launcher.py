@@ -58,10 +58,15 @@ def validate_display() -> None:
     if os.environ.get("WAYLAND_DISPLAY") and platform != "xcb":
         return
     display = str(os.environ.get("DISPLAY", "")).strip()
+    forwarded = bool(display) and (
+        _is_forwarded_x11(display) or bool(os.environ.get("SSH_CONNECTION"))
+    )
+    if forwarded:
+        os.environ["AUTOFLOW_SSH_RENDERING"] = "1"
+        os.environ["VTK_DEFAULT_OPENGL_WINDOW"] = "vtkOSOpenGLRenderWindow"
+        os.environ["QT_X11_NO_MITSHM"] = "1"
+        return
     if display and _display_is_reachable(display):
-        if _is_forwarded_x11(display):
-            os.environ["AUTOFLOW_SSH_RENDERING"] = "1"
-            os.environ["VTK_DEFAULT_OPENGL_WINDOW"] = "vtkEGLRenderWindow"
         return
     local_displays = _reachable_local_displays()
     current = display or "<unset>"

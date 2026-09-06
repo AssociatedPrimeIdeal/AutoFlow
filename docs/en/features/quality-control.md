@@ -81,6 +81,11 @@ The first report schema uses conservative screening thresholds owned by code. Th
 | `summary.json -> quality_report` | case processing completes | embedded report for batch aggregation |
 | GUI QC table | `Refresh QC` runs | current workspace checks, including unsaved interactive edits |
 
+Plane generation reports intentionally dropped planes (no branch-supported
+cross-section) as a review warning. A path with no valid planes remains in the
+graph for topology, but its path IC is undefined and any fork depending on
+its missing metrics is reported as incomplete.
+
 The overall state is `not_ready` when a required check fails, `needs_review` when it warns, `incomplete` when required stages have not run, and `ready` when all required available checks pass.
 
 ## Limitations
@@ -90,6 +95,7 @@ The overall state is `not_ready` when a required check fails, `needs_review` whe
 - graph cycles and disconnected segmentation components can be intentional in some anatomies and therefore require review
 - pressure solver residuals, WSS sensitivity intervals, uncertainty maps, and registration QC are not yet available in the v1 schema
 - a `ready` report means the implemented automated checks passed; it does not prove ground-truth accuracy
+- dropped branch-unsupported planes are not treated as zero flow; review their entries in `plane_qc.json` when a path has fewer planes than requested
 
 ## Where To Change Code
 

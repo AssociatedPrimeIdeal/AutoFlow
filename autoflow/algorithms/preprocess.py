@@ -7,6 +7,7 @@ from scipy.ndimage import (
     gaussian_filter,
     find_objects,
     label,
+    distance_transform_edt,
 )
 
 from ..core.models import SkeletonParams
@@ -267,6 +268,100 @@ def preprocess_mask_for_skeleton(mask_3d, params=None, resolution=None):
         if np.any(proc):
             out[bbox] |= proc
     return out.astype(bool)
+
+
+def separate_longitudinal_label_contacts(mask_3d, label_mask_3d, label_values, resolution=None,
+                                         min_contact_voxels=8, elongation_threshold=2.5,
+                                         force_pairs=None):
+    """Conservatively cut elongated side-by-side contacts between labels.
+
+    This keeps the group mask as the skeleton input.  It only uses the source
+    labels to identify a contact interface whose physical extent is strongly
+    elongated; compact interfaces (the usual end-to-end label transitions)
+    are left untouched.
+    """
+    mask = np.asarray(mask_3d, dtype=bool)
+    labels = np.asarray(label_mask_3d)
+    if mask.shape != labels.shape or mask.ndim != 3:
+        raise ValueError("mask_3d and label_mask_3d must be matching 3D arrays")
+    values = sorted({int(value) for value in (label_values or []) if int(value) != 0})
+    if len(values) < 2 or not np.any(mask):
+        return mask.copy()
+    spacing = np.ones(3, dtype=float) if resolution is None else np.asarray(resolution, dtype=float).reshape(3)
+    out = mask.copy()
+    structure = np.ones((3, 3, 3), dtype=bool)
+    forced = {tuple(sorted((int(pair[0]), int(pair[1])))) for pair in (force_pairs or [])}
+    distance_fields = {}
+
+    for value_index, first in enumerate(values[:-1]):
+        for second in values[value_index + 1:]:
+            first_region = (labels == first) & mask
+            second_region = (labels == second) & mask
+            # Use the same 26-neighbour notion that the graph builder can
+            # connect, so diagonal voxel contacts are not left behind.
+            interface = (
+                (first_region & binary_dilation(second_region, structure=structure)) |
+                (second_region & binary_dilation(first_region, structure=structure))
+            )
+            if not np.any(interface):
+                continue
+
+            interface_labels, count = label(interface, structure=structure)
+            for contact_id in range(1, int(count) + 1):
+                contact = interface_labels == contact_id
+                coords = np.argwhere(contact)
+                pair_forced = (int(first), int(second)) in forced
+                if len(coords) < int(min_contact_voxels) and not pair_forced:
+                    continue
+                if not pair_forced:
+                    extents = (coords.max(axis=0) - coords.min(axis=0) + 1) * spacing
+                    ordered = np.sort(extents)
+                    if ordered[-1] < 3.0 * float(np.min(spacing)):
+                        continue
+                    elongation = float(ordered[-1] / max(ordered[-2], 1e-6))
+                    if elongation < float(elongation_threshold):
+                        continue
+
+                # Do not cut through a one-voxel-thick vessel.  The distance
+                # check is evaluated per side of the contact and remains
+                # independent of the symbolic label names.
+                if first not in distance_fields:
+                    distance_fields[first] = distance_transform_edt(labels == first, sampling=spacing)
+                if second not in distance_fields:
+                    distance_fields[second] = distance_transform_edt(labels == second, sampling=spacing)
+                first_radius = distance_fields[first]
+                second_radius = distance_fields[second]
+                radius_threshold = 0.75 * float(np.min(spacing))
+                safe = contact & (
+                    ((labels == first) & (first_radius >= radius_threshold)) |
+                    ((labels == second) & (second_radius >= radius_threshold))
+                )
+                if np.any(safe):
+                    out[safe] = False
+    return out
+
+
+def separate_special_label_contacts(mask_3d, label_mask_3d, special_label_values, resolution=None):
+    """Separate contacts between the configured special segmentation labels.
+
+    The group mask remains the single skeleton input.  Only interfaces between
+    the supplied special labels are cut; every other label pair is untouched.
+    This is intentionally a small, deterministic wrapper around the legacy
+    contact-removal primitive, with all special pairs forced so that a close
+    side-by-side contact cannot be interpreted as one branch by the skeleton
+    graph builder.
+    """
+    values = sorted({int(value) for value in (special_label_values or []) if int(value) != 0})
+    if len(values) < 2:
+        return np.asarray(mask_3d, dtype=bool).copy()
+    pairs = [(first, second) for index, first in enumerate(values[:-1]) for second in values[index + 1:]]
+    return separate_longitudinal_label_contacts(
+        mask_3d,
+        label_mask_3d,
+        values,
+        resolution=resolution,
+        force_pairs=pairs,
+    )
 
 
 def largest_connected_component(mask, connectivity=1):

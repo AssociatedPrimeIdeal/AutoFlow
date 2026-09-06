@@ -111,6 +111,8 @@ class PreprocessParams:
 @dataclass
 class SkeletonParams:
     remove_small_cc: bool = False
+    separate_special_label_contacts: bool = True
+    special_contact_labels: List[str] = field(default_factory=lambda: ["RBCT", "CCA", "LBCT"])
     min_cc_volume_mm3: float = 50.0
     cc_filter_mode: str = "hybrid"
     cc_rel_min_ratio: float = 0.01
@@ -131,6 +133,8 @@ class SkeletonParams:
     def to_dict(self):
         return {
             "remove_small_cc": self.remove_small_cc,
+            "separate_special_label_contacts": self.separate_special_label_contacts,
+            "special_contact_labels": [str(value) for value in self.special_contact_labels],
             "min_cc_volume_mm3": self.min_cc_volume_mm3,
             "cc_filter_mode": str(self.cc_filter_mode),
             "cc_rel_min_ratio": float(self.cc_rel_min_ratio),
@@ -184,8 +188,16 @@ class SkeletonParams:
             preprocess = cfg.get("preprocess", {})
             cfg["preprocess"] = copy.deepcopy(preprocess) if isinstance(preprocess, dict) else {}
             label_groups[str(group_name)] = cfg
+        raw_special_labels = payload.get("special_contact_labels", ["RBCT", "CCA", "LBCT"])
+        if not isinstance(raw_special_labels, (list, tuple)):
+            raw_special_labels = [raw_special_labels]
+        special_labels = [str(value).strip() for value in raw_special_labels if str(value).strip()]
+        # Accept the pre-rename key when opening an older workspace/config.
+        separate_special = payload.get("separate_special_label_contacts", payload.get("separate_label_contacts", True))
         return SkeletonParams(
             remove_small_cc=bool(payload.get("remove_small_cc", False)),
+            separate_special_label_contacts=bool(separate_special),
+            special_contact_labels=special_labels,
             min_cc_volume_mm3=float(payload.get("min_cc_volume_mm3", 50.0)),
             cc_filter_mode=str(payload.get("cc_filter_mode", "hybrid") or "hybrid"),
             cc_rel_min_ratio=float(payload.get("cc_rel_min_ratio", 0.01)),
@@ -232,6 +244,8 @@ class SkeletonParams:
         overrides = cfg.get("preprocess", {}) if isinstance(cfg.get("preprocess", {}), dict) else {}
         params = SkeletonParams(
             remove_small_cc=self.remove_small_cc,
+            separate_special_label_contacts=self.separate_special_label_contacts,
+            special_contact_labels=list(self.special_contact_labels),
             min_cc_volume_mm3=self.min_cc_volume_mm3,
             cc_filter_mode=self.cc_filter_mode,
             cc_rel_min_ratio=self.cc_rel_min_ratio,
@@ -246,6 +260,8 @@ class SkeletonParams:
         )
         for key in [
             "remove_small_cc",
+            "separate_special_label_contacts",
+            "special_contact_labels",
             "min_cc_volume_mm3",
             "cc_filter_mode",
             "cc_rel_min_ratio",
@@ -260,6 +276,9 @@ class SkeletonParams:
         ]:
             if key in overrides and overrides.get(key) is not None:
                 setattr(params, key, overrides.get(key))
+        # Group-level configs written before the rename remain readable.
+        if "separate_special_label_contacts" not in overrides and "separate_label_contacts" in overrides:
+            params.separate_special_label_contacts = bool(overrides.get("separate_label_contacts"))
         return params
 
 

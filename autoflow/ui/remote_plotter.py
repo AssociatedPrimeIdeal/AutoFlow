@@ -2,16 +2,22 @@
 
 Qt's regular widgets work over forwarded X11 on systems where QOpenGLWidget
 cannot obtain a usable GLX context.  This widget keeps VTK on an off-screen
-EGL render window and transfers completed RGB frames into a normal QWidget.
+software render window and transfers completed RGB frames into a normal QWidget.
 """
 
 from __future__ import annotations
 
 import contextlib
 import math
+import os
 import time
 
 import numpy as np
+
+if os.environ.get("AUTOFLOW_SSH_RENDERING") == "1":
+    os.environ["VTK_DEFAULT_OPENGL_WINDOW"] = "vtkOSOpenGLRenderWindow"
+    os.environ["QT_X11_NO_MITSHM"] = "1"
+
 import pyvista as pv
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -58,6 +64,7 @@ class RemotePlotter(QtWidgets.QWidget):
         self._wheel_remainder = 0
         self._last_capture_at = 0.0
         self._minimum_frame_interval_ms = 30
+        self._autoflow_window_level_active = False
 
         self._frame_timer = QtCore.QTimer(self)
         self._frame_timer.setSingleShot(True)
@@ -79,6 +86,19 @@ class RemotePlotter(QtWidgets.QWidget):
         if plotter is None:
             raise AttributeError(name)
         return getattr(plotter, name)
+
+    @property
+    def iren(self):
+        """Return the underlying VTK interactor used by mouse forwarding."""
+        wrapper = self._plotter.iren
+        interactor = getattr(wrapper, "interactor", None)
+        if interactor is not None:
+            return interactor
+        interactor = self._plotter.render_window.GetInteractor()
+        if interactor is None:
+            wrapper.initialize()
+            interactor = wrapper.interactor
+        return interactor
 
     @property
     def interactor(self):
@@ -179,18 +199,44 @@ class RemotePlotter(QtWidgets.QWidget):
     def _set_mouse_event(self, event):
         x, y = self._vtk_position(event)
         control, shift = self._modifier_state(event)
-        self._plotter.iren.interactor.SetEventInformation(x, y, control, shift, "\0", 0, None)
+        interactor = self.iren
+        interactor.SetEventInformation(x, y, control, shift, "\0", 0, None)
+        # ``SetEventInformation`` has no Alt argument.  Keep it in the VTK
+        # interactor explicitly so SceneController can distinguish an
+        # Alt+left rotation from a plain left-button pan.
+        try:
+            interactor.SetAltKey(int(bool(event.modifiers() & QtCore.Qt.AltModifier)))
+        except Exception:
+            pass
 
     def mousePressEvent(self, event):
         self.setFocus(QtCore.Qt.MouseFocusReason)
         self._set_mouse_event(event)
-        interactor = self._plotter.iren.interactor
+        interactor = self.iren
+        style = interactor.GetInteractorStyle()
+        shift_left = (
+            event.button() == QtCore.Qt.LeftButton
+            and bool(event.modifiers() & QtCore.Qt.ShiftModifier)
+        )
         if event.button() == QtCore.Qt.LeftButton:
-            interactor.LeftButtonPressEvent()
+            if shift_left:
+                dispatch = getattr(
+                    self, "_autoflow_window_level_dispatch", None
+                )
+                if callable(dispatch):
+                    dispatch("press")
+                if not self._autoflow_window_level_active:
+                    style.OnLeftButtonDown()
+            elif style.GetEnabled():
+                style.OnLeftButtonDown()
         elif event.button() == QtCore.Qt.MiddleButton:
-            interactor.MiddleButtonPressEvent()
+            style.OnMiddleButtonDown()
         elif event.button() == QtCore.Qt.RightButton:
-            interactor.RightButtonPressEvent()
+            style.OnRightButtonDown()
+            try:
+                interactor.InvokeEvent("RightButtonPressEvent")
+            except Exception:
+                pass
         else:
             event.ignore()
             return
@@ -198,27 +244,57 @@ class RemotePlotter(QtWidgets.QWidget):
 
     def mouseMoveEvent(self, event):
         self._set_mouse_event(event)
-        self._plotter.iren.interactor.MouseMoveEvent()
+        interactor = self.iren
+        style = interactor.GetInteractorStyle()
+        if not self._autoflow_window_level_active:
+            style.OnMouseMove()
+        # A UserEvent gives the window/level control a reliable drag
+        # notification without disturbing VTK's own state.
+        if self._autoflow_window_level_active:
+            dispatch = getattr(self, "_autoflow_window_level_dispatch", None)
+            if callable(dispatch):
+                dispatch("move")
         event.accept()
 
     def mouseReleaseEvent(self, event):
         self._set_mouse_event(event)
-        interactor = self._plotter.iren.interactor
+        interactor = self.iren
+        style = interactor.GetInteractorStyle()
+        event_name = None
         if event.button() == QtCore.Qt.LeftButton:
-            interactor.LeftButtonReleaseEvent()
+            if self._autoflow_window_level_active:
+                dispatch = getattr(
+                    self, "_autoflow_window_level_dispatch", None
+                )
+                if callable(dispatch):
+                    dispatch("release")
+            else:
+                style.OnLeftButtonUp()
+                event_name = "LeftButtonReleaseEvent"
         elif event.button() == QtCore.Qt.MiddleButton:
-            interactor.MiddleButtonReleaseEvent()
+            event_name = "MiddleButtonReleaseEvent"
+            style.OnMiddleButtonUp()
         elif event.button() == QtCore.Qt.RightButton:
-            interactor.RightButtonReleaseEvent()
+            style.OnRightButtonUp()
+            event_name = "RightButtonReleaseEvent"
         else:
             event.ignore()
             return
+        # vtkGenericRenderWindowInteractor's convenience release methods update
+        # button state but do not always invoke observers on an off-screen
+        # interactor.  Explicitly dispatch the event so camera and window/level
+        # gestures can reliably restore their state.
+        if event_name is not None:
+            try:
+                interactor.InvokeEvent(event_name)
+            except Exception:
+                pass
         event.accept()
 
     def wheelEvent(self, event):
         self._set_mouse_event(event)
         self._wheel_remainder += int(event.angleDelta().y())
-        interactor = self._plotter.iren.interactor
+        interactor = self.iren
         while self._wheel_remainder >= 120:
             interactor.MouseWheelForwardEvent()
             self._wheel_remainder -= 120
@@ -241,19 +317,19 @@ class RemotePlotter(QtWidgets.QWidget):
         key_code = text[0] if text else "\0"
         key_sym = self._key_symbol(event)
         control, shift = self._modifier_state(event)
-        self._plotter.iren.interactor.SetKeyEventInformation(
+        self.iren.SetKeyEventInformation(
             control, shift, key_code, int(event.isAutoRepeat()), key_sym
         )
 
     def keyPressEvent(self, event):
         self._set_key_event(event)
-        self._plotter.iren.interactor.KeyPressEvent()
-        self._plotter.iren.interactor.CharEvent()
+        self.iren.KeyPressEvent()
+        self.iren.CharEvent()
         event.accept()
 
     def keyReleaseEvent(self, event):
         self._set_key_event(event)
-        self._plotter.iren.interactor.KeyReleaseEvent()
+        self.iren.KeyReleaseEvent()
         event.accept()
 
     def shutdown(self):

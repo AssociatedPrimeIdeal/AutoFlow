@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import importlib.util
 import os
 import re
+import signal
 import sys
 import time
 import traceback
@@ -40,6 +41,7 @@ from ..algorithms import (
     _plot_plane_flowrate_axes,
     _plot_pwv_axes,
     _project_point_to_path,
+    filter_paths_by_segmentation,
     generate_pathlines_from_plane_at_t,
 )
 from ..algorithms.data import discover_h5_input_cases, inspect_h5_input_case
@@ -69,6 +71,14 @@ from ..rendering import (
     render_wss_video,
 )
 from .viewer import SceneController
+
+
+# Additional item data roles used by the Browser for non-object path nodes.
+# SceneObject UIDs continue to live in Qt.UserRole so existing selection and
+# deletion paths remain compatible with the rest of the UI.
+_BROWSER_NODE_ROLE = int(QtCore.Qt.UserRole) + 1
+_BROWSER_PATH_INDEX_ROLE = int(QtCore.Qt.UserRole) + 2
+_BROWSER_GROUP_ROLE = int(QtCore.Qt.UserRole) + 3
 
 
 def _parse_grouped_index(data_key, prefix):
@@ -654,7 +664,41 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mid_splitter = mid_splitter
         mid_splitter.setChildrenCollapsible(False)
         mid_splitter.setHandleWidth(6)
-        mid_splitter.addWidget(self.plotter)
+        plotter_panel = QtWidgets.QWidget()
+        plotter_layout = QtWidgets.QVBoxLayout(plotter_panel)
+        plotter_layout.setContentsMargins(0, 0, 0, 0)
+        plotter_layout.setSpacing(3)
+        plotter_layout.addWidget(self.plotter, 1)
+        range_bar = QtWidgets.QHBoxLayout()
+        range_bar.addWidget(QtWidgets.QLabel("Window/Level:"))
+        range_bar.addWidget(QtWidgets.QLabel("Window"))
+        self.slider_render_window = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.slider_render_window.setRange(1, 1000)
+        self.slider_render_window.setEnabled(False)
+        self.slider_render_window.setToolTip("Adjust window width")
+        range_bar.addWidget(self.slider_render_window, 1)
+        self.label_render_window = QtWidgets.QLabel("—")
+        self.label_render_window.setMinimumWidth(72)
+        range_bar.addWidget(self.label_render_window)
+        range_bar.addWidget(QtWidgets.QLabel("Level"))
+        self.slider_render_level = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.slider_render_level.setRange(0, 1000)
+        self.slider_render_level.setEnabled(False)
+        self.slider_render_level.setToolTip("Adjust window level")
+        range_bar.addWidget(self.slider_render_level, 1)
+        self.label_render_level = QtWidgets.QLabel("—")
+        self.label_render_level.setMinimumWidth(72)
+        range_bar.addWidget(self.label_render_level)
+        self.btn_reset_render_range = QtWidgets.QPushButton("Auto")
+        self.btn_reset_render_range.setToolTip("Restore the automatic range for the selected scalar object")
+        self.btn_reset_render_range.setEnabled(False)
+        self.btn_reset_render_range.clicked.connect(self._reset_selected_render_range)
+        range_bar.addWidget(self.btn_reset_render_range)
+        range_bar.addStretch(1)
+        self.slider_render_window.valueChanged.connect(self._on_render_range_changed)
+        self.slider_render_level.valueChanged.connect(self._on_render_range_changed)
+        plotter_layout.addLayout(range_bar)
+        mid_splitter.addWidget(plotter_panel)
         step_and_params = QtWidgets.QWidget()
         sp_lay = QtWidgets.QVBoxLayout(step_and_params)
         sp_lay.setContentsMargins(0, 0, 0, 0)
@@ -751,6 +795,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tree_objects.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.tree_objects.customContextMenuRequested.connect(self._on_browser_ctx_menu)
         lay.addWidget(self.tree_objects)
+        opacity_row = QtWidgets.QHBoxLayout()
+        self.label_browser_opacity = QtWidgets.QLabel("Opacity: —")
+        self.slider_browser_opacity = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_browser_opacity.setRange(0, 100)
+        self.slider_browser_opacity.setValue(100)
+        self.slider_browser_opacity.setEnabled(False)
+        self.slider_browser_opacity.setToolTip("Adjust opacity for the selected Browser object(s)")
+        self.slider_browser_opacity.valueChanged.connect(self._on_browser_opacity_changed)
+        opacity_row.addWidget(self.label_browser_opacity)
+        opacity_row.addWidget(self.slider_browser_opacity, 1)
+        lay.addLayout(opacity_row)
         row = QtWidgets.QHBoxLayout()
         self.btn_delete_obj = QtWidgets.QPushButton("Delete Selected")
         self.btn_delete_obj.setIcon(standard_icon(self, "SP_TrashIcon"))
@@ -892,6 +947,11 @@ class MainWindow(QtWidgets.QMainWindow):
         fl = QtWidgets.QFormLayout(grp)
         self.chk_remove_small_cc = QtWidgets.QCheckBox()
         self.chk_remove_small_cc.setChecked(False)
+        self.chk_separate_special_label_contacts = QtWidgets.QCheckBox()
+        self.chk_separate_special_label_contacts.setChecked(True)
+        self.chk_separate_special_label_contacts.setToolTip(
+            "Separate contacts between RBCT, CCA, and LBCT before skeletonization."
+        )
         self.combo_cc_filter_mode = QtWidgets.QComboBox()
         self.combo_cc_filter_mode.addItems(["hybrid", "absolute", "relative", "largest"])
         self.edit_min_cc_volume = QtWidgets.QLineEdit("50.0")
@@ -903,6 +963,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_gaussian.setChecked(True)
         self.edit_gauss_sigma = QtWidgets.QLineEdit("0.5")
         fl.addRow("Remove Small CC", self.chk_remove_small_cc)
+        fl.addRow("Separate Special Label Contacts", self.chk_separate_special_label_contacts)
         fl.addRow("CC Filter Mode", self.combo_cc_filter_mode)
         fl.addRow(u"Min Volume (mm\u00b3)", self.edit_min_cc_volume)
         fl.addRow("Relative Min Ratio", self.edit_cc_rel_min_ratio)
@@ -2060,16 +2121,20 @@ class MainWindow(QtWidgets.QMainWindow):
         finite = values[np.isfinite(values)]
         if finite.size == 0:
             finite = np.array([0.0], dtype=float)
+        path_ic_value = metric.get("path_ic")
+        path_ic_text = "undefined" if path_ic_value is None else f"{float(path_ic_value):.3f}"
         lines = [
             header,
             f"Metric: {series_label}   Frames: {int(values.size)}   Current phase: {current_t}",
             f"Current: {float(values[current_t]):.4g}   Min: {float(np.min(finite)):.4g}   Mean: {float(np.mean(finite)):.4g}   Max: {float(np.max(finite)):.4g}",
-            f"Path IC: {float(metric.get('path_ic', 1.0)):.3f}   Net Flow: {float(metric.get('netflow_mL_beat', 0.0)):.4g} mL/beat   Peak Velocity: {float(metric.get('peakv_cm_s', 0.0)):.4g} cm/s",
+            f"Path IC: {path_ic_text}   Net Flow: {float(metric.get('netflow_mL_beat', 0.0)):.4g} mL/beat   Peak Velocity: {float(metric.get('peakv_cm_s', 0.0)):.4g} cm/s",
         ]
         related = []
         for item in list(metric.get("fork_ic", []) or []):
             try:
-                related.append(f"fork {int(item.get('fork_id', -1))} ({str(item.get('role', 'path'))}): {float(item.get('ic', 1.0)):.3f}")
+                ic_value = item.get("ic", 1.0)
+                ic_text = "undefined" if ic_value is None else f"{float(ic_value):.3f}"
+                related.append(f"fork {int(item.get('fork_id', -1))} ({str(item.get('role', 'path'))}): {ic_text}")
             except Exception:
                 continue
         if related:
@@ -2091,7 +2156,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         info = self.workspace.path_info[int(path_idx)]
         self.label_ic_target.setText(f"Target: path {int(path_idx)}")
-        path_ic = float((qc.get("path_ic", {}) or {}).get(str(int(path_idx)), 1.0))
+        path_ic_raw = (qc.get("path_ic", {}) or {}).get(str(int(path_idx)))
+        path_ic = None if path_ic_raw is None else float(path_ic_raw)
         qc_forks = {int(item.get("fork_id", -1)): item for item in list(qc.get("forks", []) or [])}
         related_fork_ids = []
         for fork_id in list(info.get("fork_ids", []) or []):
@@ -2107,14 +2173,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 if int(path_idx) in members:
                     related_fork_ids.append(int(fork_id))
         related_fork_ids = sorted(dict.fromkeys(related_fork_ids))
-        labels = [f"Path {int(path_idx)}"]
-        values = [path_ic]
-        colors = ["#1f77b4"]
+        labels = []
+        values = []
+        colors = []
+        if path_ic is not None:
+            labels.append(f"Path {int(path_idx)}")
+            values.append(path_ic)
+            colors.append("#1f77b4")
         for fork_id in related_fork_ids:
             item = qc_forks.get(int(fork_id), {})
-            labels.append(f"Fork {int(fork_id)}")
-            values.append(float(item.get("ic", 1.0)))
-            colors.append("#d9480f")
+            fork_ic = item.get("ic", 1.0)
+            # Matplotlib bars cannot represent None.  Undefined forks remain
+            # visible in the status text below, but are omitted from the bar
+            # chart rather than plotted as a misleading zero.
+            if fork_ic is not None:
+                labels.append(f"Fork {int(fork_id)}")
+                values.append(float(fork_ic))
+                colors.append("#d9480f")
         self.fig_pwv.clear()
         ax = self.fig_pwv.add_subplot(111)
         xpos = np.arange(len(values), dtype=float)
@@ -2134,12 +2209,14 @@ class MainWindow(QtWidgets.QMainWindow):
         outgoing = [int(x) for x in info.get("outgoing_path_ids", [])]
         lines = [
             f"Path {int(path_idx)}   dir={str(info.get('direction_text', '') or '')}",
-            f"Path IC: {path_ic:.3f}   Incoming: {incoming if incoming else 'none'}   Outgoing: {outgoing if outgoing else 'none'}",
+            f"Path IC: {'undefined' if path_ic is None else f'{path_ic:.3f}'}   Incoming: {incoming if incoming else 'none'}   Outgoing: {outgoing if outgoing else 'none'}",
         ]
         if related_fork_ids:
             for fork_id in related_fork_ids:
                 item = qc_forks.get(int(fork_id), {})
-                lines.append(f"Branch/Fork {int(fork_id)}: IC={float(item.get('ic', 1.0)):.3f}   left={item.get('left', [])}   right={item.get('right', [])}")
+                fork_ic = item.get("ic", 1.0)
+                ic_text = "undefined" if fork_ic is None else f"{float(fork_ic):.3f}"
+                lines.append(f"Branch/Fork {int(fork_id)}: IC={ic_text}   left={item.get('left', [])}   right={item.get('right', [])}")
         else:
             lines.append("No related branch junctions were found for the selected path.")
         self.label_pwv_status.setText("\n".join(lines))
@@ -2220,6 +2297,9 @@ class MainWindow(QtWidgets.QMainWindow):
         a = QtGui.QAction("3D Axis Orientation...", self)
         a.triggered.connect(self._open_display_orientation_settings)
         ms.addAction(a)
+        a = QtGui.QAction("3D Background Color...", self)
+        a.triggered.connect(self._open_background_color_settings)
+        ms.addAction(a)
         mv = mb.addMenu("View")
         for label, slot in [("Reset Camera", lambda: self.scene.reset_camera()), ("Toggle Axes", lambda: self.scene.toggle_axes()),
             ("White BG", lambda: self.scene.set_background("white")), ("Dark BG", lambda: self.scene.set_background("#202124"))]:
@@ -2264,6 +2344,19 @@ class MainWindow(QtWidgets.QMainWindow):
         directions = [combo.currentText() for combo in combos]
         if self.scene.set_display_axis_directions(directions):
             self.log(f"3D display orientation: {', '.join(directions)}")
+
+    def _open_background_color_settings(self):
+        if self.scene is None:
+            return
+        try:
+            current = QtGui.QColor(str(self.scene.plotter.background_color.hex_rgb))
+        except Exception:
+            current = QtGui.QColor("#000000")
+        color = QtWidgets.QColorDialog.getColor(current, self, "3D Background Color")
+        if color.isValid():
+            value = color.name()
+            self.scene.set_background(value)
+            self._config_bundle.setdefault("ui", {})["background_color"] = value
 
     def _refresh_quality_panel(self):
         if not hasattr(self, "quality_table"):
@@ -2492,6 +2585,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _bind_scene(self):
         self.scene = SceneController(self.plotter, self.workspace, self.log)
+        background = str(self._config_bundle.get("ui", {}).get("background_color", "#000000") or "#000000")
+        self.scene.set_background(background)
         self.scene.initialize()
         self.scene.enable_plane_picking(self._on_3d_plane_picked)
         self.scene.enable_path_picking(self._on_3d_path_picked)
@@ -3736,6 +3831,8 @@ class MainWindow(QtWidgets.QMainWindow):
         data_key = str(getattr(obj, "data_key", "") or "")
         if data_key == "segmask_raw_surface" or data_key.startswith("segmask_group_"):
             return "Segmentation"
+        if data_key == "pcmra_volume":
+            return "PC-MRA"
         if data_key == "pwv_planes":
             return "PWV"
         if data_key.startswith("skeleton_") or obj.kind == ObjectKind.SKELETON:
@@ -3776,11 +3873,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _browser_type_sort_key(self, type_name):
         order = [
+            "PC-MRA",
             "Segmentation",
             "Skeleton",
             "Graph",
             "Forks",
             "Paths",
+            "Unbound Planes",
             "Planes",
             "Pathlines",
             "Streamlines",
@@ -3801,13 +3900,141 @@ class MainWindow(QtWidgets.QMainWindow):
         except ValueError:
             return (len(order), str(type_name).lower())
 
+    def _browser_path_index_for_object(self, obj):
+        """Return the path associated with a scene object, if any.
+
+        Planes and pathlines are keyed by their plane index, while paths carry
+        their own path index.  The helper deliberately resolves this from the
+        workspace rather than changing SceneObject or PlaneData semantics.
+        """
+        if obj is None:
+            return None
+        data_key = str(getattr(obj, "data_key", "") or "")
+        if data_key.startswith("smooth_path_") or obj.kind == ObjectKind.BRANCH:
+            return _parse_path_index(data_key)
+        if obj.kind == ObjectKind.PLANE:
+            plane_idx = _parse_plane_index(data_key)
+        elif data_key.startswith("pathline_"):
+            plane_idx = _parse_pathline_index(data_key)
+        else:
+            return None
+        if plane_idx is None or not (0 <= int(plane_idx) < len(self.workspace.planes)):
+            return None
+        path_idx = int(getattr(self.workspace.planes[int(plane_idx)], "path_index", -1))
+        return path_idx if path_idx >= 0 else None
+
+    def _browser_plane_group_name(self, plane_idx):
+        if not (0 <= int(plane_idx) < len(self.workspace.planes)):
+            return "Global"
+        plane_group = str(getattr(self.workspace.planes[int(plane_idx)], "group_name", "") or "")
+        return plane_group if plane_group else "Global"
+
+    def _browser_plane_path_key(self, plane_idx):
+        if not (0 <= int(plane_idx) < len(self.workspace.planes)):
+            return None
+        plane = self.workspace.planes[int(plane_idx)]
+        path_idx = int(getattr(plane, "path_index", -1))
+        if path_idx < 0:
+            return None
+        return self._browser_plane_group_name(plane_idx), path_idx
+
+    def _browser_path_label(self, group_name, path_idx):
+        path_idx = int(path_idx)
+        count = sum(
+            1
+            for plane in self.workspace.planes
+            if int(getattr(plane, "path_index", -1)) == path_idx
+            and str(getattr(plane, "group_name", "") or "") == ("" if group_name == "Global" else str(group_name))
+        )
+        suffix = "plane" if count == 1 else "planes"
+        return f"Path {path_idx} · {count} {suffix}"
+
+    def _browser_make_checkable(self, item, checked=True):
+        item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+        item.setCheckState(0, QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
+        return item
+
+    def _browser_add_leaf(self, parent, obj, *, name=None):
+        item = QtWidgets.QTreeWidgetItem([str(name or obj.name), obj.kind.value])
+        tooltip = str(name or obj.name)
+        if str(getattr(obj, "data_key", "")) == "pcmra_volume":
+            tooltip += "\nShift+left-drag in 3D: window width / window level"
+        item.setToolTip(0, tooltip)
+        item.setToolTip(1, obj.kind.value)
+        item.setData(0, QtCore.Qt.UserRole, obj.uid)
+        self._browser_make_checkable(item, bool(obj.visible))
+        parent.addChild(item)
+        return item
+
+    def _browser_add_path_node(self, group_entry, path_idx):
+        path_idx = int(path_idx)
+        key = (str(group_entry["name"]), path_idx)
+        existing = group_entry["paths"].get(key)
+        if existing is not None:
+            return existing
+        type_item = group_entry["types"].setdefault("Paths", None)
+        if type_item is None:
+            type_item = QtWidgets.QTreeWidgetItem(["Paths", "Type"])
+            type_item.setToolTip(0, "Paths")
+            type_item.setToolTip(1, "Type")
+            self._browser_make_checkable(type_item)
+            group_entry["types"]["Paths"] = type_item
+            group_entry["item"].addChild(type_item)
+        path_item = QtWidgets.QTreeWidgetItem([self._browser_path_label(group_entry["name"], path_idx), "Path"])
+        path_item.setToolTip(0, self._browser_path_label(group_entry["name"], path_idx))
+        path_item.setToolTip(1, "Path and associated planes")
+        path_item.setData(0, _BROWSER_NODE_ROLE, "path")
+        path_item.setData(0, _BROWSER_PATH_INDEX_ROLE, path_idx)
+        path_item.setData(0, _BROWSER_GROUP_ROLE, str(group_entry["name"]))
+        self._browser_make_checkable(path_item)
+        type_item.addChild(path_item)
+        group_entry["paths"][key] = path_item
+        return path_item
+
+    def _browser_path_node_for_object(self, group_entry, obj):
+        path_idx = self._browser_path_index_for_object(obj)
+        if path_idx is None:
+            return None
+        return self._browser_add_path_node(group_entry, path_idx)
+
+    def _browser_sort_path_children(self, path_item):
+        children = [path_item.child(i) for i in range(path_item.childCount())]
+        def sort_key(item):
+            uid = item.data(0, QtCore.Qt.UserRole)
+            obj = self.workspace.scene_objects.get(uid) if uid is not None else None
+            if obj is not None and (obj.kind == ObjectKind.BRANCH or str(obj.data_key).startswith("smooth_path_")):
+                return (0, -1.0, str(item.text(0)).lower())
+            if obj is not None and obj.kind == ObjectKind.PLANE:
+                plane_idx = _parse_plane_index(obj.data_key)
+                distance = float(getattr(self.workspace.planes[int(plane_idx)], "distance", 0.0)) if plane_idx is not None and 0 <= int(plane_idx) < len(self.workspace.planes) else 0.0
+                return (1, distance, int(plane_idx) if plane_idx is not None else 10**9)
+            return (2, 0.0, str(item.text(0)).lower())
+        children.sort(key=sort_key)
+        for idx, child in enumerate(children):
+            path_item.removeChild(child)
+            path_item.insertChild(idx, child)
+        path_item.setCheckState(0, self._browser_check_state_for_item(path_item))
+
+    def _browser_sort_path_nodes(self, type_item):
+        nodes = [type_item.child(i) for i in range(type_item.childCount())]
+        def sort_key(item):
+            raw = item.data(0, _BROWSER_PATH_INDEX_ROLE)
+            try:
+                return (0, int(raw))
+            except (TypeError, ValueError):
+                return (1, str(item.text(0)).lower())
+        nodes.sort(key=sort_key)
+        for idx, node in enumerate(nodes):
+            type_item.removeChild(node)
+            type_item.insertChild(idx, node)
+            self._browser_sort_path_children(node)
+
     def _iter_browser_leaf_items(self, item):
         if item is None:
             return
         uid = item.data(0, QtCore.Qt.UserRole)
         if uid is not None:
             yield item
-            return
         for i in range(item.childCount()):
             yield from self._iter_browser_leaf_items(item.child(i))
 
@@ -3841,7 +4068,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.workspace.segmentation.visible = bool(visible)
                     refresh_segmentation = True
                 self.scene.apply_object_properties(obj, render=False, refresh_scalar_bar=False)
-            return refresh_segmentation
         for i in range(item.childCount()):
             refresh_segmentation = self._set_browser_item_visibility(item.child(i), visible) or refresh_segmentation
         return refresh_segmentation
@@ -4286,10 +4512,12 @@ class MainWindow(QtWidgets.QMainWindow):
         header = f"Plane {int(plane_idx)} | Path {int(metric.get('path_index', plane.path_index))}"
         if path_dir:
             header += f" {path_dir}"
+        path_ic_value = metric.get("path_ic")
+        path_ic_text = "undefined" if path_ic_value is None else f"{float(path_ic_value):.3f}"
         text_block = (
             f"{header}\n"
             f"t={t}  Flow Rate={flow_t:.4f} mL/s  Area={area_t:.3f} mm^2  Mean Velocity={meanv_t:.3f} cm/s\n"
-            f"Peak Velocity={float(metric.get('peakv_cm_s', 0.0)):.3f} cm/s  Net Flow={float(metric.get('netflow_mL_beat', 0.0)):.4f} mL/beat  IC={float(metric.get('path_ic', 1.0)):.3f}"
+            f"Peak Velocity={float(metric.get('peakv_cm_s', 0.0)):.3f} cm/s  Net Flow={float(metric.get('netflow_mL_beat', 0.0)):.4f} mL/beat  IC={path_ic_text}"
         )
         self._set_plane_info_text(text_block)
 
@@ -4298,6 +4526,88 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_path_info_text("")
             return
         info = self.workspace.path_info[int(path_idx)]
+        # Plane generation records the segmentation owner selected for each
+        # path.  Prefer that value so the GUI reports the same label used by
+        # the segmentation filter (including paths that cross a fork).  The
+        # nested ``plane_layout`` form is written after plane metrics; the
+        # top-level form is present immediately after plane generation.
+        owner_label = 0
+        plane_qc = getattr(getattr(self.workspace, "derived", None), "plane_qc", {})
+        if isinstance(plane_qc, dict):
+            layout_paths = plane_qc.get("paths")
+            if not isinstance(layout_paths, list):
+                layout = plane_qc.get("plane_layout", {})
+                layout_paths = layout.get("paths") if isinstance(layout, dict) else None
+            for item in layout_paths or []:
+                if not isinstance(item, dict) or int(item.get("path_index", -1)) != int(path_idx):
+                    continue
+                try:
+                    owner_label = int(item.get("owner_label", 0) or 0)
+                except (TypeError, ValueError):
+                    owner_label = 0
+                break
+        if owner_label <= 0:
+            # A plane can retain the owner label even when the aggregate QC is
+            # not available (for example, immediately after a workspace load).
+            values = []
+            for plane in getattr(self.workspace, "planes", []):
+                if int(getattr(plane, "path_index", -1)) != int(path_idx):
+                    continue
+                try:
+                    value = int(getattr(plane, "segmentation_label", 0) or 0)
+                except (TypeError, ValueError):
+                    value = 0
+                if value > 0:
+                    values.append(value)
+            if values:
+                owner_label = int(max(set(values), key=values.count))
+        if owner_label <= 0 and getattr(self.workspace, "segmask_labels_3d", None) is not None:
+            # Before planes are generated, derive the same owner label on
+            # demand so path inspection remains informative after only the
+            # graph step.  This does not modify the path or workspace masks.
+            paths = getattr(self.workspace, "centerline_paths", [])
+            if 0 <= int(path_idx) < len(paths):
+                try:
+                    _unused_paths, fallback_qc = filter_paths_by_segmentation(
+                        [paths[int(path_idx)]],
+                        self.workspace.segmask_labels_3d,
+                        spacing=self.workspace.resolution,
+                        origin=self.workspace.origin,
+                        path_info=[info],
+                        inter_time=int(getattr(self.workspace.plane_gen_params, "inter_time", 10) or 10),
+                    )
+                    owner_label = int((fallback_qc[0] if fallback_qc else {}).get("owner_label", 0) or 0)
+                except Exception:
+                    owner_label = 0
+        # Always prefer a fresh evaluation of the currently displayed graph
+        # path.  A workspace can contain planes/QC imported from an earlier
+        # skeleton run whose path numbering or topology no longer matches the
+        # current graph; those cached labels must not override the current
+        # segmentation assignment shown to the user.
+        paths = getattr(self.workspace, "centerline_paths", [])
+        if getattr(self.workspace, "segmask_labels_3d", None) is not None and 0 <= int(path_idx) < len(paths):
+            try:
+                _current_paths, current_qc = filter_paths_by_segmentation(
+                    [paths[int(path_idx)]],
+                    self.workspace.segmask_labels_3d,
+                    spacing=self.workspace.resolution,
+                    origin=self.workspace.origin,
+                    path_info=[info],
+                    inter_time=int(getattr(self.workspace.plane_gen_params, "inter_time", 10) or 10),
+                )
+                current_owner = int((current_qc[0] if current_qc else {}).get("owner_label", 0) or 0)
+                if current_owner > 0:
+                    owner_label = current_owner
+            except Exception:
+                pass
+        label_map = dict(getattr(getattr(self.workspace, "skeleton_params", None), "label_map", {}) or {})
+        id_to_name = {}
+        for name, value in label_map.items():
+            try:
+                id_to_name[int(value)] = str(name)
+            except (TypeError, ValueError):
+                continue
+        owner_name = id_to_name.get(owner_label, "unknown") if owner_label > 0 else "unknown"
         incoming = [int(x) for x in info.get("incoming_path_ids", [])]
         outgoing = [int(x) for x in info.get("outgoing_path_ids", [])]
         forks = []
@@ -4306,7 +4616,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 forks.append(f"node={int(fork.get('node', -1))} L={fork.get('left', [])} R={fork.get('right', [])}")
         fork_txt = " ; ".join(forks) if forks else "none"
         text_block = (
-            f"Path {int(path_idx)} | dir={info.get('direction_text', '')}\n"
+            f"Path {int(path_idx)} | label={owner_name} (id={owner_label}) | dir={info.get('direction_text', '')}\n"
             f"start_node={int(info.get('start_node', -1))}  end_node={int(info.get('end_node', -1))}\n"
             f"incoming: {incoming if incoming else 'none'}  outgoing: {outgoing if outgoing else 'none'}\n"
             f"forks: {fork_txt}"
@@ -4523,6 +4833,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ws.input_state.metadata["spatial_order_raw"] = list(ws.spatial_order)
             ws.input_state.metadata["venc_order_raw"] = list(ws.venc_order)
         ws.skeleton_params.remove_small_cc = self.chk_remove_small_cc.isChecked()
+        ws.skeleton_params.separate_special_label_contacts = self.chk_separate_special_label_contacts.isChecked()
         ws.skeleton_params.cc_filter_mode = str(self.combo_cc_filter_mode.currentText().strip() or "hybrid")
         ws.skeleton_params.min_cc_volume_mm3 = self._float_from_text(self.edit_min_cc_volume.text(), 50.0)
         ws.skeleton_params.cc_rel_min_ratio = self._float_from_text(self.edit_cc_rel_min_ratio.text(), 0.01)
@@ -4676,6 +4987,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.edit_input_spatial_order.setText(", ".join(str(x) for x in ws.spatial_order[:3]))
         self.edit_input_venc_order.setText(", ".join(str(x) for x in ws.venc_order[:3]))
         self.chk_remove_small_cc.setChecked(ws.skeleton_params.remove_small_cc)
+        self.chk_separate_special_label_contacts.setChecked(bool(getattr(ws.skeleton_params, "separate_special_label_contacts", True)))
         self.combo_cc_filter_mode.setCurrentText(str(getattr(ws.skeleton_params, "cc_filter_mode", "hybrid") or "hybrid"))
         self.edit_min_cc_volume.setText(str(ws.skeleton_params.min_cc_volume_mm3))
         self.edit_cc_rel_min_ratio.setText(str(getattr(ws.skeleton_params, "cc_rel_min_ratio", 0.01)))
@@ -4845,6 +5157,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _refresh_all(self):
         self._sync_segmentation_scene_object()
         self._refresh_browser()
+        self._refresh_render_range_control()
         self._refresh_timeline()
         self._sync_params_to_ui()
         self._refresh_selection_info()
@@ -4857,41 +5170,100 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tree_objects.blockSignals(True)
         self.tree_objects.clear()
         groups = {}
+        path_objects = []
+        plane_objects = []
+        pathline_objects = []
+
+        def ensure_group(obj, group_name=None):
+            group_name = str(group_name or self._browser_group_name(obj))
+            if group_name in groups:
+                return groups[group_name]
+            top = QtWidgets.QTreeWidgetItem([group_name, "Group"])
+            top.setToolTip(0, group_name)
+            top.setToolTip(1, "Group")
+            self._browser_make_checkable(top)
+            color_name = str(getattr(obj, "browser_color", "") or "")
+            if color_name:
+                color = QtGui.QColor(color_name)
+                if color.isValid():
+                    top.setForeground(0, QtGui.QBrush(color))
+            entry = {"name": group_name, "item": top, "types": {}, "paths": {}}
+            groups[group_name] = entry
+            self.tree_objects.addTopLevelItem(top)
+            return entry
+
+        def ensure_type(group_entry, type_name):
+            type_map = group_entry["types"]
+            if type_name in type_map:
+                return type_map[type_name]
+            type_item = QtWidgets.QTreeWidgetItem([type_name, "Type"])
+            type_item.setToolTip(0, type_name)
+            type_item.setToolTip(1, "Type")
+            self._browser_make_checkable(type_item)
+            type_map[type_name] = type_item
+            group_entry["item"].addChild(type_item)
+            return type_item
+
+        # Create the ordinary group/type rows first, then build the path tree
+        # so planes and pathlines can be attached to their owning path even if
+        # SceneObjects were inserted in a different order.
         for obj in self.workspace.scene_objects.values():
             if obj.data_key == "branch_surface":
                 continue
-            group_name = self._browser_group_name(obj)
-            type_name = self._browser_type_name(obj)
-            if group_name not in groups:
-                top = QtWidgets.QTreeWidgetItem([group_name, "Group"])
-                top.setToolTip(0, group_name)
-                top.setToolTip(1, "Group")
-                top.setFlags(top.flags() | QtCore.Qt.ItemIsUserCheckable)
-                top.setCheckState(0, QtCore.Qt.Checked)
-                color_name = str(getattr(obj, "browser_color", "") or "")
-                if color_name:
-                    color = QtGui.QColor(color_name)
-                    if color.isValid():
-                        top.setForeground(0, QtGui.QBrush(color))
-                groups[group_name] = {"item": top, "types": {}}
-                self.tree_objects.addTopLevelItem(top)
-            group_entry = groups[group_name]
-            type_map = group_entry["types"]
-            if type_name not in type_map:
-                type_item = QtWidgets.QTreeWidgetItem([type_name, "Type"])
-                type_item.setToolTip(0, type_name)
-                type_item.setToolTip(1, "Type")
-                type_item.setFlags(type_item.flags() | QtCore.Qt.ItemIsUserCheckable)
-                type_item.setCheckState(0, QtCore.Qt.Checked)
-                type_map[type_name] = type_item
-                group_entry["item"].addChild(type_item)
-            it = QtWidgets.QTreeWidgetItem([obj.name, obj.kind.value])
-            it.setToolTip(0, obj.name)
-            it.setToolTip(1, obj.kind.value)
-            it.setData(0, QtCore.Qt.UserRole, obj.uid)
-            it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
-            it.setCheckState(0, QtCore.Qt.Checked if obj.visible else QtCore.Qt.Unchecked)
-            type_map[type_name].addChild(it)
+            if obj.kind == ObjectKind.BRANCH or str(obj.data_key).startswith("smooth_path_"):
+                path_objects.append(obj)
+                ensure_group(obj)
+            elif obj.kind == ObjectKind.PLANE:
+                plane_objects.append(obj)
+                ensure_group(obj)
+            elif str(obj.data_key).startswith("pathline_"):
+                pathline_objects.append(obj)
+                ensure_group(obj)
+            else:
+                group_entry = ensure_group(obj)
+                self._browser_add_leaf(ensure_type(group_entry, self._browser_type_name(obj)), obj)
+
+        # Path geometry is the anchor row for each path.  A path node can still
+        # be created when only planes/pathlines exist (for example after an
+        # imported plane file), which keeps the relationship visible.
+        for obj in path_objects:
+            group_entry = ensure_group(obj)
+            path_idx = self._browser_path_index_for_object(obj)
+            if path_idx is None:
+                self._browser_add_leaf(ensure_type(group_entry, "Paths"), obj)
+                continue
+            self._browser_add_leaf(self._browser_add_path_node(group_entry, path_idx), obj)
+
+        plane_items = {}
+        for obj in plane_objects:
+            plane_idx = _parse_plane_index(obj.data_key)
+            group_entry = ensure_group(obj)
+            path_key = self._browser_plane_path_key(plane_idx) if plane_idx is not None else None
+            if path_key is None:
+                plane_item = self._browser_add_leaf(ensure_type(group_entry, "Unbound Planes"), obj)
+            else:
+                path_group, path_idx = path_key
+                # Use the plane's group as the authoritative grouping key even
+                # if a stale SceneObject group_name is present.
+                group_entry = ensure_group(obj, path_group)
+                plane_item = self._browser_add_leaf(self._browser_add_path_node(group_entry, path_idx), obj)
+            if plane_idx is not None:
+                plane_items[int(plane_idx)] = plane_item
+
+        for obj in pathline_objects:
+            plane_idx = _parse_pathline_index(obj.data_key)
+            path_group = self._browser_plane_group_name(int(plane_idx)) if plane_idx is not None else None
+            group_entry = ensure_group(obj, path_group) if path_group else ensure_group(obj)
+            plane_item = plane_items.get(int(plane_idx)) if plane_idx is not None else None
+            if plane_item is not None:
+                self._browser_add_leaf(plane_item, obj)
+                continue
+            path_idx = self._browser_path_index_for_object(obj)
+            if path_idx is not None:
+                self._browser_add_leaf(self._browser_add_path_node(group_entry, path_idx), obj)
+            else:
+                self._browser_add_leaf(ensure_type(group_entry, "Pathlines"), obj)
+
         for group_entry in groups.values():
             top = group_entry["item"]
             type_items = list(group_entry["types"].items())
@@ -4899,10 +5271,24 @@ class MainWindow(QtWidgets.QMainWindow):
             for idx, (_type_name, type_item) in enumerate(type_items):
                 top.removeChild(type_item)
                 top.insertChild(idx, type_item)
+                if _type_name == "Paths":
+                    self._browser_sort_path_nodes(type_item)
                 type_item.setCheckState(0, self._browser_check_state_for_item(type_item))
             top.setCheckState(0, self._browser_check_state_for_item(top))
-        self.tree_objects.expandAll()
+        # Keep the useful navigation levels visible while collapsing each path
+        # body.  A case with dozens of planes therefore starts compact, and
+        # selecting an object still expands its ancestors on demand.
+        for i in range(self.tree_objects.topLevelItemCount()):
+            top = self.tree_objects.topLevelItem(i)
+            top.setExpanded(True)
+            for j in range(top.childCount()):
+                type_item = top.child(j)
+                type_item.setExpanded(True)
+                if type_item.text(0) == "Paths":
+                    for k in range(type_item.childCount()):
+                        type_item.child(k).setExpanded(False)
         self.tree_objects.blockSignals(False)
+        self._refresh_browser_opacity_control()
 
     def _selected_uid(self):
         items = self.tree_objects.selectedItems()
@@ -4910,8 +5296,193 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         return items[0].data(0, QtCore.Qt.UserRole)
 
+    def _browser_selected_objects(self):
+        objects = []
+        seen = set()
+        for item in self.tree_objects.selectedItems():
+            for leaf in self._iter_browser_leaf_items(item):
+                uid = leaf.data(0, QtCore.Qt.UserRole)
+                obj = self.workspace.scene_objects.get(uid) if uid else None
+                if obj is not None and obj.uid not in seen:
+                    objects.append(obj)
+                    seen.add(obj.uid)
+        return objects
+
+    def _refresh_browser_opacity_control(self):
+        objects = self._browser_selected_objects()
+        if not objects:
+            self.slider_browser_opacity.blockSignals(True)
+            self.slider_browser_opacity.setEnabled(False)
+            self.slider_browser_opacity.setValue(100)
+            self.slider_browser_opacity.blockSignals(False)
+            self.label_browser_opacity.setText("Opacity: —")
+            return
+        values = [float(np.clip(getattr(obj, "opacity", 1.0), 0.0, 1.0)) for obj in objects]
+        value = int(round(values[0] * 100.0))
+        mixed = any(abs(current - values[0]) > 1e-6 for current in values[1:])
+        self.slider_browser_opacity.blockSignals(True)
+        self.slider_browser_opacity.setEnabled(True)
+        self.slider_browser_opacity.setValue(value)
+        self.slider_browser_opacity.blockSignals(False)
+        self.label_browser_opacity.setText(
+            f"Opacity: {value}%" + (" (mixed)" if mixed else "")
+        )
+
+    def _set_browser_opacity_for_items(self, items, value):
+        try:
+            opacity = float(np.clip(float(value), 0.0, 1.0))
+        except (TypeError, ValueError):
+            return
+        objects = []
+        seen = set()
+        for item in items or []:
+            for leaf in self._iter_browser_leaf_items(item):
+                uid = leaf.data(0, QtCore.Qt.UserRole)
+                obj = self.workspace.scene_objects.get(uid) if uid else None
+                if obj is not None and obj.uid not in seen:
+                    objects.append(obj)
+                    seen.add(obj.uid)
+        for obj in objects:
+            obj.opacity = opacity
+            if obj.data_key == "segmask_raw_surface":
+                self.workspace.segmentation.opacity = opacity
+            self.scene.apply_object_properties(obj, render=False, refresh_scalar_bar=False)
+        if objects:
+            self.ortho_viewer.refresh()
+            self._refresh_segmentation_ui()
+            self._refresh_browser_opacity_control()
+            self._refresh_scene()
+
+    def _on_browser_opacity_changed(self, value):
+        self._set_browser_opacity_for_items(
+            self.tree_objects.selectedItems(), float(value) / 100.0
+        )
+
+    def _selected_render_object(self):
+        for obj in self._browser_selected_objects():
+            if obj.scalars or obj.data_key == "pcmra_volume":
+                return obj
+        return None
+
+    def _render_object_range(self, obj):
+        if obj.data_key == "pcmra_volume":
+            data = self.scene._build_dataset(obj.data_key)
+            return self.scene._volume_scalar_range(obj, data, respect_clim=False)
+        data = self.scene._build_dataset(obj.data_key)
+        if data is None or not obj.scalars:
+            return None
+        values = None
+        if obj.scalars in getattr(data, "point_data", {}):
+            values = np.asarray(data.point_data[obj.scalars], dtype=float)
+        elif obj.scalars in getattr(data, "cell_data", {}):
+            values = np.asarray(data.cell_data[obj.scalars], dtype=float)
+        if values is None:
+            return None
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            return None
+        low = float(np.min(finite))
+        high = float(np.percentile(finite, 99.5))
+        if not np.isfinite(high) or high <= low:
+            high = float(np.max(finite))
+        return (low, high if high > low else low + 1.0)
+
+    def _refresh_render_range_control(self):
+        obj = self._selected_render_object()
+        if obj is None:
+            self.slider_render_window.setEnabled(False)
+            self.slider_render_level.setEnabled(False)
+            self.btn_reset_render_range.setEnabled(False)
+            self.label_render_window.setText("—")
+            self.label_render_level.setText("—")
+            return
+        clim = tuple(obj.clim) if obj.clim is not None else self._render_object_range(obj)
+        if clim is None:
+            self.slider_render_window.setEnabled(False)
+            self.slider_render_level.setEnabled(False)
+            self.btn_reset_render_range.setEnabled(False)
+            self.label_render_window.setText("—")
+            self.label_render_level.setText("—")
+            return
+        auto_range = self._render_object_range(obj)
+        if auto_range is None:
+            auto_range = clim
+        auto_low, auto_high = (float(value) for value in auto_range)
+        auto_width = max(auto_high - auto_low, 1e-12)
+        width = max(float(clim[1]) - float(clim[0]), 1e-12)
+        level = (float(clim[0]) + float(clim[1])) * 0.5
+        width_slider_value = int(round(np.clip((width / auto_width - 0.01) / 1.99, 0.0, 1.0) * 999.0)) + 1
+        level_slider_value = int(round(np.clip((level - (auto_low - auto_width)) / (3.0 * auto_width), 0.0, 1.0) * 1000.0))
+        self.slider_render_window.blockSignals(True)
+        self.slider_render_level.blockSignals(True)
+        self.slider_render_window.setValue(width_slider_value)
+        self.slider_render_level.setValue(level_slider_value)
+        self.slider_render_window.blockSignals(False)
+        self.slider_render_level.blockSignals(False)
+        self.slider_render_window.setEnabled(True)
+        self.slider_render_level.setEnabled(True)
+        self.btn_reset_render_range.setEnabled(True)
+        self.label_render_window.setText(f"{width:.4g}")
+        self.label_render_level.setText(f"{level:.4g}")
+
+    def _on_render_range_changed(self, _value):
+        obj = self._selected_render_object()
+        if obj is None:
+            return
+        auto_range = self._render_object_range(obj)
+        if auto_range is None:
+            return
+        auto_low, auto_high = (float(value) for value in auto_range)
+        auto_width = max(auto_high - auto_low, 1e-12)
+        width = auto_width * (0.01 + 1.99 * self.slider_render_window.value() / 999.0)
+        level = auto_low - auto_width + 3.0 * auto_width * self.slider_render_level.value() / 1000.0
+        low = level - width * 0.5
+        high = level + width * 0.5
+        if high <= low:
+            return
+        obj.clim = (low, high)
+        self.label_render_window.setText(f"{width:.4g}")
+        self.label_render_level.setText(f"{level:.4g}")
+        self.scene.readd_object(obj, refresh_scalar_bar=False)
+        self.scene.render_all()
+
+    def _reset_selected_render_range(self):
+        obj = self._selected_render_object()
+        if obj is None:
+            return
+        obj.clim = None
+        self.scene.readd_object(obj, refresh_scalar_bar=False)
+        self.scene.render_all()
+        self._refresh_render_range_control()
+
     def _on_browser_select(self):
-        uid = self._selected_uid()
+        self._refresh_browser_opacity_control()
+        self._refresh_render_range_control()
+        items = self.tree_objects.selectedItems()
+        item = items[0] if items else None
+        uid = item.data(0, QtCore.Qt.UserRole) if item is not None else None
+        node_type = item.data(0, _BROWSER_NODE_ROLE) if item is not None else None
+        if uid is None and node_type == "path":
+            path_idx = item.data(0, _BROWSER_PATH_INDEX_ROLE)
+            try:
+                path_idx = int(path_idx)
+            except (TypeError, ValueError):
+                path_idx = -1
+            path_uid = self._find_uid_by_indexed_data_key("smooth_path", path_idx)
+            self.workspace.selected_path_index = path_idx if 0 <= path_idx < len(self.workspace.path_info) else -1
+            self._selected_plane_index = -1
+            self._clear_plane_drag_widgets()
+            self.scene.highlight_plane(None)
+            self.scene.highlight_path(path_uid)
+            self.scene.show_forks_for_path(self.workspace.selected_path_index)
+            self.ortho_viewer.set_selected_plane(None)
+            self._set_plane_info_text("")
+            if self.workspace.selected_path_index >= 0:
+                self._log_selected_path_info(self.workspace.selected_path_index)
+            else:
+                self._set_path_info_text("")
+            self._refresh_analysis_panel()
+            return
         if uid:
             obj = self.workspace.scene_objects.get(uid)
             pathline_idx = _parse_pathline_index(obj.data_key) if obj else None
@@ -4984,13 +5555,9 @@ class MainWindow(QtWidgets.QMainWindow):
         uid = item.data(0, QtCore.Qt.UserRole)
         self.tree_objects.blockSignals(True)
         if uid is not None:
-            obj = self.workspace.scene_objects.get(uid)
-            if obj is not None:
-                obj.visible = item.checkState(0) == QtCore.Qt.Checked
-                if obj.data_key == "segmask_raw_surface":
-                    self.workspace.segmentation.visible = bool(obj.visible)
-                    refresh_segmentation = True
-                self.scene.apply_object_properties(obj, render=False, refresh_scalar_bar=False)
+            refresh_segmentation = self._set_browser_item_visibility(
+                item, item.checkState(0) == QtCore.Qt.Checked
+            )
             self._sync_browser_parent_states(item)
         else:
             checked = item.checkState(0) == QtCore.Qt.Checked
@@ -5010,19 +5577,42 @@ class MainWindow(QtWidgets.QMainWindow):
         uid = item.data(0, QtCore.Qt.UserRole)
         menu = QtWidgets.QMenu(self)
         if uid is None:
-            act_show = menu.addAction("Show All")
-            act_hide = menu.addAction("Hide All")
-            act_del_all = menu.addAction("Delete All")
+            node_type = item.data(0, _BROWSER_NODE_ROLE)
+            path_idx = item.data(0, _BROWSER_PATH_INDEX_ROLE)
+            if node_type == "path":
+                act_show = menu.addAction("Show Path Contents")
+                act_hide = menu.addAction("Hide Path Contents")
+                act_generate = menu.addAction("Generate Pathlines for This Path")
+                act_del_all = menu.addAction("Delete Path Contents")
+            else:
+                act_show = menu.addAction("Show All")
+                act_hide = menu.addAction("Hide All")
+                act_generate = None
+                act_del_all = menu.addAction("Delete All")
             action = menu.exec(self.tree_objects.viewport().mapToGlobal(pos))
             if action == act_show:
                 self._set_group_vis(item, True)
             elif action == act_hide:
                 self._set_group_vis(item, False)
+            elif act_generate is not None and action == act_generate:
+                try:
+                    path_idx = int(path_idx)
+                except (TypeError, ValueError):
+                    path_idx = -1
+                plane_indices = [
+                    idx for idx, plane in enumerate(self.workspace.planes)
+                    if int(getattr(plane, "path_index", -1)) == path_idx
+                    and self._browser_plane_group_name(idx) == str(item.data(0, _BROWSER_GROUP_ROLE) or "Global")
+                ]
+                self._trigger_pathlines(plane_indices=plane_indices, selected_plane_idx=plane_indices[0] if plane_indices else None)
             elif action == act_del_all:
                 self.tree_objects.setCurrentItem(item)
                 self._on_delete_object()
         else:
             act_toggle = menu.addAction("Toggle Visibility")
+            act_opacity = menu.addAction("Set Opacity…")
+            act_reset_opacity = menu.addAction("Reset Opacity (100%)")
+            act_reset_window_level = None
             act_del = menu.addAction("Delete")
             obj = self.workspace.scene_objects.get(uid)
             act_plane_sl = None
@@ -5034,14 +5624,34 @@ class MainWindow(QtWidgets.QMainWindow):
                 selected_plane_indices = self._selected_plane_indices()
                 if len(selected_plane_indices) > 1:
                     act_selected_sl = menu.addAction(f"Generate Pathlines for Selected Planes ({len(selected_plane_indices)})")
+            if obj and str(getattr(obj, "data_key", "")) == "pcmra_volume":
+                act_reset_window_level = menu.addAction("Reset PC-MRA Window/Level")
             if pathline_idx is not None:
                 act_pathline_color = menu.addAction("Set Pathline Color")
             action = menu.exec(self.tree_objects.viewport().mapToGlobal(pos))
             if action == act_toggle:
                 if obj:
-                    obj.visible = not obj.visible
-                    self.scene.apply_object_properties(obj)
-                    self._refresh_browser()
+                    self._set_browser_item_visibility(item, not obj.visible)
+                    self._sync_browser_parent_states(item)
+                    self._refresh_scene()
+            elif action == act_opacity:
+                obj = self.workspace.scene_objects.get(uid)
+                if obj is not None:
+                    value, accepted = QtWidgets.QInputDialog.getDouble(
+                        self,
+                        "Set Opacity",
+                        f"Opacity for {obj.name} (0–100%):",
+                        float(np.clip(obj.opacity, 0.0, 1.0)) * 100.0,
+                        0.0,
+                        100.0,
+                        1,
+                    )
+                    if accepted:
+                        self._set_browser_opacity_for_items([item], value / 100.0)
+            elif action == act_reset_opacity:
+                self._set_browser_opacity_for_items([item], 1.0)
+            elif act_reset_window_level is not None and action == act_reset_window_level:
+                self.scene.reset_volume_window_level()
             elif action == act_del:
                 self._on_delete_object()
             elif act_plane_sl is not None and action == act_plane_sl:
@@ -5313,11 +5923,7 @@ class MainWindow(QtWidgets.QMainWindow):
         clear_streamlines = False
         uids = []
         for item in items:
-            uid = item.data(0, QtCore.Qt.UserRole)
-            if uid is not None:
-                uids.append(uid)
-            else:
-                uids.extend(self._collect_browser_uids(item))
+            uids.extend(self._collect_browser_uids(item))
         uids = list(dict.fromkeys(uids))
         if not uids:
             return
@@ -5383,6 +5989,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.workspace.current_t = value
         self.scene.update_time(value)
         self.ortho_viewer.refresh()
+        self._refresh_render_range_control()
         if final or not self.slider_t.isSliderDown():
             self._refresh_segmentation_ui()
             self._refresh_selection_info()
@@ -5402,6 +6009,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_timeline()
         self.scene.update_time(self.workspace.current_t)
         self.ortho_viewer.refresh()
+        self._refresh_render_range_control()
         self._refresh_segmentation_ui()
         self._refresh_selection_info()
 
@@ -5411,6 +6019,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_timeline()
         self.scene.update_time(self.workspace.current_t)
         self.ortho_viewer.refresh()
+        self._refresh_render_range_control()
         self._refresh_segmentation_ui()
         self._refresh_selection_info()
 
@@ -5448,6 +6057,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_timeline()
         self.scene.update_time(self.workspace.current_t)
         self.ortho_viewer.refresh(update_plane=False)
+        self._refresh_render_range_control()
         render_elapsed_ms = (time.perf_counter() - tick_started_at) * 1000.0
         self._playback_render_times_ms.append(render_elapsed_ms)
         average_render_ms = sum(self._playback_render_times_ms) / len(self._playback_render_times_ms)
@@ -7311,8 +7921,14 @@ def main(config_dir=None):
     configure_high_dpi()
     app = QtWidgets.QApplication(sys.argv)
     apply_application_theme(app)
+    signal.signal(signal.SIGINT, lambda *_args: app.quit())
+    signal_timer = QtCore.QTimer()
+    signal_timer.timeout.connect(lambda: None)
+    signal_timer.start(100)
     w = MainWindow(config_dir=config_dir)
     w.show()
+    w.raise_()
+    w.activateWindow()
     sys.exit(app.exec())
 
 

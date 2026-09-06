@@ -20,6 +20,12 @@ For grouped multi-label segmentations, AutoFlow now:
 5. applies per-group preprocessing
 6. skeletonizes each group separately
 
+Graph paths derived from the skeleton are split at graph nodes with degree
+`>= 3`, so fork existence does not depend on noisy or locally ambiguous flow
+directions. Flow is sampled on the segmentation-filtered path geometry to
+orient each path and assign incoming/outgoing roles after topology has been
+established.
+
 ## When to use it
 - use it after segmentation is available
 - use it before graph and plane generation
@@ -66,6 +72,8 @@ summary = run_case("case.h5", config=AutoFlowConfig(output_dir="./results/case")
 | Parameter | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
 | `remove_small_cc` | bool | `True` | `configs/skeleton.json` | remove small connected components before grouped preprocessing | `autoflow/core/models.py` |
+| `separate_special_label_contacts` | bool | `True` | `configs/skeleton.json`, GUI skeleton parameters, CLI `--separate-special-label-contacts` | separates contacts only between the configured special labels (default: `RBCT`, `CCA`, `LBCT`) | `autoflow/algorithms/preprocess.py` |
+| `special_contact_labels` | list[str] | `["RBCT", "CCA", "LBCT"]` | `configs/skeleton.json` | names of labels whose pairwise contacts are cut; all other label pairs are untouched | `autoflow/core/models.py` |
 | `min_cc_volume_mm3` | float | `50.0` | `configs/skeleton.json` | component-volume threshold | `autoflow/core/models.py` |
 | `cc_filter_mode` | string | `hybrid` | `configs/skeleton.json` | choose `absolute`, `relative`, `hybrid`, or `largest` connected-component filtering | `autoflow/core/models.py` |
 | `cc_rel_min_ratio` | float | `0.01` | `configs/skeleton.json` | relative threshold against the largest connected component for `relative` and `hybrid` filtering | `autoflow/core/models.py` |
@@ -78,6 +86,11 @@ summary = run_case("case.h5", config=AutoFlowConfig(output_dir="./results/case")
 | `label_groups.<group>.preprocess` | mapping | `{}` | `configs/labels.json` | per-group preprocessing overrides before skeletonization | `autoflow/algorithms/preprocess.py` |
 | `single_label_group_name` | string | `single_label` | `configs/labels.json` | fallback group name for binary or one-label inputs | `autoflow/core/models.py` |
 
+Fork detection is topology-based and therefore remains stable when flow near a
+junction is weak. Path direction is still flow-informed, but uses the path
+after segmentation filtering so adjacent labels do not dominate the direction
+score.
+
 ## Outputs
 
 | Output file or object | Created when | Meaning |
@@ -88,6 +101,7 @@ summary = run_case("case.h5", config=AutoFlowConfig(output_dir="./results/case")
 ## Limitations
 - segmentation is required
 - quality depends directly on segmentation quality
+- special-label contact separation changes only the skeleton/graph mask; the original label mask used by flow and metrics is preserved
 - interactive skeleton editing is only available when exactly one segmentation group is active
 
 ## Where to change code
@@ -96,6 +110,7 @@ summary = run_case("case.h5", config=AutoFlowConfig(output_dir="./results/case")
 | --- | --- | --- | --- |
 | preprocessing before skeletonization | `autoflow/algorithms/preprocess.py` | `autoflow/core/models.py`, `autoflow/config.py` | `tests/test_smoke_phantoms.py` |
 | grouped skeleton pipeline flow | `autoflow/core/pipeline.py` | `autoflow/algorithms/skeleton.py` | `tests/test_smoke_phantoms.py` |
+| graph fork detection and flow-based path orientation | `autoflow/algorithms/branch.py`, `autoflow/algorithms/planes.py` | `autoflow/core/pipeline.py` | `tests/test_smoke_phantoms.py` |
 | interactive skeleton edit behavior | `autoflow/ui/app.py`, `autoflow/ui/editors.py` | `autoflow/core/pipeline.py` | GUI manual verification |
 
 ## Tests
@@ -109,4 +124,5 @@ summary = run_case("case.h5", config=AutoFlowConfig(output_dir="./results/case")
 | grouped skeleton is listed in the browser but absent from the 3D view | an older viewer did not resolve grouped `skeleton_<group>` data keys | install the current editable build and run `Generate Skeleton` again |
 | skeleton contains many small branches | noisy segmentation | raise cleanup thresholds or improve segmentation |
 | one grouped vessel disappears | every component in that group fell below the active cleanup threshold | lower `min_cc_volume_mm3` or `cc_rel_min_ratio`, or improve the segmentation |
+| two special labels remain joined | contact separation is disabled or the labels are absent from `special_contact_labels` | enable `separate_special_label_contacts` and check the configured list; all non-special labels are intentionally left unchanged |
 | `Edit Skeleton` is unavailable | more than one segmentation group is active | use a single-group case or simplify `configs/labels.json` |

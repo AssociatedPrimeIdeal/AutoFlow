@@ -1,5 +1,7 @@
 {
   "remove_small_cc": true,
+  "separate_special_label_contacts": true,
+  "special_contact_labels": ["RBCT", "CCA", "LBCT"],
   "min_cc_volume_mm3": 50.0,
   "cc_filter_mode": "hybrid",
   "cc_rel_min_ratio": 0.01,

@@ -20,9 +20,16 @@ dependencies = [
   "pydicom",
   "imageio",
   "Pillow",
+  "PyMaxflow",
 ]
 
 [project.optional-dependencies]
+docs = [
+  "mkdocs-material>=9.5,<10",
+]
+test = [
+  "pytest",
+]
 gui = [
   "PySide6>=6.6",
   "pyqtgraph>=0.13",

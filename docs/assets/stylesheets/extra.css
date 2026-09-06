@@ -1,0 +1,60 @@
+:root {
+  --af-navy: #10233f;
+  --af-teal: #0ea5a4;
+  --md-primary-fg-color: var(--af-navy);
+  --md-primary-fg-color--light: #29476f;
+  --md-primary-fg-color--dark: #071426;
+  --md-accent-fg-color: var(--af-teal);
+}
+
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3 { letter-spacing: -0.02em; }
+.md-typeset h1 { font-weight: 760; }
+.md-typeset img { border-radius: 0.65rem; box-shadow: 0 8px 28px rgba(16, 35, 63, 0.12); }
+
+.af-hero {
+  background: linear-gradient(135deg, #10233f 0%, #173b67 58%, #0e8f96 100%);
+  border-radius: 1.2rem;
+  color: #fff;
+  margin: 0 0 1.5rem;
+  overflow: hidden;
+  padding: clamp(1.4rem, 4vw, 3.2rem);
+  position: relative;
+}
+.af-hero::after {
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 50%;
+  content: "";
+  height: 22rem;
+  position: absolute;
+  right: -7rem;
+  top: -9rem;
+  width: 22rem;
+}
+.af-hero h1 { color: #fff; margin-top: 0; }
+.af-hero p { color: rgba(255, 255, 255, 0.86); max-width: 48rem; }
+.af-hero .md-button { margin: 0.3rem 0.4rem 0.3rem 0; }
+.af-hero--split { display: grid; gap: 2rem; grid-template-columns: minmax(0, 1fr) 12rem; }
+.af-hero-stat { align-self: center; border-left: 1px solid rgba(255,255,255,0.24); padding-left: 1.2rem; }
+.af-hero-stat strong { color: #fff; display: block; font-size: 1.05rem; margin-top: 0.55rem; }
+.af-hero-stat strong:first-child { margin-top: 0; }
+.af-hero-stat p { margin: 0; }
+.af-video { border: 1px solid var(--md-default-fg-color--lightest); border-radius: 0.8rem; display: block; max-width: 100%; width: 100%; }
+
+.af-grid {
+  display: grid;
+  gap: 0.9rem;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  margin: 1rem 0 1.5rem;
+}
+.af-card { border: 1px solid var(--md-default-fg-color--lightest); border-radius: 0.8rem; padding: 1rem 1.1rem; }
+.af-card strong { color: var(--af-navy); display: block; margin-bottom: 0.35rem; }
+.af-card p { font-size: 0.88rem; margin: 0; }
+.af-note { color: var(--md-default-fg-color--light); font-size: 0.88rem; }
+
+@media screen and (max-width: 600px) {
+  .md-typeset table:not([class]) { font-size: 0.76rem; }
+  .af-hero--split { grid-template-columns: 1fr; }
+  .af-hero-stat { border-left: 0; border-top: 1px solid rgba(255,255,255,0.24); padding-left: 0; padding-top: 1rem; }
+}

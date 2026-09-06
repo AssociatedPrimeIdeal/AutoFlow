@@ -86,6 +86,8 @@ class AutoFlowConfig:
     use_center_plane: Optional[bool] = None
 
     remove_small_cc: bool = True
+    separate_special_label_contacts: bool = True
+    special_contact_labels: Sequence[str] = field(default_factory=lambda: ["RBCT", "CCA", "LBCT"])
     min_cc_volume: float = 50.0
     cc_filter_mode: str = "hybrid"
     cc_rel_min_ratio: float = 0.01
@@ -242,6 +244,8 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
         elif str(getattr(cfg, "plane_mode", "") or "").strip() == "":
             ws.plane_gen_params.plane_mode = "distance"
     ws.skeleton_params.remove_small_cc = bool(cfg.remove_small_cc)
+    ws.skeleton_params.separate_special_label_contacts = bool(getattr(cfg, "separate_special_label_contacts", True))
+    ws.skeleton_params.special_contact_labels = [str(value).strip() for value in (getattr(cfg, "special_contact_labels", None) or ["RBCT", "CCA", "LBCT"]) if str(value).strip()]
     ws.skeleton_params.min_cc_volume_mm3 = float(cfg.min_cc_volume)
     ws.skeleton_params.cc_filter_mode = str(cfg.cc_filter_mode or "hybrid")
     ws.skeleton_params.cc_rel_min_ratio = float(cfg.cc_rel_min_ratio)
@@ -448,6 +452,8 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 segmentation_filter=config.segmentation_filter,
                 use_center_plane=config.use_center_plane,
                 remove_small_cc=config.remove_small_cc,
+                separate_special_label_contacts=config.separate_special_label_contacts,
+                special_contact_labels=config.special_contact_labels,
                 min_cc_volume=config.min_cc_volume,
                 cc_filter_mode=config.cc_filter_mode,
                 cc_rel_min_ratio=config.cc_rel_min_ratio,

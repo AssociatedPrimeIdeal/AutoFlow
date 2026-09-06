@@ -50,6 +50,8 @@ from .preprocess import (
     _component_bbox,
     _preprocess_single_component,
     preprocess_mask_for_skeleton,
+    separate_longitudinal_label_contacts,
+    separate_special_label_contacts,
     largest_connected_component,
 )
 
@@ -151,6 +153,7 @@ from .metrics import (
     save_plane_pixelwise_h5,
     _compute_single_plane_metric,
     compute_plane_metrics_multithread,
+    filter_planes_by_branch_support,
     load_metrics_as_table,
 )
 
@@ -188,6 +191,8 @@ __all__ = [
     "filter_4d_labeled_components",
     "remove_small_cc_from_binary_mask",
     "preprocess_mask_for_skeleton",
+    "separate_longitudinal_label_contacts",
+    "separate_special_label_contacts",
     "largest_connected_component",
     "generate_skeleton_from_mask3d",
     "build_graph_from_points",
@@ -250,6 +255,7 @@ __all__ = [
     "augment_plane_metrics_with_derived",
     "save_plane_pixelwise_h5",
     "compute_plane_metrics_multithread",
+    "filter_planes_by_branch_support",
     "load_metrics_as_table",
     "compute_pwv_groups",
     "detect_waveform_foot_time_ms",

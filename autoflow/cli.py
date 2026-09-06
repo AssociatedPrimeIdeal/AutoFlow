@@ -115,6 +115,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.set_defaults(use_center_plane=None)
 
     parser.add_argument("--remove-small-cc", action="store_true", help="Remove small connected components before skeletonization.")
+    parser.add_argument(
+        "--separate-special-label-contacts",
+        "--separate-label-contacts",
+        dest="separate_special_label_contacts",
+        action="store_true",
+        help="Separate contacts between configured special labels before skeletonization (default).",
+    )
+    parser.add_argument(
+        "--no-separate-special-label-contacts",
+        "--no-separate-label-contacts",
+        dest="separate_special_label_contacts",
+        action="store_false",
+        help="Disable special-label contact separation.",
+    )
+    parser.set_defaults(separate_special_label_contacts=None)
     parser.add_argument("--min-cc-volume", type=float, default=None, help="Minimum component volume in mm^3 when removal is enabled.")
     parser.add_argument("--cc-filter-mode", choices=["absolute", "relative", "hybrid", "largest"], default=None, help="Connected-component filtering mode used during skeleton preprocessing.")
     parser.add_argument("--cc-rel-min-ratio", type=float, default=None, help="Relative component threshold ratio against the largest connected component when using relative or hybrid filtering.")
@@ -233,6 +248,7 @@ def main() -> None:
         "plane_spacing_ratio": args.plane_spacing_ratio,
         "segmentation_filter": args.segmentation_filter,
         "min_cc_volume": args.min_cc_volume,
+        "separate_special_label_contacts": args.separate_special_label_contacts,
         "cc_filter_mode": args.cc_filter_mode,
         "cc_rel_min_ratio": args.cc_rel_min_ratio,
         "seed_ratio": args.seed_ratio,
