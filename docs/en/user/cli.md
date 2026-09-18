@@ -185,7 +185,7 @@ Behavior details:
 | `--with` | csv | empty | command line | opt in to `pwv`, `wss`, `tke`, `pg`, and/or `vortex` | `autoflow/cli.py`, `autoflow/processing.py` |
 | `--skip-derived` | bool | `False` | `configs/batch.json` | remove WSS, TKE, and relative-pressure work from the requested set | `autoflow/processing.py` |
 | `--skip-plane-metrics` | bool | `False` | `configs/batch.json` | skip plane metric export | `autoflow/processing.py` |
-| `--single-thread` | bool | multithread on | `configs/batch.json` | disable multithreaded plane metrics | `autoflow/core/pipeline.py` |
+| `--single-thread` | bool | parallel on | `configs/batch.json` | disable adaptive plane parallelism; large jobs use isolated processes despite the compatibility flag name | `autoflow/core/pipeline.py`, `autoflow/algorithms/metrics.py` |
 
 ### Loading and background phase correction
 
@@ -262,8 +262,8 @@ WSS, TKE, and pressure-analysis compute defaults are now split by metric:
 
 | CLI flag | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `--seed-ratio` | float | `0.02` | `configs/streamlines.json` | streamline seed density | `autoflow/algorithms/streamlines.py` |
-| `--tube-radius` | float | `0.25` | `configs/streamlines.json` | streamline tube radius in mm | `autoflow/rendering/videos.py` |
+| `--seed-ratio` | float | `0.1` | `configs/streamlines.json` | streamline seed density | `autoflow/algorithms/streamlines.py` |
+| `--tube-radius` | float | `0.05` | `configs/streamlines.json` | streamline tube radius in mm | `autoflow/rendering/videos.py` |
 | `--pressure-method` | string | `least_squares` | `configs/pressure_gradient.json` | choose `least_squares` or `ppe` relative-pressure reconstruction; both use SciPy sparse solvers | `autoflow/algorithms/metrics.py` |
 
 ### Auto segmentation

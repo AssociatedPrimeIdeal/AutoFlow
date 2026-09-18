@@ -11,6 +11,9 @@
 4D connected-component cleanup is supported in the GUI and pipeline.
 For a 4D prediction, topology uses a 3D majority-vote mask while phase-wise
 plane metrics and derived fields keep the original dynamic `XYZT` mask.
+The 3D vote is used only for topology and plane placement; a plane's
+segmentation label is selected from the corresponding 4D frame during metric
+sampling.
 
 ## What It Does
 Segmentation gives AutoFlow the lumen mask needed for skeletons, graphs, planes, plane metrics, WSS, streamlines, and pathlines.

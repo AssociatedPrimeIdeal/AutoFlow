@@ -92,8 +92,8 @@ class AutoFlowConfig:
     cc_filter_mode: str = "hybrid"
     cc_rel_min_ratio: float = 0.01
 
-    seed_ratio: float = 0.02
-    max_steps: int = 2000
+    seed_ratio: float = 0.1
+    max_steps: int = 200
     min_seeds: int = 50
     pathline_seed_ratio: float = 0.2
     pathline_max_steps: int = 200
@@ -105,7 +105,7 @@ class AutoFlowConfig:
     pathline_tube_radius: float = 0.25
     terminal_speed: float = 0.01
     rng_seed: int = 0
-    tube_radius: float = 0.25
+    tube_radius: float = 0.05
     pathline_color: Optional[str] = None
     plane_pathline_color: Optional[str] = None
     pathline_color_mode: str = "per_plane"

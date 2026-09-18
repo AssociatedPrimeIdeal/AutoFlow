@@ -11,7 +11,7 @@ Entry files:
 - `autoflow/ui/remote_plotter.py`
 - `autoflow/ui/theme.py`
 
-The desktop GUI uses PySide6. The three orthogonal slice views and the manual segmentation editor use pyqtgraph; the selected oblique-plane plot and analysis plots continue to use Matplotlib.
+The desktop GUI uses PySide6. The three orthogonal slice views and the manual segmentation editor use pyqtgraph; analysis plots use Matplotlib.
 
 ## Start The GUI
 
@@ -74,9 +74,19 @@ to suppress background noise. The default volume color transfer is grayscale
 with white high intensities, and the default 3-D background is black. Select any Browser object to adjust its
 individual `Opacity` with the slider below the tree; the context menu also has
 `Set Opacity…` and `Reset Opacity (100%)`. Selecting a group applies the slider
-to all of its descendants. The right-hand ortho viewer has a separate
+to all of its descendants. The `Visibility: Planes` and `Visibility: Pathlines`
+switches below the tree toggle every object of the selected type at once and
+show a mixed state when only some are visible. The right-hand ortho viewer has a separate
 `Overlay` slider for the 2-D segmentation overlay; it does not change the
 underlying scalar window/level.
+
+The 3-D view supports a combined review of PC-MRA, segmentation, and planes.
+After label-group preprocessing, the aggregate segmentation surface is hidden
+so it is not drawn twice; the label-group surfaces are shown at 15% opacity by
+default. Plane surfaces are rendered as bright unlit wireframes so they remain
+readable over the PC-MRA volume. Selecting a plane in the Browser adds a
+magenta highlight; if all planes are too dense, hide individual plane entries
+or use the group/path checkboxes.
 
 When `PC-MRA (4D)` is visible, hold `Shift` and the central 3-D view's left
 mouse button, then drag horizontally for window width and vertically for window
@@ -122,6 +132,7 @@ Input also provides `Reload Input with Current Parameters`. An unchanged input s
 | --- | --- | --- |
 | `3D Axis Orientation...` | choose the displayed positive direction for each 3D axis; the scene mirrors around its center while internal data remains unchanged | `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
 | `3D Background Color...` | choose the 3-D viewport background color; the choice applies to surfaces and PC-MRA volume rendering and starts from the `ui.background_color` config value | `autoflow/config.py`, `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
+| `Ortho Viewer Display...` | set the initial three-view zoom and plane-contour smoothing | `autoflow/ui/ortho_viewer.py`, `autoflow/ui/slice_view.py` |
 
 ## Standard Workflow
 
@@ -135,12 +146,14 @@ Input also provides `Reload Input with Current Parameters`. An unchanged input s
 8. if phase unwrapping ran, inspect `Estimated Wrap Locations`, `Phase Wrap Count`, and the `Unwrapped − Wrapped` views to see where wraps were detected
 9. if the segmentation is a label mask, AutoFlow will reduce 4D labels to 3D by time majority vote, remove small connected components per label, merge labels by configured groups, filter grouped components with the configured skeleton cleanup rule, and then run grouped skeleton, graph, and plane generation
 10. move through the workflow stages and run the actions shown for the current stage; `Run All` is limited to the active stage
-9. inspect group sections in the browser, 3D view, ortho viewer, and selection panel
-10. click `Pathlines` to generate all planes by default, or use a plane context menu to choose This Plane or Selected Planes; generated planes accumulate, and requesting an existing single-plane pathline selects it instead of integrating it again
-11. open `Review & Export`, refresh QC, inspect warnings and suggested actions, then export the report when needed
-12. open the top-level `Settings > 3D Axis Orientation` action to reverse any displayed positive axis direction (LR/RL, AP/PA, or FH/HF) when the case's viewing convention requires it
-12. use `Export > Export Videos...` when you want selected offline MP4 exports
-13. save the active segmentation if you want to reuse it later
+11. inspect group sections in the browser, 3D view, ortho viewer, and selection panel
+12. select a plane to replace the standard slices automatically with `U × V`, `V × N`, and `U × N` views centered on `Plane.center`; the first view is the plane itself and shows the segmentation overlay plus the cyan metric-ROI contour. The `Content` menu then enables `Through-plane Flow (cm/s)`, projected onto the selected plane normal. Clearing the plane selection restores the standard axial, coronal, and sagittal views. Scalar slices use linear interpolation and labels use nearest-neighbour sampling. The three viewers choose robust per-slice window/level values, start with the configured view-only zoom, and use right-click to zoom back out without cropping the data
+13. select `Edit contour` to use the CVI-style freehand editor on the `U × V` view: draw a closed stroke for a new contour, or draw a stroke that crosses an existing contour to replace one local boundary segment. Endpoints snap to the old boundary, the stroke is smoothed, and the area grows or shrinks from the drawn route without an add/remove mode. The edit is committed to the current frame only and recomputes only that frame's plane metrics; TKE, WSS, pressure, and other derived volumes remain unchanged. Ambiguous joins, multiple crossings, or self-intersections are rejected. Use `Undo`, `Redo`, and `Reset frame` for repeated edits
+14. click `Pathlines` to generate all planes by default, or use a plane context menu to choose This Plane or Selected Planes; generated planes accumulate, and requesting an existing single-plane pathline selects it instead of integrating it again
+15. open `Review & Export`, refresh QC, inspect warnings and suggested actions, then export the report when needed
+16. open the top-level `Settings > 3D Axis Orientation` action to reverse any displayed positive axis direction (LR/RL, AP/PA, or FH/HF) when the case's viewing convention requires it
+17. use `Export > Export Videos...` when you want selected offline MP4 exports
+18. save the active segmentation if you want to reuse it later
 
 ## Step Buttons
 
@@ -158,7 +171,12 @@ Input also provides `Reload Input with Current Parameters`. An unchanged input s
 | `Edit Graph` | enter a dedicated graph edit mode | select a group object in the browser to edit that vessel directly; otherwise choose a vessel group in the dialog. The scene hides unrelated layers; select/drag nodes, select/delete edges, press E or use Edge Mode to add/remove edges, then save or cancel |
 | `Run All` | in `Centerline & Planes`, run skeleton, graph, and planes; in `Hemodynamics`, run plane metrics, derived metrics, live streamlines, and all-plane pathlines | does not create segmentation automatically; `Compute PWV` remains explicit |
 
-Compute-oriented pipeline buttons execute in Qt workers. Pathline integration also runs in its own worker before the GUI creates its VTK scene actors, so slow integration does not block the application window. The progress dialog remains responsive while algorithms run. After completion, the GUI invalidates and rebuilds only scene objects affected by those steps instead of recreating every VTK actor. Closing the window is blocked while a task is active so the workspace cannot be destroyed during a calculation.
+Compute-oriented pipeline buttons execute in Qt workers. Plane metric progress advances once for each completed plane, and pathline integration also runs in its own worker before the GUI creates its VTK scene actors, so slow integration does not block the application window. The progress dialog remains responsive while algorithms run. The Browser `Planes` and `Pathlines` visibility switches show or hide every object of that type at once; a partially checked switch indicates mixed visibility. After completion, the GUI invalidates and rebuilds only scene objects affected by those steps instead of recreating every VTK actor. Closing the window is blocked while a task is active so the workspace cannot be destroyed during a calculation.
+
+`Parallel Plane Metrics` keeps small jobs serial and runs jobs with at least
+128 planes in up to eight isolated worker processes. The process isolation is
+required because VTK slicing is not safe against concurrent access to shared
+datasets. Progress still advances once per completed plane.
 
 `Run All` scope:
 
@@ -170,7 +188,7 @@ Compute-oriented pipeline buttons execute in Qt workers. Pathline integration al
 | Panel | Main purpose | Main code |
 | --- | --- | --- |
 | `Input / Background Correction` | loader and DICOM settings, including the active `MSAC` or `WRLS + ARTO` correction method | `autoflow/ui/app.py`, `autoflow/config.py` |
-| `Generate Skeleton Parameters` | cleanup and morphology controls, including the `Separate Special Label Contacts` switch for `RBCT`/`CCA`/`LBCT` contacts | `autoflow/ui/app.py`, `autoflow/config.py` |
+| `Generate Skeleton Parameters` | cleanup and morphology controls, including the `Separate Special Label Contacts` switch for `RBCT`/`CCA`/`LBCT` contacts | `autoflow/ui/app.py`, `autoflow/config.py`, `autoflow/algorithms/preprocess.py` |
 | `Generate Planes Parameters` | uniform/fixed-step layout, segmentation filter, and advanced trim controls | `autoflow/ui/app.py` |
 | `PWV Parameters` | edit groups, waveform selection, spacing, and plot styling | `autoflow/ui/app.py` |
 | `Streamline Parameters` | seed density, steps, terminal speed, colors | `autoflow/ui/app.py` |
@@ -295,23 +313,51 @@ The ortho viewer supports:
 - a persistent interactive colorbar for every scalar source
 - jump-to-plane-center behavior
 
-The three slice views are labeled `Axial (LR-AP)`, `Coronal (LR-FH)`, and `Sagittal (AP-FH)`. Their slider and voxel-coordinate labels use `LR`, `AP`, and `FH` in the same order as the normalized arrays.
+The three slice views are stacked vertically. With no plane selected they are labeled `Axial (LR-AP)`, `Coronal (LR-FH)`, and `Sagittal (AP-FH)`, and their slider and voxel-coordinate labels use `LR`, `AP`, and `FH` in normalized array order. Selecting a plane automatically changes the stack to `U × V`, `V × N`, and `U × N` around that plane. The `U × V` view is the plane surface and carries its segmentation overlay, cyan metric-ROI contour, and any saved yellow manual-ROI boundary.
 
 Slice interactions:
 
 | Input | Action |
 | --- | --- |
 | left click or drag | move the linked LR/AP/FH cursor |
-| wheel | step the slice orthogonal to the hovered view |
+| wheel | step the slice orthogonal to the hovered view when no plane is selected |
 | `Ctrl` + wheel | zoom around the pointer |
+| right click or right drag | zoom out around the pointer |
 | `Shift` + left drag | pan one view |
 | middle drag | adjust window width and level |
-| double-click | expand one slice across the complete 2x2 view area or restore the four-panel layout |
+| double-click | expand one slice across the viewer area or restore the three-view vertical stack |
 | `R` | reset slice zoom and display range |
 | Left / Right | step through cardiac phases while focus is in the ortho viewer |
 
+Drag a slice viewer by its title bar to move it above or below the other two
+viewers. The order is saved in the AutoFlow GUI settings and applies to both
+the standard and selected-plane layouts. During `Edit contour`, the freehand
+stroke is drawn without rebuilding the segmentation or metric views. The exact
+ROI geometry is saved when the mouse is released. If plane metrics already
+exist, only the affected plane and cardiac frame are updated; otherwise metric
+calculation is deferred until the user runs the plane-metrics step.
+
+Rapid slice-slider drags are coalesced into a short display refresh, while the
+LR/AP/FH labels continue to track the slider immediately. This keeps navigation
+responsive on large 4D volumes without changing the selected voxel or data.
+
+`Settings -> Ortho Viewer Display` keeps the default three-view zoom factor and
+contour display smoothing. It also controls the maximum distance used to snap
+an open contour endpoint to the original boundary; `Auto` retains the adaptive
+voxel-spacing threshold. Display settings do not change the metric ROI, its
+area, or any sampled output.
+
 The `Overlay` slider changes the segmentation color overlay opacity immediately
 without changing the scalar image window/level.
+
+When a plane is selected, `Edit contour` is available below the main content
+bar. It edits only the selected plane and current cardiac frame. A closed
+freehand stroke creates a new contour when no current contour exists; otherwise
+the first and last valid boundary joins define the local section to replace.
+For an open replacement stroke, an endpoint that stops short of the original
+boundary is connected by a straight segment to the nearest usable boundary
+point. The editor smooths the stroke and rejects uncertain or self-intersecting
+geometry without changing the saved contour.
 
 ## External Segmentation Editor
 

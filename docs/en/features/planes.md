@@ -25,13 +25,23 @@ In grouped multi-label workflows, every plane keeps the group name of the path i
 
 ### GUI
 1. run `Generate Graph`, then click `Generate Planes`, or click `Add Plane` to create a free plane at the current ortho cursor
-2. select a plane in the browser or 3D view
+2. select a plane in the Browser, or right-click its visible 3-D wireframe; the
+   3-D picker checks the plane foreground layer before the PC-MRA volume
 3. click `Edit Plane`
 4. drag the cyan center handle to move it; generated planes stay on their associated path, while manually added planes can move anywhere
 5. drag the orange or yellow in-plane-axis handle to rotate the plane around the other local axis
-6. click `Finish Plane Edit`; the ortho view, active pathline, metrics, and saved plane outputs are updated after the interaction ends
-7. adjust a selected plane's `Opacity` with the Browser slider (or its context menu), then use `Export -> Export Plane Coordinates...` to export selected Browser planes, or all planes when none are selected
-8. load a target case, use `File -> Import Plane Coordinates...`, then choose world, local, or relative-centerline mapping and Replace or Append
+6. selecting a plane automatically replaces the three vertically stacked standard views with `U × V`, `V × N`, and `U × N` views centered on `Plane.center`; clearing the selection restores axial, coronal, and sagittal views
+7. inspect the `U × V` view, which is the selected plane itself. Its colored overlay is the active segmentation sampled with nearest-neighbour interpolation, and its cyan outline is the display-smoothed current-time ROI used for area and flow metrics. A saved manual ROI is shown with a dashed yellow outline
+8. select `Through-plane Flow (cm/s)` in the main `Content` menu to display velocity projected onto the selected plane normal in all three plane-orthogonal views
+9. use `Settings -> Ortho Viewer Display` to tune display-only contour smoothing and set the default three-view FOV (50% means a 2x view-only zoom); changes do not alter metric areas or crop data
+10. select `Edit contour` and draw on `U × V`: a closed stroke creates a contour when none exists; with an existing boundary, a stroke crossing it twice replaces the shorter local boundary arc. Endpoints snap automatically, the stroke is smoothed, and outward/inward routes expand/shrink the selected region without an add/remove mode. Each frame has its own contour operation; invalid joins, multiple crossings, and self-intersections are rejected. Submitting an edit recomputes only that frame's plane metrics; TKE, WSS, pressure, and other derived volumes are not recomputed. `Undo`, `Redo`, and `Reset frame` are available
+11. scalar images use linear interpolation, labels use nearest-neighbour sampling, and each viewer gets an automatic robust window/level from its displayed slice. Right-click zooms back out
+12. click `Finish Plane Edit`; the ortho view, active pathline, metrics, and saved plane outputs are updated after the interaction ends
+13. adjust a selected plane's `Opacity` with the Browser slider (or its context menu), then use `Export -> Export Plane Coordinates...` to export selected Browser planes, or all planes when none are selected
+14. load a target case, use `File -> Import Plane Coordinates...`, then choose world, local, or relative-centerline mapping and Replace or Append
+
+When `Calculate && Save Metrics` runs in the GUI, its progress dialog advances
+after each plane completes and shows the current plane count.
 
 The Generate Planes panel exposes `Plane Mode`, `Plane Count`, `Anchor`,
 `Direction`, `Spacing Mode`, `Spacing Ratio`, and the enabled-by-default
@@ -118,14 +128,17 @@ summary = run_case("case.h5", config=config)
 | `--import-planes` / `reuse_planes` | path | empty | CLI or `AutoFlowConfig` | load a v2 or legacy plane-coordinate file before metrics | `autoflow/plane_io.py` |
 | `--plane-import-mode` / `plane_import_mode` | string | `world` | CLI or `AutoFlowConfig` | choose world, local, or relative-centerline cross-case mapping | `autoflow/plane_io.py` |
 | `--export-planes` / `export_planes` | path | empty | CLI or `AutoFlowConfig` | write an additional portable coordinate file | `autoflow/processing.py` |
+| `roi_polygon_uv_mm` | list of `[u, v]` mm points | empty | imported or existing plane metadata | legacy plane-local polygon limit applied to every frame | `autoflow/algorithms/metrics.py`, `autoflow/plane_io.py` |
+| `roi_edit_operations` | map of frame index to operations | empty | GUI `Edit contour` or imported plane metadata | frame-local `replace` operations store the final hand-edited contour; legacy `add`/`remove` operations remain readable | `autoflow/algorithms/metrics.py`, `autoflow/ui/ortho_viewer.py` |
+| `slice_default_view_fraction` | float, 0.1–1.0 | `0.5` | GUI `Settings -> Ortho Viewer Display` | initial physical view range fraction for all three viewers; `0.5` is a 2x view-only zoom | `autoflow/ui/ortho_viewer.py`, `autoflow/ui/slice_view.py` |
 
 ## Outputs
 
 | Output file or object | Created when | Meaning |
 | --- | --- | --- |
-| `planes.json` | planes exist | serialized plane geometry, `segmentation_label`, `placement_mode`, and attached summaries when metrics exist |
-| `planes.h5` | planes exist | one root group per plane with geometry, `placement_mode`, `label_name`, path metadata, metrics, and `payload_json` |
-| `plane_positions.json` | planes exist | v2 portable coordinate file containing world/local centers and relative path mapping hints |
+| `planes.json` | planes exist | serialized plane geometry, optional `roi_polygon_uv_mm`, `segmentation_label`, `placement_mode`, and attached summaries when metrics exist |
+| `planes.h5` | planes exist | one root group per plane with geometry, optional manual ROI in `payload_json`, `placement_mode`, `label_name`, path metadata, and metrics |
+| `plane_positions.json` | planes exist | v2 portable coordinate file containing world/local centers, optional plane-local ROI polygons, and relative path mapping hints |
 | `plane_qc.json` | plane generation or metrics run | owner label, confidence, original/retained path lengths, requested/actual counts, and per-plane branch-support decisions |
 | plane scene objects | GUI or pipeline plane step succeeds | grouped plane objects with stable internal keys such as `plane_aorta_systemic_branches_5`, shown in the browser as `plane 5` |
 
@@ -142,6 +155,8 @@ For cross-case import, `world` preserves `center_world_mm` and requires register
 - plane editing is GUI-only
 - generated plane centers remain constrained to their associated path; use `Add Plane` for unrestricted placement
 - plane metrics are recomputed only when a drag finishes, so the metric panel can briefly show the previous values during an active drag
+- selected-plane zoom is display-only; it never changes segmentation or the metric ROI
+- the selected-plane overlay is sampled from the active mask at the selected time frame with nearest-neighbour interpolation; the cyan metric-ROI contour may apply display smoothing, but the underlying calculation mask is unchanged
 - AutoFlow world coordinates are canonical physical millimetres based on origin and spacing, not a general DICOM registration transform
 
 ## Where To Change Code

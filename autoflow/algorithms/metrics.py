@@ -1,3 +1,5 @@
+import os
+
 import h5py
 import numpy as np
 import pyvista as pv
@@ -19,6 +21,14 @@ from .surfaces import (
     create_uniform_grid,
     create_uniform_vector,
 )
+
+
+# Replacement contours usually stay within the same local voxel box across
+# successive edits. Cache those small support meshes so each edit does not
+# rebuild an identical VTK threshold grid. The cache is intentionally bounded
+# because meshes retain VTK-owned memory.
+_LOCAL_SUPPORT_MESH_CACHE = {}
+_LOCAL_SUPPORT_MESH_CACHE_MAX = 16
 
 
 def extract_vectors(polydata):
@@ -200,7 +210,9 @@ def apply_internal_consistency_to_metrics(plane_metrics, path_info=None, forks=N
 
 def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes, RR=1000.0,
                           branch_labels_3d=None, path_info=None, forks=None,
-                          paths=None, return_qc=False, segmentation_labels_3d=None):
+                          paths=None, return_qc=False, segmentation_labels_3d=None,
+                          segmentation_labels_4d=None, skip_support_mesh=False,
+                          progress_callback=None):
     flow = _ensure_flow5d(flow_xyzt3)
     mask = np.asarray(segmask_binary_4d, dtype=bool)
     spacing = np.asarray(spacing, dtype=float).reshape(-1)[:3]
@@ -214,9 +226,25 @@ def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes
     if mask.shape[3] != flow.shape[3]:
         raise ValueError(f"mask time dimension {mask.shape[3]} does not match flow {flow.shape[3]}")
     Nt = int(flow.shape[3])
-    branch_grid = _build_branch_grid(branch_labels_3d, spacing, origin)
+    # A replacement ROI is already an explicit local cut; branch ownership is
+    # not sampled for that path. The frame-only contour update can therefore
+    # skip constructing the full-volume branch grid as well.
+    branch_grid = None if bool(skip_support_mesh) else _build_branch_grid(branch_labels_3d, spacing, origin)
     mask_phase_lookup = _build_mask_phase_lookup(mask)
-    support_mesh_cache = _build_plane_support_mesh_cache(mask, mask_phase_lookup, spacing, origin)
+    # ROI replacement edits build a small local support mesh inside
+    # ``_build_plane_slice_region``. Avoid eagerly meshing the entire 3-D mask
+    # for the common one-frame contour-edit case.
+    needs_support_mesh = not bool(skip_support_mesh)
+    support_mesh_cache = (
+        _build_plane_support_mesh_cache(mask, mask_phase_lookup, spacing, origin)
+        if needs_support_mesh else None
+    )
+    if support_mesh_cache is not None:
+        _add_labeled_plane_support_meshes(
+            support_mesh_cache, mask,
+            segmentation_labels_4d if segmentation_labels_4d is not None else segmentation_labels_3d,
+            planes, spacing, origin
+        )
     mask_static = all(int(rep_t) == 0 for rep_t in mask_phase_lookup)
     mask_template = mask[..., 0] if mask_static else None
 
@@ -231,7 +259,8 @@ def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes
         return []
 
     results = []
-    for plane in planes:
+    total_planes = len(planes)
+    for plane_index, plane in enumerate(planes, start=1):
         target_label = None
         if branch_labels_3d is not None:
             target_label = int(getattr(plane, "label", 0) or 0)
@@ -245,8 +274,15 @@ def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes
         results.append(_compute_single_plane_metric(
             (flow, mask, spacing, origin, plane, Nt, RR,
              branch_grid, target_label, path_info, pp, mask_template, mask_phase_lookup,
-             support_mesh_cache, segmentation_labels_3d)
+             support_mesh_cache, segmentation_labels_3d, segmentation_labels_4d)
         ))
+        if progress_callback is not None:
+            progress_callback({
+                "stage": "plane_metric",
+                "current": int(plane_index),
+                "total": int(total_planes),
+                "message": f"Calculated plane metrics ({plane_index}/{total_planes})",
+            })
 
     results, qc = apply_internal_consistency_to_metrics(results, path_info=path_info, forks=forks)
     for plane_index, metric in enumerate(results):
@@ -320,6 +356,31 @@ def _build_plane_support_mesh_cache(mask4d, mask_phase_lookup, spacing, origin):
     for rep_t in sorted({int(x) for x in mask_phase_lookup}):
         cache[rep_t] = _build_plane_support_mesh(mask4d[..., rep_t], spacing, origin)
     return cache
+
+
+def _add_labeled_plane_support_meshes(cache, mask4d, labels4d, planes, spacing, origin):
+    """Prebuild support meshes for labeled planes so planes share VTK geometry."""
+    if labels4d is None:
+        return
+    labels = np.asarray(labels4d)
+    mask = _ensure_mask4d(mask4d)
+    labels_was_3d = labels.ndim == 3
+    if labels.ndim == 3:
+        labels = labels[..., np.newaxis]
+    if labels.ndim != 4 or labels.shape[:3] != mask.shape[:3]:
+        return
+    requested = sorted({
+        int(getattr(plane, "segmentation_label", 0) or 0)
+        for plane in planes
+        if int(getattr(plane, "segmentation_label", 0) or 0) > 0
+    })
+    for label in requested:
+        for tidx in range(int(mask.shape[3])):
+            label_t = 0 if labels_was_3d else min(int(tidx), int(labels.shape[3]) - 1)
+            cache[("seg4d", int(tidx), int(label))] = _build_plane_support_mesh(
+                mask[..., tidx] & (labels[..., label_t] == int(label)), spacing, origin
+            )
+            cache[("seg3d", int(tidx), int(label))] = cache[("seg4d", int(tidx), int(label))]
 
 
 def filter_planes_by_branch_support(
@@ -447,7 +508,7 @@ def filter_planes_by_branch_support(
     return valid_planes, qc
 
 
-def _build_plane_slice_spec(
+def _build_plane_slice_region(
     mask_xyz,
     plane,
     spacing,
@@ -457,11 +518,75 @@ def _build_plane_slice_spec(
     *,
     select_connected=False,
     support_mesh=None,
+    frame_index=0,
 ):
     mask_xyz = np.asarray(mask_xyz, dtype=bool)
     if not np.any(mask_xyz):
         return None
+    operations = list((getattr(plane, "roi_edit_operations", {}) or {}).get(str(int(frame_index)), []) or [])
+    replacement_polygon = None
+    for operation in operations:
+        if str(operation.get("mode", "")) != "replace":
+            continue
+        candidate = np.asarray(operation.get("polygon", []), dtype=float)
+        if candidate.ndim == 2 and candidate.shape[1] == 2 and len(candidate) >= 3:
+            replacement_polygon = candidate
+
     mesh = support_mesh
+    if replacement_polygon is not None:
+        normal = np.asarray(plane.normal, dtype=float).reshape(3)
+        normal /= np.linalg.norm(normal) + 1e-12
+        reference = np.eye(3, dtype=float)[int(np.argmin(np.abs(normal)))]
+        axis_u = np.cross(reference, normal); axis_u /= np.linalg.norm(axis_u) + 1e-12
+        axis_v = np.cross(normal, axis_u); axis_v /= np.linalg.norm(axis_v) + 1e-12
+        center_local = np.asarray(plane.center, dtype=float).reshape(3)
+        polygon_xyz = (
+            center_local.reshape(1, 3)
+            + replacement_polygon[:, :1] * axis_u.reshape(1, 3)
+            + replacement_polygon[:, 1:2] * axis_v.reshape(1, 3)
+        )
+        voxel_spacing = np.asarray(spacing, dtype=float).reshape(3)
+        # Keep a generous local halo around the polygon. This makes a support
+        # mesh prewarmed for the current contour reusable for nearby outward
+        # edits without changing the selected cells (the polygon filter below
+        # still defines the exact ROI).
+        margin = max(float(np.linalg.norm(voxel_spacing)), 4.0 * float(np.min(voxel_spacing)))
+        lower = np.floor((np.min(polygon_xyz, axis=0) - margin) / spacing).astype(int)
+        upper = np.ceil((np.max(polygon_xyz, axis=0) + margin) / spacing).astype(int) + 1
+        lower = np.clip(lower, 0, np.asarray(mask_xyz.shape) - 1)
+        upper = np.clip(upper, lower + 1, np.asarray(mask_xyz.shape))
+        expanded_mask = np.zeros_like(mask_xyz, dtype=bool)
+        expanded_mask[
+            lower[0]:upper[0],
+            lower[1]:upper[1],
+            lower[2]:upper[2],
+        ] = True
+        cache_key = (
+            tuple(int(x) for x in mask_xyz.shape),
+            tuple(int(x) for x in lower),
+            tuple(int(x) for x in upper),
+            tuple(np.round(np.asarray(spacing, dtype=float).reshape(3), 6)),
+            tuple(np.round(np.asarray(origin, dtype=float).reshape(3), 6)),
+        )
+        mesh = _LOCAL_SUPPORT_MESH_CACHE.get(cache_key)
+        if mesh is None:
+            # Reuse a cached mesh whose local box contains this edit's box.
+            # The mesh carries global cell ids, so extracting the narrower
+            # polygon region remains exact.
+            for candidate_key, candidate_mesh in _LOCAL_SUPPORT_MESH_CACHE.items():
+                if candidate_key[0] != cache_key[0] or candidate_key[3:] != cache_key[3:]:
+                    continue
+                candidate_lower = np.asarray(candidate_key[1], dtype=int)
+                candidate_upper = np.asarray(candidate_key[2], dtype=int)
+                if np.all(candidate_lower <= lower) and np.all(candidate_upper >= upper):
+                    mesh = candidate_mesh
+                    break
+        if mesh is None:
+            mesh = _build_plane_support_mesh(expanded_mask, spacing, origin)
+            if mesh is not None:
+                if len(_LOCAL_SUPPORT_MESH_CACHE) >= _LOCAL_SUPPORT_MESH_CACHE_MAX:
+                    _LOCAL_SUPPORT_MESH_CACHE.pop(next(iter(_LOCAL_SUPPORT_MESH_CACHE)))
+                _LOCAL_SUPPORT_MESH_CACHE[cache_key] = mesh
     if mesh is None:
         mesh = _build_plane_support_mesh(mask_xyz, spacing, origin)
     if mesh is None or mesh.n_cells == 0:
@@ -474,7 +599,7 @@ def _build_plane_slice_spec(
     if pg is None or pg.n_cells == 0:
         return None
     pg = pg.compute_cell_sizes(area=True)
-    if branch_grid is not None and target_label is not None and int(target_label) > 0:
+    if replacement_polygon is None and branch_grid is not None and target_label is not None and int(target_label) > 0:
         centers = pg.cell_centers().sample(branch_grid)
         bid = np.asarray(centers.point_data.get("branch_id", []))
         if len(bid) == 0:
@@ -486,10 +611,131 @@ def _build_plane_slice_spec(
         if pg is None or pg.n_cells == 0:
             return None
         pg = pg.compute_cell_sizes(area=True)
-    if select_connected:
+    # Lasso edits may only operate on the same branch-supported cut cells as
+    # the automatic metric ROI; the later polygon limit narrows that base ROI.
+    operation_pg = pg
+    roi_polygon = np.asarray(getattr(plane, "roi_polygon_uv_mm", []) or [], dtype=float)
+    if roi_polygon.size and replacement_polygon is None:
+        if roi_polygon.ndim != 2 or roi_polygon.shape[1] != 2 or len(roi_polygon) < 3:
+            return None
+        normal = np.asarray(plane.normal, dtype=float).reshape(3)
+        normal = normal / (np.linalg.norm(normal) + 1e-12)
+        reference = np.eye(3, dtype=float)[int(np.argmin(np.abs(normal)))]
+        axis_u = np.cross(reference, normal)
+        axis_u = axis_u / (np.linalg.norm(axis_u) + 1e-12)
+        axis_v = np.cross(normal, axis_u)
+        axis_v = axis_v / (np.linalg.norm(axis_v) + 1e-12)
+        centers = np.asarray(pg.cell_centers().points, dtype=float)
+        relative = centers - plane_center_world.reshape(1, 3)
+        points_uv = np.column_stack((np.dot(relative, axis_u), np.dot(relative, axis_v)))
+        inside = _points_in_polygon(points_uv, roi_polygon)
+        keep = np.where(inside)[0]
+        if len(keep) == 0:
+            return None
+        pg = pg.extract_cells(keep)
+        if pg is None or pg.n_cells == 0:
+            return None
+        pg = pg.compute_cell_sizes(area=True)
+    if select_connected and not operations:
         pg = _select_connected_region(pg, ref_point=plane_center_world)
         if pg is None or pg.n_cells == 0:
             return None
+    if operations:
+        normal = np.asarray(plane.normal, dtype=float).reshape(3)
+        normal /= np.linalg.norm(normal) + 1e-12
+        reference = np.eye(3, dtype=float)[int(np.argmin(np.abs(normal)))]
+        axis_u = np.cross(reference, normal); axis_u /= np.linalg.norm(axis_u) + 1e-12
+        axis_v = np.cross(normal, axis_u); axis_v /= np.linalg.norm(axis_v) + 1e-12
+        base_cell_ids = np.asarray(pg.cell_data.get("_cell_id", []), dtype=np.int64).reshape(-1)
+        all_centers = np.asarray(operation_pg.cell_centers().points, dtype=float)
+        all_relative = all_centers - plane_center_world.reshape(1, 3)
+        all_points_uv = np.column_stack((all_relative @ axis_u, all_relative @ axis_v))
+        selected_ids = set(int(x) for x in base_cell_ids.tolist())
+        for operation in operations:
+            polygon = np.asarray(operation.get("polygon", []), dtype=float)
+            if polygon.ndim != 2 or polygon.shape[1] != 2 or len(polygon) < 3:
+                continue
+            hit = _points_in_polygon(all_points_uv, polygon)
+            hit_ids = set(int(x) for x in np.asarray(operation_pg.cell_data.get("_cell_id", []), dtype=np.int64).reshape(-1)[hit].tolist())
+            operation_mode = str(operation.get("mode", "remove"))
+            if operation_mode == "replace":
+                selected_ids = hit_ids
+            elif operation_mode == "add":
+                selected_ids |= hit_ids
+            else:
+                selected_ids -= hit_ids
+        all_ids = np.asarray(operation_pg.cell_data.get("_cell_id", []), dtype=np.int64).reshape(-1)
+        pg = operation_pg.extract_cells(np.where(np.isin(all_ids, list(selected_ids)))[0])
+        if pg is None or pg.n_cells == 0:
+            return None
+        pg = pg.compute_cell_sizes(area=True)
+    return pg
+
+
+def _points_in_polygon(points_xy, polygon_xy):
+    points = np.asarray(points_xy, dtype=float).reshape(-1, 2)
+    polygon = np.asarray(polygon_xy, dtype=float).reshape(-1, 2)
+    if len(points) == 0 or len(polygon) < 3:
+        return np.zeros(len(points), dtype=bool)
+    point_x = points[:, 0]
+    point_y = points[:, 1]
+    inside = np.zeros(len(points), dtype=bool)
+    previous = polygon[-1]
+    for current in polygon:
+        x0, y0 = float(previous[0]), float(previous[1])
+        x1, y1 = float(current[0]), float(current[1])
+        crosses = (y0 > point_y) != (y1 > point_y)
+        x_cross = (x1 - x0) * (point_y - y0) / (y1 - y0 + 1e-15) + x0
+        inside ^= crosses & (point_x < x_cross)
+        previous = current
+    return inside
+
+
+def _plane_roi_point_mask(points_world, plane, origin):
+    points = np.asarray(points_world, dtype=float).reshape(-1, 3)
+    roi_polygon = np.asarray(getattr(plane, "roi_polygon_uv_mm", []) or [], dtype=float)
+    if len(points) == 0 or roi_polygon.size == 0:
+        return np.ones(len(points), dtype=bool)
+    if roi_polygon.ndim != 2 or roi_polygon.shape[1] != 2 or len(roi_polygon) < 3:
+        return np.zeros(len(points), dtype=bool)
+    normal = np.asarray(plane.normal, dtype=float).reshape(3)
+    normal = normal / (np.linalg.norm(normal) + 1e-12)
+    reference = np.eye(3, dtype=float)[int(np.argmin(np.abs(normal)))]
+    axis_u = np.cross(reference, normal)
+    axis_u = axis_u / (np.linalg.norm(axis_u) + 1e-12)
+    axis_v = np.cross(normal, axis_u)
+    axis_v = axis_v / (np.linalg.norm(axis_v) + 1e-12)
+    center_world = np.asarray(plane.center, dtype=float).reshape(3) + np.asarray(origin, dtype=float).reshape(3)
+    relative = points - center_world.reshape(1, 3)
+    points_uv = np.column_stack((np.dot(relative, axis_u), np.dot(relative, axis_v)))
+    return _points_in_polygon(points_uv, roi_polygon)
+
+
+def _build_plane_slice_spec(
+    mask_xyz,
+    plane,
+    spacing,
+    origin,
+    branch_grid=None,
+    target_label=None,
+    *,
+    select_connected=False,
+    support_mesh=None,
+    frame_index=0,
+):
+    pg = _build_plane_slice_region(
+        mask_xyz,
+        plane,
+        spacing,
+        origin,
+        branch_grid=branch_grid,
+        target_label=target_label,
+        select_connected=select_connected,
+        support_mesh=support_mesh,
+        frame_index=frame_index,
+    )
+    if pg is None or pg.n_cells == 0:
+        return None
     cell_ids = np.asarray(pg.cell_data.get("_cell_id", []), dtype=np.int64).reshape(-1)
     if cell_ids.size != int(pg.n_cells):
         return None
@@ -503,7 +749,7 @@ def _build_plane_slice_spec(
     }
 def _get_cached_plane_slice_spec(slice_cache, cache_key, mask_xyz, plane, spacing, origin,
                                  branch_grid=None, target_label=None, *, select_connected=False,
-                                 support_mesh=None):
+                                 support_mesh=None, frame_index=0):
     if cache_key not in slice_cache:
         slice_cache[cache_key] = _build_plane_slice_spec(
             mask_xyz,
@@ -514,6 +760,7 @@ def _get_cached_plane_slice_spec(slice_cache, cache_key, mask_xyz, plane, spacin
             target_label=target_label,
             select_connected=select_connected,
             support_mesh=support_mesh,
+            frame_index=frame_index,
         )
     return slice_cache[cache_key]
 
@@ -682,7 +929,7 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
             rep_t = int(mask_phase_lookup[tidx])
             slice_spec = _get_cached_plane_slice_spec(
                 slice_cache,
-                rep_t,
+                (rep_t, tidx),
                 mask4d[..., rep_t],
                 plane,
                 spacing,
@@ -789,8 +1036,12 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
             if wall is not None and getattr(wall, "n_points", 0) > 0:
                 if "wss" not in wall.point_data and "wss" in wall.cell_data:
                     vals = np.asarray(wall.cell_data.get("wss", []), dtype=float).reshape(-1)
+                    sample_points = np.asarray(wall.cell_centers().points, dtype=float)
                 else:
                     vals = np.asarray(wall.point_data.get("wss", []), dtype=float).reshape(-1)
+                    sample_points = np.asarray(wall.points, dtype=float)
+                if len(vals) == len(sample_points):
+                    vals = vals[_plane_roi_point_mask(sample_points, plane, origin)]
                 wss_vals = vals[np.isfinite(vals)]
         if wss_vals.size:
             wss_mean_t.append(float(np.mean(wss_vals)))
@@ -1848,7 +2099,7 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
 def _compute_single_plane_metric(args):
     (flow, mask, spacing, origin, plane, Nt, RR, branch_grid, target_label,
      path_info, path_points, mask_template, mask_phase_lookup,
-     support_mesh_cache, segmentation_labels_3d) = args
+     support_mesh_cache, segmentation_labels_3d, segmentation_labels_4d) = args
     normal = np.asarray(plane.normal, dtype=float).reshape(3)
     normal = normal / (np.linalg.norm(normal) + 1e-12)
 
@@ -1867,20 +2118,30 @@ def _compute_single_plane_metric(args):
     meanv_fwd_t = []     
     meanv_rev_t = []     
     slice_cache = {}
+    labels4d_arr = None if segmentation_labels_4d is None else np.asarray(segmentation_labels_4d)
+    labels3d_arr = None if segmentation_labels_3d is None else np.asarray(segmentation_labels_3d)
 
     for t in range(Nt):
         rep_t = int(mask_phase_lookup[t]) if mask_phase_lookup else int(t)
         mask_t = mask_template if mask_template is not None else mask[..., rep_t]
         plane_seg_label = int(getattr(plane, "segmentation_label", 0) or 0)
-        if plane_seg_label > 0 and segmentation_labels_3d is not None:
-            seg3d = np.asarray(segmentation_labels_3d)
-            if seg3d.ndim == 4:
-                seg3d = seg3d[..., 0]
-            if seg3d.shape == mask_t.shape[:3]:
-                mask_t = np.asarray(mask_t, dtype=bool) & (seg3d == plane_seg_label)[..., None] if mask_t.ndim == 4 else np.asarray(mask_t, dtype=bool) & (seg3d == plane_seg_label)
+        mask_t = np.asarray(mask_t, dtype=bool)
+        if plane_seg_label > 0:
+            # Prefer phase-specific labels when available, while retaining
+            # the legacy 3-D label behavior for older workspaces and H5
+            # inputs that do not carry a 4-D label sequence.
+            if labels4d_arr is not None and labels4d_arr.ndim == 4 and labels4d_arr.shape[:3] == mask_t.shape[:3]:
+                mask_t = mask_t & (labels4d_arr[..., int(t)] == plane_seg_label)
+            elif labels3d_arr is not None:
+                labels3d = labels3d_arr[..., 0] if labels3d_arr.ndim == 4 else labels3d_arr
+                if labels3d.shape == mask_t.shape[:3]:
+                    mask_t = mask_t & (labels3d == plane_seg_label)
+        frame_specific_roi = bool(getattr(plane, "roi_edit_operations", {}) or {})
+        frame_specific_labels = plane_seg_label > 0 and segmentation_labels_4d is not None
+        slice_cache_key = (rep_t, t) if (frame_specific_roi or frame_specific_labels) else rep_t
         slice_spec = _get_cached_plane_slice_spec(
             slice_cache,
-            rep_t,
+            slice_cache_key,
             mask_t,
             plane,
             spacing,
@@ -1888,7 +2149,16 @@ def _compute_single_plane_metric(args):
             branch_grid=branch_grid,
             target_label=target_label,
             select_connected=True,
-            support_mesh=(None if plane_seg_label > 0 else (support_mesh_cache.get(rep_t) if support_mesh_cache is not None else None)),
+            support_mesh=(
+                (
+                    support_mesh_cache.get(("seg4d", int(t), plane_seg_label))
+                    if segmentation_labels_4d is not None
+                    else support_mesh_cache.get(("seg3d", rep_t, plane_seg_label))
+                )
+                if plane_seg_label > 0 and support_mesh_cache is not None
+                else (support_mesh_cache.get(rep_t) if support_mesh_cache is not None else None)
+            ),
+            frame_index=t,
         )
         if slice_spec is None:
             flowrate.append(0.0); flowrate_fwd.append(0.0); flowrate_rev.append(0.0)
@@ -1987,6 +2257,12 @@ def _compute_single_plane_metric(args):
         "local_path_tangent": [float(x) for x in np.asarray(local_tangent, dtype=float).tolist()],
         "local_path_direction": _vector_orientation_text(local_tangent),
         "normal_tangent_cos": float(ntc),
+        "roi_mode": "manual_polygon" if len(getattr(plane, "roi_polygon_uv_mm", []) or []) >= 3 else "automatic",
+        "roi_polygon_uv_mm": [
+            [float(point[0]), float(point[1])]
+            for point in (getattr(plane, "roi_polygon_uv_mm", []) or [])
+            if len(point) >= 2
+        ],
     }
     if path_info is not None and 0 <= int(plane.path_index) < len(path_info):
         info = path_info[int(plane.path_index)]
@@ -1998,11 +2274,129 @@ def _compute_single_plane_metric(args):
     return metric
 
 
+def _compute_plane_metrics_process_chunk(
+    indexed_planes, flow, mask, spacing, origin, RR, branch_labels_3d,
+    path_info, paths, segmentation_labels_3d, segmentation_labels_4d,
+    progress_path,
+):
+    indices = [int(index) for index, _plane in indexed_planes]
+    planes = [plane for _index, plane in indexed_planes]
+
+    def _mark_progress(_payload):
+        if not progress_path:
+            return
+        fd = os.open(progress_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, b"1\n")
+        finally:
+            os.close(fd)
+
+    metrics = compute_plane_metrics(
+        flow, mask, spacing, origin, planes,
+        RR=RR,
+        branch_labels_3d=branch_labels_3d,
+        path_info=path_info,
+        forks=None,
+        paths=paths,
+        return_qc=False,
+        segmentation_labels_3d=segmentation_labels_3d,
+        segmentation_labels_4d=segmentation_labels_4d,
+        progress_callback=_mark_progress if progress_path else None,
+    )
+    return list(zip(indices, metrics))
+
+
+def _run_plane_metric_processes(
+    flow, mask, spacing, origin, planes, RR, branch_labels_3d, path_info,
+    paths, segmentation_labels_3d, segmentation_labels_4d, max_workers,
+    progress_callback,
+):
+    import tempfile
+    import threading
+    import time
+    from joblib import Parallel, delayed
+
+    worker_count = max(1, min(int(max_workers), len(planes)))
+    chunks = [list(enumerate(planes))[offset::worker_count] for offset in range(worker_count)]
+    progress_dir = tempfile.TemporaryDirectory(prefix="autoflow_plane_metrics_")
+    progress_path = os.path.join(progress_dir.name, "progress.log") if progress_callback is not None else ""
+    if progress_path:
+        open(progress_path, "ab").close()
+
+    def _calculate():
+        return Parallel(
+            n_jobs=worker_count,
+            backend="loky",
+            max_nbytes="10M",
+            mmap_mode="r",
+        )(
+            delayed(_compute_plane_metrics_process_chunk)(
+                chunk, flow, mask, spacing, origin, RR, branch_labels_3d,
+                path_info, paths, segmentation_labels_3d, segmentation_labels_4d,
+                progress_path,
+            )
+            for chunk in chunks if chunk
+        )
+
+    completed = 0
+    try:
+        if progress_callback is None:
+            chunk_results = _calculate()
+        else:
+            state = {"result": None, "error": None}
+
+            def _target():
+                try:
+                    state["result"] = _calculate()
+                except BaseException as exc:
+                    state["error"] = exc
+
+            runner = threading.Thread(target=_target, name="autoflow-plane-processes", daemon=True)
+            runner.start()
+            read_offset = 0
+            while runner.is_alive():
+                with open(progress_path, "rb") as handle:
+                    handle.seek(read_offset)
+                    new_events = handle.readlines()
+                    read_offset = handle.tell()
+                for _event in new_events:
+                    completed += 1
+                    progress_callback({
+                        "stage": "plane_metric",
+                        "current": int(completed),
+                        "total": int(len(planes)),
+                        "message": f"Calculated plane metrics ({completed}/{len(planes)})",
+                    })
+                runner.join(timeout=0.05)
+            runner.join()
+            with open(progress_path, "rb") as handle:
+                handle.seek(read_offset)
+                remaining_events = handle.readlines()
+            for _event in remaining_events:
+                completed += 1
+                progress_callback({
+                    "stage": "plane_metric",
+                    "current": int(completed),
+                    "total": int(len(planes)),
+                    "message": f"Calculated plane metrics ({completed}/{len(planes)})",
+                })
+            if state["error"] is not None:
+                raise state["error"]
+            chunk_results = state["result"]
+        results = [None] * len(planes)
+        for chunk in chunk_results or []:
+            for plane_index, metric in chunk:
+                results[int(plane_index)] = metric
+        return results
+    finally:
+        progress_dir.cleanup()
+
+
 def compute_plane_metrics_multithread(flow_xyzt3, segmask_binary_4d, spacing, origin, planes, RR=1000.0,
                                        branch_labels_3d=None, path_info=None, forks=None,
                                        paths=None, return_qc=False, max_workers=None,
-                                       segmentation_labels_3d=None):
-    from concurrent.futures import ThreadPoolExecutor
+                                       segmentation_labels_3d=None, segmentation_labels_4d=None,
+                                       progress_callback=None):
     flow = _ensure_flow5d(flow_xyzt3)
     mask = np.asarray(segmask_binary_4d, dtype=bool)
     spacing = np.asarray(spacing, dtype=float).reshape(-1)[:3]
@@ -2013,49 +2407,33 @@ def compute_plane_metrics_multithread(flow_xyzt3, segmask_binary_4d, spacing, or
         mask = np.repeat(mask[..., np.newaxis], flow.shape[3], axis=3)
     elif mask.ndim == 4 and mask.shape[3] == 1 and flow.shape[3] > 1:
         mask = np.repeat(mask, flow.shape[3], axis=3)
-    Nt = int(flow.shape[3])
-    mask_phase_lookup = _build_mask_phase_lookup(mask)
-    support_mesh_cache = _build_plane_support_mesh_cache(mask, mask_phase_lookup, spacing, origin)
-    mask_static = all(int(rep_t) == 0 for rep_t in mask_phase_lookup)
-    mask_template = mask[..., 0] if mask_static else None
-
-    branch_grid = _build_branch_grid(branch_labels_3d, spacing, origin)
-    paths_lookup = None
-    if paths is not None:
-        paths_lookup = [np.asarray(p, dtype=float).reshape(-1, 3) for p in paths]
-
     if len(planes) == 0:
         empty_qc = {"path_ic": {}, "segmentation_label_ic": {}, "fork_ic": {}, "forks": []}
         if return_qc:
             return [], empty_qc
         return []
 
-    args_list = []
-    for plane in planes:
-        target_label = None
-        if branch_labels_3d is not None:
-            target_label = int(getattr(plane, "label", 0) or 0)
-            if target_label <= 0:
-                target_label = _target_label_for_plane(plane, branch_labels_3d, spacing, origin)
-        pp = None
-        if paths_lookup is not None:
-            pi = int(getattr(plane, "path_index", -1))
-            if 0 <= pi < len(paths_lookup):
-                pp = paths_lookup[pi]
-        args_list.append((flow, mask, spacing, origin, plane, Nt, RR,
-                          branch_grid, target_label, path_info, pp, mask_template,
-                          mask_phase_lookup, support_mesh_cache, segmentation_labels_3d))
     if max_workers is None:
         import os as _os
-        # Shared VTK support geometry makes small and medium plane sets faster
-        # without thread scheduling.  Reserve parallel slicing for unusually
-        # large sets and cap it to avoid oversubscribing VTK/BLAS workers.
+        # Separate worker processes avoid unsafe concurrent access to shared
+        # VTK datasets. Process startup only pays off for large plane sets.
         max_workers = 1 if len(planes) < 128 else min(len(planes), 8, max(1, _os.cpu_count() or 4))
     if int(max_workers) <= 1:
-        results = [_compute_single_plane_metric(args) for args in args_list]
+        result = compute_plane_metrics(
+            flow, mask, spacing, origin, planes, RR=RR,
+            branch_labels_3d=branch_labels_3d, path_info=path_info,
+            forks=forks, paths=paths, return_qc=return_qc,
+            segmentation_labels_3d=segmentation_labels_3d,
+            segmentation_labels_4d=segmentation_labels_4d,
+            progress_callback=progress_callback,
+        )
+        return result
     else:
-        with ThreadPoolExecutor(max_workers=int(max_workers)) as pool:
-            results = list(pool.map(_compute_single_plane_metric, args_list))
+        results = _run_plane_metric_processes(
+            flow, mask, spacing, origin, planes, RR, branch_labels_3d,
+            path_info, paths, segmentation_labels_3d, segmentation_labels_4d,
+            max_workers, progress_callback,
+        )
     results, qc = apply_internal_consistency_to_metrics(results, path_info=path_info, forks=forks)
     for plane_index, metric in enumerate(results):
         if isinstance(metric, dict):

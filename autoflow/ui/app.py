@@ -1,5 +1,6 @@
 import hashlib
 import json
+import copy
 from collections import deque
 from dataclasses import dataclass
 import importlib.util
@@ -371,7 +372,14 @@ class _PipelineTaskWorker(QtCore.QObject):
                     "message": f"Running {step.label}...",
                 })
                 step_started = time.perf_counter()
-                result = self._engine.run_step(self._workspace, step, lambda _message: None)
+                def _step_progress(payload, *, _step=step):
+                    data = dict(payload or {})
+                    data.setdefault("step", _step)
+                    self.progress.emit(data)
+                result = self._engine.run_step(
+                    self._workspace, step, lambda _message: None,
+                    progress_callback=_step_progress,
+                )
                 elapsed = time.perf_counter() - step_started
                 results.append((step, result, float(elapsed)))
                 self.progress.emit({
@@ -601,6 +609,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._esc_shortcut.activated.connect(self._force_exit_edit)
         QtCore.QTimer.singleShot(0, self._setup_focus_behavior)
         self.ortho_viewer.timeStepRequested.connect(self._on_ortho_time_step)
+        self.ortho_viewer.planeRoiChanged.connect(self._on_plane_roi_changed)
         self._refresh_all()
         self.statusBar().showMessage("Ready")
 
@@ -795,6 +804,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tree_objects.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.tree_objects.customContextMenuRequested.connect(self._on_browser_ctx_menu)
         lay.addWidget(self.tree_objects)
+        visibility_row = QtWidgets.QHBoxLayout()
+        visibility_row.addWidget(QtWidgets.QLabel("Visibility:"))
+        self.chk_all_planes_visible = QtWidgets.QCheckBox("Planes")
+        self.chk_all_planes_visible.setTristate(True)
+        self.chk_all_planes_visible.setToolTip("Show or hide all plane objects")
+        self.chk_all_planes_visible.stateChanged.connect(
+            lambda state: self._set_render_category_visibility("planes", state != QtCore.Qt.Unchecked)
+        )
+        self.chk_all_pathlines_visible = QtWidgets.QCheckBox("Pathlines")
+        self.chk_all_pathlines_visible.setTristate(True)
+        self.chk_all_pathlines_visible.setToolTip("Show or hide all pathline objects")
+        self.chk_all_pathlines_visible.stateChanged.connect(
+            lambda state: self._set_render_category_visibility("pathlines", state != QtCore.Qt.Unchecked)
+        )
+        visibility_row.addWidget(self.chk_all_planes_visible)
+        visibility_row.addWidget(self.chk_all_pathlines_visible)
+        visibility_row.addStretch()
+        lay.addLayout(visibility_row)
         opacity_row = QtWidgets.QHBoxLayout()
         self.label_browser_opacity = QtWidgets.QLabel("Opacity: —")
         self.slider_browser_opacity = QtWidgets.QSlider(QtCore.Qt.Horizontal)
@@ -1083,8 +1110,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_streamline_params(self):
         grp = QtWidgets.QGroupBox("Streamline / Pathline Parameters")
         fl = QtWidgets.QFormLayout(grp)
-        self.edit_sl_ratio = QtWidgets.QLineEdit("0.02")
-        self.edit_sl_maxsteps = QtWidgets.QLineEdit("2000")
+        self.edit_sl_ratio = QtWidgets.QLineEdit("0.1")
+        self.edit_sl_maxsteps = QtWidgets.QLineEdit("200")
         self.edit_pathline_ratio = QtWidgets.QLineEdit("0.2")
         self.edit_pathline_maxsteps = QtWidgets.QLineEdit("200")
         self.edit_pathline_minseeds = QtWidgets.QLineEdit("50")
@@ -1301,7 +1328,7 @@ class MainWindow(QtWidgets.QMainWindow):
         fl_tke.addRow("Pressure Support Erosion (vox)", self.edit_dm_pg_support_erosion)
         fl_tke.addRow("Pressure Gradient Opacity", self.edit_dm_pg_opacity)
         fl_tke.addRow("Relative Pressure Opacity", self.edit_dm_rp_opacity)
-        fl_tke.addRow("Multi-thread Metrics", self.chk_dm_multithread)
+        fl_tke.addRow("Parallel Plane Metrics", self.chk_dm_multithread)
         self.params_layout.addWidget(grp_tke)
 
     def _build_vortex_params(self):
@@ -2300,6 +2327,9 @@ class MainWindow(QtWidgets.QMainWindow):
         a = QtGui.QAction("3D Background Color...", self)
         a.triggered.connect(self._open_background_color_settings)
         ms.addAction(a)
+        a = QtGui.QAction("Ortho Viewer Display...", self)
+        a.triggered.connect(lambda: self.ortho_viewer.open_plane_display_settings())
+        ms.addAction(a)
         mv = mb.addMenu("View")
         for label, slot in [("Reset Camera", lambda: self.scene.reset_camera()), ("Toggle Axes", lambda: self.scene.toggle_axes()),
             ("White BG", lambda: self.scene.set_background("white")), ("Dark BG", lambda: self.scene.set_background("#202124"))]:
@@ -2685,8 +2715,12 @@ class MainWindow(QtWidgets.QMainWindow):
         obj = ws.scene_objects.get(uid)
         if obj is None:
             return
+        has_grouped_surfaces = any(
+            str(getattr(item, "data_key", "")).startswith("segmask_group_")
+            for item in ws.scene_objects.values()
+        )
         obj.name = self._segmentation_object_name()
-        obj.visible = bool(ws.segmentation.visible)
+        obj.visible = bool(ws.segmentation.visible) and not has_grouped_surfaces
         obj.opacity = float(ws.segmentation.opacity)
         obj.scalars = "label"
         obj.cmap = "tab10"
@@ -2694,6 +2728,9 @@ class MainWindow(QtWidgets.QMainWindow):
         obj.show_scalar_bar = show_shared_colorbar
         obj.scalar_bar_title = "Label"
         obj.scalar_bar_cfg = shared_bar_cfg
+        for grouped in ws.scene_objects.values():
+            if str(getattr(grouped, "data_key", "")).startswith("segmask_group_"):
+                grouped.visible = bool(ws.segmentation.visible)
 
     def _refresh_segmentation_ui(self):
         panel = self.segmentation_panel
@@ -3523,21 +3560,20 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_segmentation_visibility_changed(self, checked):
         self.workspace.segmentation.visible = bool(checked)
         self._sync_segmentation_scene_object()
-        uid = self._find_uid_by_data_key("segmask_raw_surface")
-        if uid is not None:
-            obj = self.workspace.scene_objects.get(uid)
-            if obj is not None:
-                self.scene.apply_object_properties(obj)
+        for obj in self.workspace.scene_objects.values():
+            if obj.data_key == "segmask_raw_surface" or obj.data_key.startswith("segmask_group_"):
+                self.scene.apply_object_properties(obj, render=False)
+        self.scene.render_all()
         self.ortho_viewer.refresh()
 
     def _on_segmentation_opacity_changed(self, value):
         self.workspace.segmentation.opacity = float(np.clip(value / 100.0, 0.0, 1.0))
         self._sync_segmentation_scene_object()
-        uid = self._find_uid_by_data_key("segmask_raw_surface")
-        if uid is not None:
-            obj = self.workspace.scene_objects.get(uid)
-            if obj is not None:
-                self.scene.apply_object_properties(obj)
+        for obj in self.workspace.scene_objects.values():
+            if obj.data_key == "segmask_raw_surface" or obj.data_key.startswith("segmask_group_"):
+                obj.opacity = float(self.workspace.segmentation.opacity)
+                self.scene.apply_object_properties(obj, render=False)
+        self.scene.render_all()
         self.ortho_viewer.refresh()
 
     def _on_segmentation_label_selected(self):
@@ -4316,6 +4352,33 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._persist_plane_outputs(include_pixelwise=False)
 
+    def _on_plane_roi_changed(self, plane_idx):
+        if not (0 <= int(plane_idx) < len(self.workspace.planes)):
+            return
+        self._selected_plane_index = int(plane_idx)
+        self._plane_drag_index = int(plane_idx)
+        self._plane_drag_metrics_dirty = True
+        # A newly generated plane may not have metrics yet. Editing its
+        # contour only changes the saved ROI definition; defer all metric
+        # work until the user explicitly runs the plane-metrics step.
+        metrics = self.workspace.derived.plane_metrics
+        has_selected_metric = (
+            len(metrics) == len(self.workspace.planes)
+            and bool(metrics[int(plane_idx)])
+        )
+        if not has_selected_metric:
+            self._persist_plane_outputs(include_pixelwise=False)
+            self.ortho_viewer._selected_plane_idx = int(plane_idx)
+            self.ortho_viewer.refresh_plane_contours()
+            self._plane_drag_metrics_dirty = False
+            self.log(f"Plane {int(plane_idx)} contour saved; metric calculation deferred")
+            return
+        # A contour operation only changes the current frame. Recomputing the
+        # full 4-D plane metric here rebuilds the VTK slice mesh for every
+        # cardiac phase and makes mouse release feel unnecessarily slow.
+        self._recompute_dragged_plane_metrics(persist=True, frame_only=True)
+        self.log(f"Plane {int(plane_idx)} metric ROI updated")
+
     def _activate_plane_drag_widgets(self, plane_idx):
         if self._edit_mode is not None or not (0 <= int(plane_idx) < len(self.workspace.planes)):
             return
@@ -4417,24 +4480,213 @@ class MainWindow(QtWidgets.QMainWindow):
             self._plane_widget_initializing = False
             self._refresh_plane_edit_controls()
 
-    def _recompute_dragged_plane_metrics(self, persist=False):
+    @staticmethod
+    def _merge_plane_metric_frame(previous, updated, frame_index, frame_count, rr_ms):
+        """Patch one frame into an existing metric without losing other frames."""
+        result = dict(previous or {})
+        index = int(np.clip(frame_index, 0, max(0, int(frame_count) - 1)))
+        series_keys = {
+            key for key, value in (previous or {}).items()
+            if isinstance(value, list) and len(value) == int(frame_count)
+        }
+        for key, value in (updated or {}).items():
+            if not isinstance(value, list) or len(value) != 1:
+                continue
+            # A contour can be edited before plane metrics have ever been
+            # computed. In that case there is no existing full-length series
+            # to patch; initialize only the affected metric series and leave
+            # the other cardiac frames at zero until a full metric run.
+            if key not in series_keys and key not in result:
+                series_keys.add(key)
+            if key not in series_keys:
+                continue
+            patched = list(result.get(key, [0.0] * int(frame_count)))
+            if len(patched) != int(frame_count):
+                patched = [0.0] * int(frame_count)
+            patched[index] = value[0]
+            result[key] = patched
+            if key.endswith("_t"):
+                scalar_key = key[:-2]
+                if scalar_key in result:
+                    finite = np.asarray(patched, dtype=float)
+                    result[scalar_key] = float(np.mean(finite)) if finite.size else 0.0
+
+        flow = np.asarray(result.get("flowrate_mL_s", []), dtype=float)
+        flow_forward = np.asarray(result.get("flowrate_forward_mL_s", []), dtype=float)
+        flow_reverse = np.asarray(result.get("flowrate_reverse_mL_s", []), dtype=float)
+        flow_signed = np.asarray(result.get("flowrate_signed_mL_s", []), dtype=float)
+        if flow.size:
+            result["netflow_mL_beat"] = float(abs(np.mean(flow) * float(rr_ms) / 1000.0))
+        if flow_forward.size:
+            result["netflow_forward_mL_beat"] = float(np.mean(flow_forward) * float(rr_ms) / 1000.0)
+        if flow_reverse.size:
+            result["netflow_reverse_mL_beat"] = float(np.mean(flow_reverse) * float(rr_ms) / 1000.0)
+        if flow_forward.size and flow_reverse.size:
+            result["net_netflow_signed_mL_beat"] = float(
+                result.get("netflow_forward_mL_beat", 0.0)
+                - result.get("netflow_reverse_mL_beat", 0.0)
+            )
+            forward = float(result.get("netflow_forward_mL_beat", 0.0))
+            result["reflux_fraction"] = float(
+                result.get("netflow_reverse_mL_beat", 0.0) / forward
+            ) if forward > 1e-12 else 0.0
+        for series_key, scalar_key in (
+            ("meanv_cm_s_t", "meanv_cm_s"),
+            ("meanv_forward_cm_s_t", "meanv_forward_cm_s"),
+            ("meanv_reverse_cm_s_t", "meanv_reverse_cm_s"),
+            ("meanv_signed_cm_s_t", "meanv_signed_cm_s"),
+        ):
+            values = np.asarray(result.get(series_key, []), dtype=float)
+            if values.size:
+                result[scalar_key] = float(np.mean(values))
+        return result
+
+    def _recompute_plane_metric_frame(self, plane_idx, frame_index, include_derived):
+        """Recompute only the frame touched by a contour edit."""
+        ws = self.workspace
+        plane = ws.planes[int(plane_idx)]
+        frame = int(frame_index)
+        frame_plane = copy.copy(plane)
+        frame_ops = list(
+            (getattr(plane, "roi_edit_operations", {}) or {}).get(str(frame), []) or []
+        )
+        # The metric code uses the local index of the supplied 4-D arrays.
+        # Remap the frame-local operation to index zero for a one-frame call.
+        frame_plane.roi_edit_operations = {"0": copy.deepcopy(frame_ops)} if frame_ops else {}
+        flow = np.asarray(ws.flow_raw)
+        flow_frame = flow[..., frame:frame + 1, :]
+        mask = np.asarray(ws.segmask_binary, dtype=bool)
+        mask_frame = mask[..., None] if mask.ndim == 3 else mask[..., frame:frame + 1]
+        labels = getattr(ws, "segmask_labels", None)
+        labels_frame = None
+        if labels is not None:
+            labels = np.asarray(labels)
+            labels_frame = labels[..., None] if labels.ndim == 3 else labels[..., frame:frame + 1]
+        paths_for_tangent = (
+            ws.centerline_paths_smooth
+            if len(ws.centerline_paths_smooth) > 0
+            else ws.centerline_paths
+        )
+        partial = compute_plane_metrics(
+            flow_frame,
+            mask_frame,
+            ws.resolution,
+            ws.origin,
+            [frame_plane],
+            RR=ws.rr,
+            branch_labels_3d=ws.branch_labels,
+            segmentation_labels_3d=getattr(ws, "segmask_labels_3d", None),
+            segmentation_labels_4d=labels_frame,
+            path_info=ws.path_info,
+            forks=ws.forks,
+            paths=paths_for_tangent,
+            return_qc=False,
+            skip_support_mesh=True,
+        )
+        if not partial:
+            return None
+        previous = dict(
+            ws.derived.plane_metrics[int(plane_idx)]
+            or getattr(plane, "metrics", {})
+            or {}
+        )
+        metric = self._merge_plane_metric_frame(
+            previous,
+            partial[0],
+            frame,
+            flow.shape[3],
+            ws.rr,
+        )
+        if include_derived:
+            def frame_slice(value):
+                if value is None:
+                    return None
+                array = np.asarray(value)
+                if array.ndim == 3:
+                    return array[..., None]
+                if array.ndim == 5 and array.shape[-1] == 3:
+                    return array[..., frame:frame + 1, :]
+                return array[..., frame:frame + 1]
+
+            wss = getattr(ws.derived, "wss_surfaces", None) or []
+            wss_frame = [wss[frame]] if frame < len(wss) else []
+            derived_metrics, _ = augment_plane_metrics_with_derived(
+                [metric],
+                [frame_plane],
+                mask_frame,
+                ws.resolution,
+                ws.origin,
+                branch_labels_3d=ws.branch_labels,
+                tke_array=frame_slice(ws.derived.tke_array),
+                pressure_gradient_array=frame_slice(ws.derived.pressure_gradient_array),
+                relative_pressure_array=frame_slice(ws.derived.relative_pressure_array),
+                wss_surfaces=wss_frame,
+            )
+            if derived_metrics:
+                metric = self._merge_plane_metric_frame(
+                    metric,
+                    derived_metrics[0],
+                    frame,
+                    flow.shape[3],
+                    ws.rr,
+                )
+        return metric
+
+    def _recompute_dragged_plane_metrics(self, persist=False, frame_only=False):
         if self._plane_drag_index is None or not (0 <= int(self._plane_drag_index) < len(self.workspace.planes)):
             return
         if self.workspace.flow_raw is None or self.workspace.segmask_binary is None:
-            self.ortho_viewer.refresh()
+            if frame_only:
+                self.ortho_viewer.refresh_plane_contours()
+            else:
+                self.ortho_viewer.refresh()
             if persist:
                 self._persist_plane_outputs(include_pixelwise=False)
             self._plane_drag_metrics_dirty = False
             return
         plane_idx = int(self._plane_drag_index)
         try:
-            include_derived = bool(
+            if frame_only and (
+                len(self.workspace.derived.plane_metrics) != len(self.workspace.planes)
+                or not bool(self.workspace.derived.plane_metrics[plane_idx])
+            ):
+                # There is no prior metric series to patch. The contour-only
+                # caller persists the ROI and defers calculation explicitly.
+                self._plane_drag_metrics_dirty = False
+                return
+            include_derived = False if frame_only else bool(
                 (self.workspace.derived.wss_surfaces and self.workspace.derived.wss_volume is not None)
                 or self.workspace.derived.tke_array is not None
                 or self.workspace.derived.pressure_gradient_array is not None
                 or self.workspace.derived.relative_pressure_array is not None
             )
-            if len(self.workspace.derived.plane_metrics) != len(self.workspace.planes):
+            if frame_only:
+                # Contour edits are local to one cardiac frame. This must
+                # remain true even when the user edits a newly generated
+                # plane before running the plane-metrics step at all.
+                frame_metric = self._recompute_plane_metric_frame(
+                    plane_idx,
+                    self.workspace.current_t,
+                    include_derived,
+                )
+                if frame_metric is not None:
+                    metrics = (
+                        [dict(m) for m in self.workspace.derived.plane_metrics]
+                        if len(self.workspace.derived.plane_metrics) == len(self.workspace.planes)
+                        else [{} for _ in self.workspace.planes]
+                    )
+                    metrics[plane_idx] = frame_metric
+                    metrics, qc = apply_internal_consistency_to_metrics(
+                        metrics,
+                        path_info=self.workspace.path_info,
+                        forks=self.workspace.forks,
+                    )
+                    self.workspace.derived.plane_metrics = metrics
+                    self.workspace.derived.plane_qc = qc
+                    for i, metric in enumerate(metrics):
+                        if i < len(self.workspace.planes):
+                            self.workspace.planes[i].metrics = dict(metric)
+            elif len(self.workspace.derived.plane_metrics) != len(self.workspace.planes):
                 self.pipeline._compute_plane_metrics_internal(
                     self.workspace,
                     save=False,
@@ -4455,6 +4707,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     [self.workspace.planes[plane_idx]],
                     RR=self.workspace.rr,
                     branch_labels_3d=self.workspace.branch_labels,
+                    segmentation_labels_4d=self.workspace.segmask_labels,
                     path_info=self.workspace.path_info,
                     forks=self.workspace.forks,
                     paths=paths_for_tangent,
@@ -4487,7 +4740,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._persist_plane_outputs(include_pixelwise=False)
             self._selected_plane_index = plane_idx
             self.ortho_viewer._selected_plane_idx = plane_idx
-            self.ortho_viewer.refresh()
+            if frame_only:
+                self.ortho_viewer.refresh_plane_contours()
+            else:
+                self.ortho_viewer.refresh()
             self._log_selected_plane_metric(plane_idx)
             self._refresh_analysis_panel()
             self._plane_drag_metrics_dirty = False
@@ -4887,8 +5143,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "plot_dpi": max(self._int_from_text(self.edit_pwv_plot_dpi.text(), 160), 72),
         }
         ws.pwv_params = PwvParams.from_dict(pwv_payload, label_map=ws.label_params.label_map)
-        ws.streamline_params.seed_ratio = min(max(self._float_from_text(self.edit_sl_ratio.text(), 0.02), 0.0001), 1.0)
-        ws.streamline_params.max_steps = min(max(self._int_from_text(self.edit_sl_maxsteps.text(), 2000), 1), 200000)
+        ws.streamline_params.seed_ratio = min(max(self._float_from_text(self.edit_sl_ratio.text(), 0.1), 0.0001), 1.0)
+        ws.streamline_params.max_steps = min(max(self._int_from_text(self.edit_sl_maxsteps.text(), 200), 1), 200000)
         ws.streamline_params.terminal_speed = min(max(self._float_from_text(self.edit_sl_terminal.text(), 0.01), 0.0), 1e6)
         ws.streamline_params.pathline_seed_ratio = min(max(self._float_from_text(self.edit_pathline_ratio.text(), 0.2), 0.0001), 1.0)
         ws.streamline_params.pathline_max_steps = min(max(self._int_from_text(self.edit_pathline_maxsteps.text(), 200), 1), 200000)
@@ -5288,7 +5544,48 @@ class MainWindow(QtWidgets.QMainWindow):
                     for k in range(type_item.childCount()):
                         type_item.child(k).setExpanded(False)
         self.tree_objects.blockSignals(False)
+        self._sync_render_category_visibility_controls()
         self._refresh_browser_opacity_control()
+
+    def _render_category_objects(self, category):
+        if category == "planes":
+            return [obj for obj in self.workspace.scene_objects.values() if obj.kind == ObjectKind.PLANE]
+        if category == "pathlines":
+            return [
+                obj for obj in self.workspace.scene_objects.values()
+                if str(getattr(obj, "data_key", "") or "").startswith("pathline_")
+            ]
+        return []
+
+    def _sync_render_category_visibility_controls(self):
+        for category, checkbox in (
+            ("planes", getattr(self, "chk_all_planes_visible", None)),
+            ("pathlines", getattr(self, "chk_all_pathlines_visible", None)),
+        ):
+            if checkbox is None:
+                continue
+            objects = self._render_category_objects(category)
+            checkbox.blockSignals(True)
+            checkbox.setEnabled(bool(objects))
+            if not objects or all(bool(getattr(obj, "visible", False)) for obj in objects):
+                checkbox.setCheckState(QtCore.Qt.Checked if objects else QtCore.Qt.Unchecked)
+            elif not any(bool(getattr(obj, "visible", False)) for obj in objects):
+                checkbox.setCheckState(QtCore.Qt.Unchecked)
+            else:
+                checkbox.setCheckState(QtCore.Qt.PartiallyChecked)
+            checkbox.blockSignals(False)
+
+    def _set_render_category_visibility(self, category, visible):
+        objects = self._render_category_objects(category)
+        if not objects:
+            self._sync_render_category_visibility_controls()
+            return
+        for obj in objects:
+            obj.visible = bool(visible)
+            self.scene.apply_object_properties(obj, render=False, refresh_scalar_bar=False)
+        self._sync_render_category_visibility_controls()
+        self._refresh_browser()
+        self._refresh_scene()
 
     def _selected_uid(self):
         items = self.tree_objects.selectedItems()
@@ -5566,6 +5863,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tree_objects.blockSignals(False)
         if refresh_segmentation:
             self._refresh_segmentation_ui()
+        self._sync_render_category_visibility_controls()
         self._refresh_scene()
 
     def _on_browser_ctx_menu(self, pos):
@@ -6809,9 +7107,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.pipeline.preprocess(self.workspace)
             self.scene.trigger_streamlines()
             self._refresh_browser()
-            self.scene.invalidate_cache("streamlines")
-            self.scene.sync_from_workspace()
-            self._refresh_all()
+            self._refresh_workflow_status()
             self.log("[Run All: Hemodynamics] Live streamlines enabled; generating pathlines for all planes.")
             self._trigger_pathlines(
                 plane_indices=list(range(len(self.workspace.planes))),
@@ -6853,9 +7149,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.pipeline.preprocess(self.workspace)
                 self.scene.trigger_streamlines()
                 self._refresh_browser()
-                self.scene.invalidate_cache()
-                self.scene.sync_from_workspace()
-                self._refresh_all()
+                self._refresh_workflow_status()
                 return
             if step == StepId.PLANE_STREAMLINES:
                 self._on_plane_streamlines_step()

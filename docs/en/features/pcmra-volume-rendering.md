@@ -23,15 +23,24 @@ Use it as a 3-D anatomical backdrop while reviewing segmentation, planes,
 streamlines, and pathlines. It is especially useful when a surface-only
 segmentation view hides nearby vessels.
 
+The GUI can show PC-MRA, segmentation, and planes together. When processed
+label-group surfaces exist, the original aggregate segmentation surface is
+hidden to avoid drawing the same segmentation twice. Group surfaces start at
+15% opacity. Plane actors use bright, unlit wireframes so they remain visible
+through the volume; selecting a plane adds a magenta highlight.
+
 ## Quick use
 
 1. Load an H5 or DICOM case with magnitude and flow.
 2. In the left Browser, select the `PC-MRA (4D)` item under `Global → PC-MRA` and check or uncheck it.
 3. Adjust `Opacity` below the Browser (or use the item's right-click `Set Opacity…`).
-4. In the central 3-D view, hold `Shift` and the left mouse button and drag
+4. Keep the `Segmentation` and `Planes` Browser entries visible. Use the
+   segmentation dock or Browser opacity slider to make segmentation faint, and
+   select a plane to highlight the plane of interest.
+5. In the central 3-D view, hold `Shift` and the left mouse button and drag
    horizontally to change window width and vertically to change window level.
    All other camera gestures use VTK's default trackball-camera mapping.
-5. Use the `Window/Level` sliders below the 3-D view to adjust the range, or
+6. Use the `Window/Level` sliders below the 3-D view to adjust the range, or
    use `Auto` / `Reset PC-MRA Window/Level` to restore the automatic range.
    Without `Shift`, all three mouse buttons retain VTK's default camera
    behavior regardless of PC-MRA visibility.
@@ -48,7 +57,8 @@ segmentation view hides nearby vessels.
 
 | Parameter | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| Browser `Opacity` | 0–100% slider | 85% | GUI, per `SceneObject` | scales the PC-MRA scalar-opacity transfer function | `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
+| Browser `Opacity` | 0–100% slider | 85% for PC-MRA; 75% for planes | GUI, per `SceneObject` | scales the selected layer; for PC-MRA it scales the scalar-opacity transfer function | `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
+| segmentation opacity | 0–100% slider | 15% | Segmentation dock or Browser | controls the active segmentation surfaces; grouped surfaces replace the aggregate surface in the 3-D view | `autoflow/ui/app.py`, `autoflow/core/models.py` |
 | automatic range | current frame positive finite values | `P5` to `P99` | GUI | derives `WL=(L+H)/2` and `WW=H-L` | `autoflow/ui/viewer.py` |
 | `Window` slider | normalized slider | automatic current-frame width | GUI | changes PC-MRA window width | `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
 | `Level` slider | normalized slider | automatic current-frame center | GUI | changes PC-MRA window level | `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
@@ -65,6 +75,7 @@ opacity. The 3-D actor is a VTK volume actor, not a polygon surface.
 
 - The volume is phase-resolved, but it uses the loaded temporal frames directly; no temporal interpolation is performed.
 - PC-MRA has no scalar bar by default because it is used as an anatomical backdrop.
+- Showing every generated plane at once can be visually dense; select one plane in the Browser for the magenta focus overlay, or hide individual plane objects.
 - GPU volume rendering support depends on the local VTK/OpenGL environment.
 
 ## Where to change code

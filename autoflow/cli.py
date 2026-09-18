@@ -36,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-tke", action="store_true", help="Skip TKE computation, export, and derived summaries.")
     parser.add_argument("--skip-pressure-gradient", action="store_true", help="Skip relative-pressure reconstruction, centerline pressure-drop outputs, and pressure-gradient-derived summaries.")
     parser.add_argument("--skip-plane-metrics", action="store_true", help="Skip plane metric export.")
-    parser.add_argument("--single-thread", dest="use_multithread", action="store_false", help="Disable multithreaded plane metric calculation.")
+    parser.add_argument("--single-thread", dest="use_multithread", action="store_false", help="Disable parallel plane metric calculation.")
     parser.add_argument("--bgc", dest="background_phase_correction", action="store_true", help="Enable background phase offset correction during loading.")
     parser.add_argument(
         "--bgc-method",

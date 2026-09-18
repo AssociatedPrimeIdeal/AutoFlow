@@ -200,7 +200,7 @@ class RemotePlotter(QtWidgets.QWidget):
         x, y = self._vtk_position(event)
         control, shift = self._modifier_state(event)
         interactor = self.iren
-        interactor.SetEventInformation(x, y, control, shift, "\0", 0, None)
+        interactor.SetEventInformation(x, y, control, shift, " ", 0, None)
         # ``SetEventInformation`` has no Alt argument.  Keep it in the VTK
         # interactor explicitly so SceneController can distinguish an
         # Alt+left rotation from a plain left-button pan.
@@ -233,10 +233,14 @@ class RemotePlotter(QtWidgets.QWidget):
             style.OnMiddleButtonDown()
         elif event.button() == QtCore.Qt.RightButton:
             style.OnRightButtonDown()
-            try:
-                interactor.InvokeEvent("RightButtonPressEvent")
-            except Exception:
-                pass
+            dispatch = getattr(self, "_autoflow_right_click_dispatch", None)
+            if callable(dispatch):
+                dispatch()
+            else:
+                try:
+                    interactor.InvokeEvent("RightButtonPressEvent")
+                except Exception:
+                    pass
         else:
             event.ignore()
             return

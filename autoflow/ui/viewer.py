@@ -1,5 +1,6 @@
 import numpy as np
 import pyvista as pv
+from pyvista import _vtk
 
 from ..core.models import ObjectKind
 from ..algorithms import (
@@ -121,6 +122,7 @@ class SceneController:
         self._interaction_last_position = None
         self._volume_wl_user_callback = None
         self._qt_mouse_filter = None
+        self._plane_overlay_renderer = None
 
     @staticmethod
     def _is_volume_object(obj):
@@ -197,6 +199,19 @@ class SceneController:
             try:
                 prop.SetInterpolationTypeToNearest()
                 prop.SetScalarOpacityUnitDistance(max(float(np.mean(np.asarray(self.workspace.resolution, dtype=float))), 0.1))
+                transfer.RemoveAllPoints()
+                width = max(float(hi - lo), 1e-6)
+                opacity_scale = float(np.clip(getattr(obj, "opacity", 1.0), 0.0, 1.0))
+                for fraction, alpha in (
+                    (0.00, 0.00),
+                    (0.05, 0.00),
+                    (0.18, 0.015),
+                    (0.38, 0.05),
+                    (0.62, 0.14),
+                    (0.82, 0.28),
+                    (1.00, 0.42),
+                ):
+                    transfer.AddPoint(lo + width * fraction, alpha * opacity_scale)
             except Exception:
                 pass
         except Exception:
@@ -204,10 +219,53 @@ class SceneController:
 
     def initialize(self):
         self.plotter.set_background(self._background_color)
+        self._ensure_plane_overlay_renderer()
         self._add_orientation_axes()
         self._ensure_volume_window_level_interaction()
         self._ensure_native_qt_mouse_bridge()
         self.plotter.reset_camera()
+
+    def _ensure_plane_overlay_renderer(self):
+        render_window = getattr(self.plotter, "render_window", None)
+        main_renderer = getattr(self.plotter, "renderer", None)
+        if render_window is None or main_renderer is None:
+            return None
+        try:
+            render_window.SetNumberOfLayers(max(2, render_window.GetNumberOfLayers()))
+        except Exception:
+            return None
+        if self._plane_overlay_renderer is None:
+            try:
+                renderer = _vtk.vtkRenderer()
+                renderer.SetLayer(1)
+                renderer.SetInteractive(0)
+                renderer.SetErase(False)
+                renderer.SetPreserveDepthBuffer(False)
+                renderer.SetBackgroundAlpha(0.0)
+                renderer.SetActiveCamera(main_renderer.GetActiveCamera())
+                render_window.AddRenderer(renderer)
+                self._plane_overlay_renderer = renderer
+            except Exception:
+                self._plane_overlay_renderer = None
+        else:
+            try:
+                self._plane_overlay_renderer.SetActiveCamera(main_renderer.GetActiveCamera())
+            except Exception:
+                pass
+        return self._plane_overlay_renderer
+
+    def _move_actor_to_plane_overlay(self, actor):
+        overlay = self._ensure_plane_overlay_renderer()
+        if actor is None or overlay is None:
+            return
+        try:
+            self.plotter.renderer.RemoveActor(actor)
+        except Exception:
+            pass
+        try:
+            overlay.AddActor(actor)
+        except Exception:
+            pass
 
     def _visible_volume_object(self):
         for obj in reversed(list(self.workspace.scene_objects.values())):
@@ -611,6 +669,11 @@ class SceneController:
         return transformed
 
     def reset_scene(self):
+        if self._plane_overlay_renderer is not None:
+            try:
+                self._plane_overlay_renderer.RemoveAllViewProps()
+            except Exception:
+                pass
         try:
             self.plotter.clear()
         except Exception:
@@ -878,8 +941,15 @@ class SceneController:
         try:
             prop = obj.actor.GetProperty()
             prop.SetOpacity(float(obj.opacity))
-            prop.SetLineWidth(float(obj.line_width))
+            prop.SetLineWidth(max(float(obj.line_width), 4.0) if obj.kind == ObjectKind.PLANE else float(obj.line_width))
             prop.SetPointSize(float(obj.point_size))
+            if obj.kind == ObjectKind.PLANE:
+                prop.SetRepresentationToWireframe()
+                prop.SetLighting(False)
+                try:
+                    obj.actor.ForceOpaqueOn()
+                except Exception:
+                    pass
             if not obj.scalars and obj.color:
                 prop.SetColor(*pv.Color(obj.color).float_rgb)
         except Exception:
@@ -1008,6 +1078,11 @@ class SceneController:
 
     def _remove_plane_highlight(self):
         if self._highlight_plane_actor is not None:
+            if self._plane_overlay_renderer is not None:
+                try:
+                    self._plane_overlay_renderer.RemoveActor(self._highlight_plane_actor)
+                except Exception:
+                    pass
             try:
                 self.plotter.remove_actor(self._highlight_plane_actor)
             except Exception:
@@ -1020,6 +1095,11 @@ class SceneController:
 
     def _remove_path_highlight(self):
         if self._highlight_path_actor is not None:
+            if self._plane_overlay_renderer is not None:
+                try:
+                    self._plane_overlay_renderer.RemoveActor(self._highlight_path_actor)
+                except Exception:
+                    pass
             try:
                 self.plotter.remove_actor(self._highlight_path_actor)
             except Exception:
@@ -1033,6 +1113,11 @@ class SceneController:
 
     def _clear_fork_and_context_actors(self):
         if self._highlight_fork_actor is not None:
+            if self._plane_overlay_renderer is not None:
+                try:
+                    self._plane_overlay_renderer.RemoveActor(self._highlight_fork_actor)
+                except Exception:
+                    pass
             try:
                 self.plotter.remove_actor(self._highlight_fork_actor)
             except Exception:
@@ -1043,6 +1128,11 @@ class SceneController:
         self._highlight_fork_actor = None
         for actor in list(self._context_path_actors):
             if actor is not None:
+                if self._plane_overlay_renderer is not None:
+                    try:
+                        self._plane_overlay_renderer.RemoveActor(actor)
+                    except Exception:
+                        pass
                 try:
                     self.plotter.remove_actor(actor)
                 except Exception:
@@ -1090,6 +1180,7 @@ class SceneController:
             prop.SetLighting(False)
         except Exception:
             pass
+        self._move_actor_to_plane_overlay(actor)
 
     def refresh_plane_labels(self):
         pass
@@ -1099,6 +1190,11 @@ class SceneController:
 
     def _remove_actor(self, obj):
         if obj.actor is not None:
+            if self._plane_overlay_renderer is not None:
+                try:
+                    self._plane_overlay_renderer.RemoveActor(obj.actor)
+                except Exception:
+                    pass
             try:
                 self.plotter.remove_actor(obj.actor)
             except Exception:
@@ -1149,6 +1245,8 @@ class SceneController:
                 self._set_volume_opacity(obj, data_show)
             else:
                 obj.actor = self.plotter.add_mesh(data_show, name=obj.uid, **kwargs)
+                if obj.kind == ObjectKind.PLANE:
+                    self._move_actor_to_plane_overlay(obj.actor)
             self._tracked_actors[obj.uid] = obj.actor
             self._apply_basic_properties_only(obj)
         except Exception as e:
@@ -1167,7 +1265,7 @@ class SceneController:
         try:
             prop = obj.actor.GetProperty()
             prop.SetOpacity(float(obj.opacity))
-            prop.SetLineWidth(float(obj.line_width))
+            prop.SetLineWidth(max(float(obj.line_width), 4.0) if obj.kind == ObjectKind.PLANE else float(obj.line_width))
             prop.SetPointSize(float(obj.point_size))
         except Exception:
             pass
@@ -1238,9 +1336,9 @@ class SceneController:
             # of being darkened by the tube surface orientation.
             kw["lighting"] = False
         if obj.kind == ObjectKind.PLANE:
-            kw["show_edges"] = True
-            kw["edge_color"] = "black"
-            kw["line_width"] = max(float(obj.line_width), 2.0)
+            kw["style"] = "wireframe"
+            kw["lighting"] = False
+            kw["line_width"] = max(float(obj.line_width), 4.0)
         return kw
 
     def _resolved_object_clim(self, obj):
@@ -1264,6 +1362,14 @@ class SceneController:
             and hasattr(data, "tube")
             and obj.kind.value in ("Graph", "Branch", "Flow", "Metric", "Skeleton")
         ):
+            return data
+        # Keep live streamlines as lightweight polylines.  ``PolyData.tube``
+        # expands every trajectory into a large triangle mesh before VTK can
+        # render it; camera interaction then has to redraw that mesh on every
+        # mouse move.  ``_mesh_kwargs`` already enables VTK line tubes for the
+        # flow actor, which preserves the rounded appearance without the
+        # heavy CPU-side geometry expansion.
+        if str(getattr(obj, "data_key", "")) == "streamlines_live":
             return data
         key = (str(obj.data_key), id(data), float(obj.tube_radius))
         cached = self._display_mesh_cache.get(key)
@@ -1763,7 +1869,14 @@ class SceneController:
             if idx >= len(ws.planes):
                 return None
             p = ws.planes[idx]
-            return pv.Plane(center=np.asarray(p.center) + np.asarray(org), direction=np.asarray(p.normal), i_size=25, j_size=25)
+            return pv.Plane(
+                center=np.asarray(p.center) + np.asarray(org),
+                direction=np.asarray(p.normal),
+                i_size=25,
+                j_size=25,
+                i_resolution=1,
+                j_resolution=1,
+            )
 
         return None
 
@@ -2016,6 +2129,62 @@ class SceneController:
                 best_uid, best_idx, best_dist = uid, pidx, d
         return (best_uid, best_idx) if best_dist <= 30.0 else (None, None)
 
+    def _plane_uid_at_display_position(self, x, y):
+        renderer = self.plotter.renderer
+        target = np.asarray([float(x), float(y)], dtype=float)
+        candidates = []
+        for uid, obj in self.workspace.scene_objects.items():
+            if obj.kind != ObjectKind.PLANE or obj.actor is None:
+                continue
+            try:
+                if not obj.actor.GetVisibility():
+                    continue
+            except Exception:
+                continue
+            plane_idx = _parse_indexed_data_key(obj.data_key, "plane")
+            if plane_idx is None or not (0 <= plane_idx < len(self.workspace.planes)):
+                continue
+            plane = self.workspace.planes[plane_idx]
+            center = np.asarray(plane.center, dtype=float).reshape(3) + np.asarray(self.workspace.origin, dtype=float).reshape(3)
+            normal = np.asarray(plane.normal, dtype=float).reshape(3)
+            norm = float(np.linalg.norm(normal))
+            if norm <= 1e-12:
+                continue
+            normal /= norm
+            reference = np.eye(3, dtype=float)[int(np.argmin(np.abs(normal)))]
+            axis_u = np.cross(reference, normal)
+            axis_u /= np.linalg.norm(axis_u) + 1e-12
+            axis_v = np.cross(normal, axis_u)
+            axis_v /= np.linalg.norm(axis_v) + 1e-12
+            half_size = 12.5
+            corners = [
+                center - half_size * axis_u - half_size * axis_v,
+                center + half_size * axis_u - half_size * axis_v,
+                center + half_size * axis_u + half_size * axis_v,
+                center - half_size * axis_u + half_size * axis_v,
+            ]
+            projected = []
+            for corner in corners:
+                display_corner = self.world_to_display_point(corner)
+                renderer.SetWorldPoint(*display_corner.tolist(), 1.0)
+                renderer.WorldToDisplay()
+                projected.append(np.asarray(renderer.GetDisplayPoint(), dtype=float))
+            polygon = np.asarray(projected, dtype=float)
+            edge = np.roll(polygon[:, :2], -1, axis=0) - polygon[:, :2]
+            offset = target.reshape(1, 2) - polygon[:, :2]
+            cross = edge[:, 0] * offset[:, 1] - edge[:, 1] * offset[:, 0]
+            if not (np.all(cross >= -1e-6) or np.all(cross <= 1e-6)):
+                continue
+            center_display = self.world_to_display_point(center)
+            renderer.SetWorldPoint(*center_display.tolist(), 1.0)
+            renderer.WorldToDisplay()
+            center_depth = float(renderer.GetDisplayPoint()[2])
+            candidates.append((center_depth, uid, plane_idx))
+        if not candidates:
+            return None, None
+        _depth, uid, plane_idx = min(candidates, key=lambda item: item[0])
+        return uid, plane_idx
+
     def find_path_uid_at_position(self, picked_point):
         ws = self.workspace
         if picked_point is None:
@@ -2049,14 +2218,37 @@ class SceneController:
         picker = pv._vtk.vtkCellPicker()
         picker.SetTolerance(0.005)
 
-        def _on_right_click(obj, ev):
+        def _on_right_click(obj=None, ev=None):
             try:
                 x, y = iren.GetEventPosition()
             except Exception:
                 return
             ren = self.plotter.renderer
-            ok = picker.Pick(float(x), float(y), 0.0, ren)
-            pos = picker.GetPickPosition() if ok else None
+            pos = None
+            if self._plane_overlay_renderer is not None:
+                overlay_ok = picker.Pick(float(x), float(y), 0.0, self._plane_overlay_renderer)
+                picked_actor = picker.GetActor() if overlay_ok else None
+                picked_plane_uid = None
+                picked_plane_idx = None
+                for uid, plane in self.workspace.scene_objects.items():
+                    if plane.kind != ObjectKind.PLANE or plane.actor is None:
+                        continue
+                    if picked_actor is plane.actor or picked_actor == plane.actor:
+                        picked_plane_uid = uid
+                        picked_plane_idx = _parse_indexed_data_key(plane.data_key, "plane")
+                        break
+                if picked_plane_uid is not None and picked_plane_idx is not None:
+                    if self._plane_pick_callback is not None:
+                        self._plane_pick_callback(picked_plane_uid, picked_plane_idx)
+                    return
+            screen_plane_uid, screen_plane_idx = self._plane_uid_at_display_position(x, y)
+            if screen_plane_uid is not None and screen_plane_idx is not None:
+                if self._plane_pick_callback is not None:
+                    self._plane_pick_callback(screen_plane_uid, screen_plane_idx)
+                return
+            if pos is None:
+                ok = picker.Pick(float(x), float(y), 0.0, ren)
+                pos = picker.GetPickPosition() if ok else None
             plane_uid, plane_idx = self.find_plane_uid_at_position(pos) if pos is not None else (None, None)
             if plane_uid is not None and plane_idx is not None:
                 if self._plane_pick_callback is not None:
@@ -2072,9 +2264,18 @@ class SceneController:
             if self._path_pick_callback is not None:
                 self._path_pick_callback(None, None)
 
-        self._shared_pick_obs_id = iren.AddObserver("RightButtonPressEvent", _on_right_click)
+        add_observer = getattr(iren, "AddObserver", None)
+        if add_observer is None:
+            add_observer = iren.add_observer
+        self._shared_pick_obs_id = add_observer("RightButtonPressEvent", _on_right_click)
         self._plane_pick_obs_id = self._shared_pick_obs_id
         self._path_pick_obs_id = self._shared_pick_obs_id
+        try:
+            self.plotter._autoflow_right_click_dispatch = lambda: _on_right_click(
+                iren, "RightButtonPressEvent"
+            )
+        except Exception:
+            pass
 
     def enable_plane_picking(self, callback):
         self._plane_pick_callback = callback

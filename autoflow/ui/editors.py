@@ -105,5 +105,6 @@ class PlaneEditor:
                 label=int(p.get("label", 1)),
                 path_index=int(p.get("path_index", 0)),
                 distance=float(p.get("distance", 0.0)),
+                roi_polygon_uv_mm=[list(map(float, point[:2])) for point in p.get("roi_polygon_uv_mm", [])],
             ))
         self.workspace.planes = out

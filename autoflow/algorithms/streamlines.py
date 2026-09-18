@@ -109,13 +109,23 @@ def _crop_vector_domain_to_mask(flow_t, mask_3d, spacing, origin, padding=1):
 
 
 def generate_streamlines_at_t(flow_xyzt3, t, seeds, spacing, origin, mask_3d=None,
-                              max_steps=2000, terminal_speed=0.01,
-                              seed_ratio=0.02, min_seeds=50, rng_seed=0):
+                              max_steps=200, terminal_speed=0.01,
+                              seed_ratio=0.1, min_seeds=50, rng_seed=0):
     if mask_3d is None:
         return None
+    flow_arr = np.asarray(flow_xyzt3)
+    mask_arr = np.asarray(mask_3d)
+    if flow_arr.ndim != 5 or flow_arr.shape[-1] != 3:
+        raise ValueError(f"flow must be XYZT3, got {flow_arr.shape}")
+    if mask_arr.ndim != 3 or tuple(mask_arr.shape) != tuple(flow_arr.shape[:3]):
+        raise ValueError(
+            f"mask_3d must match flow spatial shape {flow_arr.shape[:3]}, got {mask_arr.shape}"
+        )
+    if not 0 <= int(t) < int(flow_arr.shape[3]):
+        raise ValueError(f"time index {t} is outside 0..{flow_arr.shape[3] - 1}")
     flow_t, mask_work, work_origin = _crop_vector_domain_to_mask(
-        flow_xyzt3[..., int(t), :],
-        mask_3d,
+        flow_arr[..., int(t), :],
+        mask_arr,
         spacing,
         origin,
     )
@@ -285,9 +295,9 @@ def _coerce_pathline_seeds(seeds, max_seeds):
 
 
 def generate_streamlines_from_plane_at_t(flow_xyzt3, t, plane, spacing, origin,
-                                         mask_3d=None, max_steps=2000,
+                                         mask_3d=None, max_steps=200,
                                          terminal_speed=0.01,
-                                         seed_ratio=0.02, min_seeds=50,
+                                         seed_ratio=0.1, min_seeds=50,
                                          rng_seed=0,
                                          branch_labels_3d=None):
     flow_t = np.asarray(flow_xyzt3[..., int(t), :], dtype=np.float32)
@@ -553,9 +563,9 @@ def pathline_prefix_at_phase(pathline, phase):
 
 
 def generate_pathlines_from_plane_at_t(flow_xyzt3, t, plane, spacing, origin,
-                                       mask_4d=None, mask_3d=None, max_steps=2000,
+                                       mask_4d=None, mask_3d=None, max_steps=200,
                                        terminal_speed=0.01,
-                                       seed_ratio=0.02, min_seeds=50,
+                                       seed_ratio=0.2, min_seeds=50,
                                        rng_seed=0, rr=1000.0,
                                        branch_labels_3d=None, max_seeds=250,
                                        seeds=None, progress_callback=None,

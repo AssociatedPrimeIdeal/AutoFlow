@@ -590,7 +590,6 @@ class PipelineEngine:
             # use the actual per-frame lumen where a 4D segmentation exists.
             if np.asarray(ws.segmask_labels).ndim == 4:
                 group_binary = np.isin(ws.segmask_labels, labels).astype(bool)
-                group_binary &= np.asarray(group_mask_3d, dtype=bool)[..., None]
             else:
                 group_binary = self._repeat_mask_to_time(group_mask_3d, time_count)
             processed_mask_3d = preprocess_mask_for_skeleton(group_mask_3d, group_params, resolution=ws.resolution)
@@ -658,7 +657,7 @@ class PipelineEngine:
         ws._preprocess_signature = signature
         return True
 
-    def run_step(self, ws, step, log):
+    def run_step(self, ws, step, log, progress_callback=None):
         dispatch = {
             StepId.UNWRAP_PHASE: self._step_unwrap_phase,
             StepId.GENERATE_SKELETON: self._step_generate_skeleton,
@@ -670,7 +669,7 @@ class PipelineEngine:
             StepId.COMPUTE_PWV: self._step_compute_pwv,
             StepId.GENERATE_STREAMLINES: self._step_generate_streamlines,
             StepId.PLANE_STREAMLINES: self._step_plane_streamlines,
-            StepId.COMPUTE_PLANE_METRICS: self._step_compute_plane_metrics,
+            StepId.COMPUTE_PLANE_METRICS: lambda workspace: self._step_compute_plane_metrics(workspace, progress_callback=progress_callback),
             StepId.COMPUTE_DERIVED_METRICS: self._step_compute_derived_metrics,
         }
         return dispatch[step](ws)
@@ -1205,6 +1204,7 @@ class PipelineEngine:
         compute_wss=True,
         compute_tke=True,
         compute_pressure_gradient=True,
+        progress_callback=None,
     ):
         if not ws.has_flow():
             return [], {}, "Plane metrics skipped: no flow"
@@ -1234,13 +1234,17 @@ class PipelineEngine:
                 ws.flow_raw, ws.segmask_binary, ws.resolution, ws.origin, ws.planes,
                 RR=ws.rr, branch_labels_3d=ws.branch_labels,
                 path_info=ws.path_info, forks=ws.forks, paths=paths_for_tangent,
-                return_qc=True, segmentation_labels_3d=ws.segmask_labels_3d)
+                return_qc=True, segmentation_labels_3d=ws.segmask_labels_3d,
+                segmentation_labels_4d=ws.segmask_labels,
+                progress_callback=progress_callback)
         else:
             metrics, qc = compute_plane_metrics(
                 ws.flow_raw, ws.segmask_binary, ws.resolution, ws.origin, ws.planes,
                 RR=ws.rr, branch_labels_3d=ws.branch_labels,
                 path_info=ws.path_info, forks=ws.forks, paths=paths_for_tangent,
-                return_qc=True, segmentation_labels_3d=ws.segmask_labels_3d)
+                return_qc=True, segmentation_labels_3d=ws.segmask_labels_3d,
+                segmentation_labels_4d=ws.segmask_labels,
+                progress_callback=progress_callback)
         if include_derived:
             metrics, plane_pixelwise = augment_plane_metrics_with_derived(
                 metrics, ws.planes, ws.segmask_binary, ws.resolution, ws.origin,
@@ -1583,7 +1587,7 @@ class PipelineEngine:
             f"Pathlines enabled for {len(active_indices)} planes from t=0: seed_mode={getattr(p, 'pathline_seed_mode', 'fixed')} seed_ratio={p.pathline_seed_ratio} min_seeds={p.pathline_min_seeds} seed_count_or_limit={getattr(p, 'pathline_max_seeds', 250)} max_steps={p.pathline_max_steps} terminal_speed={p.pathline_terminal_speed} rng_seed={p.pathline_rng_seed} color_mode={getattr(p, 'pathline_color_mode', 'per_plane')}",
         )
 
-    def _step_compute_plane_metrics(self, ws):
+    def _step_compute_plane_metrics(self, ws, progress_callback=None):
         if not ws.has_flow():
             return StepResult(StepId.COMPUTE_PLANE_METRICS, True, True, "Plane metrics skipped: no flow")
         if ws.segmask_raw is None:
@@ -1608,6 +1612,7 @@ class PipelineEngine:
             use_multithread=use_mt,
             include_derived=include_derived,
             ensure_derived=False,
+            progress_callback=progress_callback,
         )
         msg += " derived=reused" if include_derived else " derived=not_requested"
         self._save_planes_json(ws)

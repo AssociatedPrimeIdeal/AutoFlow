@@ -1,10 +1,10 @@
 {
-  "seed_ratio": 0.2,
+  "seed_ratio": 0.1,
   "max_steps": 200,
   "min_seeds": 50,
   "terminal_speed": 0.01,
   "rng_seed": 0,
-  "tube_radius": 0.25,
+  "tube_radius": 0.05,
   "render": {
     "clim": null,
     "show_scalar_bar": true,

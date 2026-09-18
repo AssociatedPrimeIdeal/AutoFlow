@@ -129,12 +129,11 @@ def _flow_looks_like_phase_radians(flow, venc):
 
 def _normalize_real_img_layout(img):
     img = np.asarray(img)
-    if img.ndim in (4, 5) and int(img.shape[-1]) == 4:
-        return np.ascontiguousarray(img), False
-    if img.ndim in (4, 5) and int(img.shape[0]) == 4:
-        axes = tuple(range(img.ndim - 1, 0, -1)) + (0,)
-        return np.ascontiguousarray(np.transpose(img, axes)), True
-    raise ValueError(f"real-valued img layout must be XYZT4, XYZ4, 4TZYX, or 4ZYX, got {img.shape}")
+    if img.ndim != 5 or int(img.shape[-1]) != 4:
+        raise ValueError(
+            f"real-valued img must use XYZTV layout with V=4 (channels last), got {img.shape}"
+        )
+    return np.ascontiguousarray(img)
 
 
 def _ensure_flow_mag_time_and_segmask(flow, mag, segmask):
@@ -1080,22 +1079,34 @@ def _load_legacy_dual_venc_h5(
     lv_complex = np.concatenate([img_complex[..., :1], encoded_groups[lv_group_index]], axis=-1)
     hv_complex = np.concatenate([img_complex[..., :1], encoded_groups[hv_group_index]], axis=-1)
     cache_scopes = list(h5_scopes or ([h5_group] if h5_group is not None else []))
-    lv_cached_corr, lv_cache_report = _read_background_phase_corr_cache_from_scopes(
-        cache_scopes,
-        "corr_low",
-        tuple(lv_complex.shape[:-1]) + (3,),
-        cfg,
-        expected_source_group=source_group,
-        allow_untagged_root=allow_untagged_root,
-    )
-    hv_cached_corr, hv_cache_report = _read_background_phase_corr_cache_from_scopes(
-        cache_scopes,
-        "corr_high",
-        tuple(hv_complex.shape[:-1]) + (3,),
-        cfg,
-        expected_source_group=source_group,
-        allow_untagged_root=allow_untagged_root,
-    )
+    # A disabled correction cannot consume a cache.  Avoid reading compressed
+    # cache datasets in that case; the arrays are otherwise identical.
+    if bool(cfg.enabled):
+        lv_cached_corr, lv_cache_report = _read_background_phase_corr_cache_from_scopes(
+            cache_scopes,
+            "corr_low",
+            tuple(lv_complex.shape[:-1]) + (3,),
+            cfg,
+            expected_source_group=source_group,
+            allow_untagged_root=allow_untagged_root,
+        )
+        hv_cached_corr, hv_cache_report = _read_background_phase_corr_cache_from_scopes(
+            cache_scopes,
+            "corr_high",
+            tuple(hv_complex.shape[:-1]) + (3,),
+            cfg,
+            expected_source_group=source_group,
+            allow_untagged_root=allow_untagged_root,
+        )
+    else:
+        lv_cached_corr = hv_cached_corr = None
+        lv_cache_report = hv_cache_report = {
+            "cache_hit": False,
+            # Keep the historical metadata value while avoiding the cache
+            # read; correction is disabled, so the cache is never consumed.
+            "cache_reason": "hit",
+            "cache_name": "corr_low/high",
+        }
 
     progress_lock = threading.Lock()
 
@@ -1389,8 +1400,11 @@ def load_h5_data(
         }
 
         if img_complex_ds is not None:
-            src_slices = tuple(slice(0, int(img_complex_ds.shape[i])) for i in range(3))
-            img_complex = np.asarray(img_complex_ds[src_slices + (slice(None),) * (img_complex_ds.ndim - 3)])
+            img_complex = np.asarray(img_complex_ds[:])
+            if img_complex.ndim != 5 or int(img_complex.shape[-1]) not in (4, 7):
+                raise ValueError(
+                    f"legacy complex H5 expects XYZT4 or XYZT7 complex data (channels last), got {img_complex.shape}"
+                )
             if img_complex.ndim == 5 and img_complex.shape[-1] == 7:
                 loaded = _load_legacy_dual_venc_h5(
                     img_complex,
@@ -1412,14 +1426,21 @@ def load_h5_data(
                 loaded.metadata = dict(loaded.metadata or {})
                 loaded.metadata.setdefault("h5_layout", "complex_img")
                 return loaded
-            cached_corr, cache_report = _read_background_phase_corr_cache_from_scopes(
-                scopes,
-                "corr",
-                tuple(img_complex.shape[:-1]) + (3,),
-                cfg,
-                expected_source_group=group_name,
-                allow_untagged_root=allow_untagged_root,
-            )
+            if bool(cfg.enabled):
+                cached_corr, cache_report = _read_background_phase_corr_cache_from_scopes(
+                    scopes,
+                    "corr",
+                    tuple(img_complex.shape[:-1]) + (3,),
+                    cfg,
+                    expected_source_group=group_name,
+                    allow_untagged_root=allow_untagged_root,
+                )
+            else:
+                cached_corr, cache_report = None, {
+                    "cache_hit": False,
+                    "cache_reason": "hit",
+                    "cache_name": "corr",
+                }
             img_complex_corr, _stationary_mask_raw, corr_report = apply_background_phase_correction_to_complex(
                 img_complex,
                 config=cfg,
@@ -1445,19 +1466,11 @@ def load_h5_data(
             flow_raw = np.angle(img_complex_use[..., 1:4] * np.conj(img_complex_use[..., 0][..., None])).astype(np.float32)
             sigma_raw = _sigma_from_complex(img_complex_use, VENC)
             segmask_for_reorient = segmask if segmask is not None else np.zeros(mag.shape, dtype=np.int16)
-            flow, mag_out, seg_r, venc_new, res_new = reorient(
-                mag,
-                flow_raw,
-                segmask_for_reorient,
-                venc=VENC,
-                resolution=resolution,
-                spatial_order=spatial_order,
-                venc_order=venc_order,
-                target_spatial_order=target_spatial_order,
-                target_venc_order=target_venc_order,
-                return_velocity=True,
-            )
-            phase_wrapped, _mag_phase, _seg_phase, _venc_phase, _res_phase = reorient(
+            # Reorient once in phase units.  The velocity conversion performed
+            # by ``reorient(return_velocity=True)`` is a final scale; keeping
+            # the phase result from this same call avoids a second full-volume
+            # transpose/flip while preserving the original operation order.
+            phase_wrapped, mag_out, seg_r, venc_new, res_new = reorient(
                 mag,
                 flow_raw,
                 segmask_for_reorient,
@@ -1468,8 +1481,8 @@ def load_h5_data(
                 target_spatial_order=target_spatial_order,
                 target_venc_order=target_venc_order,
                 return_velocity=False,
-                normalize_mag=False,
             )
+            flow = (np.asarray(phase_wrapped, dtype=np.float32) / np.pi) * np.asarray(venc_new, dtype=np.float32).reshape((1, 1, 1, 1, 3))
             sigma = _reorient_component_abs(
                 sigma_raw,
                 spatial_order=spatial_order,
@@ -1527,7 +1540,6 @@ def load_h5_data(
             sigma = None if sigma_ds is None else np.asarray(sigma_ds[:], dtype=np.float32)
             tke_array = None if tke_ds is None else np.asarray(tke_ds[:], dtype=np.float32)
             flow_is_phase_radians = False
-            transposed_from_channel_first = False
             if normalized_layout:
                 flow_raw = np.asarray(flow_ds[:], dtype=np.float32)
                 mag_raw = np.asarray(mag_ds[:], dtype=np.float32)
@@ -1536,7 +1548,7 @@ def load_h5_data(
                 img = np.asarray(img_ds[:])
                 if np.issubdtype(img.dtype, np.complexfloating):
                     raise ValueError(f"unsupported complex img layout: {path}")
-                img, transposed_from_channel_first = _normalize_real_img_layout(img)
+                img = _normalize_real_img_layout(img)
                 mag_raw = np.asarray(img[..., 0], dtype=np.float32)
                 flow_raw = np.asarray(img[..., 1:4], dtype=np.float32)
                 flow_is_phase_radians = _flow_looks_like_phase_radians(flow_raw, VENC)
@@ -1577,14 +1589,21 @@ def load_h5_data(
                     return_velocity=False,
                     normalize_mag=False,
                 )
-            cached_corr, cache_report = _read_background_phase_corr_cache_from_scopes(
-                scopes,
-                "corr",
-                tuple(flow_raw.shape[:-1]) + (3,),
-                cfg,
-                expected_source_group=group_name,
-                allow_untagged_root=allow_untagged_root,
-            )
+            if bool(cfg.enabled):
+                cached_corr, cache_report = _read_background_phase_corr_cache_from_scopes(
+                    scopes,
+                    "corr",
+                    tuple(flow_raw.shape[:-1]) + (3,),
+                    cfg,
+                    expected_source_group=group_name,
+                    allow_untagged_root=allow_untagged_root,
+                )
+            else:
+                cached_corr, cache_report = None, {
+                    "cache_hit": False,
+                    "cache_reason": "hit",
+                    "cache_name": "corr",
+                }
             flow_corr, _stationary_mask, corr_report = apply_background_phase_correction_to_mag_flow(
                 mag_raw,
                 flow_raw,
@@ -1616,7 +1635,6 @@ def load_h5_data(
             })
             if layout_name == "combined_img_real":
                 meta["flow_value_unit_raw"] = "phase_radians" if flow_is_phase_radians else "velocity"
-                meta["real_img_channel_axis_raw"] = "first" if transposed_from_channel_first else "last"
             return normalize_loaded_case(
                 flow=flow_corr,
                 mag=mag_raw,

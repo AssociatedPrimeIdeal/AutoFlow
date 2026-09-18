@@ -356,12 +356,12 @@ class PlaneGenerationParams:
 
 @dataclass
 class StreamlineParams:
-    seed_ratio: float = 0.02
-    max_steps: int = 2000
+    seed_ratio: float = 0.1
+    max_steps: int = 200
     min_seeds: int = 50
     terminal_speed: float = 0.01
     rng_seed: int = 0
-    tube_radius: float = 0.25
+    tube_radius: float = 0.05
 
     pathline_seed_ratio: float = 0.2
     pathline_max_steps: int = 200
@@ -399,12 +399,12 @@ class StreamlineParams:
     @staticmethod
     def from_dict(d):
         return StreamlineParams(
-            seed_ratio=float(d.get("seed_ratio", 0.02)),
-            max_steps=int(d.get("max_steps", 2000)),
+            seed_ratio=float(d.get("seed_ratio", 0.1)),
+            max_steps=int(d.get("max_steps", 200)),
             min_seeds=int(d.get("min_seeds", 50)),
             terminal_speed=float(d.get("terminal_speed", 0.01)),
             rng_seed=int(d.get("rng_seed", 0)),
-            tube_radius=float(d.get("tube_radius", 0.25)),
+            tube_radius=float(d.get("tube_radius", 0.05)),
             pathline_seed_ratio=float(d.get("pathline_seed_ratio", d.get("seed_ratio", 0.2))),
             pathline_max_steps=int(d.get("pathline_max_steps", d.get("max_steps", 200))),
             pathline_min_seeds=int(d.get("pathline_min_seeds", d.get("min_seeds", 50))),
@@ -924,6 +924,8 @@ class PlaneData:
     distance: float = 0.0
     segmentation_label: int = 0
     group_name: str = ""
+    roi_polygon_uv_mm: List[List[float]] = field(default_factory=list)
+    roi_edit_operations: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
     metrics: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -1002,7 +1004,7 @@ class SegmentationState:
     auto: SegmentationVersion = field(default_factory=SegmentationVersion)
     active_source: str = ""
     visible: bool = True
-    opacity: float = 0.35
+    opacity: float = 0.15
     active_label: int = 1
     label_names: Dict[str, str] = field(default_factory=dict)
     label_colors: Dict[str, str] = field(default_factory=dict)
@@ -1508,6 +1510,8 @@ class Workspace:
                 "planes": [{"center": arr(p.center), "normal": arr(p.normal), "label": int(p.label),
                             "segmentation_label": int(getattr(p, "segmentation_label", 0) or 0),
                             "path_index": int(p.path_index), "distance": float(p.distance), "group_name": str(p.group_name),
+                            "roi_polygon_uv_mm": copy.deepcopy(getattr(p, "roi_polygon_uv_mm", []) or []),
+                            "roi_edit_operations": copy.deepcopy(getattr(p, "roi_edit_operations", {}) or {}),
                             "metrics": copy.deepcopy(p.metrics)} for p in state.get("planes", [])],
                 "path_index_offset": int(state.get("path_index_offset", 0)),
                 "plane_index_offset": int(state.get("plane_index_offset", 0)),
@@ -1556,7 +1560,9 @@ class Workspace:
             "planes": [{"center": arr(p.center), "normal": arr(p.normal), "label": int(p.label),
                         "segmentation_label": int(getattr(p, "segmentation_label", 0) or 0),
                         "path_index": int(p.path_index), "distance": float(p.distance),
-                        "group_name": str(p.group_name), "metrics": copy.deepcopy(p.metrics)} for p in self.planes],
+                        "group_name": str(p.group_name),
+                        "roi_polygon_uv_mm": copy.deepcopy(getattr(p, "roi_polygon_uv_mm", []) or []),
+                        "metrics": copy.deepcopy(p.metrics)} for p in self.planes],
             "flow_raw": arr(self.flow_raw),
             "flow_input": arr(self.flow_input),
             "phase_wrapped": arr(self.phase_wrapped),
@@ -1642,6 +1648,8 @@ class Workspace:
                     path_index=int(p.get("path_index", 0)),
                     distance=float(p.get("distance", 0.0)),
                     group_name=str(p.get("group_name", group_name) or group_name),
+                    roi_polygon_uv_mm=copy.deepcopy(p.get("roi_polygon_uv_mm", []) or []),
+                    roi_edit_operations=copy.deepcopy(p.get("roi_edit_operations", {}) or {}),
                     metrics=copy.deepcopy(p.get("metrics", {})),
                 ))
             self.multilabel_groups[str(group_name)] = {
@@ -1694,6 +1702,7 @@ class Workspace:
                 center=np.asarray(p["center"], dtype=float), normal=np.asarray(p["normal"], dtype=float),
                 label=int(p.get("label", 1)), segmentation_label=int(p.get("segmentation_label", 0) or 0), path_index=int(p.get("path_index", 0)),
                 distance=float(p.get("distance", 0.0)), group_name=str(p.get("group_name", "") or ""),
+                roi_polygon_uv_mm=copy.deepcopy(p.get("roi_polygon_uv_mm", []) or []),
                 metrics=copy.deepcopy(p.get("metrics", {}))))
         self.flow_raw = nparr("flow_raw")
         self.flow_input = nparr("flow_input")

@@ -95,13 +95,18 @@ class SliceViewBox(pg.ViewBox):
     brushSizeStepRequested = QtCore.Signal(int)
     windowLevelDragged = QtCore.Signal(float, float)
     viewDoubleClicked = QtCore.Signal(str)
+    contourStrokeStarted = QtCore.Signal(str, float, float)
+    contourStrokeMoved = QtCore.Signal(str, float, float)
+    contourStrokeFinished = QtCore.Signal(str)
 
     def __init__(self, plane: str):
         super().__init__(enableMenu=False)
         self.plane = str(plane)
         self.editable = False
+        self.contour_editable = False
         self.spacing = (1.0, 1.0)
         self._image_shape = (0, 0)
+        self._sample_origin = (0.0, 0.0)
         self.setAspectLocked(True)
         self.setMouseEnabled(x=False, y=False)
 
@@ -116,11 +121,29 @@ class SliceViewBox(pg.ViewBox):
         if self._image_shape[0] <= 0 or self._image_shape[1] <= 0:
             return None
         point = self.mapSceneToView(scene_position)
-        h = int(np.clip(np.rint(point.x() / self.spacing[0]), 0, self._image_shape[0] - 1))
-        v = int(np.clip(np.rint(point.y() / self.spacing[1]), 0, self._image_shape[1] - 1))
+        h = int(
+            np.clip(
+                np.rint((point.x() - self._sample_origin[0]) / self.spacing[0]),
+                0,
+                self._image_shape[0] - 1,
+            )
+        )
+        v = int(
+            np.clip(
+                np.rint((point.y() - self._sample_origin[1]) / self.spacing[1]),
+                0,
+                self._image_shape[1] - 1,
+            )
+        )
         return h, v
 
     def mouseClickEvent(self, event):
+        if self.contour_editable and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            point = self.mapSceneToView(event.scenePos())
+            self.contourStrokeStarted.emit(self.plane, float(point.x()), float(point.y()))
+            self.contourStrokeFinished.emit(self.plane)
+            event.accept()
+            return
         point = self._voxel_at(event.scenePos())
         if point is None:
             event.ignore()
@@ -140,9 +163,28 @@ class SliceViewBox(pg.ViewBox):
             self.strokeFinished.emit(self.plane)
             event.accept()
             return
+        if event.button() == QtCore.Qt.MouseButton.RightButton:
+            point = self.mapSceneToView(event.scenePos())
+            self.scaleBy((1.18, 1.18), center=point)
+            event.accept()
+            return
         event.ignore()
 
     def mouseDragEvent(self, event, axis=None):
+        if (
+            self.contour_editable
+            and event.button() == QtCore.Qt.MouseButton.LeftButton
+            and not (event.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier)
+        ):
+            point = self.mapSceneToView(event.scenePos())
+            if event.isStart():
+                self.contourStrokeStarted.emit(self.plane, float(point.x()), float(point.y()))
+            else:
+                self.contourStrokeMoved.emit(self.plane, float(point.x()), float(point.y()))
+            if event.isFinish():
+                self.contourStrokeFinished.emit(self.plane)
+            event.accept()
+            return
         point = self._voxel_at(event.scenePos())
         if point is None:
             event.ignore()
@@ -179,6 +221,16 @@ class SliceViewBox(pg.ViewBox):
                 self.strokeMoved.emit(self.plane, h, v, temporary_erase)
             if event.isFinish():
                 self.strokeFinished.emit(self.plane)
+            event.accept()
+            return
+
+        if button == QtCore.Qt.MouseButton.RightButton:
+            if not event.isStart():
+                current = self.mapSceneToView(event.scenePos())
+                previous = self.mapSceneToView(event.lastScenePos())
+                delta_y = float(current.y() - previous.y())
+                factor = float(np.exp(np.clip(delta_y * 0.012, -0.12, 0.12)))
+                self.scaleBy((factor, factor), center=current)
             event.accept()
             return
 
@@ -219,12 +271,18 @@ class SliceView(QtWidgets.QFrame):
     brushSizeStepRequested = QtCore.Signal(int)
     windowLevelDragged = QtCore.Signal(float, float)
     viewDoubleClicked = QtCore.Signal(str)
+    contourStrokeStarted = QtCore.Signal(str, float, float)
+    contourStrokeMoved = QtCore.Signal(str, float, float)
+    contourStrokeFinished = QtCore.Signal(str)
 
     def __init__(self, plane: str, parent=None):
         super().__init__(parent)
         self.spec = PLANE_SPECS[str(plane)]
         self._spacing = (1.0, 1.0)
         self._shape = (0, 0)
+        self._extent = None
+        self._view_center = None
+        self._default_view_fraction = 0.92
         self._hover_voxel = None
         self._brush_diameter_mm = 6.0
         self._brush_color = QtGui.QColor("#39d5c5")
@@ -265,6 +323,15 @@ class SliceView(QtWidgets.QFrame):
         self.overlay_item.setZValue(10)
         self.view_box.addItem(self.image_item)
         self.view_box.addItem(self.overlay_item)
+        self.contour_items = []
+        self.draft_stroke_item = pg.PlotCurveItem(pen=pg.mkPen("#ffd43b", width=2.0))
+        self.preview_contour_item = pg.PlotCurveItem(pen=pg.mkPen("#7CFC00", width=2.0))
+        self.draft_stroke_item.setZValue(45)
+        self.preview_contour_item.setZValue(44)
+        self.draft_stroke_item.hide()
+        self.preview_contour_item.hide()
+        self.view_box.addItem(self.draft_stroke_item)
+        self.view_box.addItem(self.preview_contour_item)
 
         self.vertical_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#ff5f5f", width=1.0))
         self.horizontal_line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("#58d178", width=1.0))
@@ -272,6 +339,10 @@ class SliceView(QtWidgets.QFrame):
         self.horizontal_line.setZValue(30)
         self.view_box.addItem(self.vertical_line)
         self.view_box.addItem(self.horizontal_line)
+        self.plane_line = pg.PlotCurveItem(pen=pg.mkPen("#ffd43b", width=1.5, style=QtCore.Qt.PenStyle.DashLine))
+        self.plane_line.setZValue(35)
+        self.plane_line.hide()
+        self.view_box.addItem(self.plane_line)
 
         self.brush_item = QtWidgets.QGraphicsEllipseItem()
         self.brush_item.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
@@ -301,6 +372,9 @@ class SliceView(QtWidgets.QFrame):
         self.view_box.brushSizeStepRequested.connect(self.brushSizeStepRequested)
         self.view_box.windowLevelDragged.connect(self.windowLevelDragged)
         self.view_box.viewDoubleClicked.connect(self.viewDoubleClicked)
+        self.view_box.contourStrokeStarted.connect(self.contourStrokeStarted)
+        self.view_box.contourStrokeMoved.connect(self.contourStrokeMoved)
+        self.view_box.contourStrokeFinished.connect(self.contourStrokeFinished)
         self.plot.scene().sigMouseMoved.connect(self._scene_mouse_moved)
 
     def set_editable(self, enabled: bool):
@@ -315,15 +389,100 @@ class SliceView(QtWidgets.QFrame):
         self._brush_visible = bool(visible)
         self._update_brush_item()
 
-    def reset_view(self):
+    def set_plane_intersection(self, endpoints):
+        if endpoints is None:
+            self.plane_line.hide()
+            return
+        points = np.asarray(endpoints, dtype=float).reshape(-1, 2)
+        if len(points) < 2:
+            self.plane_line.hide()
+            return
+        self.plane_line.setData(points[:, 0], points[:, 1])
+        self.plane_line.show()
+
+    def set_contours(self, contours):
+        self.clear_contours()
+        for points, color, width, dashed in contours or []:
+            points = np.asarray(points, dtype=float).reshape(-1, 2)
+            if len(points) < 2:
+                continue
+            style = QtCore.Qt.PenStyle.DashLine if dashed else QtCore.Qt.PenStyle.SolidLine
+            item = pg.PlotCurveItem(
+                points[:, 0],
+                points[:, 1],
+                pen=pg.mkPen(str(color), width=float(width), style=style),
+            )
+            item.setZValue(36)
+            self.view_box.addItem(item)
+            self.contour_items.append(item)
+
+    def set_contour_editing(self, enabled):
+        self.view_box.contour_editable = bool(enabled)
+        if not enabled:
+            self.clear_contour_draft()
+
+    def set_contour_draft(self, stroke, preview=None):
+        stroke = np.asarray(stroke, dtype=float).reshape(-1, 2)
+        if len(stroke) >= 2:
+            self.draft_stroke_item.setData(stroke[:, 0], stroke[:, 1])
+            self.draft_stroke_item.show()
+        else:
+            self.draft_stroke_item.hide()
+        if preview is not None:
+            preview = np.asarray(preview, dtype=float).reshape(-1, 2)
+            if len(preview) >= 3:
+                closed = np.vstack((preview, preview[0]))
+                self.preview_contour_item.setData(closed[:, 0], closed[:, 1])
+                self.preview_contour_item.show()
+                return
+        self.preview_contour_item.hide()
+
+    def clear_contour_draft(self):
+        self.draft_stroke_item.clear()
+        self.preview_contour_item.clear()
+        self.draft_stroke_item.hide()
+        self.preview_contour_item.hide()
+
+    def clear_contours(self):
+        for item in self.contour_items:
+            self.view_box.removeItem(item)
+        self.contour_items.clear()
+
+    def set_default_view_fraction(self, fraction: float):
+        self._default_view_fraction = float(np.clip(fraction, 0.1, 1.0))
+
+    def set_orientation_labels(self, horizontal_ends=None, vertical_ends=None):
+        horizontal_ends = horizontal_ends or self.spec.horizontal_ends
+        vertical_ends = vertical_ends or self.spec.vertical_ends
+        self.orientation_items["h0"].setText(str(horizontal_ends[0]))
+        self.orientation_items["h1"].setText(str(horizontal_ends[1]))
+        self.orientation_items["v0"].setText(str(vertical_ends[0]))
+        self.orientation_items["v1"].setText(str(vertical_ends[1]))
+
+    def reset_view(self, zoom=None):
         if self._shape[0] <= 0 or self._shape[1] <= 0:
             return
-        x_half = 0.5 * self._spacing[0]
-        y_half = 0.5 * self._spacing[1]
+        if self._extent is None:
+            x0 = -0.5 * self._spacing[0]
+            x1 = (self._shape[0] - 0.5) * self._spacing[0]
+            y0 = -0.5 * self._spacing[1]
+            y1 = (self._shape[1] - 0.5) * self._spacing[1]
+        else:
+            x0, x1, y0, y1 = self._extent
+        if zoom is None:
+            zoom = self._default_view_fraction
+        zoom = max(float(zoom), 1e-3)
+        if self._view_center is None:
+            x_center = 0.5 * (x0 + x1)
+            y_center = 0.5 * (y0 + y1)
+        else:
+            x_center, y_center = self._view_center
+        x_half = 0.5 * (x1 - x0) * zoom
+        y_half = 0.5 * (y1 - y0) * zoom
         self.view_box.setRange(
-            xRange=(-x_half, (self._shape[0] - 0.5) * self._spacing[0]),
-            yRange=(-y_half, (self._shape[1] - 0.5) * self._spacing[1]),
-            padding=0.02,
+            xRange=(x_center - x_half, x_center + x_half),
+            yRange=(y_center - y_half, y_center + y_half),
+            padding=0.0,
         )
 
     def _scene_mouse_moved(self, scene_position):
@@ -345,8 +504,8 @@ class SliceView(QtWidgets.QFrame):
             self.brush_item.hide()
             return
         h, v = self._hover_voxel
-        center_x = h * self._spacing[0]
-        center_y = v * self._spacing[1]
+        center_x = self.view_box._sample_origin[0] + h * self._spacing[0]
+        center_y = self.view_box._sample_origin[1] + v * self._spacing[1]
         radius = self._brush_diameter_mm / 2.0
         self.brush_item.setRect(center_x - radius, center_y - radius, 2.0 * radius, 2.0 * radius)
         color = self._brush_color
@@ -365,6 +524,8 @@ class SliceView(QtWidgets.QFrame):
         fixed_index: int,
         colormap: pg.ColorMap,
         levels,
+        extent=None,
+        view_center=None,
     ):
         data = np.asarray(image)
         self._shape = tuple(int(value) for value in data.shape[:2])
@@ -372,16 +533,37 @@ class SliceView(QtWidgets.QFrame):
             float(value) if np.isfinite(value) and float(value) > 0.0 else 1.0
             for value in spacing[:2]
         )
-        geometry_changed = (self.view_box._image_shape, self.view_box.spacing) != (
-            self._shape,
-            self._spacing,
-        )
+        if extent is None:
+            normalized_extent = (
+                -0.5 * self._spacing[0],
+                (self._shape[0] - 0.5) * self._spacing[0],
+                -0.5 * self._spacing[1],
+                (self._shape[1] - 0.5) * self._spacing[1],
+            )
+        else:
+            values = tuple(float(value) for value in extent)
+            if len(values) != 4 or not all(np.isfinite(value) for value in values):
+                raise ValueError("slice extent must be (x0, x1, y0, y1)")
+            normalized_extent = values
+        geometry_changed = (
+            self.view_box._image_shape,
+            self.view_box.spacing,
+            self._extent,
+            self._view_center,
+        ) != (self._shape, self._spacing, normalized_extent, view_center)
         self.view_box.set_geometry(self._shape, self._spacing)
+        self._extent = normalized_extent
+        self._view_center = None if view_center is None else tuple(float(value) for value in view_center[:2])
+        self._sample_origin = (
+            normalized_extent[0] + 0.5 * self._spacing[0],
+            normalized_extent[2] + 0.5 * self._spacing[1],
+        )
+        self.view_box._sample_origin = self._sample_origin
         rect = QtCore.QRectF(
-            -0.5 * self._spacing[0],
-            -0.5 * self._spacing[1],
-            self._shape[0] * self._spacing[0],
-            self._shape[1] * self._spacing[1],
+            normalized_extent[0],
+            normalized_extent[2],
+            normalized_extent[1] - normalized_extent[0],
+            normalized_extent[3] - normalized_extent[2],
         )
         self.image_item.setImage(data.T, autoLevels=False, levels=levels)
         self.image_item.setLookupTable(colormap.getLookupTable(nPts=256, alpha=True))
@@ -389,10 +571,10 @@ class SliceView(QtWidgets.QFrame):
         self.set_overlay(overlay, rect=rect)
 
         self.update_cursor(cursor, fixed_index, levels)
-        x0 = 0.0
-        x1 = max(0.0, (self._shape[0] - 1) * self._spacing[0])
-        y0 = 0.0
-        y1 = max(0.0, (self._shape[1] - 1) * self._spacing[1])
+        x0 = self._sample_origin[0]
+        x1 = x0 + max(0.0, (self._shape[0] - 1) * self._spacing[0])
+        y0 = self._sample_origin[1]
+        y1 = y0 + max(0.0, (self._shape[1] - 1) * self._spacing[1])
         self.orientation_items["h0"].setPos(x0, (y0 + y1) / 2.0)
         self.orientation_items["h1"].setPos(x1, (y0 + y1) / 2.0)
         self.orientation_items["v0"].setPos((x0 + x1) / 2.0, y0)
@@ -434,8 +616,8 @@ class SliceView(QtWidgets.QFrame):
 
     def update_cursor(self, cursor, fixed_index: int, levels=None):
         h, v = int(cursor[0]), int(cursor[1])
-        self.vertical_line.setPos(h * self._spacing[0])
-        self.horizontal_line.setPos(v * self._spacing[1])
+        self.vertical_line.setPos(self._sample_origin[0] + h * self._spacing[0])
+        self.horizontal_line.setPos(self._sample_origin[1] + v * self._spacing[1])
         self.title_label.setText(
             f"{self.spec.title}  {self.spec.horizontal_name} x {self.spec.vertical_name}"
         )
@@ -443,9 +625,17 @@ class SliceView(QtWidgets.QFrame):
         if levels is not None:
             self.image_item.setLevels(levels)
 
+    def set_title(self, title, position=None):
+        self.title_label.setText(str(title))
+        if position is not None:
+            self.position_label.setText(str(position))
+
     def clear(self):
         self.image_item.clear()
         self.overlay_item.clear()
         self.overlay_item.hide()
+        self.plane_line.hide()
+        self.clear_contours()
+        self.clear_contour_draft()
         self.position_label.setText("-")
         self.brush_item.hide()

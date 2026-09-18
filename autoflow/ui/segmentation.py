@@ -247,7 +247,7 @@ class SegmentationDock(QtWidgets.QWidget):
         self.check_visible.setChecked(True)
         self.slider_opacity = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.slider_opacity.setRange(0, 100)
-        self.slider_opacity.setValue(35)
+        self.slider_opacity.setValue(15)
         self.text_provenance = QtWidgets.QPlainTextEdit()
         self.text_provenance.setReadOnly(True)
         self.text_provenance.setMaximumHeight(100)

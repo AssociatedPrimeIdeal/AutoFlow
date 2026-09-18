@@ -38,15 +38,15 @@ with h5py.File("case.h5", "r") as handle:
     handle.visititems(show)
 ```
 
-看到 `img_complex` 或 `img` 后，再核对它是否有 4 个通道；看到 `mag` 和 `flow` 时，核对 `flow` 最后一个维度是否为 3。不要只看文件扩展名判断格式。
+看到 `img_complex` 或 `img` 后，再核对通道是否位于最后一维。单 VENC complex 和实数合并格式必须是 `XYZT4`，dual-VENC complex 必须是 `XYZT7`。看到 `mag` 和 `flow` 时，核对 `mag` 是 `XYZT`、`flow` 是 `XYZT3`。通道首维格式不会自动转置，而是在加载时直接报错。不要只看文件扩展名判断格式。
 
 ## Supported Inputs
 
 | Input type | Supported | Typical entry points | Notes |
 | --- | --- | --- | --- |
-| legacy complex H5 | yes | CLI, GUI, Python API | can provide segmentation and complex-derived sigma |
+| legacy complex H5 | yes | CLI, GUI, Python API | requires channels-last `XYZT4` or `XYZT7`; can provide segmentation and complex-derived sigma |
 | normalized H5 with `mag` and `flow` | yes | CLI, GUI, Python API | preferred normalized path |
-| normalized H5 with real-valued `img[..., 0:4]` or `img[0:4, ...]` | yes | CLI, GUI, Python API | interpreted as `mag + flow_xyz`; channel-first `img[0:4, ...]` is transposed during load |
+| normalized H5 with real-valued `img[..., 0:4]` | yes | CLI, GUI, Python API | requires `XYZT4` and is interpreted as `mag + flow_xyz` |
 | direct DICOM directory | yes | CLI, GUI, Python API | scanned into importable cases |
 | single DICOM file | yes for case collection | CLI | resolved through case collection logic |
 
@@ -95,8 +95,8 @@ with h5py.File("case.h5", "r") as handle:
 
 ## H5 Orientation Normalization
 
-- AutoFlow uses `SpatialOrder` together with `VENCOrder` or `VencOrder` for all supported H5 layouts, including legacy complex H5, normalized `mag` + `flow`, and real-valued `img[..., 0:4]` or `img[0:4, ...]`.
-- for real-valued channel-first `img[0:4, ...]`, AutoFlow first transposes the raw array into internal `XYZT4` or `XYZ4` order before applying the usual spatial-axis and velocity-component normalization.
+- AutoFlow uses `SpatialOrder` together with `VENCOrder` or `VencOrder` for all supported H5 layouts, including legacy complex H5, normalized `mag` + `flow`, and real-valued `img[..., 0:4]`.
+- combined real and complex `img` arrays must use channels-last `XYZTV`; channel-first inputs are rejected during loading instead of being guessed or transposed.
 - loaded arrays are normalized to internal spatial order `LR, AP, FH` and velocity-component order `LR, AP, FH` before downstream processing.
 - the GUI labels the normalized render axes and ortho views with `LR, AP, FH`; `spatial_order_raw` describes the source layout and must not be interpreted as the post-load array-axis order.
 - opposite-direction labels such as `RL`, `PA`, and `HF` trigger spatial flips and velocity sign flips so the final `flow` stays physically consistent after reordering.

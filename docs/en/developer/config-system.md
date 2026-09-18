@@ -193,6 +193,9 @@ GPU selection is intentionally not part of the config contract. WRLS+ARTO probes
 | `pressure_gradient.render.relative_pressure_show_scalar_bar` | bool | `True` | `configs/pressure_gradient.json` | show or hide the relative-pressure colorbar in GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
 | `pressure_gradient.render.relative_pressure_bar_cfg` | object | built-in default | `configs/pressure_gradient.json` | relative-pressure scalar-bar placement and font settings for offline video | `autoflow/rendering/videos.py` |
 | `streamlines.render.clim` | list[float, float] or `null` | `null` | `configs/streamlines.json` | explicit streamline velocity range; `null` uses `0` to the P99 finite segmented velocity across all phases in GUI and video | `autoflow/algorithms/streamlines.py`, `autoflow/ui/viewer.py`, `autoflow/rendering/videos.py` |
+| `streamlines.seed_ratio` | float | `0.1` | `configs/streamlines.json` | streamline seed density | `autoflow/core/models.py`, `autoflow/algorithms/streamlines.py` |
+| `streamlines.max_steps` | int | `200` | `configs/streamlines.json` | streamline integration step limit | `autoflow/core/models.py`, `autoflow/algorithms/streamlines.py` |
+| `streamlines.tube_radius` | float | `0.05` | `configs/streamlines.json` | streamline tube radius in mm | `autoflow/core/models.py`, `autoflow/rendering/videos.py` |
 | `streamlines.render.show_scalar_bar` | bool | `True` | `configs/streamlines.json` | show or hide the streamline colorbar in GUI and offline videos | `autoflow/rendering/videos.py`, `autoflow/core/pipeline.py` |
 | `streamlines.render.bar_cfg` | object | built-in default | `configs/streamlines.json` | streamline scalar-bar placement and font settings for offline video | `autoflow/rendering/videos.py` |
 | `pathlines.seed_ratio` | float | `0.2` | `configs/pathlines.json` | cross-section sampling ratio in pathline ratio mode | `autoflow/algorithms/streamlines.py` |

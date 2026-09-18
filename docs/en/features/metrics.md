@@ -11,7 +11,7 @@
 ## What It Does
 Plane metrics compute time-resolved cross-sectional measurements for each plane and save them into `plane_metrics.json`. The same per-plane payload is also mirrored into `planes.json` and `planes.h5`, so one plane index has one consistent set of geometry and summaries across outputs. The GUI plane-metric step computes basic flow, area, and velocity without implicitly starting WSS, TKE, or pressure work. If derived arrays already exist, it reuses them. Batch runs compute only the derived fields explicitly requested through `--with` or `requested_metrics`.
 
-For each unique segmentation phase, plane metrics build one thresholded VTK support mesh and reuse it across all planes. Each plane still has its own slice and connectivity selection, while repeated cardiac phases reuse the resulting slice specification. Plane centers remain local physical coordinates and are shifted by `origin` only for VTK slicing.
+For each unique segmentation phase, plane metrics build one thresholded VTK support mesh and reuse it across all planes. Each plane still has its own slice and connectivity selection, while repeated cardiac phases reuse the resulting slice specification. Large parallel jobs use independent loky worker processes with memory-mapped arrays because concurrently slicing a shared VTK dataset from Python threads is unsafe. Plane centers remain local physical coordinates and are shifted by `origin` only for VTK slicing.
 
 Generated planes are filtered before metric integration when their requested
 branch has no cells in the segmentation-filtered cross-section. The exclusion
@@ -64,7 +64,7 @@ Use the standard `run_case()` or `run_batch()` flow. Plane metrics run unless `s
 | Parameter | Type | Default | Where set | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
 | `skip_plane_metrics` | bool | `False` | batch config or CLI/API | disable the whole plane-metric export step | `autoflow/processing.py` |
-| `use_multithread` | bool | `True` | `configs/batch.json` | allow adaptive plane parallelism; sets below 128 planes stay serial because shared VTK geometry is faster without scheduling overhead | `autoflow/core/pipeline.py` |
+| `use_multithread` | bool | `True` | `configs/batch.json` | compatibility-named parallel switch; sets below 128 planes stay serial, while larger sets use up to eight independent worker processes with memory-mapped arrays | `autoflow/core/pipeline.py`, `autoflow/algorithms/metrics.py` |
 
 ## Outputs
 
@@ -116,6 +116,7 @@ Use the standard `run_case()` or `run_batch()` flow. Plane metrics run unless `s
 - `WSS / TKE / Pressure / Vortex` augments existing GUI plane metrics with WSS, TKE, and pressure summaries after computing missing derived families; vortex fields are whole-volume only and do not add plane summaries
 - interactive plane edits defer the complete pixelwise H5 resampling pass until the explicit metric-save step
 - support-mesh reuse assumes identical mask bytes represent identical geometry; changing segmentation content creates a new support mesh
+- the compatibility setting is still named `use_multithread`, but large jobs use processes to isolate VTK state; process startup can make small jobs slower, so fewer than 128 planes remain serial
 
 ## Where To Change Code
 

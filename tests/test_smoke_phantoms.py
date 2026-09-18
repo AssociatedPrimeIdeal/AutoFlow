@@ -15,6 +15,7 @@ from autoflow.algorithms.pwv import compute_cross_correlation_delay_ms, detect_w
 from autoflow.algorithms.preprocess import filter_connected_components, separate_longitudinal_label_contacts
 from autoflow.algorithms.metrics import (
     compute_plane_metrics,
+    compute_plane_metrics_multithread,
     compute_vortex_metrics,
     compute_wss_metrics,
     filter_planes_by_branch_support,
@@ -43,12 +44,45 @@ from autoflow.plane_io import (
 from autoflow.plane_io import save_pwv_h5
 from autoflow.quality import QUALITY_REPORT_SCHEMA, build_quality_report, save_quality_report
 from autoflow.rendering.videos import _build_union_surface, _path_color, _path_group_name, _write_video, render_plane_rotation_video
+from autoflow.ui.contour_edit import new_contour_from_stroke, polygon_area, replace_contour_segment
 
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 PHANTOM_CASES = ("phantom_S", "phantom_U", "phantom_Y")
 REL_TOL = 0.05
 PLANE_SPACING_MM = 15.0
+
+
+def test_cvi_style_contour_edit_creates_and_replaces_one_local_arc():
+    theta = np.linspace(0.0, 2.0 * np.pi, 160, endpoint=False)
+    original = np.column_stack((10.0 * np.cos(theta), 8.0 * np.sin(theta)))
+    created, message = new_contour_from_stroke(np.vstack((original, original[0])), 0.35)
+    assert created is not None, message
+    assert abs(polygon_area(created)) > 150.0
+
+    outward_stroke = np.asarray([
+        [8.0, -4.0], [13.0, -2.0], [14.0, 0.0], [13.0, 2.0], [8.0, 4.0]
+    ])
+    edited, message = replace_contour_segment(original, outward_stroke, 0.35, 1.5)
+    assert edited is not None, message
+    assert abs(polygon_area(edited)) > abs(polygon_area(original))
+
+    inward_stroke = np.asarray([
+        [8.0, -4.0], [5.0, -2.0], [4.0, 0.0], [5.0, 2.0], [8.0, 4.0]
+    ])
+    edited, message = replace_contour_segment(original, inward_stroke, 0.35, 1.5)
+    assert edited is not None, message
+    assert abs(polygon_area(edited)) < abs(polygon_area(original))
+
+    # The final point may stop just inside/outside the vessel. It is projected
+    # to the nearest unambiguous boundary point so the user does not need to
+    # land exactly on the original contour.
+    open_stroke = np.asarray([
+        [8.0, -4.0], [13.0, -2.0], [14.0, 0.0], [13.0, 2.0], [7.0, 4.0]
+    ])
+    edited, message = replace_contour_segment(original, open_stroke, 0.35, 1.5)
+    assert edited is not None, message
+    assert abs(polygon_area(edited)) > abs(polygon_area(original))
 
 
 def test_separate_longitudinal_label_contacts_preserves_end_to_end_transition():
@@ -229,6 +263,61 @@ def test_nonzero_origin_preserves_plane_metrics_and_plane_seeds():
     assert shifted["area_mm2"] == pytest.approx(at_zero["area_mm2"])
     assert shifted["flowrate_mL_s"] == pytest.approx(at_zero["flowrate_mL_s"])
     assert all(value > 0.0 for value in shifted["area_mm2"])
+
+    progress = []
+    compute_plane_metrics(
+        flow, mask, (1.0, 1.0, 1.0), (0.0, 0.0, 0.0), [plane, plane],
+        progress_callback=progress.append,
+    )
+    assert [(event["current"], event["total"]) for event in progress] == [(1, 2), (2, 2)]
+
+    parallel_progress = []
+    parallel = compute_plane_metrics_multithread(
+        flow, mask, (1.0, 1.0, 1.0), (0.0, 0.0, 0.0), [plane, plane],
+        max_workers=2,
+        progress_callback=parallel_progress.append,
+    )
+    assert np.asarray([metric["flowrate_mL_s"] for metric in parallel]) == pytest.approx(
+        np.asarray([metric["flowrate_mL_s"] for metric in compute_plane_metrics(
+            flow, mask, (1.0, 1.0, 1.0), (0.0, 0.0, 0.0), [plane, plane]
+        )])
+    )
+    assert [(event["current"], event["total"]) for event in parallel_progress] == [(1, 2), (2, 2)]
+
+
+def test_oblique_cylinder_plane_metrics_match_analytic_area_and_flow():
+    size = 96
+    spacing = 1.0
+    radius = 16.0
+    speed = 80.0
+    center = np.array([48.0, 48.0, 48.0])
+    x = (np.arange(size, dtype=float) + 0.5)[:, None, None] * spacing
+    y = (np.arange(size, dtype=float) + 0.5)[None, :, None] * spacing
+    z = (np.arange(size, dtype=float) + 0.5)[None, None, :] * spacing
+    mask = (
+        ((x - center[0]) ** 2 + (y - center[1]) ** 2 <= radius ** 2)
+        & (np.abs(z - center[2]) < 30.0)
+    )[..., None]
+    flow = np.zeros((size, size, size, 1, 3), dtype=np.float32)
+    flow[..., 0, 2] = speed
+    normal = np.array([0.45, 0.25, 1.0], dtype=float)
+    normal /= np.linalg.norm(normal)
+    plane = PlaneData(center=center, normal=normal, label=1, path_index=0)
+
+    metric = compute_plane_metrics(
+        flow,
+        mask,
+        spacing=(spacing, spacing, spacing),
+        origin=(0.0, 0.0, 0.0),
+        planes=[plane],
+        RR=1000.0,
+    )[0]
+
+    expected_area = np.pi * radius ** 2 / normal[2]
+    expected_flow = speed * normal[2] * expected_area / 100.0
+    assert metric["area_mm2"][0] == pytest.approx(expected_area, rel=0.02)
+    assert metric["flowrate_mL_s"][0] == pytest.approx(expected_flow, rel=0.02)
+    assert metric["meanv_cm_s"] == pytest.approx(speed * normal[2], rel=1e-6)
 
     seeds = _plane_seeds(
         mask[..., 0], plane, (1.0, 1.0, 1.0), (100.0, 200.0, 300.0),
@@ -660,7 +749,7 @@ def test_load_h5_data_supports_nested_group_real_img_layout_case_insensitive_key
     with h5py.File(path, "w") as handle:
         handle.attrs["origin"] = np.array([1.0, 2.0, 3.0], dtype=np.float32)
         case = handle.create_group("Case001")
-        case.create_dataset("IMG", data=np.concatenate([mag[..., None], flow], axis=-1))
+        case.create_dataset("IMG", data=np.concatenate([mag[..., None, None], flow[..., None, :]], axis=-1))
         case.create_dataset("resolution", data=np.array([1.2, 1.3, 1.4], dtype=np.float32))
         case.create_dataset("rr", data=np.array(812.5, dtype=np.float32))
         case.create_dataset("Venc", data=np.array([50.0, 60.0, 70.0], dtype=np.float32))
@@ -903,7 +992,7 @@ def test_load_h5_data_accepts_comma_separated_spatial_and_venc_order_strings(tmp
         axis=-1,
     )
     with h5py.File(path, "w") as handle:
-        handle.create_dataset("img", data=np.concatenate([mag[..., None], flow], axis=-1))
+        handle.create_dataset("img", data=np.concatenate([mag[..., None, None], flow[..., None, :]], axis=-1))
         handle.create_dataset("Resolution", data=np.array([1.2, 1.3, 1.4], dtype=np.float32))
         handle.create_dataset("RR", data=np.array(812.5, dtype=np.float32))
         handle.create_dataset("VENC", data=np.array([50.0, 60.0, 70.0], dtype=np.float32))
@@ -956,7 +1045,7 @@ def test_load_h5_data_rescales_real_img_phase_radians_to_venc(tmp_path):
     assert np.allclose(loaded.mag, mag)
 
 
-def test_load_h5_data_transposes_channel_first_real_img_layout(tmp_path):
+def test_load_h5_data_rejects_non_xyztv_real_img_layouts(tmp_path):
     path = tmp_path / "real_img_channel_first.h5"
     mag = (np.arange(48, dtype=np.float32).reshape(2, 3, 4, 2) + 1.0) / 10.0
     flow = np.stack(
@@ -978,14 +1067,20 @@ def test_load_h5_data_transposes_channel_first_real_img_layout(tmp_path):
         handle.create_dataset("SpatialOrder", data=np.asarray(["LR", "AP", "FH"], dtype="S4"))
         handle.create_dataset("VENCOrder", data=np.asarray(["LR", "AP", "FH"], dtype="S4"))
 
-    loaded = load_h5_data(str(path))
+    with pytest.raises(ValueError, match=r"XYZTV layout with V=4.*\(4, 2, 4, 3, 2\)"):
+        load_h5_data(str(path))
 
-    assert loaded.metadata["h5_layout"] == "combined_img_real"
-    assert loaded.metadata["real_img_channel_axis_raw"] == "first"
-    assert loaded.mag.shape == mag.shape
-    assert loaded.flow.shape == flow.shape
-    assert np.allclose(loaded.mag, mag)
-    assert np.allclose(loaded.flow, flow)
+    no_time_path = tmp_path / "real_img_without_time_axis.h5"
+    with h5py.File(no_time_path, "w") as handle:
+        handle.create_dataset("img", data=img[..., 0, :])
+        handle.create_dataset("Resolution", data=np.array([1.0, 1.1, 1.2], dtype=np.float32))
+        handle.create_dataset("RR", data=np.array(720.0, dtype=np.float32))
+        handle.create_dataset("VENC", data=np.array([50.0, 60.0, 70.0], dtype=np.float32))
+        handle.create_dataset("SpatialOrder", data=np.asarray(["LR", "AP", "FH"], dtype="S4"))
+        handle.create_dataset("VENCOrder", data=np.asarray(["LR", "AP", "FH"], dtype="S4"))
+
+    with pytest.raises(ValueError, match=r"XYZTV layout with V=4.*\(2, 3, 4, 4\)"):
+        load_h5_data(str(no_time_path))
 
 
 def test_load_h5_data_reorients_normalized_h5_real_flow_mag_and_optional_fields(tmp_path):
@@ -1133,6 +1228,28 @@ def test_load_h5_data_writes_and_reuses_background_phase_corr_cache(monkeypatch,
     assert cached_meta["cache_hit"] is True
     assert cached_meta["cache_name"] == "corr"
     assert np.allclose(loaded_cached.flow, loaded.flow)
+
+
+def test_disabled_background_correction_does_not_read_compressed_cache(monkeypatch, tmp_path):
+    path = tmp_path / "disabled_corr_cache.h5"
+    mag = np.ones((3, 3, 2, 1), dtype=np.float32)
+    flow = np.zeros((3, 3, 2, 1, 3), dtype=np.float32)
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("mag", data=mag)
+        handle.create_dataset("flow", data=flow)
+        handle.create_dataset("corr", data=np.ones((3, 3, 2, 1, 3), dtype=np.float32), compression="gzip")
+        handle.create_dataset("Resolution", data=np.ones(3, dtype=np.float32))
+        handle.create_dataset("VENC", data=np.full(3, 100.0, dtype=np.float32))
+        handle.create_dataset("SpatialOrder", data=np.asarray(["LR", "AP", "FH"], dtype="S4"))
+        handle.create_dataset("VENCOrder", data=np.asarray(["LR", "AP", "FH"], dtype="S4"))
+
+    def fail_cache_read(*_args, **_kwargs):
+        raise AssertionError("disabled correction must not read the corr dataset")
+
+    monkeypatch.setattr("autoflow.algorithms.data._read_background_phase_corr_cache_from_scopes", fail_cache_read)
+    loaded = load_h5_data(str(path), correction_config={"enabled": False})
+    assert np.array_equal(loaded.flow, flow)
+    assert loaded.metadata["background_phase_correction"]["skipped_reason"] == "disabled"
 
 
 def test_msac_reports_trial_progress():
@@ -1461,6 +1578,31 @@ def test_load_h5_data_supports_nested_group_complex_img_layout(tmp_path):
     assert np.allclose(loaded.flow, flow, atol=1e-5)
     assert loaded.sigma is not None
     assert loaded.capabilities.has_complex_source is True
+
+
+def test_load_h5_data_rejects_channel_first_complex_img_layout(tmp_path):
+    path = tmp_path / "complex_img_channel_first.h5"
+    mag = np.full((2, 3, 4, 2), 3.0, dtype=np.float32)
+    flow = np.zeros((2, 3, 4, 2, 3), dtype=np.float32)
+    flow[..., 0] = 12.0
+    flow[..., 1] = -7.5
+    flow[..., 2] = 3.25
+    venc = np.array([50.0, 60.0, 70.0], dtype=np.float32)
+    phase = np.pi * flow / venc.reshape((1, 1, 1, 1, 3))
+    img = np.zeros((2, 3, 4, 2, 4), dtype=np.complex64)
+    img[..., 0] = mag.astype(np.complex64)
+    img[..., 1:4] = mag[..., None] * np.exp(1j * phase)
+    img_channel_first = np.transpose(img, (4, 3, 2, 1, 0))
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("img", data=img_channel_first)
+        handle.create_dataset("Resolution", data=np.array([1.0, 1.1, 1.2], dtype=np.float32))
+        handle.create_dataset("RR", data=np.array(900.0, dtype=np.float32))
+        handle.create_dataset("VENC", data=venc)
+        handle.create_dataset("SpatialOrder", data=np.asarray(["LR", "AP", "FH"], dtype="S4"))
+        handle.create_dataset("VENCOrder", data=np.asarray(["LR", "AP", "FH"], dtype="S4"))
+
+    with pytest.raises(ValueError, match=r"XYZT4 or XYZT7.*\(4, 2, 4, 3, 2\)"):
+        load_h5_data(str(path))
 
 
 def test_s_u_y_plane_metrics_match_truth_within_two_percent_mean_error():
@@ -1915,7 +2057,9 @@ def test_config_dir_reads_feature_render_settings_from_metric_jsons(tmp_path):
     auto_resolved = bundle_to_autoflow_kwargs({"streamlines": {"render": {"clim": None}}})
     assert auto_resolved["streamline_clim"] is None
     assert AutoFlowConfig().streamline_clim is None
-    assert AutoFlowConfig().tube_radius == pytest.approx(0.25)
+    assert AutoFlowConfig().seed_ratio == pytest.approx(0.1)
+    assert AutoFlowConfig().max_steps == 200
+    assert AutoFlowConfig().tube_radius == pytest.approx(0.05)
 
 
 def test_hybrid_component_filter_keeps_multiple_group_components():

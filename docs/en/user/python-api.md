@@ -134,7 +134,9 @@ launch_gui(config_dir="./configs")
 | `min_cc_volume` | float | `50.0` | absolute component threshold in mm^3 | `autoflow/algorithms/preprocess.py` |
 | `cc_filter_mode` | string | `hybrid` | choose `absolute`, `relative`, `hybrid`, or `largest` component filtering | `autoflow/algorithms/preprocess.py` |
 | `cc_rel_min_ratio` | float | `0.01` | relative threshold against the largest component for `relative` and `hybrid` filtering | `autoflow/algorithms/preprocess.py` |
-| `seed_ratio` | float | `0.02` | streamline seed density | `autoflow/algorithms/streamlines.py` |
+| `seed_ratio` | float | `0.1` | streamline seed density | `autoflow/algorithms/streamlines.py` |
+| `max_steps` | int | `200` | streamline integration steps | `autoflow/algorithms/streamlines.py` |
+| `tube_radius` | float | `0.05` | streamline tube radius in mm | `autoflow/rendering/videos.py` |
 | `pathline_seed_ratio` | float | `0.2` | `configs/pathlines.json` ratio-mode cross-section seed density | `autoflow/algorithms/streamlines.py` |
 | `pathline_min_seeds` | int | `50` | `configs/pathlines.json` ratio-mode lower seed bound | `autoflow/algorithms/streamlines.py` |
 | `pathline_seed_mode` | string | `fixed` | `configs/pathlines.json`: choose `fixed` for the configured count per plane or `ratio` for area-dependent sampling | `autoflow/algorithms/streamlines.py`, `autoflow/core/models.py` |
