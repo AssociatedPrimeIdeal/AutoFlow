@@ -13,7 +13,7 @@
 | `pwv.json` | PWV runs successfully | PWV fit results for each configured PWV group | `autoflow/core/pipeline.py`, `autoflow/algorithms/pwv.py` |
 | `pwv_<group>.png` | PWV plotting succeeds | per-group two-panel plot with time-to-foot fit and all plane flowrate waveforms | `autoflow/algorithms/pwv.py` |
 | `derived_metrics_pixelwise.npz` | derived metrics run | whole-volume WSS, pressure-gradient intermediates, reconstructed relative pressure, optional TKE, and requested vortex-kinematics arrays (uncompressed NPZ for faster export) | `autoflow/processing.py` |
-| `quality_report.json` | every processed case | staged automated QC with `pass`, `warn`, `fail`, or `not_run` checks and suggested review actions | `autoflow/quality.py`, `autoflow/processing.py` |
+| `quality_report.json` | every processed case | staged automated QC plus a label-named, flow-directed path/branch/plane hierarchy with summary statistics and conservation equations | `autoflow/quality.py`, `autoflow/processing.py` |
 | `summary.json` | every processed case; also updated by GUI video export when present | single-case summary including request flags plus stage and video timings | `autoflow/processing.py`, `autoflow/ui/app.py` |
 | `phase_unwrap.npz` | optional phase-unwrapping run | wrapped/unwrapped phase, flow, signed `wrap_count`, `wrap_mask`, and `mask_used` | `autoflow/processing.py` |
 | `batch_report.json` | batch run | batch summary report | `autoflow/api.py`, `autoflow/processing.py` |
@@ -49,6 +49,7 @@
 - `pwv.json` is also mirrored into `summary.json` as `pwv_results`, `pwv_file`, and `pwv_plot_files`
 - `summary.json` records `requested_metrics`, `requested_videos`, `stage_times_sec`, `video_times_sec`, `pressure_method`, `centerline_pressure_profiles`, and the generated quality report
 - `summary.json` also records optional `phase_unwrap` method/device, skip reason, elapsed time, and wrap statistics
+- `quality_report.json -> flow_hierarchy` stores per-label summaries, junction equations such as `SMV + SV = PV`, and recursive roots named by flow order (`PV`, `PV1`, `PV1-1`); each path carries mean ± population-SD statistics and distance-sorted plane details
 - multi-group H5 inputs write separate case subdirectories whose names include the H5 data-group path
 - GUI `Export Videos...` also updates `summary.json` with refreshed `videos`, refreshed `video_times_sec`, and a `gui_video_export` record for that export run
 - `planes.json` and `planes.h5` store per-plane `label_name` from `label_map` plus `path_info` when path metadata is available; grouped multi-label workflows can therefore expose both readable plane labels and `path_info.group_name` in those files

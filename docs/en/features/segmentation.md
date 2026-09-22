@@ -30,7 +30,7 @@ Segmentation gives AutoFlow the lumen mask needed for skeletons, graphs, planes,
 ### GUI
 1. load a case
 2. open the `Segmentation` workflow stage; loading never starts automatic segmentation
-3. use `Source -> Configure...` to choose `input`, `threshold`, or `auto`; the shipped config defaults to the Dataset7020 temporal model, while an explicit 3D model folder keeps the static backend
+3. use `Source -> Configure...` to choose `input`, `threshold`, or `auto`; automatic mode offers `4D temporal (nnUNet4D)` and `3D static + time broadcast (nnUNet)`, with backend-specific model defaults
 4. click `Run Automatic Segmentation` to start nnUNet after confirming the settings
 5. wait for the auto-segmentation progress dialog to finish
 6. click `Open in SpatioTemporal Labeler`; AutoFlow exports six exchange files one feature per progress step and opens the separately installed GPL-3.0 editor
@@ -51,10 +51,10 @@ During a manual stroke, only the active slice overlay is redrawn. Linked views r
 autoflow-run case.h5 --output-dir results/case --autoseg
 ```
 
-For the temporal Dataset7020 model, select the 4D backend and point the model
-setting at either its nnUNet model directory or the supplied orchestration
-script. `single` uses `fold_all` (or the first available fold); `all` averages
-all available folds, including a future five-fold export:
+For the default temporal Dataset7020 model, select the 4D backend and leave the
+model and checkpoint settings at `auto`. `single` uses `fold_all` (or the first
+available fold); `all` averages all available folds, including a future
+five-fold export:
 
 When both `fold_all` and numeric folds are present, `single` deliberately keeps
 the full-data `fold_all` branch while `all` selects the numeric folds for the
@@ -63,7 +63,16 @@ cross-validation ensemble.
 ```bash
 autoflow-run case.h5 --output-dir results/case --autoseg \
   --autoseg-backend nnUNet4D \
-  --autoseg-model /nas-data2/ryy/CMR4DFlow2026/Segdata/scripts/nnunet/4D/run_7020_4d_full_ssd_20260824.sh \
+  --autoseg-model auto --autoseg-checkpoint auto \
+  --autoseg-folds single
+```
+
+For one static Dataset7010 prediction copied to every cardiac phase:
+
+```bash
+autoflow-run case.h5 --output-dir results/case --autoseg \
+  --autoseg-backend nnUNet \
+  --autoseg-model auto --autoseg-checkpoint auto \
   --autoseg-folds single
 ```
 
@@ -113,9 +122,9 @@ summary = run_case("case.h5", config=config)
 | `threshold_closing` | bool | `True` | `configs/segmentation.json` | morphological closing | `autoflow/algorithms/segmentation.py` |
 | `threshold_opening` | bool | `False` | `configs/segmentation.json` | morphological opening | `autoflow/algorithms/segmentation.py` |
 | `auto_backend` / `--autoseg-backend` | string | `nnUNet4D` in the shipped config | GUI config or CLI/API | automatic backend; `nnUNet4D` consumes temporal channels and returns XYZT labels; choose `nnUNet` for static 3D models | `autoflow/algorithms/segmentation.py` |
-| `auto_model` / `--autoseg-model` | path | Dataset7020 `.sh` in the shipped config | GUI config or CLI/API | 4D accepts a model folder or the Dataset7020 `.sh` script, which is resolved to its checkpoint directory; 3D accepts a model folder | `autoflow/algorithms/segmentation.py` |
-| `auto_checkpoint` / `--autoseg-checkpoint` | string | `checkpoint_final.pth` | GUI config or CLI/API | checkpoint name | `autoflow/algorithms/segmentation.py` |
-| `auto_folds` / `--autoseg-folds` | string | `single` | GUI config or CLI/API | choose `single`, `all`/`ensemble`, or a comma-separated fold list; `checkpoint_best.pth` is used when final is unavailable | `autoflow/algorithms/segmentation.py` |
+| `auto_model` / `--autoseg-model` | path or `auto` | `auto` | GUI config or CLI/API | `auto` selects Dataset7010 for 3D and Dataset7020 for 4D; explicit 4D values accept a model folder or orchestration `.sh`, while 3D accepts a model folder | `autoflow/algorithms/segmentation.py` |
+| `auto_checkpoint` / `--autoseg-checkpoint` | string or `auto` | `auto` | GUI config or CLI/API | `auto` selects `checkpoint_final.pth` for Dataset7010 and `checkpoint_best.pth` for Dataset7020 | `autoflow/algorithms/segmentation.py` |
+| `auto_folds` / `--autoseg-folds` | string | `single` | GUI config or CLI/API | choose `single`, `all`/`ensemble`, or a comma-separated fold list | `autoflow/algorithms/segmentation.py` |
 | `auto_device` / `--autoseg-device` | string | `auto` | GUI config or CLI/API | choose the inference device; CUDA also enables GPU input and probability-export resampling by default | `autoflow/algorithms/segmentation.py` |
 | `auto_label_map` / `--autoseg-label-map` | JSON | empty | GUI config or CLI/API | remap predicted labels | `autoflow/algorithms/segmentation.py` |
 | `AUTOFLOW_NNUNET4D_GROUPED` | environment string | `auto` | process environment | use one common crop and shared resampling for all temporal samples; set `0` to force the standard subprocess path or `1` to fail instead of falling back | `autoflow/algorithms/segmentation.py` |
@@ -142,8 +151,10 @@ summary = run_case("case.h5", config=config)
 
 ## Limitations
 - automatic backends are `nnUNet` (3D/static) and `nnUNet4D` (Dataset7020 temporal-channel model)
+- the `nnUNet` backend predicts one 3D label volume from Dataset7010's 12 summary channels and broadcasts that unchanged volume across the input time count
+- the `nnUNet4D` backend predicts one label volume per frame from Dataset7020's 37 global and temporal channels and returns the stacked dynamic `XYZT` labels
 - automatic segmentation requires loaded `mag` and `flow`
-- an empty model setting resolves the bundled model from the installed `autoflow` package, independent of the current working directory; explicit relative overrides still resolve from the current working directory
+- `auto` or an empty model setting selects the matching local Dataset7010/Dataset7020 profile when available; static 3D falls back to the model bundled in the installed package, and the legacy Dataset7020 orchestration script remains the 4D fallback
 - pip wheels and the Windows standalone build include only `fold_all/checkpoint_final.pth` plus `dataset.json` and `plans.json`; training logs, debug output, `checkpoint_best.pth`, and `checkpoint_latest.pth` are not packaged
 - the nnUNet model was trained with `HF/AP/RL` feature geometry, so AutoFlow performs one required conversion from its normalized `LR/AP/FH` arrays before inference and restores the predicted labels once afterward; removing either conversion would change model inputs or downstream geometry
 - when inference uses CUDA, AutoFlow creates a temporary model plan that uses nnUNet's `resample_torch_fornnunet` implementation for floating-point input channels; the source model and its `plans.json` are not modified

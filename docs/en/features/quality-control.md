@@ -12,6 +12,8 @@
 
 Quality control converts pipeline state into explicit `pass`, `warn`, `fail`, or `not_run` checks. It currently screens physical geometry, finite velocity values, VENC saturation, background-phase provenance, segmentation content and temporal stability, graph topology, plane alignment, plane sampling, flow internal consistency, and PWV fit quality.
 
+The report also contains a flow-directed vessel hierarchy. Paths use segmentation label names rather than raw path numbers. The main level-0 path keeps the label name (`PV`); same-label children are ordered by descending mean absolute net flow and named `PV1`, `PV2`, then `PV1-1`, `PV1-2`, and so on. Each path reports mean ± population SD across its planes for net flow, peak flow rate, mean velocity, and peak velocity. Junction conservation uses the same readable names, for example `SMV + SV = PV` or `PV = PV1 + PV2`.
+
 The report is for engineering review prioritization. It does not establish clinical validity and must not be interpreted as a diagnostic conclusion.
 
 ## When To Use It
@@ -29,7 +31,8 @@ The report is for engineering review prioritization. It does not establish clini
 2. open `Review & Export`
 3. click `Refresh QC`
 4. inspect warnings and failures; hover the result for its threshold and suggested action
-5. click `Export QC Report`
+5. inspect the collapsed level-0 vessel rows; expand a row for downstream branches and expand `Planes` for individual measurements
+6. click `Export QC Report`
 
 ### CLI
 
@@ -58,6 +61,7 @@ save_quality_report(workspace, "results/case/quality_report.json", report=report
 | active segmentation | for segmentation QC | foreground labels, components, volume, and temporal stability |
 | graph and paths | for topology QC | connected components, endpoints, branch nodes, isolated nodes, and cycles |
 | planes and plane metrics | for plane/hemodynamic QC | plane alignment, sampling, area stability, and internal consistency |
+| path topology, flow direction, and segmentation labels | for the vessel hierarchy | parent/child order, readable branch names, and label-named junction equations |
 | PWV results | when PWV runs | successful groups and minimum fit R2 |
 
 ## Parameters
@@ -77,9 +81,12 @@ The first report schema uses conservative screening thresholds owned by code. Th
 
 | Output | Created when | Meaning |
 | --- | --- | --- |
-| `quality_report.json` | CLI or Python case processing completes | schema, overall state, counts, checks, values, thresholds, actions, and run context |
+| `quality_report.json` | CLI or Python case processing completes | schema, overall state, counts, checks, values, thresholds, actions, run context, and `flow_hierarchy` |
 | `summary.json -> quality_report` | case processing completes | embedded report for batch aggregation |
-| GUI QC table | `Refresh QC` runs | current workspace checks, including unsaved interactive edits |
+| GUI QC check table | `Refresh QC` runs | current workspace checks, including unsaved interactive edits |
+| GUI vessel flow tree | `Refresh QC` runs | collapsed level-0 trunks with recursively expandable branches, conservation equations, and plane details |
+
+`flow_hierarchy` uses schema `autoflow.flow_hierarchy.v1`. Its `labels` array contains per-label aggregate statistics. `junctions` contains the incoming and outgoing path ids, display names, equation, and consistency score. `roots` contains the recursive path tree; every path includes its statistics, path internal consistency, related junctions, child paths, and distance-sorted planes.
 
 Plane generation reports intentionally dropped planes (no branch-supported
 cross-section) as a review warning. A path with no valid planes remains in the
@@ -96,6 +103,8 @@ The overall state is `not_ready` when a required check fails, `needs_review` whe
 - pressure solver residuals, WSS sensitivity intervals, uncertainty maps, and registration QC are not yet available in the v1 schema
 - a `ready` report means the implemented automated checks passed; it does not prove ground-truth accuracy
 - dropped branch-unsupported planes are not treated as zero flow; review their entries in `plane_qc.json` when a path has fewer planes than requested
+- when topology produces more than one disconnected level-0 path for the same label, the highest-flow root keeps the bare label and additional roots use `-R2`, `-R3`, and so on
+- branch numbering is run-specific because it follows measured mean net flow; it is stable for unchanged topology and metrics, but it is not a permanent anatomical identifier across independently processed cases
 
 ## Where To Change Code
 
@@ -107,8 +116,8 @@ The overall state is `not_ready` when a required check fails, `needs_review` whe
 
 ## Tests
 
-- `~/miniconda3/envs/ryy/bin/python -m pytest tests/test_smoke_phantoms.py -q`
-- `~/miniconda3/envs/ryy/bin/python -m pytest tests/test_pressure_gradient_phantom.py -q`
+- `/home/renyuyang/miniconda3/envs/autoflow311/bin/python -m pytest tests/test_smoke_phantoms.py -q`
+- `/home/renyuyang/miniconda3/envs/autoflow311/bin/python -m pytest tests/test_pressure_gradient_phantom.py -q`
 - manually refresh the GUI table before and after changing a plane or segmentation
 
 ## Common Problems

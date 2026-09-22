@@ -114,8 +114,8 @@ class AutoFlowConfig:
 
     autoseg: bool = False
     autoseg_backend: str = "nnUNet4D"
-    autoseg_model: str = "/nas-data2/ryy/CMR4DFlow2026/Segdata/scripts/nnunet/4D/run_7020_4d_full_ssd_20260824.sh"
-    autoseg_checkpoint: str = "checkpoint_final.pth"
+    autoseg_model: str = "auto"
+    autoseg_checkpoint: str = "auto"
     autoseg_folds: str = "single"
     autoseg_device: str = "auto"
     autoseg_label_map: str = ""
@@ -216,7 +216,7 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
     ws.segmentation.write_auto_cache = bool(cfg.write_segmentation_cache)
     ws.segmentation.auto_backend = str(cfg.autoseg_backend or "nnUNet")
     ws.segmentation.auto_model = str(cfg.autoseg_model or "")
-    ws.segmentation.auto_checkpoint = str(cfg.autoseg_checkpoint or "checkpoint_final.pth")
+    ws.segmentation.auto_checkpoint = str(cfg.autoseg_checkpoint or "auto")
     ws.segmentation.auto_folds = str(cfg.autoseg_folds or "single")
     ws.segmentation.auto_device = str(cfg.autoseg_device or "auto")
     ws.segmentation.auto_label_map = str(cfg.autoseg_label_map or "")

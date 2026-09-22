@@ -36,7 +36,6 @@ gui = [
   "pyqtgraph>=0.13",
   "pyvistaqt",
   "matplotlib",
-  "numpy<2",
   "nnunetv2==2.5.2",
   "nibabel",
 ]

@@ -1511,6 +1511,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.quality_table.setMinimumHeight(150)
         quality_layout.addWidget(self.quality_table)
 
+        self.flow_report_summary_label = QtWidgets.QLabel(
+            "Vessel flow hierarchy becomes available after plane metrics are calculated."
+        )
+        self.flow_report_summary_label.setWordWrap(True)
+        quality_layout.addWidget(self.flow_report_summary_label)
+
+        self.flow_report_tree = QtWidgets.QTreeWidget()
+        self.flow_report_tree.setHeaderLabels(["Vessel / Path", "Level", "Flow & Velocity (mean ± SD)", "Consistency"])
+        self.flow_report_tree.setRootIsDecorated(True)
+        self.flow_report_tree.setAlternatingRowColors(True)
+        flow_header = self.flow_report_tree.header()
+        flow_header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        flow_header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        flow_header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
+        flow_header.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        self.flow_report_tree.setMinimumHeight(230)
+        quality_layout.addWidget(self.flow_report_tree)
+
         quality_buttons = QtWidgets.QHBoxLayout()
         self.btn_refresh_quality = QtWidgets.QPushButton("Refresh QC")
         self.btn_refresh_quality.clicked.connect(self._refresh_quality_panel)
@@ -2388,13 +2406,140 @@ class MainWindow(QtWidgets.QMainWindow):
             self.scene.set_background(value)
             self._config_bundle.setdefault("ui", {})["background_color"] = value
 
+    @staticmethod
+    def _quality_mean_sd(summary, digits=2):
+        payload = dict(summary or {})
+        mean = payload.get("mean")
+        std = payload.get("std")
+        if mean is None or std is None:
+            return "n/a"
+        return f"{float(mean):.{int(digits)}f} ± {float(std):.{int(digits)}f}"
+
+    def _quality_flow_statistics_text(self, statistics):
+        stats = dict(statistics or {})
+        return (
+            f"Qnet {self._quality_mean_sd(stats.get('net_flow_mL_beat'))} mL/beat  ·  "
+            f"Qpeak {self._quality_mean_sd(stats.get('peak_flow_mL_s'))} mL/s  ·  "
+            f"Vmean {self._quality_mean_sd(stats.get('mean_velocity_cm_s'))} cm/s  ·  "
+            f"Vpeak {self._quality_mean_sd(stats.get('peak_velocity_cm_s'))} cm/s  ·  "
+            f"n={int(stats.get('plane_count', 0) or 0)}"
+        )
+
+    @staticmethod
+    def _quality_consistency_text(node):
+        value = node.get("internal_consistency")
+        internal = "undefined" if value is None else f"{float(value):.3f}"
+        relations = []
+        for junction in list(node.get("junctions", []) or []):
+            junction_value = junction.get("internal_consistency")
+            junction_text = "undefined" if junction_value is None else f"{float(junction_value):.3f}"
+            relations.append(f"{junction.get('equation', '? = ?')}: {junction_text}")
+        text = f"Internal IC {internal}"
+        if relations:
+            text += "  ·  " + "  ·  ".join(relations)
+        return text
+
+    def _add_quality_flow_path_item(self, parent, node):
+        item = QtWidgets.QTreeWidgetItem([
+            str(node.get("name", "Path")),
+            str(int(node.get("branch_level", 0))),
+            self._quality_flow_statistics_text(node.get("statistics", {})),
+            self._quality_consistency_text(node),
+        ])
+        path_index = int(node.get("path_index", -1))
+        item.setToolTip(
+            0,
+            f"Label: {node.get('label_name', 'Unlabeled')}\nPath index: {path_index}\n"
+            "Child branches are ordered by descending mean absolute net flow.",
+        )
+        item.setToolTip(2, self._quality_flow_statistics_text(node.get("statistics", {})))
+        item.setToolTip(3, self._quality_consistency_text(node))
+        item.setData(0, _BROWSER_PATH_INDEX_ROLE, path_index)
+        if int(node.get("branch_level", 0)) == 0:
+            for column in range(4):
+                font = item.font(column)
+                font.setBold(True)
+                item.setFont(column, font)
+        consistency_values = [node.get("internal_consistency")]
+        consistency_values.extend(
+            junction.get("internal_consistency")
+            for junction in list(node.get("junctions", []) or [])
+        )
+        consistency_values = [float(value) for value in consistency_values if value is not None]
+        if consistency_values:
+            ic_value = min(consistency_values)
+            color = "#1b5e20" if ic_value >= 0.8 else ("#8a4b00" if ic_value >= 0.6 else "#b71c1c")
+            item.setForeground(3, QtGui.QBrush(QtGui.QColor(color)))
+        if parent is None:
+            self.flow_report_tree.addTopLevelItem(item)
+        else:
+            parent.addChild(item)
+
+        for child in list(node.get("children", []) or []):
+            self._add_quality_flow_path_item(item, child)
+
+        planes = list(node.get("planes", []) or [])
+        if planes:
+            plane_group = QtWidgets.QTreeWidgetItem([f"Planes ({len(planes)})", "Details", "", ""])
+            item.addChild(plane_group)
+            for plane in planes:
+                def number(key, digits=2):
+                    value = plane.get(key)
+                    return "n/a" if value is None else f"{float(value):.{int(digits)}f}"
+
+                sequence = int(plane.get("sequence", 0) or 0)
+                plane_index = int(plane.get("plane_index", -1))
+                distance = number("distance_mm", 1)
+                detail = (
+                    f"Qnet {number('net_flow_mL_beat')} mL/beat  ·  "
+                    f"Qpeak {number('peak_flow_mL_s')} mL/s  ·  "
+                    f"Vmean {number('mean_velocity_cm_s')} cm/s  ·  "
+                    f"Vpeak {number('peak_velocity_cm_s')} cm/s"
+                )
+                plane_item = QtWidgets.QTreeWidgetItem([
+                    f"Plane {sequence}",
+                    f"{distance} mm",
+                    detail,
+                    "",
+                ])
+                plane_item.setToolTip(0, f"Global plane index: {plane_index}\nPath index: {path_index}")
+                plane_group.addChild(plane_item)
+        item.setExpanded(False)
+        return item
+
+    def _populate_quality_flow_tree(self, hierarchy):
+        if not hasattr(self, "flow_report_tree"):
+            return
+        self.flow_report_tree.clear()
+        payload = dict(hierarchy or {})
+        roots = list(payload.get("roots", []) or [])
+        status = str(payload.get("status", "not_run"))
+        if not roots:
+            self.flow_report_tree.setEnabled(False)
+            self.flow_report_summary_label.setText(
+                "Vessel flow hierarchy is not available. Generate paths, planes, and plane metrics, then refresh QC."
+            )
+            return
+        self.flow_report_summary_label.setText(
+            f"Vessel flow report: {payload.get('summary', '')}. "
+            "Level-0 trunks are shown by default; expand a trunk for downstream branches, conservation equations, and per-plane details."
+        )
+        for root in roots:
+            self._add_quality_flow_path_item(None, root)
+        self.flow_report_tree.collapseAll()
+        self.flow_report_tree.setEnabled(status in {"available", "topology_only"})
+
     def _refresh_quality_panel(self):
         if not hasattr(self, "quality_table"):
             return
         self.quality_table.clear()
+        if hasattr(self, "flow_report_tree"):
+            self.flow_report_tree.clear()
         if not self.workspace.data_loaded:
             self._last_quality_report = None
             self.quality_summary_label.setText("Load a case to generate QC results.")
+            if hasattr(self, "flow_report_summary_label"):
+                self.flow_report_summary_label.setText("Load a case to generate the vessel flow report.")
             self._refresh_workflow_status()
             return
         try:
@@ -2436,6 +2581,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 item.setToolTip(2, tooltip)
                 item.setToolTip(3, tooltip)
             self.quality_table.addTopLevelItem(item)
+        self._populate_quality_flow_tree(report.get("flow_hierarchy", {}))
         self._refresh_workflow_status()
 
     def _on_export_quality_report(self):
@@ -2984,7 +3130,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
 
         resolved_device = seg_state.auto_device or "cpu"
-        checkpoint_name = seg_state.auto_checkpoint or "checkpoint_final.pth"
+        checkpoint_name = seg_state.auto_checkpoint or "auto"
         model_argument = (
             str(seg_state.auto_model)
             if backend_token in {"nnunet4d", "nnunet_4d", "4d"}

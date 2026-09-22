@@ -44,6 +44,7 @@ pip install ".[gui,labeler]"
 ```
 
 Normal and editable installs include the bundled nnUNet `dataset.json`, `plans.json`, and final checkpoint as package data. The `gui` extra also installs the nnUNet inference runtime; no separate automatic-segmentation extra or model download is required. The `labeler` extra installs the pinned SpatioTemporal Labeler `v0.4.0` interface; its upstream source remains a separate GPL-3.0 submodule.
+The GUI extra does not pin NumPy to the 1.x series; NumPy 2 is supported when the environment's compiled SciPy, scikit-image, h5py, matplotlib, and VTK wheels are mutually compatible.
 
 ## Quick Start
 
@@ -81,16 +82,18 @@ Typical outputs under `./results/demo/<case_name>/`:
 - `plane_positions.json`
 - `plane_metrics.json`
 - `plane_qc.json`
-- `quality_report.json` with staged input, segmentation, topology, plane, flow-consistency, and PWV checks
+- `quality_report.json` with staged checks plus a label-named, flow-directed path hierarchy, branch-conservation equations, and expandable path/plane statistics in the GUI QC view
 - `pwv.json` when PWV runs
 - `pwv_<group>.png` when PWV plotting succeeds
 - `summary.json` with `stage_times_sec`, `video_times_sec`, and request flags
 - source H5 `segmask` is updated in place for reuse, plus `*_auto_segmentation.nii.gz` and `*_auto_segmentation_feature_*.nii.gz` when `--autoseg` runs on an H5 input
 
-The shipped automatic-segmentation config uses the Dataset7020 temporal
-`nnUNet4D` model (`run_7020_4d_full_ssd_20260824.sh`). Use
-`--autoseg-folds single` for the current `fold_all` checkpoint, or `all` / an
-explicit list such as `0,1,2,3,4` when five folds are available. For a
+The shipped automatic-segmentation config defaults to 4D temporal inference.
+The backend-specific `auto` profile selects Dataset7020 `checkpoint_best.pth`
+for `nnUNet4D`, or Dataset7010 `checkpoint_final.pth` for static `nnUNet`; the
+static result is copied to every cardiac phase. Use `--autoseg-folds single`
+for either current `fold_all` checkpoint, or `all` / an explicit list such as
+`0,1,2,3,4` when five folds are available. For a
 read-only cold benchmark, use `tools/benchmark_pipeline.py`, which defaults to
 the registered DV validation H5 and ignores embedded correction and segmentation
 caches.

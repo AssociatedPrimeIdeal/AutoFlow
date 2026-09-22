@@ -1026,8 +1026,8 @@ class SegmentationState:
     threshold_closing: bool = True
     threshold_opening: bool = False
     auto_backend: str = "nnUNet4D"
-    auto_model: str = "/nas-data2/ryy/CMR4DFlow2026/Segdata/scripts/nnunet/4D/run_7020_4d_full_ssd_20260824.sh"
-    auto_checkpoint: str = "checkpoint_final.pth"
+    auto_model: str = "auto"
+    auto_checkpoint: str = "auto"
     auto_folds: str = "single"
     auto_device: str = "auto"
     auto_label_map: str = ""
@@ -1134,8 +1134,8 @@ class SegmentationState:
             threshold_closing=bool(payload.get("threshold_closing", True)),
             threshold_opening=bool(payload.get("threshold_opening", False)),
             auto_backend=str(payload.get("auto_backend", "nnUNet4D")),
-            auto_model=str(payload.get("auto_model", "/nas-data2/ryy/CMR4DFlow2026/Segdata/scripts/nnunet/4D/run_7020_4d_full_ssd_20260824.sh")),
-            auto_checkpoint=str(payload.get("auto_checkpoint", "checkpoint_final.pth")),
+            auto_model=str(payload.get("auto_model", "auto")),
+            auto_checkpoint=str(payload.get("auto_checkpoint", "auto")),
             auto_folds=str(payload.get("auto_folds", "single") or "single"),
             auto_device=str(payload.get("auto_device", "auto")),
             auto_label_map=str(payload.get("auto_label_map", "")),

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from PySide6 import QtCore, QtWidgets
 
 
@@ -99,9 +101,11 @@ class SegmentationConfigDialog(QtWidgets.QDialog):
     def _build_auto_page(self):
         page = QtWidgets.QWidget()
         form = QtWidgets.QFormLayout(page)
-        self.edit_auto_backend = QtWidgets.QLineEdit()
+        self.combo_auto_backend = QtWidgets.QComboBox()
+        self.combo_auto_backend.addItem("4D temporal (nnUNet4D)", "nnUNet4D")
+        self.combo_auto_backend.addItem("3D static + time broadcast (nnUNet)", "nnUNet")
         self.edit_auto_model = QtWidgets.QLineEdit()
-        self.edit_auto_model.setPlaceholderText("Bundled default")
+        self.edit_auto_model.setPlaceholderText("auto (backend-specific model)")
         self.edit_auto_checkpoint = QtWidgets.QLineEdit()
         self.edit_auto_folds = QtWidgets.QLineEdit()
         self.edit_auto_folds.setPlaceholderText("single, all, or 0,1,2,3,4")
@@ -116,9 +120,13 @@ class SegmentationConfigDialog(QtWidgets.QDialog):
         self.edit_auto_label_map = QtWidgets.QPlainTextEdit()
         self.edit_auto_label_map.setPlaceholderText('{"aorta": 1}')
         self.edit_auto_label_map.setMaximumHeight(90)
-        note = QtWidgets.QLabel("Use nnUNet4D for temporal models; Folds accepts single, all, or an explicit list such as 0,1,2,3,4. A Dataset7020 .sh path is accepted as the model setting.")
+        note = QtWidgets.QLabel(
+            "With Model and Checkpoint set to auto, 3D uses Dataset7010 checkpoint_final and "
+            "broadcasts one mask to every phase; 4D uses Dataset7020 checkpoint_best and "
+            "predicts every phase. Folds accepts single, all, or 0,1,2,3,4."
+        )
         note.setWordWrap(True)
-        form.addRow("Backend", self.edit_auto_backend)
+        form.addRow("Segmentation mode", self.combo_auto_backend)
         form.addRow("Model", self.edit_auto_model)
         form.addRow("Checkpoint", checkpoint_widget)
         form.addRow("Folds", self.edit_auto_folds)
@@ -141,7 +149,10 @@ class SegmentationConfigDialog(QtWidgets.QDialog):
     def _browse_checkpoint(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Checkpoint", "", "All (*)")
         if path:
-            self.edit_auto_checkpoint.setText(path)
+            checkpoint_path = Path(path)
+            self.edit_auto_checkpoint.setText(checkpoint_path.name)
+            if checkpoint_path.parent.name.startswith("fold_"):
+                self.edit_auto_model.setText(str(checkpoint_path.parent.parent))
 
     def _sync_mode(self, mode):
         index = {"input": 0, "threshold": 1, "auto": 2}.get(str(mode), 0)
@@ -180,7 +191,8 @@ class SegmentationConfigDialog(QtWidgets.QDialog):
         self.chk_threshold_closing.setChecked(bool(seg.threshold_closing))
         self.chk_threshold_opening.setChecked(bool(seg.threshold_opening))
         self.spin_min_cc_volume.setValue(float(seg.threshold_min_component_volume_mm3))
-        self.edit_auto_backend.setText(seg.auto_backend)
+        backend_index = self.combo_auto_backend.findData(seg.auto_backend)
+        self.combo_auto_backend.setCurrentIndex(max(0, backend_index))
         self.edit_auto_model.setText(seg.auto_model)
         self.edit_auto_checkpoint.setText(seg.auto_checkpoint)
         self.edit_auto_folds.setText(seg.auto_folds)
@@ -208,7 +220,7 @@ class SegmentationConfigDialog(QtWidgets.QDialog):
             "threshold_closing": self.chk_threshold_closing.isChecked(),
             "threshold_opening": self.chk_threshold_opening.isChecked(),
             "threshold_min_component_volume_mm3": float(self.spin_min_cc_volume.value()),
-            "auto_backend": self.edit_auto_backend.text().strip(),
+            "auto_backend": str(self.combo_auto_backend.currentData()),
             "auto_model": self.edit_auto_model.text().strip(),
             "auto_checkpoint": self.edit_auto_checkpoint.text().strip(),
             "auto_folds": self.edit_auto_folds.text().strip() or "single",

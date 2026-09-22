@@ -1717,6 +1717,8 @@ def test_nnunet_autoseg_progress_callback_reports_stage_updates(monkeypatch, tmp
     )
 
     assert seg.shape == (2, 2, 2, 3)
+    assert np.array_equal(seg[..., 0], seg[..., 1])
+    assert np.array_equal(seg[..., 1], seg[..., 2])
     assert provenance["device"] == "cpu"
     assert len(provenance["feature_files"]) == 2
     assert all(Path(path).is_file() for path in provenance["feature_files"])
@@ -1730,6 +1732,51 @@ def test_nnunet_autoseg_progress_callback_reports_stage_updates(monkeypatch, tmp
     assert "autoseg_read_prediction" in stages
     assert stages[-1] == "autoseg_finalize"
     assert all("elapsed_sec" in event for event in events)
+
+
+def test_nnunet4d_auto_profile_uses_best_checkpoint_and_keeps_frames(monkeypatch, tmp_path):
+    model_dir = tmp_path / "temporal_model"
+    fold_dir = model_dir / "fold_all"
+    fold_dir.mkdir(parents=True)
+    (fold_dir / "checkpoint_best.pth").write_bytes(b"checkpoint")
+    (model_dir / "dataset.json").write_text(
+        json.dumps({
+            "channel_names": {"0": "tp0_mag"},
+            "labels": {"background": 0, "vessel": 1},
+            "file_ending": ".nii.gz",
+        }),
+        encoding="utf-8",
+    )
+    (model_dir / "plans.json").write_text(json.dumps({"plans": "ok"}), encoding="utf-8")
+
+    def fake_runner(command, **_kwargs):
+        output_dir = Path(command[command.index("-o") + 1])
+        for frame in range(3):
+            (output_dir / f"autoflow_case_t{frame:03d}.nii.gz").write_bytes(b"fake")
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    def fake_read(path):
+        frame = int(Path(path).name.split("_t", 1)[1].split(".", 1)[0])
+        return np.full((2, 2, 2), frame + 1, dtype=np.int16)
+
+    monkeypatch.setattr("autoflow.algorithms.segmentation._read_nifti_segmentation", fake_read)
+    seg, provenance = generate_nnunet_auto_segmentation(
+        mag=np.ones((2, 2, 2, 3), dtype=np.float32),
+        flow=np.zeros((2, 2, 2, 3, 3), dtype=np.float32),
+        resolution=(1.0, 1.0, 1.0),
+        origin=(0.0, 0.0, 0.0),
+        model_folder=str(model_dir),
+        backend="nnUNet4D",
+        checkpoint_name="auto",
+        folds="single",
+        device="cpu",
+        runner=fake_runner,
+    )
+
+    assert seg.shape == (2, 2, 2, 3)
+    assert [int(seg[..., frame].flat[0]) for frame in range(3)] == [1, 2, 3]
+    assert provenance["backend"] == "nnUNet4D"
+    assert provenance["checkpoint"] == "checkpoint_best.pth"
 
 
 def test_nnunet_autoseg_prefers_gpu_resampling_and_falls_back_to_cpu(monkeypatch, tmp_path):
@@ -2447,6 +2494,59 @@ def test_quality_report_collects_actionable_pipeline_checks(tmp_path):
     assert json.loads(report_path.read_text(encoding="utf-8"))["overall_status"] == "ready"
 
 
+def test_quality_report_names_flow_hierarchy_and_label_equations():
+    from autoflow.algorithms.metrics import apply_internal_consistency_to_metrics
+
+    workspace = Workspace()
+    workspace.skeleton_params.label_map = {"PV": 14, "SMV": 15, "SV": 16}
+    workspace.label_params.label_map = dict(workspace.skeleton_params.label_map)
+    workspace.path_info = [
+        {"path_index": path_index, "group_name": "portal_splenic_venous"}
+        for path_index in range(5)
+    ]
+    workspace.forks = [
+        {"left": [0, 1], "right": [2]},
+        {"left": [2], "right": [3, 4]},
+    ]
+    labels = [15, 16, 14, 14, 14]
+    flows = [6.0, 4.0, 10.0, 6.0, 4.0]
+    metrics = []
+    for path_index, (label_value, flow_value) in enumerate(zip(labels, flows)):
+        for distance, scale in ((0.0, 0.9), (5.0, 1.1)):
+            metrics.append({
+                "plane_index": len(metrics),
+                "path_index": path_index,
+                "segmentation_label": label_value,
+                "distance": distance,
+                "netflow_mL_beat": flow_value * scale,
+                "flowrate_mL_s": [flow_value * scale, flow_value * scale * 2.0],
+                "meanv_cm_s": flow_value,
+                "peakv_cm_s": flow_value * 2.0,
+                "area_mm2": [10.0, 11.0],
+            })
+    metrics, qc = apply_internal_consistency_to_metrics(
+        metrics,
+        path_info=workspace.path_info,
+        forks=workspace.forks,
+    )
+    workspace.derived.plane_metrics = metrics
+    workspace.derived.plane_qc = qc
+
+    hierarchy = build_quality_report(workspace)["flow_hierarchy"]
+    roots = {item["name"]: item for item in hierarchy["roots"]}
+
+    assert hierarchy["schema"] == "autoflow.flow_hierarchy.v1"
+    assert set(roots) == {"PV", "SMV", "SV"}
+    assert [item["name"] for item in roots["PV"]["children"]] == ["PV1", "PV2"]
+    assert [item["sequence"] for item in roots["PV"]["planes"]] == [1, 2]
+    assert roots["PV"]["statistics"]["net_flow_mL_beat"]["mean"] == pytest.approx(10.0)
+    assert roots["PV"]["statistics"]["net_flow_mL_beat"]["std"] == pytest.approx(1.0)
+    assert {item["equation"] for item in hierarchy["junctions"]} == {
+        "SMV + SV = PV",
+        "PV = PV1 + PV2",
+    }
+
+
 def test_pathline_step_uses_per_plane_colors():
     ws = Workspace()
     ws.segmask_raw = np.ones((16, 16, 16, 2), dtype=np.int16)
@@ -2583,9 +2683,16 @@ def test_scene_pathlines_accumulate_requested_plane_indices(monkeypatch):
     ) == ["pathline_0", "pathline_1", "pathline_2"]
 
 
-def test_default_nnunet_model_folder_prefers_partbalanced():
+def test_default_nnunet_model_folder_prefers_dataset7010_when_available():
     model_dir = default_nnunet_model_folder()
-    assert model_dir.name == "nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm"
+    preferred = Path(
+        "/nas-data/ryy_rawdata/aorta_seg/nnres/Dataset7010_All_Mean/"
+        "nnUNetTrainerPartBalancedTversky__nnUNetPlans__3d_fullres"
+    )
+    if preferred.is_dir():
+        assert model_dir == preferred
+    else:
+        assert model_dir.name == "nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm"
     assert model_dir.is_dir()
 
 
@@ -2602,8 +2709,11 @@ def test_nnunet_4d_fold_modes_keep_single_and_ensemble_branches(tmp_path):
     assert _resolve_nnunet_folds(model_dir, "0,2,4") == ["0", "2", "4"]
 
 
-def test_empty_nnunet_model_uses_bundled_absolute_path(monkeypatch, tmp_path):
-    from autoflow.algorithms.segmentation import resolve_nnunet_model_folder
+def test_auto_nnunet_models_use_backend_specific_absolute_paths(monkeypatch, tmp_path):
+    import autoflow.algorithms.segmentation as segmentation_module
+    from autoflow.algorithms.segmentation import (
+        resolve_nnunet_model_folder,
+    )
     from autoflow.config import load_config_bundle
     from autoflow.core.models import SegmentationState
 
@@ -2617,13 +2727,18 @@ def test_empty_nnunet_model_uses_bundled_absolute_path(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     resolved = Path(resolve_nnunet_model_folder())
 
-    expected_4d_script = "/nas-data2/ryy/CMR4DFlow2026/Segdata/scripts/nnunet/4D/run_7020_4d_full_ssd_20260824.sh"
-    assert SegmentationState().auto_model == expected_4d_script
-    assert load_config_bundle()["segmentation"]["auto_model"] == expected_4d_script
+    assert SegmentationState().auto_model == "auto"
+    assert SegmentationState().auto_checkpoint == "auto"
+    assert load_config_bundle()["segmentation"]["auto_model"] == "auto"
+    assert load_config_bundle()["segmentation"]["auto_checkpoint"] == "auto"
     assert resolved == default_nnunet_model_folder()
     assert resolved != fake_cwd_model
     assert resolved.is_absolute()
     assert resolved.is_dir()
+    assert segmentation_module._NNUNET_4D_MODEL_DEFAULT == Path(
+        "/nas-data/ryy_rawdata/aorta_seg/nnres_noCC/Dataset7020_Aorta_4DTemporalFT/"
+        "nnUNetTrainerPartBalancedTversky__nnUNetPlansIso1mm__3d_fullres"
+    )
 
 
 def test_bundled_nnunet_relative_path_resolves_outside_repo_cwd(monkeypatch, tmp_path):

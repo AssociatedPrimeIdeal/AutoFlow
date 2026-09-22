@@ -34,6 +34,16 @@ _NNUNET_TARGET_SPATIAL_ORDER = ("HF", "AP", "RL")
 _NNUNET_TARGET_VENC_ORDER = ("HF", "AP", "RL")
 _NNUNET_GPU_PREPROCESSING_ENV = "AUTOFLOW_NNUNET_GPU_PREPROCESSING"
 _NNUNET_4D_BACKENDS = {"nnunet4d", "nnunet_4d", "4d"}
+_NNUNET_3D_MODEL_DEFAULT = Path(
+    "/nas-data/ryy_rawdata/aorta_seg/nnres/Dataset7010_All_Mean/"
+    "nnUNetTrainerPartBalancedTversky__nnUNetPlans__3d_fullres"
+)
+_NNUNET_3D_CHECKPOINT_DEFAULT = "checkpoint_final.pth"
+_NNUNET_4D_MODEL_DEFAULT = Path(
+    "/nas-data/ryy_rawdata/aorta_seg/nnres_noCC/Dataset7020_Aorta_4DTemporalFT/"
+    "nnUNetTrainerPartBalancedTversky__nnUNetPlansIso1mm__3d_fullres"
+)
+_NNUNET_4D_CHECKPOINT_DEFAULT = "checkpoint_best.pth"
 _NNUNET_4D_PIPELINE_DEFAULT = Path(
     "/nas-data2/ryy/CMR4DFlow2026/Segdata/scripts/nnunet/4D/"
     "run_7020_4d_full_ssd_20260824.sh"
@@ -986,9 +996,16 @@ def _emit_progress(progress_callback, *, stage, message, current=None, total=Non
     progress_callback(payload)
 
 
-def default_nnunet_model_folder():
+def bundled_nnunet_model_folder():
     model_name = "nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm"
     return Path(__file__).resolve().parents[1] / "segmodel" / model_name
+
+
+def default_nnunet_model_folder():
+    """Return the preferred static model, with the packaged model as fallback."""
+    if _NNUNET_3D_MODEL_DEFAULT.is_dir():
+        return _NNUNET_3D_MODEL_DEFAULT
+    return bundled_nnunet_model_folder()
 
 
 def _resolve_bundled_relative_path(path):
@@ -1000,7 +1017,7 @@ def _resolve_bundled_relative_path(path):
 
     package_root = Path(__file__).resolve().parents[2]
     packaged_path = package_root / path
-    bundled_default = default_nnunet_model_folder()
+    bundled_default = bundled_nnunet_model_folder()
     legacy_default = Path("autoflow") / "segmodel" / bundled_default.name
     if path == legacy_default:
         return bundled_default
@@ -1011,14 +1028,16 @@ def _resolve_bundled_relative_path(path):
 
 def resolve_nnunet_model_folder(model_folder=""):
     candidate = str(model_folder or "").strip()
+    if candidate.lower() in {"auto", "default"}:
+        candidate = ""
     if candidate:
         return str(_resolve_bundled_relative_path(candidate))
     default_path = default_nnunet_model_folder()
     if default_path.is_dir():
         return str(default_path)
     raise FileNotFoundError(
-        "bundled nnUNet model folder is missing: "
-        f"{default_path}. Set an explicit model folder to override the bundled default"
+        "default 3D nnUNet model folder is missing: "
+        f"{default_path}. Set an explicit model folder to override the automatic profile"
     )
 
 
@@ -1441,10 +1460,14 @@ def _generate_nnunet_4d_grouped(
 def resolve_nnunet_4d_model_folder(model_folder=""):
     """Resolve a 4D model folder or a Dataset7020 orchestration script path."""
     candidate = str(model_folder or "").strip()
+    if candidate.lower() in {"auto", "default"}:
+        candidate = ""
     if candidate.lower().endswith((".sh", ".bash")):
         return str(_model_folder_from_4d_pipeline_script(candidate))
     if candidate:
         return str(_resolve_bundled_relative_path(candidate))
+    if _NNUNET_4D_MODEL_DEFAULT.is_dir():
+        return str(_NNUNET_4D_MODEL_DEFAULT)
     model = _model_folder_from_4d_pipeline_script(_NNUNET_4D_PIPELINE_DEFAULT)
     if model.is_dir():
         return str(model)
@@ -1454,16 +1477,30 @@ def resolve_nnunet_4d_model_folder(model_folder=""):
     )
 
 
-def _resolve_nnunet_checkpoint(model_path, checkpoint_name, folds):
-    """Use a requested checkpoint, falling back to ``checkpoint_best.pth``."""
-    requested = str(checkpoint_name or "checkpoint_final.pth")
-    candidates = [requested]
-    if requested == "checkpoint_final.pth":
-        candidates.append("checkpoint_best.pth")
+def _resolve_nnunet_checkpoint(
+    model_path,
+    checkpoint_name,
+    folds,
+    *,
+    default_checkpoint=_NNUNET_3D_CHECKPOINT_DEFAULT,
+):
+    """Resolve an explicit checkpoint or a backend-specific automatic default."""
+    requested = str(checkpoint_name or "auto").strip()
+    if requested.lower() in {"", "auto", "default"}:
+        alternate = (
+            "checkpoint_best.pth"
+            if default_checkpoint == "checkpoint_final.pth"
+            else "checkpoint_final.pth"
+        )
+        candidates = [str(default_checkpoint), alternate]
+    else:
+        candidates = [requested]
+        if requested == "checkpoint_final.pth":
+            candidates.append("checkpoint_best.pth")
     for candidate in candidates:
         if all((Path(model_path) / f"fold_{fold}" / candidate).is_file() for fold in folds):
             return candidate
-    return requested
+    return candidates[0]
 
 
 def _resolve_nnunet_folds(model_path, folds=None):
@@ -1613,7 +1650,12 @@ def generate_nnunet_auto_segmentation(
         file_ending = f".{file_ending}"
     label_map = _parse_nnunet_label_map(auto_label_map, dataset_json.get("labels", {}))
     folds = _resolve_nnunet_folds(model_path, folds)
-    checkpoint_name = _resolve_nnunet_checkpoint(model_path, checkpoint_name, folds)
+    checkpoint_name = _resolve_nnunet_checkpoint(
+        model_path,
+        checkpoint_name,
+        folds,
+        default_checkpoint=_NNUNET_3D_CHECKPOINT_DEFAULT,
+    )
     affine = _nnunet_spatial_affine(resolution_nnunet, mag_nnunet.shape[:3])
     artifact_feature_paths, artifact_prediction_path = _nnunet_artifact_paths(
         artifact_prefix,
@@ -1900,7 +1942,12 @@ def generate_nnunet_4d_auto_segmentation(
         file_ending = f".{file_ending}"
     label_map = _parse_nnunet_label_map(auto_label_map, dataset_json.get("labels", {}))
     selected_folds = _resolve_nnunet_folds(model_path, folds)
-    checkpoint_name = _resolve_nnunet_checkpoint(model_path, checkpoint_name, selected_folds)
+    checkpoint_name = _resolve_nnunet_checkpoint(
+        model_path,
+        checkpoint_name,
+        selected_folds,
+        default_checkpoint=_NNUNET_4D_CHECKPOINT_DEFAULT,
+    )
     affine = _nnunet_spatial_affine(resolution_nnunet, mag_nnunet.shape[:3])
     _emit_progress(
         progress_callback,

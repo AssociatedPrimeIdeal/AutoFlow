@@ -223,4 +223,4 @@ GPU selection is intentionally not part of the config contract. WRLS+ARTO probes
 
 ## Current Caveat
 
-The CLI auto-segmentation public config fields are owned by `AutoFlowConfig`. The GUI auto-segmentation dialog is initialized from the segmentation config bundle. Both use an empty model path to select the bundled model, which is resolved from the installed package rather than the current working directory. Keep this distinction explicit when documenting or refactoring.
+The CLI auto-segmentation public config fields are owned by `AutoFlowConfig`. The GUI auto-segmentation dialog is initialized from the segmentation config bundle. Both use `auto` (or an empty value) for backend-specific resolution: static `nnUNet` prefers the local Dataset7010 final profile and falls back to the packaged model, while `nnUNet4D` prefers the local Dataset7020 best profile and falls back to the legacy orchestration-script location. Explicit relative overrides still resolve from the current working directory.

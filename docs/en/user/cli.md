@@ -272,8 +272,8 @@ WSS, TKE, and pressure-analysis compute defaults are now split by metric:
 | --- | --- | --- | --- | --- | --- |
 | `--autoseg` | bool | `False` | command line | run auto segmentation only when the loaded case has no segmentation | `autoflow/processing.py` |
 | `--autoseg-backend` | string | `nnUNet4D` in `configs/segmentation.json` | `AutoFlowConfig` | select `nnUNet4D` temporal or `nnUNet` static automatic segmentation | `autoflow/algorithms/segmentation.py` |
-| `--autoseg-model` | path | Dataset7020 `.sh` in `configs/segmentation.json` | `AutoFlowConfig` | override the 4D model folder or orchestration script; static `nnUNet` accepts a model folder | `autoflow/algorithms/segmentation.py` |
-| `--autoseg-checkpoint` | string | `checkpoint_final.pth` | `AutoFlowConfig` | choose nnUNet checkpoint | `autoflow/algorithms/segmentation.py` |
+| `--autoseg-model` | path or `auto` | `auto` | `AutoFlowConfig` | select the backend-specific Dataset7010/Dataset7020 model, or override it with a model folder (4D also accepts an orchestration script) | `autoflow/algorithms/segmentation.py` |
+| `--autoseg-checkpoint` | string or `auto` | `auto` | `AutoFlowConfig` | select Dataset7010 final or Dataset7020 best automatically, or choose an explicit checkpoint name | `autoflow/algorithms/segmentation.py` |
 | `--autoseg-folds` | string | `single` | `AutoFlowConfig` | choose `single`, `all`/`ensemble`, or explicit fold IDs such as `0,1,2,3,4` | `autoflow/algorithms/segmentation.py` |
 | `--autoseg-device` | string | `auto` | `AutoFlowConfig` | choose `auto`, `cpu`, or `cuda` | `autoflow/algorithms/segmentation.py` |
 | `--autoseg-label-map` | JSON string | empty | `AutoFlowConfig` | remap predicted labels after inference | `autoflow/algorithms/segmentation.py` |

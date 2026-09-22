@@ -25,6 +25,11 @@ git submodule update --init --recursive
 pip install -e ".[gui,labeler]"
 ```
 
+The GUI extra supports both NumPy 1.x and NumPy 2. Use a clean environment so
+pip can select mutually compatible SciPy, scikit-image, h5py, matplotlib, and
+VTK wheels instead of mixing binaries installed against different NumPy major
+versions.
+
 安装后应能看到两个命令：
 
 ```bash

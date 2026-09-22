@@ -144,9 +144,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--autoseg", action="store_true", help="If the loaded case has no segmentation, run auto segmentation before segmentation-dependent steps.")
-    parser.add_argument("--autoseg-backend", default=None, help="Auto segmentation backend. Default comes from configs/segmentation.json or falls back to nnUNet.")
-    parser.add_argument("--autoseg-model", default=None, help="Auto segmentation model folder. If omitted, AutoFlow uses the bundled default nnUNet model when present.")
-    parser.add_argument("--autoseg-checkpoint", default=None, help="Auto segmentation checkpoint name.")
+    parser.add_argument("--autoseg-backend", default=None, help="Auto segmentation backend: nnUNet4D for temporal prediction or nnUNet for static 3D prediction copied across time.")
+    parser.add_argument("--autoseg-model", default=None, help="Auto segmentation model folder, or 'auto' for the backend-specific Dataset7010/Dataset7020 profile.")
+    parser.add_argument("--autoseg-checkpoint", default=None, help="Checkpoint name, or 'auto' for Dataset7010 final / Dataset7020 best.")
     parser.add_argument(
         "--autoseg-folds",
         default=None,

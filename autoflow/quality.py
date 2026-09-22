@@ -1,5 +1,6 @@
 import json
 import os
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 import numpy as np
@@ -128,9 +129,407 @@ def _plane_geometry_stats(workspace):
     }
 
 
+def _finite_summary(values):
+    """Return JSON-safe population statistics for one value per plane."""
+    numbers = []
+    for value in values:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(number):
+            numbers.append(number)
+    if not numbers:
+        return {"mean": None, "std": None, "min": None, "max": None, "count": 0}
+    arr = np.asarray(numbers, dtype=float)
+    return {
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr)),
+        "min": float(np.min(arr)),
+        "max": float(np.max(arr)),
+        "count": int(arr.size),
+    }
+
+
+def _peak_flow_rate(metric):
+    values = metric.get("flowrate_signed_mL_s")
+    if values is None:
+        values = metric.get("flowrate_mL_s", [])
+    try:
+        arr = np.asarray(values, dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+    finite = arr[np.isfinite(arr)]
+    return float(np.max(np.abs(finite))) if finite.size else None
+
+
+def _metric_statistics(metrics):
+    payloads = [dict(metric) for metric in metrics if isinstance(metric, dict)]
+    return {
+        "plane_count": int(len(payloads)),
+        "net_flow_mL_beat": _finite_summary(metric.get("netflow_mL_beat") for metric in payloads),
+        "signed_net_flow_mL_beat": _finite_summary(
+            metric.get("net_netflow_signed_mL_beat") for metric in payloads
+        ),
+        "peak_flow_mL_s": _finite_summary(_peak_flow_rate(metric) for metric in payloads),
+        "mean_velocity_cm_s": _finite_summary(metric.get("meanv_cm_s") for metric in payloads),
+        "peak_velocity_cm_s": _finite_summary(metric.get("peakv_cm_s") for metric in payloads),
+    }
+
+
+def _path_owner_labels(workspace, metrics_by_path, path_ids):
+    """Resolve the segmentation label which owns each topology path."""
+    candidates = defaultdict(list)
+    layout_owners = {}
+    for path_index, metrics in metrics_by_path.items():
+        for metric in metrics:
+            try:
+                label_value = int(metric.get("segmentation_label", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if label_value > 0:
+                candidates[int(path_index)].append(label_value)
+
+    for plane in list(getattr(workspace, "planes", []) or []):
+        try:
+            path_index = int(getattr(plane, "path_index", -1))
+            label_value = int(getattr(plane, "segmentation_label", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if path_index >= 0 and label_value > 0:
+            candidates[path_index].append(label_value)
+
+    plane_qc = dict(getattr(getattr(workspace, "derived", None), "plane_qc", {}) or {})
+    layout = plane_qc.get("plane_layout", {})
+    layout_paths = plane_qc.get("paths")
+    if not isinstance(layout_paths, list) and isinstance(layout, dict):
+        layout_paths = layout.get("paths")
+    for item in layout_paths or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            path_index = int(item.get("path_index", -1))
+            label_value = int(item.get("owner_label", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if path_index >= 0 and label_value > 0:
+            # Plane generation made this path-level ownership decision before
+            # sampling metrics, so it takes precedence over plane payloads.
+            layout_owners[path_index] = label_value
+
+    path_info = list(getattr(workspace, "path_info", []) or [])
+    group_labels = {}
+    for group_name, state in dict(getattr(workspace, "multilabel_groups", {}) or {}).items():
+        if not isinstance(state, dict):
+            continue
+        values = []
+        for value in list(state.get("labels", []) or []):
+            try:
+                values.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        group_labels[str(group_name)] = values
+    owners = {}
+    for path_index in path_ids:
+        if int(path_index) in layout_owners:
+            owners[int(path_index)] = int(layout_owners[int(path_index)])
+            continue
+        votes = candidates.get(int(path_index), [])
+        if votes:
+            counts = Counter(votes)
+            owners[int(path_index)] = int(sorted(counts, key=lambda value: (-counts[value], value))[0])
+            continue
+        group_name = ""
+        if 0 <= int(path_index) < len(path_info):
+            group_name = str(path_info[int(path_index)].get("group_name", "") or "")
+        labels = group_labels.get(group_name, [])
+        owners[int(path_index)] = int(labels[0]) if len(labels) == 1 else 0
+    return owners
+
+
+def _label_names(workspace):
+    reverse = {}
+    for params_name in ("label_params", "skeleton_params"):
+        params = getattr(workspace, params_name, None)
+        for name, value in dict(getattr(params, "label_map", {}) or {}).items():
+            try:
+                reverse[int(value)] = str(name)
+            except (TypeError, ValueError):
+                continue
+    custom = dict(getattr(getattr(workspace, "segmentation", None), "label_names", {}) or {})
+    for value, name in custom.items():
+        try:
+            label_value = int(value)
+        except (TypeError, ValueError):
+            continue
+        text = str(name or "").strip()
+        if text and text.casefold() != f"label {label_value}".casefold():
+            reverse[label_value] = text
+    return reverse
+
+
+def _flow_hierarchy_report(workspace):
+    """Build a label-named, flow-directed path/plane hierarchy for QC."""
+    metrics = [dict(metric) for metric in list(getattr(getattr(workspace, "derived", None), "plane_metrics", []) or []) if isinstance(metric, dict)]
+    path_info = list(getattr(workspace, "path_info", []) or [])
+    planes = list(getattr(workspace, "planes", []) or [])
+    path_ids = set(range(len(path_info)))
+    metrics_by_path = defaultdict(list)
+    for metric_index, metric in enumerate(metrics):
+        try:
+            path_index = int(metric.get("path_index", -1))
+        except (TypeError, ValueError):
+            continue
+        if path_index < 0:
+            continue
+        metric.setdefault("plane_index", int(metric_index))
+        metrics_by_path[path_index].append(metric)
+        path_ids.add(path_index)
+    for plane in planes:
+        try:
+            path_index = int(getattr(plane, "path_index", -1))
+        except (TypeError, ValueError):
+            continue
+        if path_index >= 0:
+            path_ids.add(path_index)
+
+    if not path_ids:
+        return {
+            "schema": "autoflow.flow_hierarchy.v1",
+            "status": "not_run",
+            "summary": "No paths are available.",
+            "sort_rule": "siblings sorted by descending mean absolute net flow, then path index",
+            "statistics": "mean and population standard deviation across planes",
+            "labels": [],
+            "junctions": [],
+            "roots": [],
+        }
+
+    path_ids = sorted(path_ids)
+    owner_label = _path_owner_labels(workspace, metrics_by_path, path_ids)
+    reverse_labels = _label_names(workspace)
+    group_for_path = {}
+    for path_index in path_ids:
+        info = path_info[path_index] if 0 <= path_index < len(path_info) else {}
+        group_for_path[path_index] = str(info.get("group_name", "") or "")
+
+    def label_name(path_index):
+        label_value = int(owner_label.get(int(path_index), 0) or 0)
+        if label_value > 0:
+            return reverse_labels.get(label_value, f"Label {label_value}")
+        group_name = group_for_path.get(int(path_index), "")
+        return group_name if group_name else "Unlabeled"
+
+    path_stats = {path_index: _metric_statistics(metrics_by_path.get(path_index, [])) for path_index in path_ids}
+
+    def sort_flow(path_index):
+        value = path_stats[path_index]["net_flow_mL_beat"].get("mean")
+        return abs(float(value)) if value is not None and np.isfinite(float(value)) else -1.0
+
+    plane_rows = defaultdict(list)
+    for metric_index, metric in enumerate(metrics):
+        try:
+            path_index = int(metric.get("path_index", -1))
+        except (TypeError, ValueError):
+            continue
+        if path_index < 0:
+            continue
+        plane_index = int(metric.get("plane_index", metric_index))
+        distance = metric.get("distance")
+        if distance is None and 0 <= plane_index < len(planes):
+            distance = getattr(planes[plane_index], "distance", None)
+        plane_rows[path_index].append({
+            "plane_index": plane_index,
+            "distance_mm": _json_value(distance),
+            "net_flow_mL_beat": _json_value(metric.get("netflow_mL_beat")),
+            "signed_net_flow_mL_beat": _json_value(metric.get("net_netflow_signed_mL_beat")),
+            "peak_flow_mL_s": _json_value(_peak_flow_rate(metric)),
+            "mean_velocity_cm_s": _json_value(metric.get("meanv_cm_s")),
+            "peak_velocity_cm_s": _json_value(metric.get("peakv_cm_s")),
+            "area_mean_mm2": _json_value(_finite_summary(metric.get("area_mm2", []))["mean"]),
+        })
+    for rows in plane_rows.values():
+        rows.sort(key=lambda row: (
+            float(row["distance_mm"]) if row.get("distance_mm") is not None else np.inf,
+            int(row["plane_index"]),
+        ))
+        for sequence, row in enumerate(rows, start=1):
+            row["sequence"] = int(sequence)
+
+    plane_qc = dict(getattr(getattr(workspace, "derived", None), "plane_qc", {}) or {})
+    qc_forks = {
+        int(item.get("fork_id", index)): dict(item)
+        for index, item in enumerate(list(plane_qc.get("forks", []) or []))
+        if isinstance(item, dict)
+    }
+    source_forks = list(getattr(workspace, "forks", []) or [])
+    fork_count = max(len(source_forks), max(qc_forks.keys(), default=-1) + 1)
+
+    incoming_to_outgoing = defaultdict(set)
+    raw_junctions = []
+    for fork_id in range(fork_count):
+        source = dict(source_forks[fork_id]) if fork_id < len(source_forks) else {}
+        qc_item = qc_forks.get(fork_id, {})
+        incoming = [int(value) for value in qc_item.get("left", source.get("left", [])) if int(value) in path_ids]
+        outgoing = [int(value) for value in qc_item.get("right", source.get("right", [])) if int(value) in path_ids]
+        for parent in incoming:
+            incoming_to_outgoing[parent].update(outgoing)
+        ic_value = qc_item.get("ic", dict(plane_qc.get("fork_ic", {}) or {}).get(str(fork_id)))
+        raw_junctions.append({
+            "fork_id": int(fork_id),
+            "incoming_path_indices": incoming,
+            "outgoing_path_indices": outgoing,
+            "internal_consistency": _json_value(ic_value),
+            "status": str(qc_item.get("status", "not_available" if ic_value is None else "ok")),
+        })
+
+    parent_candidates = defaultdict(list)
+    for parent, children in incoming_to_outgoing.items():
+        for child in children:
+            child_key = (int(owner_label.get(child, 0)), label_name(child))
+            parent_key = (int(owner_label.get(parent, 0)), label_name(parent))
+            if child != parent and child_key == parent_key:
+                parent_candidates[child].append(parent)
+    parent_of = {}
+    for child, candidates in parent_candidates.items():
+        parent_of[child] = sorted(set(candidates), key=lambda value: (-sort_flow(value), value))[0]
+
+    # A directed cycle is not a valid report tree.  Preserve every path and
+    # break the first cyclic parent link deterministically into another root.
+    for start in path_ids:
+        chain = set()
+        current = start
+        while current in parent_of:
+            if current in chain:
+                parent_of.pop(current, None)
+                break
+            chain.add(current)
+            current = parent_of[current]
+
+    children_of = defaultdict(list)
+    for child, parent in parent_of.items():
+        children_of[parent].append(child)
+    for parent in children_of:
+        children_of[parent].sort(key=lambda value: (-sort_flow(value), value))
+
+    roots_by_label = defaultdict(list)
+    for path_index in path_ids:
+        if path_index not in parent_of:
+            roots_by_label[(int(owner_label.get(path_index, 0)), label_name(path_index))].append(path_index)
+    for roots in roots_by_label.values():
+        roots.sort(key=lambda value: (-sort_flow(value), value))
+
+    display_names = {}
+    levels = {}
+
+    def assign_names(path_index, name, level):
+        if path_index in display_names:
+            return
+        display_names[path_index] = str(name)
+        levels[path_index] = int(level)
+        for sibling_index, child in enumerate(children_of.get(path_index, []), start=1):
+            suffix = (
+                str(sibling_index)
+                if int(level) == 0 and "-R" not in str(name)
+                else f"-{sibling_index}"
+            )
+            assign_names(child, f"{name}{suffix}", int(level) + 1)
+
+    label_keys = sorted(roots_by_label, key=lambda item: (item[0] <= 0, item[0], item[1].casefold()))
+    for _label_value, name in label_keys:
+        roots = roots_by_label[(_label_value, name)]
+        for root_index, path_index in enumerate(roots, start=1):
+            root_name = name if root_index == 1 else f"{name}-R{root_index}"
+            assign_names(path_index, root_name, 0)
+    for path_index in path_ids:
+        if path_index not in display_names:
+            assign_names(path_index, f"{label_name(path_index)}-R", 0)
+
+    junctions = []
+    junctions_by_path = defaultdict(list)
+    for raw in raw_junctions:
+        incoming = sorted(raw["incoming_path_indices"], key=lambda value: (-sort_flow(value), value))
+        outgoing = sorted(raw["outgoing_path_indices"], key=lambda value: (-sort_flow(value), value))
+        left_text = " + ".join(display_names.get(value, f"Path {value}") for value in incoming) or "?"
+        right_text = " + ".join(display_names.get(value, f"Path {value}") for value in outgoing) or "?"
+        item = dict(raw)
+        item["incoming_path_indices"] = incoming
+        item["outgoing_path_indices"] = outgoing
+        item["incoming_names"] = [display_names.get(value, f"Path {value}") for value in incoming]
+        item["outgoing_names"] = [display_names.get(value, f"Path {value}") for value in outgoing]
+        item["equation"] = f"{left_text} = {right_text}"
+        junctions.append(item)
+        for path_index in set(incoming + outgoing):
+            junctions_by_path[path_index].append(item)
+
+    path_ic = dict(plane_qc.get("path_ic", {}) or {})
+
+    def build_node(path_index):
+        node = {
+            "name": display_names[path_index],
+            "label_id": int(owner_label.get(path_index, 0) or 0),
+            "label_name": label_name(path_index),
+            "group_name": group_for_path.get(path_index, ""),
+            "path_index": int(path_index),
+            "branch_level": int(levels.get(path_index, 0)),
+            "parent_path_index": int(parent_of[path_index]) if path_index in parent_of else None,
+            "statistics": path_stats[path_index],
+            "internal_consistency": _json_value(path_ic.get(str(path_index))),
+            "junctions": [dict(item) for item in junctions_by_path.get(path_index, [])],
+            "planes": [dict(row) for row in plane_rows.get(path_index, [])],
+            "children": [],
+        }
+        node["children"] = [build_node(child) for child in children_of.get(path_index, [])]
+        return node
+
+    roots = []
+    label_summaries = []
+    for label_value, name in label_keys:
+        label_paths = [path_index for path_index in path_ids if label_name(path_index) == name and int(owner_label.get(path_index, 0)) == int(label_value)]
+        label_metrics = [metric for path_index in label_paths for metric in metrics_by_path.get(path_index, [])]
+        ic_values = []
+        for path_index in label_paths:
+            value = path_ic.get(str(path_index))
+            if value is not None:
+                try:
+                    if np.isfinite(float(value)):
+                        ic_values.append(float(value))
+                except (TypeError, ValueError):
+                    pass
+        label_summaries.append({
+            "label_id": int(label_value),
+            "label_name": name,
+            "path_count": int(len(label_paths)),
+            "root_count": int(len(roots_by_label[(label_value, name)])),
+            "statistics": _metric_statistics(label_metrics),
+            "minimum_path_internal_consistency": float(min(ic_values)) if ic_values else None,
+        })
+        roots.extend(build_node(path_index) for path_index in roots_by_label[(label_value, name)])
+
+    status = "available" if metrics else "topology_only"
+    return {
+        "schema": "autoflow.flow_hierarchy.v1",
+        "status": status,
+        "summary": f"{len(path_ids)} paths, {len(metrics)} planes, {len(junctions)} flow junctions",
+        "sort_rule": "siblings sorted by descending mean absolute net flow, then path index",
+        "statistics": "mean and population standard deviation across planes",
+        "units": {
+            "net_flow": "mL/beat",
+            "peak_flow": "mL/s",
+            "velocity": "cm/s",
+            "distance": "mm",
+            "consistency": "0-1",
+        },
+        "labels": label_summaries,
+        "junctions": junctions,
+        "roots": roots,
+    }
+
+
 def build_quality_report(workspace, source_path="", run_context=None):
     ws = workspace
     checks = []
+    flow_hierarchy = _flow_hierarchy_report(ws)
     flow = getattr(ws, "flow_raw", None)
     mag = getattr(ws, "mag_raw", None)
     resolution = np.asarray(getattr(ws, "resolution", [np.nan] * 3), dtype=float).reshape(-1)[:3]
@@ -447,6 +846,7 @@ def build_quality_report(workspace, source_path="", run_context=None):
         "overall_status": overall_status,
         "status_counts": status_counts,
         "checks": checks,
+        "flow_hierarchy": flow_hierarchy,
         "run_context": _json_value(dict(run_context or {})),
         "interpretation": "Automated engineering QC for review prioritization; it is not clinical validation or a diagnostic conclusion.",
     }
