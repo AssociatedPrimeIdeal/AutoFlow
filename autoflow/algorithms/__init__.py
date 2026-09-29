@@ -57,11 +57,13 @@ from .preprocess import (
 
 from .skeleton import (
     generate_skeleton_from_mask3d,
+    generate_three_pass_special_skeleton,
 )
 
 from .graph import (
     build_graph_from_points,
     remove_triangle_cycles,
+    remove_short_terminal_branches,
     graph_to_networkx,
     graph_to_polydata,
 )
@@ -195,8 +197,10 @@ __all__ = [
     "separate_special_label_contacts",
     "largest_connected_component",
     "generate_skeleton_from_mask3d",
+    "generate_three_pass_special_skeleton",
     "build_graph_from_points",
     "remove_triangle_cycles",
+    "remove_short_terminal_branches",
     "graph_to_networkx",
     "graph_to_polydata",
     "smooth_path_savgol",

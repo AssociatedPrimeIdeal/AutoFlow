@@ -873,6 +873,33 @@ def _h5_group_embedded_features(handle, group_name=None):
         "has_embedded_segmentation": seg_ds is not None,
         "has_background_correction_cache": bool(has_correction_cache),
     }
+    # Detect legacy dual-VENC cases from metadata and dataset shape without
+    # materializing the image volume.  The GUI uses this to ask which source
+    # (LV, HV, or reconstructed DV) should be exposed as ``flow``.
+    # Image layout belongs to the selected case group.  Root-level metadata
+    # may be shared by several groups, so do not use a root image as a dual
+    # marker for a nested normalized case.
+    img_ds = _find_h5_dataset(group, "img_complex", "img")
+    is_dual_venc = bool(
+        img_ds is not None
+        and np.issubdtype(img_ds.dtype, np.complexfloating)
+        and img_ds.ndim == 5
+        and int(img_ds.shape[-1]) == 7
+    )
+    dual_info = {"enabled": is_dual_venc}
+    if is_dual_venc:
+        try:
+            raw_venc = _read_h5_value_from_scopes(scopes, "VENC", "venc", default=None)
+            venc_values = _coerce_h5_numeric_array(raw_venc, np.array([], dtype=float))
+            if venc_values.size == 6:
+                low, high, _low_group, _high_group = _split_dual_venc_triplets(venc_values)
+                dual_info.update({"lv_venc": low.astype(float).tolist(), "hv_venc": high.astype(float).tolist()})
+        except (TypeError, ValueError):
+            # The loader will provide the detailed error if the VENC metadata
+            # is malformed; discovery should still list the H5 case.
+            pass
+    features["is_dual_venc"] = is_dual_venc
+    features["dual_venc"] = dual_info
     if correction_method is not None:
         features["background_correction_method"] = correction_method
     return features
@@ -1000,6 +1027,26 @@ def _split_dual_venc_triplets(venc):
     )
 
 
+def _coerce_dual_venc_mode(value):
+    """Normalize the user-facing dual-VENC source selection."""
+    token = str(value or "dv").strip().lower().replace("_", "-").replace(" ", "-")
+    aliases = {
+        "lv": "lv",
+        "low": "lv",
+        "low-venc": "lv",
+        "hv": "hv",
+        "high": "hv",
+        "high-venc": "hv",
+        "dv": "dv",
+        "dual": "dv",
+        "dual-venc": "dv",
+    }
+    mode = aliases.get(token)
+    if mode is None:
+        raise ValueError(f"dual_venc_mode must be one of 'lv', 'hv', or 'dv', got {value!r}")
+    return mode
+
+
 def _dual_venc_triplet_ratio(lv, hv):
     lv = np.asarray(lv, dtype=np.float32)
     hv = np.asarray(hv, dtype=np.float32)
@@ -1069,9 +1116,12 @@ def _load_legacy_dual_venc_h5(
     h5_scopes=None,
     source_group=None,
     allow_untagged_root=True,
+    dual_venc_mode="dv",
 ):
     if img_complex.ndim != 5 or img_complex.shape[-1] != 7:
         raise ValueError(f"legacy dual-venc H5 expects XYZT7 complex data, got {img_complex.shape}")
+
+    dual_venc_mode = _coerce_dual_venc_mode(dual_venc_mode)
 
     mag = np.abs(img_complex[..., 0]).astype(np.float32)
     lv_venc, hv_venc, lv_group_index, hv_group_index = _split_dual_venc_triplets(venc)
@@ -1276,6 +1326,22 @@ def _load_legacy_dual_venc_h5(
             target_venc_order=("LR", "AP", "FH"),
         )
 
+    selected_flow = {
+        "lv": flow_lv,
+        "hv": flow_hv,
+        "dv": flow_dual,
+    }[dual_venc_mode]
+    selected_venc = {
+        "lv": lv_triplet,
+        "hv": hv_triplet,
+        "dv": hv_triplet,
+    }[dual_venc_mode]
+    selected_phase = {
+        "lv": phase_lv,
+        "hv": phase_hv,
+        "dv": phase_lv,
+    }[dual_venc_mode]
+
     meta = {
         "background_phase_correction": {
             "dual_venc_low": background_phase_report_for_metadata(lv_report),
@@ -1283,8 +1349,12 @@ def _load_legacy_dual_venc_h5(
         },
         "spatial_order_raw": [str(x) for x in spatial_order[:3]],
         "venc_order_raw": [str(x) for x in venc_order[:3]],
+        "is_dual_venc": True,
+        "dual_venc_mode": dual_venc_mode,
         "dual_venc": {
             "enabled": True,
+            "mode": dual_venc_mode,
+            "selected_mode": dual_venc_mode,
             "input_channels": int(img_complex.shape[-1]),
             "lv_channel_indices": list(range(1 + 3 * lv_group_index, 4 + 3 * lv_group_index)),
             "hv_channel_indices": list(range(1 + 3 * hv_group_index, 4 + 3 * hv_group_index)),
@@ -1302,17 +1372,17 @@ def _load_legacy_dual_venc_h5(
         },
     }
     return normalize_loaded_case(
-        flow=flow_dual,
+        flow=selected_flow,
         mag=mag_out,
         segmentation=seg_r if segmask is not None else None,
         resolution=np.asarray(res_new, dtype=float),
         origin=origin,
-        venc=np.asarray(hv_triplet, dtype=float),
+        venc=np.asarray(selected_venc, dtype=float),
         rr=float(rr),
         sigma=None,
         correction=correction_low,
         correction_high=correction_high,
-        phase_wrapped=np.asarray(phase_lv, dtype=np.float32),
+        phase_wrapped=np.asarray(selected_phase, dtype=np.float32),
         phase_wrapped_high=np.asarray(phase_hv, dtype=np.float32),
         tke_array=None,
         metadata=meta,
@@ -1336,9 +1406,11 @@ def load_h5_data(
     source_group=None,
     force_recompute_seg=False,
     ignore_embedded_segmentation=False,
+    dual_venc_mode="dv",
 ):
     target_spatial_order = ("LR", "AP", "FH")
     target_venc_order = ("LR", "AP", "FH")
+    dual_venc_mode = _coerce_dual_venc_mode(dual_venc_mode)
     cfg = _loader_correction_config(correction_config)
     h5_mode = "r+" if bool(cfg.enabled) and bool(cfg.write_cache) else "r"
     try:
@@ -1421,6 +1493,7 @@ def load_h5_data(
                     h5_scopes=scopes,
                     source_group=group_name,
                     allow_untagged_root=allow_untagged_root,
+                    dual_venc_mode=dual_venc_mode,
                 )
                 loaded.source_group = group_name
                 loaded.metadata = dict(loaded.metadata or {})

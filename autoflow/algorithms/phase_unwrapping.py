@@ -1,14 +1,16 @@
-"""Optional traditional phase-unwrapping backends.
+"""Optional traditional and learned phase-unwrapping backends.
 
 The public API uses AutoFlow's canonical ``XYZTV3`` layout (phase in radians,
-velocity in cm/s).  The bundled PUDIP-Flow implementation uses ``Nv,Nt,X,Y,Z``;
-conversion and diagnostics live here so the rest of AutoFlow never needs to
-know about that legacy layout.
+velocity in cm/s).  The traditional and upstream learned implementations use
+different array layouts; conversion and diagnostics live here so the rest of
+AutoFlow never needs to know about those backend-specific layouts.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import importlib
+import sys
 import time
 from typing import Any, Callable, Dict, Optional
 
@@ -17,7 +19,204 @@ import numpy as np
 from .traditional import unwrap_data
 
 
-METHODS = ("none", "gc3D", "lap4D", "nprs")
+METHODS = ("none", "gc3D", "lap4D", "nprs", "pudip", "gust")
+_LEARNED_BACKEND_PACKAGES = {"pudip": "pudipflow", "gust": "gustflow"}
+_LEARNED_BACKEND_REQUIREMENTS = {
+    "pudip": ("torch", "tqdm", "matplotlib"),
+    "gust": ("torch", "cupy", "matplotlib"),
+}
+
+
+def _canonical_method(method: str) -> str:
+    aliases = {
+        "gc3d": "gc3D", "lap4d": "lap4D", "nprs": "nprs",
+        "pudip": "pudip", "pudip-flow": "pudip", "pudipflow": "pudip",
+        "gust": "gust", "gust-flow": "gust", "gustflow": "gust",
+    }
+    token = str(method or "none").strip()
+    return aliases.get(token.lower(), token)
+
+
+def backend_available(method: str) -> bool:
+    """Return whether an optional learned backend is installed and importable."""
+    token = _canonical_method(method)
+    package_name = _LEARNED_BACKEND_PACKAGES.get(token)
+    if package_name is None:
+        return True
+    try:
+        package_available = package_name in sys.modules or importlib.util.find_spec(package_name) is not None
+        if not package_available:
+            return False
+        return all(
+            dependency in sys.modules or importlib.util.find_spec(dependency) is not None
+            for dependency in _LEARNED_BACKEND_REQUIREMENTS[token]
+        )
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return False
+
+
+def _load_external_backend(package_name: str):
+    """Load a phase-unwrapping package installed by the optional ``pu`` extra."""
+    try:
+        return importlib.import_module(package_name)
+    except Exception as exc:
+        raise RuntimeError(
+            f"{package_name} is unavailable; install the optional phase-unwrapping "
+            f"dependencies with pip install .[pu]"
+        ) from exc
+
+
+def _backend_device(device: str, *, require_cuda: bool = False) -> str:
+    token = str(device or "auto").strip().lower()
+    if token in {"cpu", "none"}:
+        if require_cuda:
+            raise RuntimeError("the selected phase-unwrapping backend requires CUDA")
+        return "cpu"
+    try:
+        import torch
+    except Exception as exc:
+        raise RuntimeError("the selected phase-unwrapping backend requires PyTorch") from exc
+    has_cuda = bool(torch.cuda.is_available())
+    if token in {"cuda", "gpu", "auto"}:
+        if has_cuda:
+            return "cuda"
+        if require_cuda:
+            raise RuntimeError("the selected phase-unwrapping backend requires a CUDA device")
+        return "cpu"
+    if token.startswith("cuda:"):
+        if not has_cuda:
+            raise RuntimeError(f"requested phase-unwrapping device {device!r}, but CUDA is unavailable")
+        return token
+    raise ValueError(f"unsupported phase-unwrapping device: {device!r}")
+
+
+def _backend_spacing(value) -> tuple[float, float, float]:
+    arr = np.asarray(value if value is not None else (1.0, 1.0, 1.0), dtype=np.float32).reshape(-1)
+    if arr.size == 1:
+        arr = np.repeat(arr, 3)
+    if arr.size < 3 or not np.all(np.isfinite(arr[:3])) or np.any(arr[:3] <= 0):
+        raise ValueError(f"backend voxel spacing must contain three positive values, got {arr.tolist()}")
+    return tuple(float(v) for v in arr[:3])
+
+
+def _backend_weight_mask(mask: np.ndarray, phase_shape) -> np.ndarray:
+    x, y, z, t, components = (int(v) for v in phase_shape)
+    if components != 3 or tuple(mask.shape) != (x, y, z, t):
+        raise ValueError("phase backend mask does not match the phase shape")
+    return np.broadcast_to(
+        np.transpose(np.asarray(mask, dtype=np.float32), (3, 0, 1, 2))[None, ...],
+        (3, t, x, y, z),
+    ).copy()
+
+
+def _deep_backend_params(config: Dict[str, Any], method: str) -> Dict[str, Any]:
+    raw = dict(config.get("backend_params") or {})
+    params = dict(raw.get(method) or {}) if isinstance(raw.get(method), dict) else {}
+    for key, value in raw.items():
+        if key != method and not isinstance(value, dict):
+            params.setdefault(str(key), value)
+    prefix = f"{method}_"
+    for key, value in config.items():
+        if str(key).startswith(prefix):
+            params.setdefault(str(key)[len(prefix):], value)
+    return params
+
+
+def _pudip_unwrap(phase: np.ndarray, weightmask: np.ndarray, venc: np.ndarray, config: Dict[str, Any], device: str):
+    module = _load_external_backend("pudipflow")
+    backend = _deep_backend_params(config, "pudip")
+    resolved_device = _backend_device(device)
+    wrapped = np.transpose(phase, (4, 3, 0, 1, 2))
+    weight = _backend_weight_mask(weightmask, phase.shape)
+    kwargs = {
+        "venc": venc,
+        "level": int(backend.get("level", 4)),
+        "features": int(backend.get("features", 128)),
+        "input_depth": int(backend.get("input_depth", 128)),
+        "lr": float(backend.get("lr", 1e-3)),
+        "num_iter": int(backend.get("num_iter", 1000)),
+        "tv_weights": tuple(float(v) for v in backend.get("tv_weights", (1.0, 1.0, 1.0, 1.0))),
+        "loss_type": str(backend.get("loss_type", "l1")),
+        "device": resolved_device,
+        "lr_scheduler": str(backend.get("lr_scheduler", "cosine")),
+        "div_weight": float(backend.get("div_weight", 0.0)),
+        "spacing": _backend_spacing(backend.get("spacing")),
+        "reshape_mode": str(backend.get("reshape_mode", "bt_as_channel")),
+    }
+    runner = module.PUDIPFlow(**kwargs)
+    recovered, history = runner.run(
+        wrapped,
+        weight,
+        plot=False,
+        save_video=False,
+    )
+    if hasattr(recovered, "detach"):
+        recovered = recovered.detach().cpu().numpy()
+    recovered = np.asarray(recovered, dtype=np.float32)
+    if recovered.shape != wrapped.shape:
+        raise ValueError(f"PUDIP-Flow returned {recovered.shape}, expected {wrapped.shape}")
+    phase_unwrapped = np.transpose(
+        recovered * np.pi / venc.reshape(3, 1, 1, 1, 1),
+        (2, 3, 4, 1, 0),
+    )
+    return phase_unwrapped, resolved_device, {"iterations": int(kwargs["num_iter"]), "history": history}
+
+
+def _gust_unwrap(
+    phase: np.ndarray,
+    weightmask: np.ndarray,
+    venc: np.ndarray,
+    config: Dict[str, Any],
+    device: str,
+    *,
+    center_confidence: Optional[np.ndarray] = None,
+):
+    module = _load_external_backend("gustflow")
+    backend = _deep_backend_params(config, "gust")
+    resolved_device = _backend_device(device, require_cuda=True)
+    wrapped = np.transpose(phase, (4, 3, 0, 1, 2))
+    weight = _backend_weight_mask(weightmask, phase.shape)
+    confidence = backend.get("center_confidence") if center_confidence is None else center_confidence
+    if confidence is None:
+        confidence = np.any(weightmask, axis=3).astype(np.float32)
+    confidence = np.asarray(confidence, dtype=np.float32)
+    if confidence.shape != phase.shape[:3]:
+        raise ValueError(
+            f"GUST-Flow center_confidence must have shape {phase.shape[:3]}, got {confidence.shape}"
+        )
+    runner = module.GUSTFlow(
+        venc=venc,
+        voxel_spacing=_backend_spacing(backend.get("voxel_spacing")),
+        num_primitives=int(backend.get("num_primitives", 8192)),
+        num_iter=int(backend.get("num_iter", 1000)),
+        lr=float(backend.get("lr", 0.03)),
+        device=resolved_device,
+        seed=int(backend.get("seed", 314159)),
+    )
+    try:
+        result = runner.fit(wrapped, weight, center_confidence=confidence)
+    except Exception as exc:
+        detail = str(exc).strip() or type(exc).__name__
+        lowered = detail.lower()
+        if "out of memory" in lowered or "cuda" in lowered or "cupy" in lowered:
+            raise RuntimeError(
+                "GUST-Flow CUDA execution failed (usually insufficient VRAM or an "
+                "incompatible CUDA/CuPy/PyTorch build). Try Lap4D, reduce the input "
+                "volume, or run GUST-Flow in a matching CUDA environment. "
+                f"Original error: {detail}"
+            ) from exc
+        raise RuntimeError(f"GUST-Flow failed: {detail}") from exc
+    recovered = getattr(result, "recovered", result)
+    if hasattr(recovered, "detach"):
+        recovered = recovered.detach().cpu().numpy()
+    recovered = np.asarray(recovered, dtype=np.float32)
+    if recovered.shape != wrapped.shape:
+        raise ValueError(f"GUST-Flow returned {recovered.shape}, expected {wrapped.shape}")
+    phase_unwrapped = np.transpose(
+        recovered * np.pi / venc.reshape(3, 1, 1, 1, 1),
+        (2, 3, 4, 1, 0),
+    )
+    return phase_unwrapped, resolved_device, {"iterations": int(backend.get("num_iter", 1000))}
 
 
 def _as_phase_xyz_t3(value: np.ndarray) -> np.ndarray:
@@ -42,6 +241,21 @@ def _as_mask_xyz_t(mask: Optional[np.ndarray], shape_xyz_t) -> np.ndarray:
     else:
         raise ValueError(f"mask must be XYZ or XYZT, got {arr.shape}")
     return np.asarray(arr > 0, dtype=bool)
+
+
+def _as_mask_or_weight_xyz_t(value: np.ndarray, shape_xyz_t, *, name: str) -> np.ndarray:
+    """Normalize a learned-backend weight map without binarizing it."""
+    x, y, z, t = (int(v) for v in shape_xyz_t)
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.ndim == 3:
+        if tuple(arr.shape) != (x, y, z):
+            raise ValueError(f"{name} shape {arr.shape} does not match {(x, y, z)}")
+        arr = np.repeat(arr[..., None], t, axis=3)
+    elif arr.ndim != 4 or tuple(arr.shape) != (x, y, z, t):
+        raise ValueError(f"{name} must be XYZ or XYZT, got {arr.shape}")
+    if not np.all(np.isfinite(arr)) or np.any(arr < 0):
+        raise ValueError(f"{name} must contain finite non-negative values")
+    return np.ascontiguousarray(arr, dtype=np.float32)
 
 
 def _coerce_venc(venc) -> np.ndarray:
@@ -284,19 +498,25 @@ def unwrap_phase(
     params: Optional[Dict[str, Any]] = None,
     device: str = "auto",
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    backend_weightmask: Optional[np.ndarray] = None,
+    backend_center_confidence: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """Run one traditional method and return flow plus wrap diagnostics."""
     method_token = str(method or "none").strip()
     if method_token.lower() == "none":
         raise ValueError("phase unwrapping method is disabled")
-    aliases = {"gc3d": "gc3D", "lap4d": "lap4D", "nprs": "nprs"}
-    method_token = aliases.get(method_token.lower(), method_token)
+    method_token = _canonical_method(method_token)
     if method_token not in METHODS[1:]:
-        raise ValueError(f"unsupported phase unwrapping method: {method}; choose gc3D, lap4D, or nprs")
+        raise ValueError(
+            f"unsupported phase unwrapping method: {method}; choose gc3D, lap4D, nprs, pudip, or gust"
+        )
 
     phase = _as_phase_xyz_t3(phase_wrapped)
     x, y, z, t, _ = phase.shape
     mask4 = _as_mask_xyz_t(mask, (x, y, z, t))
+    backend_weight = mask4 if backend_weightmask is None else _as_mask_or_weight_xyz_t(
+        backend_weightmask, (x, y, z, t), name="backend weight mask"
+    )
     if not np.any(mask4):
         flow_wrapped = phase * _coerce_venc(venc).reshape((1, 1, 1, 1, 3)) / np.pi
         return {
@@ -313,15 +533,35 @@ def unwrap_phase(
     cfg.setdefault("nprs_upsampling_factor", 2)
     cfg.setdefault("nprs_pi_unwrap", True)
     cfg.setdefault("nprs_auto_crop", True)
+    cfg.setdefault("backend_params", {})
     started = time.perf_counter()
     phase_unwrapped = np.empty_like(phase, dtype=np.float32)
     wrap_count = np.zeros_like(phase, dtype=np.int16)
     used_device = "cpu"
+    backend_metadata: Dict[str, Any] = {}
     gpu_device = _resolve_gpu_device(device)
+    if method_token in {"pudip", "gust"}:
+        if progress_callback is not None:
+            progress_callback({
+                "stage": "phase_unwrap_backend",
+                "current": 0,
+                "total": 1,
+                "message": f"Running {method_token.upper()}-Flow phase unwrapping",
+            })
+        if method_token == "pudip":
+            phase_unwrapped, used_device, backend_metadata = _pudip_unwrap(
+                phase, backend_weight, venc3, cfg, device,
+            )
+        else:
+            phase_unwrapped, used_device, backend_metadata = _gust_unwrap(
+                phase, backend_weight, venc3, cfg, device,
+                center_confidence=backend_center_confidence,
+            )
+        wrap_count = np.rint((phase_unwrapped - phase) / (2.0 * np.pi)).astype(np.int16)
     if method_token == "gc3D" and importlib.util.find_spec("maxflow") is None:
         raise RuntimeError("gc3D requires PyMaxflow; install it or choose lap4D/nprs")
 
-    for component in range(3):
+    for component in range(3) if method_token not in {"pudip", "gust"} else ():
         if progress_callback is not None:
             progress_callback({"stage": "phase_unwrap_component", "current": component, "total": 3,
                                "message": f"Unwrapping phase component {component + 1}/3 ({method_token})"})
@@ -413,6 +653,7 @@ def unwrap_phase(
         "method": method_token,
         "device": used_device,
         "elapsed_sec": float(time.perf_counter() - started),
+        "backend_metadata": backend_metadata,
         "statistics": {
             "evaluated_voxels": int(np.count_nonzero(mask4)),
             "wrapped_voxels_any": int(np.count_nonzero(np.any(wrap_mask, axis=-1))),
@@ -422,4 +663,4 @@ def unwrap_phase(
     }
 
 
-__all__ = ["METHODS", "unwrap_phase"]
+__all__ = ["METHODS", "backend_available", "unwrap_phase"]

@@ -11,6 +11,14 @@ Full local install for GUI, automatic segmentation, and tests:
 pip install -e ".[gui,test]"
 ```
 
+Install the learned PUDIP-Flow and GUST-Flow phase-unwrapping backends as well:
+
+```bash
+pip install -e ".[gui,test,pu]"
+```
+
+To install every optional group in one step, use `pip install -e ".[all]"`.
+
 CLI-only install:
 
 ```bash
@@ -19,7 +27,7 @@ pip install .
 
 Both normal and editable installs include the bundled nnUNet final checkpoint and its required metadata. The `gui` extra installs both the GUI and nnUNet inference dependencies; there is no separate automatic-segmentation extra.
 
-To enable the optional SpatioTemporal Labeler `v0.4.0` exchange workflow, initialize the pinned source submodule and install its extra:
+To enable the optional SpatioTemporal Labeler `v0.4.7` exchange workflow, initialize the pinned source submodule and install its extra:
 
 ```bash
 git submodule update --init --recursive

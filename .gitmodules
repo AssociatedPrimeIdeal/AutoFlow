@@ -1,3 +1,9 @@
 [submodule "third_party/SpatioTemporalLabeler"]
 	path = third_party/SpatioTemporalLabeler
 	url = https://github.com/AssociatedPrimeIdeal/SpatioTemporalLabeler.git
+[submodule "third_party/PUDIP-Flow"]
+	path = third_party/PUDIP-Flow
+	url = https://github.com/AssociatedPrimeIdeal/PUDIP-Flow.git
+[submodule "third_party/GUST-Flow"]
+	path = third_party/GUST-Flow
+	url = https://github.com/AssociatedPrimeIdeal/GUST-Flow.git

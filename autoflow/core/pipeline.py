@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import hashlib
@@ -9,7 +10,8 @@ from ..algorithms import (
     filter_segmask_labels, binarize_segmask, merge_segmask_to_3d,
     preprocess_mask_for_skeleton,
     separate_special_label_contacts,
-    generate_skeleton_from_mask3d, build_graph_from_points,
+    generate_skeleton_from_mask3d, generate_three_pass_special_skeleton, build_graph_from_points,
+    remove_short_terminal_branches,
     segment_vessels_from_graph_and_mask,
     generate_planes_from_paths,
     compute_plane_metrics, compute_derived_metrics,
@@ -73,6 +75,25 @@ class PipelineEngine:
 
     def _group_object_name(self, prefix, group_name, index=None):
         return self._group_data_key(prefix, group_name, index=index)
+
+    def _special_label_values(self, ws, group_params, group_label_values):
+        """Resolve configured special-label names to values present in a group."""
+        label_map = dict(getattr(getattr(ws, "skeleton_params", None), "label_map", {}) or {})
+        if not label_map:
+            label_map = dict(getattr(getattr(ws, "label_params", None), "label_map", {}) or {})
+        group_values = {int(value) for value in (group_label_values or [])}
+        values = []
+        for token in list(getattr(group_params, "special_contact_labels", []) or []):
+            value = label_map.get(str(token).strip())
+            if value is None:
+                try:
+                    value = int(token)
+                except (TypeError, ValueError):
+                    continue
+            value = int(value)
+            if value in group_values and value not in values:
+                values.append(value)
+        return values
 
     def _indexed_object_name(self, prefix, index):
         label_map = {
@@ -340,6 +361,9 @@ class PipelineEngine:
         if dicom_overrides:
             load_kwargs["parameter_overrides"] = dicom_overrides
         load_kwargs["dicom_read_workers"] = int(getattr(ws.loader_params, "dicom_read_workers", 1) or 1)
+        source_metadata = getattr(load_target, "metadata", {}) if not isinstance(load_target, (str, bytes, os.PathLike)) else {}
+        if isinstance(source_metadata, dict) and source_metadata.get("dual_venc_mode"):
+            load_kwargs["dual_venc_mode"] = str(source_metadata["dual_venc_mode"])
         if progress_callback is not None:
             load_kwargs["progress_callback"] = progress_callback
         try:
@@ -418,12 +442,15 @@ class PipelineEngine:
         ws.flow_raw = flow
         ws.flow_input = np.array(flow, copy=True)
         phase_loaded = getattr(data, "phase_wrapped", None)
-        if phase_loaded is None and str(data.source_format or "").lower().startswith("dicom"):
-            # Direct DICOM loaders expose velocity rather than raw phase.  The
-            # encoded velocity is periodic at ±VENC, so reconstruct a wrapped
-            # phase representation for the optional unwrap stage.
+        phase_reconstructed = False
+        if phase_loaded is None and str(data.source_format or "").lower() != "legacy_h5_dual_venc":
+            # Normalized H5 and direct DICOM loaders expose velocity rather
+            # than raw phase.  The encoded velocity is periodic at ±VENC, so
+            # reconstruct the wrapped phase representation needed by the
+            # optional unwrap stage.  Keep the original velocity untouched.
             venc_arr = np.asarray(data.venc, dtype=np.float32).reshape(1, 1, 1, 1, -1)
             phase_loaded = np.angle(np.exp(1j * flow * np.pi / np.maximum(venc_arr, 1e-6))).astype(np.float32)
+            phase_reconstructed = True
         ws.phase_wrapped = None if phase_loaded is None else np.asarray(phase_loaded, dtype=np.float32)
         ws.phase_wrapped_high = None if getattr(data, "phase_wrapped_high", None) is None else np.asarray(data.phase_wrapped_high, dtype=np.float32)
         ws.phase_unwrap_result = {}
@@ -431,6 +458,8 @@ class PipelineEngine:
         ws.input_state.source_format = str(data.source_format or "")
         ws.input_state.source_group = data.source_group
         ws.input_state.metadata = dict(data.metadata or {})
+        if phase_reconstructed:
+            ws.input_state.metadata["phase_wrapped_reconstructed_from_velocity"] = True
         ws.input_state.capabilities = data.capabilities
         if ws.phase_wrapped is not None:
             ws.input_state.capabilities.has_wrapped_phase = True
@@ -517,6 +546,8 @@ class PipelineEngine:
             elif corr_meta.get("enabled"):
                 reason = str(corr_meta.get("skipped_reason", "") or "skipped")
                 msg += f" bpc={reason}"
+        if bool(ws.input_state.metadata.get("phase_wrapped_reconstructed_from_velocity", False)):
+            msg += " wrapped_phase=reconstructed_from_velocity"
         msg += f" caps={ws.input_state.capabilities.to_dict()}"
         log(msg)
         return msg
@@ -593,21 +624,12 @@ class PipelineEngine:
             else:
                 group_binary = self._repeat_mask_to_time(group_mask_3d, time_count)
             processed_mask_3d = preprocess_mask_for_skeleton(group_mask_3d, group_params, resolution=ws.resolution)
-            # Apply contact cutting after morphology so closing cannot bridge
-            # the deliberately introduced separation or erase a thin vessel.
-            label_map = dict(getattr(ws.skeleton_params, "label_map", {}) or {})
-            if not label_map:
-                label_map = dict(getattr(getattr(ws, "label_params", None), "label_map", {}) or {})
-            protected_values = []
-            special_label_names = list(getattr(group_params, "special_contact_labels", []) or [])
-            for label_name in special_label_names:
-                try:
-                    value = int(label_map.get(label_name))
-                except (TypeError, ValueError):
-                    continue
-                if value in labels:
-                    protected_values.append(value)
-            if getattr(group_params, "separate_special_label_contacts", True) and len(protected_values) >= 2:
+            # Apply legacy contact cutting only when explicitly selected.  The
+            # three-pass mode keeps this display/metric mask intact and builds
+            # its separate skeleton passes during _step_generate_skeleton.
+            protected_values = self._special_label_values(ws, group_params, labels)
+            special_handling = str(getattr(group_params, "special_handling", "three_pass_merge") or "three_pass_merge").strip().lower().replace("-", "_")
+            if special_handling == "contact_surface" and getattr(group_params, "separate_special_label_contacts", True) and len(protected_values) >= 2:
                 processed_mask_3d = separate_special_label_contacts(
                     processed_mask_3d,
                     voted_labels_3d,
@@ -675,7 +697,7 @@ class PipelineEngine:
         return dispatch[step](ws)
 
     def _step_unwrap_phase(self, ws):
-        """Optional traditional phase unwrapping with explicit diagnostics."""
+        """Optional traditional or learned phase unwrapping with diagnostics."""
         cfg = getattr(ws, "phase_unwrap_params", None)
         method = str(getattr(cfg, "method", "") or "").strip()
         # Method selection is the single enable switch.  ``enabled`` and the
@@ -686,7 +708,14 @@ class PipelineEngine:
             ws.pipeline.mark_done(StepId.UNWRAP_PHASE, skipped=True)
             return StepResult(StepId.UNWRAP_PHASE, True, True, "Phase unwrapping skipped: disabled")
         metadata = dict(ws.input_state.metadata or {})
-        dual = bool(metadata.get("dual_venc", {}).get("enabled", False)) or str(ws.input_state.source_format).lower() == "legacy_h5_dual_venc"
+        dual_info = metadata.get("dual_venc", {})
+        if not isinstance(dual_info, dict):
+            dual_info = {}
+        dual_mode = str(dual_info.get("selected_mode", dual_info.get("mode", "dv")) or "dv").lower()
+        dual = (
+            (bool(dual_info.get("enabled", False)) or str(ws.input_state.source_format).lower() == "legacy_h5_dual_venc")
+            and dual_mode == "dv"
+        )
         if dual:
             ws.phase_unwrap_result = {"skipped": True, "reason": "dual_venc"}
             ws.pipeline.mark_done(StepId.UNWRAP_PHASE, skipped=True)
@@ -695,16 +724,46 @@ class PipelineEngine:
             ws.phase_unwrap_result = {"skipped": True, "reason": "wrapped_phase_unavailable"}
             ws.pipeline.mark_done(StepId.UNWRAP_PHASE, skipped=True)
             return StepResult(StepId.UNWRAP_PHASE, True, True, "Phase unwrapping skipped: wrapped phase unavailable")
-        mask_source = str(getattr(cfg, "mask_source", "segmentation") or "segmentation").lower()
-        if mask_source == "all":
-            mask = np.ones(np.asarray(ws.phase_wrapped).shape[:4], dtype=bool)
-        else:
-            mask = ws.segmask_raw
-            if mask is None:
+        mask_source = str(getattr(cfg, "mask_source", "segmask") or "segmask").lower()
+        segmask = None if ws.segmask_raw is None else np.asarray(ws.segmask_raw) > 0
+        phase_shape = np.asarray(ws.phase_wrapped).shape[:4]
+        if segmask is not None and tuple(segmask.shape) != tuple(phase_shape):
+            raise ValueError(f"segmentation mask shape {segmask.shape} does not match wrapped phase {phase_shape}")
+        if mask_source in {"segmentation", "segmask", "seg", "mask"}:
+            if segmask is None:
                 ws.phase_unwrap_result = {"skipped": True, "reason": "segmentation_unavailable"}
                 ws.pipeline.mark_done(StepId.UNWRAP_PHASE, skipped=True)
                 return StepResult(StepId.UNWRAP_PHASE, True, True, "Phase unwrapping skipped: segmentation mask unavailable")
-            mask = np.asarray(mask) > 0
+            mask = segmask
+            backend_weightmask = segmask.astype(np.float32)
+            backend_center_confidence = np.any(segmask, axis=3).astype(np.float32)
+        elif mask_source == "pcmra_std":
+            # Learned backends use the temporal PC-MRA standard deviation as
+            # their confidence map.  PUDIP receives the corresponding
+            # std(PC-MRA) * PC-MRA weight volume; GUST uses std(PC-MRA) to
+            # initialize Gaussian centers and the same volume as its loss
+            # weight.  The segmentation remains the evaluation/output mask
+            # when one is available.
+            phase = np.asarray(ws.phase_wrapped, dtype=np.float32)
+            magnitude = np.asarray(ws.mag_raw, dtype=np.float32)
+            pcmra = magnitude * np.linalg.norm(phase, axis=-1)
+            pcmra = np.nan_to_num(pcmra, nan=0.0, posinf=0.0, neginf=0.0)
+            pcmra_scale = float(np.max(pcmra))
+            if pcmra_scale > 0:
+                pcmra = pcmra / pcmra_scale
+            pcmra_std = np.std(pcmra, axis=3).astype(np.float32)
+            std_scale = float(np.max(pcmra_std))
+            if std_scale > 0:
+                pcmra_std /= std_scale
+            backend_weightmask = np.asarray(pcmra * pcmra_std[..., None], dtype=np.float32)
+            backend_center_confidence = pcmra_std
+            mask = segmask if segmask is not None else np.broadcast_to(
+                pcmra_std[..., None] > 0, phase_shape
+            ).copy()
+        else:
+            raise ValueError(
+                f"unsupported phase-unwrapping mask source {mask_source!r}; choose segmask or pcmra_std"
+            )
         if not np.any(mask):
             ws.phase_unwrap_result = {"skipped": True, "reason": "empty_mask"}
             ws.pipeline.mark_done(StepId.UNWRAP_PHASE, skipped=True)
@@ -715,12 +774,28 @@ class PipelineEngine:
             "nprs_upsampling_factor": int(getattr(cfg, "nprs_upsampling_factor", 2)),
             "nprs_pi_unwrap": bool(getattr(cfg, "nprs_pi_unwrap", True)),
             "nprs_auto_crop": bool(getattr(cfg, "nprs_auto_crop", True)),
+            "backend_params": copy.deepcopy(getattr(cfg, "backend_params", {}) or {}),
         }
+        # Both learned backends use physical voxel spacing.  Keep explicit
+        # backend overrides intact while supplying the loaded case geometry by
+        # default.
+        backend_params = params["backend_params"]
+        if isinstance(backend_params.get("pudip"), dict):
+            backend_params["pudip"].setdefault(
+                "spacing", tuple(float(v) for v in np.asarray(ws.resolution).reshape(-1)[:3])
+            )
+        if isinstance(backend_params.get("gust"), dict):
+            backend_params["gust"].setdefault(
+                "voxel_spacing", tuple(float(v) for v in np.asarray(ws.resolution).reshape(-1)[:3])
+            )
         try:
             result = unwrap_phase(
                 ws.phase_wrapped, mask, ws.venc, str(cfg.method),
                 params=params, device=str(getattr(cfg, "device", "auto")),
+                backend_weightmask=backend_weightmask,
+                backend_center_confidence=backend_center_confidence,
             )
+            result["mask_source"] = mask_source
         except Exception as exc:
             ws.phase_unwrap_result = {"skipped": False, "error": str(exc)}
             ws.pipeline.completed.pop(StepId.UNWRAP_PHASE.value, None)
@@ -793,8 +868,20 @@ class PipelineEngine:
         ws.remove_objects_by_prefix("skeleton_")
         for group_name in ws.group_order:
             group_state = ws.multilabel_groups.get(group_name, {})
-            processed = np.asarray(group_state.get("segmask_3d"), dtype=bool)
-            pts, mask = generate_skeleton_from_mask3d(processed, ws.resolution)
+            group_params = ws.skeleton_params.params_for_group(group_name)
+            special_handling = str(getattr(group_params, "special_handling", "three_pass_merge") or "three_pass_merge").strip().lower().replace("-", "_")
+            if special_handling == "three_pass_merge":
+                protected_values = self._special_label_values(ws, group_params, group_state.get("labels", []))
+                pts, mask = generate_three_pass_special_skeleton(
+                    np.asarray(ws.segmask_labels_3d),
+                    group_state.get("labels", []),
+                    protected_values,
+                    group_params,
+                    ws.resolution,
+                )
+            else:
+                processed = np.asarray(group_state.get("segmask_3d"), dtype=bool)
+                pts, mask = generate_skeleton_from_mask3d(processed, ws.resolution)
             group_state["skeleton_points"] = np.asarray(pts, dtype=float)
             group_state["skeleton_mask"] = np.asarray(mask, dtype=bool)
             ws.multilabel_groups[group_name] = group_state
@@ -850,8 +937,11 @@ class PipelineEngine:
         ws.remove_objects_by_prefix("path_arrow_")
         for group_name in ws.group_order:
             group_state = ws.multilabel_groups.get(group_name, {})
+            group_params = ws.skeleton_params.params_for_group(group_name)
             local_points = np.asarray(group_state.get("skeleton_points"), dtype=float).reshape(-1, 3) if group_state.get("skeleton_points") is not None else np.empty((0, 3), dtype=float)
             local_graph = build_graph_from_points(local_points, ws.resolution)
+            min_edge_points = max(0, int(getattr(group_params, "min_edge_points", 3)))
+            local_graph = remove_short_terminal_branches(local_graph, min_edge_points=min_edge_points)
             group_state["graph"] = local_graph
             local_binary = np.asarray(group_state.get("segmask_binary"), dtype=bool)
             local_labels, local_paths, local_node_paths, local_path_info, local_forks = segment_vessels_from_graph_and_mask(

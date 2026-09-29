@@ -112,12 +112,12 @@ class BackgroundPhaseCorrectionConfig:
 
 @dataclass
 class PhaseUnwrappingConfig:
-    """Optional traditional phase-unwrapping workflow settings."""
+    """Optional traditional or learned phase-unwrapping workflow settings."""
     # Retained only so workspaces written by older AutoFlow versions can be
     # loaded.  Selecting ``method`` is now the sole user-facing opt-in.
     enabled: bool = False
     method: str = "none"
-    mask_source: str = "segmentation"
+    mask_source: str = "segmask"
     device: str = "auto"
     tfc: bool = True
     lap4d_ts: float = 2.0
@@ -125,6 +125,7 @@ class PhaseUnwrappingConfig:
     nprs_pi_unwrap: bool = True
     nprs_auto_crop: bool = True
     write_output: bool = True
+    backend_params: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self):
         return {
@@ -136,6 +137,7 @@ class PhaseUnwrappingConfig:
             "nprs_upsampling_factor": int(self.nprs_upsampling_factor),
             "nprs_pi_unwrap": bool(self.nprs_pi_unwrap),
             "nprs_auto_crop": bool(self.nprs_auto_crop),
+            "backend_params": copy.deepcopy(self.backend_params),
             "write_output": bool(self.write_output),
         }
 
@@ -143,15 +145,19 @@ class PhaseUnwrappingConfig:
     def from_dict(d):
         payload = dict(d or {})
         method = str(payload.get("method", "none") or "none").strip()
-        aliases = {"gc3d": "gc3D", "lap4d": "lap4D"}
+        aliases = {
+            "gc3d": "gc3D", "lap4d": "lap4D", "pudip": "pudip", "gust": "gust",
+            "pudip-flow": "pudip", "pudipflow": "pudip",
+            "gust-flow": "gust", "gustflow": "gust",
+        }
         method = aliases.get(method.lower(), method)
-        if method not in {"none", "gc3D", "lap4D", "nprs"}:
+        if method not in {"none", "gc3D", "lap4D", "nprs", "pudip", "gust"}:
             method = "none"
-        mask_source = str(payload.get("mask_source", "segmentation") or "segmentation").strip().lower()
-        if mask_source in {"active_segmentation", "seg", "mask"}:
-            mask_source = "segmentation"
-        if mask_source not in {"segmentation", "all"}:
-            mask_source = "segmentation"
+        mask_source = str(payload.get("mask_source", "segmask") or "segmask").strip().lower()
+        if mask_source in {"active_segmentation", "segmentation", "seg", "mask"}:
+            mask_source = "segmask"
+        if mask_source not in {"segmask", "pcmra_std"}:
+            mask_source = "segmask"
         return PhaseUnwrappingConfig(
             enabled=bool(payload.get("enabled", False)),
             method=method,
@@ -162,6 +168,7 @@ class PhaseUnwrappingConfig:
             nprs_upsampling_factor=max(1, int(payload.get("nprs_upsampling_factor", 2) or 2)),
             nprs_pi_unwrap=bool(payload.get("nprs_pi_unwrap", True)),
             nprs_auto_crop=bool(payload.get("nprs_auto_crop", True)),
+            backend_params=copy.deepcopy(payload.get("backend_params", {}) or {}),
             write_output=bool(payload.get("write_output", True)),
         )
 

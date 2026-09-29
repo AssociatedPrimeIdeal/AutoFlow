@@ -69,6 +69,86 @@ def remove_triangle_cycles(graph):
     return GraphData(points=graph.points.copy(), edges=new_edges)
 
 
+def remove_short_terminal_branches(graph, min_edge_points=3, *, min_edge_count=None):
+    """Remove short terminal branches from a skeleton graph.
+
+    The graph built from voxel skeleton points contains one graph edge per
+    pair of neighbouring skeleton points.  This helper therefore measures a
+    terminal branch by the number of consecutive graph edges from a degree-1
+    endpoint to the next junction (or to the other endpoint of a simple
+    component).  Junction-to-junction links are preserved.  ``min_edge_count``
+    is accepted as a descriptive alias for callers that use edge terminology.
+
+    After removal, retained nodes are compacted and reindexed.  The original
+    skeleton mask and points remain available separately for visualization.
+    """
+    if min_edge_count is not None:
+        min_edge_points = min_edge_count
+    try:
+        threshold = int(min_edge_points)
+    except (TypeError, ValueError):
+        threshold = 3
+    threshold = max(0, threshold)
+    if threshold <= 1 or len(getattr(graph, "edges", [])) == 0:
+        return graph
+
+    G = graph_to_networkx(graph)
+    if G.number_of_edges() == 0:
+        return graph
+
+    degree = dict(G.degree())
+    endpoints = sorted(int(node) for node, value in degree.items() if int(value) == 1)
+    visited_edges = set()
+    edges_to_remove = set()
+
+    for start in endpoints:
+        for neighbor in sorted(G.neighbors(start)):
+            first_edge = tuple(sorted((int(start), int(neighbor))))
+            if first_edge in visited_edges:
+                continue
+            path_edges = []
+            previous = int(start)
+            current = int(neighbor)
+            visited_edges.add(first_edge)
+            path_edges.append(first_edge)
+
+            # Walk until the next endpoint, a junction, or a malformed graph
+            # boundary.  Degree-2 nodes are the interior of one logical arm.
+            while int(degree.get(current, 0)) == 2:
+                neighbors = sorted(int(value) for value in G.neighbors(current))
+                next_nodes = [value for value in neighbors if value != previous]
+                if not next_nodes:
+                    break
+                nxt = int(next_nodes[0])
+                edge = tuple(sorted((current, nxt)))
+                if edge in visited_edges:
+                    break
+                path_edges.append(edge)
+                visited_edges.add(edge)
+                previous, current = current, nxt
+
+            if len(path_edges) < threshold:
+                edges_to_remove.update(path_edges)
+
+    if not edges_to_remove:
+        return graph
+    retained_edges = [
+        (int(edge[0]), int(edge[1]))
+        for edge in np.asarray(graph.edges, dtype=int).reshape(-1, 2)
+        if tuple(sorted((int(edge[0]), int(edge[1])))) not in edges_to_remove
+    ]
+    if not retained_edges:
+        return GraphData()
+    used_nodes = sorted({node for edge in retained_edges for node in edge})
+    node_map = {old: new for new, old in enumerate(used_nodes)}
+    new_edges = np.asarray(
+        [[node_map[int(left)], node_map[int(right)]] for left, right in retained_edges],
+        dtype=int,
+    ).reshape(-1, 2)
+    new_points = np.asarray(graph.points, dtype=float)[np.asarray(used_nodes, dtype=int)]
+    return GraphData(points=new_points, edges=new_edges)
+
+
 def graph_to_networkx(graph):
     G = nx.Graph()
     for i in range(len(graph.points)):

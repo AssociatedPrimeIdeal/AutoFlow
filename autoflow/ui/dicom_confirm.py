@@ -77,6 +77,63 @@ class H5CaseSelectDialog(QtWidgets.QDialog):
         super().accept()
 
 
+class DualVencSelectDialog(QtWidgets.QDialog):
+    """Choose which source a legacy dual-VENC H5 should expose as flow."""
+
+    def __init__(self, lv_venc=None, hv_venc=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Dual-VENC Source")
+        self.resize(520, 280)
+        self._buttons = {}
+
+        layout = QtWidgets.QVBoxLayout(self)
+        intro = QtWidgets.QLabel(
+            "This H5 contains low- and high-VENC channels. Choose the velocity source for this load."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        group = QtWidgets.QGroupBox("Flow source")
+        group_layout = QtWidgets.QVBoxLayout(group)
+        options = (
+            ("lv", "LV (low VENC)", "Use the low-VENC velocity and VENC values."),
+            ("hv", "HV (high VENC)", "Use the high-VENC velocity and VENC values."),
+            ("dv", "DV (dual-VENC reconstruction)", "Combine LV and HV with the dual-VENC alias reconstruction."),
+        )
+        for mode, title, description in options:
+            button = QtWidgets.QRadioButton(title)
+            button.setToolTip(description)
+            self._buttons[mode] = button
+            group_layout.addWidget(button)
+            detail = QtWidgets.QLabel(description)
+            detail.setIndent(24)
+            detail.setStyleSheet("color: palette(mid);")
+            group_layout.addWidget(detail)
+        self._buttons["dv"].setChecked(True)
+        layout.addWidget(group)
+
+        venc_text = []
+        if lv_venc is not None:
+            venc_text.append("LV VENC: " + ", ".join(f"{float(x):.6g}" for x in list(lv_venc)[:3]))
+        if hv_venc is not None:
+            venc_text.append("HV VENC: " + ", ".join(f"{float(x):.6g}" for x in list(hv_venc)[:3]))
+        if venc_text:
+            label = QtWidgets.QLabel(" | ".join(venc_text))
+            label.setWordWrap(True)
+            layout.addWidget(label)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_mode(self):
+        for mode, button in self._buttons.items():
+            if button.isChecked():
+                return mode
+        return "dv"
+
+
 class DicomImportDialog(QtWidgets.QDialog):
     def __init__(self, cases, preview_loader, parent=None):
         super().__init__(parent)

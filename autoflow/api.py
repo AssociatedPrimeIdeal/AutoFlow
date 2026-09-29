@@ -62,7 +62,7 @@ class AutoFlowConfig:
     ignore_embedded_segmentation: bool = False
     phase_unwrap_enabled: bool = False
     phase_unwrap_method: str = "none"
-    phase_unwrap_mask: str = "segmentation"
+    phase_unwrap_mask: str = "segmask"
     phase_unwrap_device: str = "auto"
     phase_unwrap_tfc: bool = True
     phase_unwrap_lap4d_ts: float = 2.0
@@ -86,11 +86,14 @@ class AutoFlowConfig:
     use_center_plane: Optional[bool] = None
 
     remove_small_cc: bool = True
+    special_handling: str = "three_pass_merge"
+    special_merge_radius_mm: float = 1.5
     separate_special_label_contacts: bool = True
     special_contact_labels: Sequence[str] = field(default_factory=lambda: ["RBCT", "CCA", "LBCT"])
     min_cc_volume: float = 50.0
     cc_filter_mode: str = "hybrid"
     cc_rel_min_ratio: float = 0.01
+    min_edge_points: int = 3
 
     seed_ratio: float = 0.1
     max_steps: int = 200
@@ -163,6 +166,7 @@ class AutoFlowConfig:
     streamline_clim: Optional[Tuple[float, float]] = None
     streamline_show_scalar_bar: bool = True
     streamline_bar_cfg: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_STREAMLINE_BAR_CFG))
+    phase_unwrap_backend_params: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_config_dir(cls, config_dir: Optional[str] = None, **overrides):
@@ -205,13 +209,15 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
     ws.loader_params.ignore_embedded_segmentation = bool(cfg.ignore_embedded_segmentation)
     ws.phase_unwrap_params.enabled = bool(cfg.phase_unwrap_enabled)
     ws.phase_unwrap_params.method = str(cfg.phase_unwrap_method or "none")
-    ws.phase_unwrap_params.mask_source = str(cfg.phase_unwrap_mask or "segmentation")
+    ws.phase_unwrap_params.mask_source = str(cfg.phase_unwrap_mask or "segmask")
     ws.phase_unwrap_params.device = str(cfg.phase_unwrap_device or "auto")
     ws.phase_unwrap_params.tfc = bool(cfg.phase_unwrap_tfc)
     ws.phase_unwrap_params.lap4d_ts = float(cfg.phase_unwrap_lap4d_ts)
     ws.phase_unwrap_params.nprs_upsampling_factor = int(cfg.phase_unwrap_nprs_upsampling_factor)
     ws.phase_unwrap_params.nprs_pi_unwrap = bool(cfg.phase_unwrap_nprs_pi_unwrap)
     ws.phase_unwrap_params.nprs_auto_crop = bool(cfg.phase_unwrap_nprs_auto_crop)
+    if cfg.phase_unwrap_backend_params:
+        ws.phase_unwrap_params.backend_params = copy.deepcopy(cfg.phase_unwrap_backend_params)
     ws.segmentation.force_recompute_auto_cache = bool(cfg.force_recompute_seg)
     ws.segmentation.write_auto_cache = bool(cfg.write_segmentation_cache)
     ws.segmentation.auto_backend = str(cfg.autoseg_backend or "nnUNet")
@@ -244,11 +250,14 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
         elif str(getattr(cfg, "plane_mode", "") or "").strip() == "":
             ws.plane_gen_params.plane_mode = "distance"
     ws.skeleton_params.remove_small_cc = bool(cfg.remove_small_cc)
+    ws.skeleton_params.special_handling = str(getattr(cfg, "special_handling", "three_pass_merge") or "three_pass_merge")
+    ws.skeleton_params.special_merge_radius_mm = max(0.0, float(getattr(cfg, "special_merge_radius_mm", 1.5)))
     ws.skeleton_params.separate_special_label_contacts = bool(getattr(cfg, "separate_special_label_contacts", True))
     ws.skeleton_params.special_contact_labels = [str(value).strip() for value in (getattr(cfg, "special_contact_labels", None) or ["RBCT", "CCA", "LBCT"]) if str(value).strip()]
     ws.skeleton_params.min_cc_volume_mm3 = float(cfg.min_cc_volume)
     ws.skeleton_params.cc_filter_mode = str(cfg.cc_filter_mode or "hybrid")
     ws.skeleton_params.cc_rel_min_ratio = float(cfg.cc_rel_min_ratio)
+    ws.skeleton_params.min_edge_points = max(0, int(getattr(cfg, "min_edge_points", 3)))
     ws.streamline_params.seed_ratio = float(cfg.seed_ratio)
     ws.streamline_params.max_steps = int(cfg.max_steps)
     ws.streamline_params.min_seeds = int(cfg.min_seeds)
@@ -323,6 +332,7 @@ def run_case(
         phase_unwrap_nprs_upsampling_factor=cfg.phase_unwrap_nprs_upsampling_factor,
         phase_unwrap_nprs_pi_unwrap=cfg.phase_unwrap_nprs_pi_unwrap,
         phase_unwrap_nprs_auto_crop=cfg.phase_unwrap_nprs_auto_crop,
+        phase_unwrap_backend_params=copy.deepcopy(cfg.phase_unwrap_backend_params),
         requested_metrics=list(cfg.requested_metrics),
         requested_videos=list(cfg.requested_videos),
         fps=cfg.fps,
@@ -438,6 +448,7 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 phase_unwrap_nprs_upsampling_factor=config.phase_unwrap_nprs_upsampling_factor,
                 phase_unwrap_nprs_pi_unwrap=config.phase_unwrap_nprs_pi_unwrap,
                 phase_unwrap_nprs_auto_crop=config.phase_unwrap_nprs_auto_crop,
+                phase_unwrap_backend_params=copy.deepcopy(config.phase_unwrap_backend_params),
                 write_segmentation_cache=config.write_segmentation_cache,
                 plane_mode=config.plane_mode,
                 plane_count=config.plane_count,
@@ -452,11 +463,14 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 segmentation_filter=config.segmentation_filter,
                 use_center_plane=config.use_center_plane,
                 remove_small_cc=config.remove_small_cc,
+                special_handling=config.special_handling,
+                special_merge_radius_mm=config.special_merge_radius_mm,
                 separate_special_label_contacts=config.separate_special_label_contacts,
                 special_contact_labels=config.special_contact_labels,
                 min_cc_volume=config.min_cc_volume,
                 cc_filter_mode=config.cc_filter_mode,
                 cc_rel_min_ratio=config.cc_rel_min_ratio,
+                min_edge_points=config.min_edge_points,
                 seed_ratio=config.seed_ratio,
                 max_steps=config.max_steps,
                 min_seeds=config.min_seeds,

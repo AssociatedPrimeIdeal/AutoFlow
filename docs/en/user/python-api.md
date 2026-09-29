@@ -32,6 +32,12 @@ config = AutoFlowConfig(
 )
 ```
 
+Use `phase_unwrap_method="pudip"` or `"gust"` for the optional learned
+backends after initializing their git submodules and installing
+`pip install ".[pu]"`. Put their training options in
+`configs/phase_unwrapping.json` under `backend_params`, or pass the same mapping as
+`AutoFlowConfig(phase_unwrap_backend_params={...})`.
+
 The returned summary includes `phase_unwrap` statistics and, when enabled, a `phase_unwrap_file` NPZ. Dual-VENC inputs report a skipped phase-unwrapping step.
 
 ### Run a batch
@@ -129,11 +135,14 @@ launch_gui(config_dir="./configs")
 | `plane_anchor` | string | `center` | `start`, `center`, `end`, or `junction` placement anchor | `autoflow/algorithms/planes.py` |
 | `plane_offset_mm` | float | `5.0` | first offset from the graph junction in anchored-offset mode | `autoflow/algorithms/planes.py` |
 | `remove_small_cc` | bool | `True` | drop small components before skeletonization | `autoflow/algorithms/preprocess.py` |
-| `separate_special_label_contacts` | bool | `True` | separate contacts only between configured special labels (default: `RBCT`, `CCA`, `LBCT`) | `autoflow/algorithms/preprocess.py` |
+| `special_handling` | string | `three_pass_merge` | choose `three_pass_merge` or `contact_surface` for configured special-label groups | `autoflow/core/pipeline.py`, `autoflow/algorithms/skeleton.py` |
+| `special_merge_radius_mm` | float | `1.5` | merge radius for the three-pass strategy | `autoflow/algorithms/skeleton.py` |
+| `separate_special_label_contacts` | bool | `True` | contact-separation gate used when `special_handling=contact_surface` | `autoflow/algorithms/preprocess.py` |
 | `special_contact_labels` | list[str] | `["RBCT", "CCA", "LBCT"]` | names of labels whose pairwise contacts are separated | `autoflow/core/models.py` |
 | `min_cc_volume` | float | `50.0` | absolute component threshold in mm^3 | `autoflow/algorithms/preprocess.py` |
 | `cc_filter_mode` | string | `hybrid` | choose `absolute`, `relative`, `hybrid`, or `largest` component filtering | `autoflow/algorithms/preprocess.py` |
 | `cc_rel_min_ratio` | float | `0.01` | relative threshold against the largest component for `relative` and `hybrid` filtering | `autoflow/algorithms/preprocess.py` |
+| `min_edge_points` | int | `3` | minimum graph edge segments in a terminal branch; shorter branches are removed during graph generation | `autoflow/algorithms/graph.py` |
 | `seed_ratio` | float | `0.1` | streamline seed density | `autoflow/algorithms/streamlines.py` |
 | `max_steps` | int | `200` | streamline integration steps | `autoflow/algorithms/streamlines.py` |
 | `tube_radius` | float | `0.05` | streamline tube radius in mm | `autoflow/rendering/videos.py` |

@@ -40,7 +40,24 @@ gui = [
   "nibabel",
 ]
 labeler = [
-  "spatiotemporal-labeler @ git+https://github.com/AssociatedPrimeIdeal/SpatioTemporalLabeler.git@b1301f249645cf4c0e885d08388887ba5482ba0e",
+  "spatiotemporal-labeler @ git+https://github.com/AssociatedPrimeIdeal/SpatioTemporalLabeler.git@da9fd467264df9cc432f8222f82e175e5a89b641",
+]
+pu = [
+  "pudipflow @ git+https://github.com/AssociatedPrimeIdeal/PUDIP-Flow.git@1b2b97e7344ee25cac3a2dd0c46513650b94d39e",
+  "gustflow @ git+https://github.com/AssociatedPrimeIdeal/GUST-Flow.git@e68d90deb083a6fdf772fdc7cdcbe8dc71370c25 ; python_version >= '3.10'",
+]
+all = [
+  "mkdocs-material>=9.5,<10",
+  "pytest",
+  "PySide6>=6.6",
+  "pyqtgraph>=0.13",
+  "pyvistaqt",
+  "matplotlib",
+  "nnunetv2==2.5.2",
+  "nibabel",
+  "spatiotemporal-labeler @ git+https://github.com/AssociatedPrimeIdeal/SpatioTemporalLabeler.git@da9fd467264df9cc432f8222f82e175e5a89b641",
+  "pudipflow @ git+https://github.com/AssociatedPrimeIdeal/PUDIP-Flow.git@1b2b97e7344ee25cac3a2dd0c46513650b94d39e",
+  "gustflow @ git+https://github.com/AssociatedPrimeIdeal/GUST-Flow.git@e68d90deb083a6fdf772fdc7cdcbe8dc71370c25 ; python_version >= '3.10'",
 ]
 [project.scripts]
 autoflow-run = "autoflow.cli:main"

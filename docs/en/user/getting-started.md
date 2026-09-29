@@ -12,6 +12,8 @@
 pip install -e ".[gui,test]"
 ```
 
+需要 PUDIP-Flow 和 GUST-Flow 时使用 `pip install -e ".[gui,test,pu]"`；要安装所有可选组件，使用 `pip install -e ".[all]"`。
+
 只做 CLI 批处理时可以使用：
 
 ```bash

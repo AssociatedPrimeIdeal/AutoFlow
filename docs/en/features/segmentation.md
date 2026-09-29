@@ -4,7 +4,7 @@
 
 | Entry point | Status | Notes |
 | --- | --- | --- |
-| GUI | Supported | original, imported, threshold, auto, and external Labeler review flows |
+| GUI | Supported | 3D/4D nnUNet generation plus original/imported review and external Labeler flows; threshold generation is not exposed in the GUI |
 | CLI | Supported | `--autoseg` only runs when no segmentation is already loaded |
 | Python API | Partial | supported through `AutoFlowConfig` and workspace state, not a standalone high-level editing API |
 
@@ -21,7 +21,7 @@ Segmentation gives AutoFlow the lumen mask needed for skeletons, graphs, planes,
 ## When To Use It
 - use it whenever the input has no usable vessel mask
 - use imported segmentation when the mask already exists externally
-- use threshold segmentation for quick mask generation from `mag`, `pcmra`, or `pcmra_std`
+- use the GUI's 3D or 4D nnUNet mode when generating a model segmentation
 - use automatic segmentation when nnUNet is available and you want the result cached back into the source H5 for reuse
 - do not expect fake TKE reconstruction from segmentation alone
 
@@ -30,13 +30,13 @@ Segmentation gives AutoFlow the lumen mask needed for skeletons, graphs, planes,
 ### GUI
 1. load a case
 2. open the `Segmentation` workflow stage; loading never starts automatic segmentation
-3. use `Source -> Configure...` to choose `input`, `threshold`, or `auto`; automatic mode offers `4D temporal (nnUNet4D)` and `3D static + time broadcast (nnUNet)`, with backend-specific model defaults
-4. click `Run Automatic Segmentation` to start nnUNet after confirming the settings
+3. in the `Segmentation Parameters` panel, choose `3D` or `4D`, then set the model path, checkpoint, folds, device, and label map
+4. click `Run Automatic Segmentation` to start nnUNet
 5. wait for the auto-segmentation progress dialog to finish
 6. click `Open in SpatioTemporal Labeler`; AutoFlow exports six exchange files one feature per progress step and opens the separately installed GPL-3.0 editor
 7. in Labeler, save `segmentation.nii` with `Ctrl+S` before closing; AutoFlow detects the changed file and offers to apply it as the imported segmentation source
 
-The right dock opens on `Segmentation`. Its first `Source` section contains active-source switching, visibility, opacity, provenance, `Configure...`, `Import...`, and `Save...`; its `Edit` section contains the explicit `Run Automatic Segmentation` command. The top menu bar does not duplicate these commands in a separate `Segmentation` menu.
+The right dock opens on `Segmentation`. Its first `Source` section contains active-source switching, visibility, opacity, provenance, `Import...`, and `Save...`; its `Edit` section retains the automatic-run shortcut, review, and cleanup actions. Segmentation generation settings are kept with the other workflow parameters in the main window. The top menu bar does not duplicate these commands in a separate `Segmentation` menu.
 
 The right ortho viewer's `Overlay` slider controls the opacity of the
 segmentation label overlay on the `Content` slices. The 3-D Browser has a
@@ -113,21 +113,20 @@ summary = run_case("case.h5", config=config)
 
 | Parameter | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `mode` | string | `input` | GUI segmentation config | choose `input`, `threshold`, or `auto` | `autoflow/ui/segmentation.py` |
-| `input_source` | string | `original` | GUI segmentation config | choose original or imported source | `autoflow/ui/segmentation.py` |
-| `threshold_scalar` | string | `pcmra` | `configs/segmentation.json` | scalar used for threshold segmentation | `autoflow/algorithms/segmentation.py` |
-| `threshold_value` | object | manual `10%..100%` percent window | `configs/segmentation.json` | threshold mode and values | `autoflow/algorithms/segmentation.py` |
-| `threshold_keep_largest_cc` | bool | `True` | `configs/segmentation.json` | keep largest connected component | `autoflow/algorithms/segmentation.py` |
-| `threshold_min_component_volume_mm3` | float | `0.0` | `configs/segmentation.json` | remove components below threshold | `autoflow/algorithms/segmentation.py` |
-| `threshold_closing` | bool | `True` | `configs/segmentation.json` | morphological closing | `autoflow/algorithms/segmentation.py` |
-| `threshold_opening` | bool | `False` | `configs/segmentation.json` | morphological opening | `autoflow/algorithms/segmentation.py` |
-| `auto_backend` / `--autoseg-backend` | string | `nnUNet4D` in the shipped config | GUI config or CLI/API | automatic backend; `nnUNet4D` consumes temporal channels and returns XYZT labels; choose `nnUNet` for static 3D models | `autoflow/algorithms/segmentation.py` |
-| `auto_model` / `--autoseg-model` | path or `auto` | `auto` | GUI config or CLI/API | `auto` selects Dataset7010 for 3D and Dataset7020 for 4D; explicit 4D values accept a model folder or orchestration `.sh`, while 3D accepts a model folder | `autoflow/algorithms/segmentation.py` |
-| `auto_checkpoint` / `--autoseg-checkpoint` | string or `auto` | `auto` | GUI config or CLI/API | `auto` selects `checkpoint_final.pth` for Dataset7010 and `checkpoint_best.pth` for Dataset7020 | `autoflow/algorithms/segmentation.py` |
-| `auto_folds` / `--autoseg-folds` | string | `single` | GUI config or CLI/API | choose `single`, `all`/`ensemble`, or a comma-separated fold list | `autoflow/algorithms/segmentation.py` |
-| `auto_device` / `--autoseg-device` | string | `auto` | GUI config or CLI/API | choose the inference device; CUDA also enables GPU input and probability-export resampling by default | `autoflow/algorithms/segmentation.py` |
-| `auto_label_map` / `--autoseg-label-map` | JSON | empty | GUI config or CLI/API | remap predicted labels | `autoflow/algorithms/segmentation.py` |
-| `AUTOFLOW_NNUNET4D_GROUPED` | environment string | `auto` | process environment | use one common crop and shared resampling for all temporal samples; set `0` to force the standard subprocess path or `1` to fail instead of falling back | `autoflow/algorithms/segmentation.py` |
+| `mode` | string | `auto` | workspace/API | internal source mode; the GUI's Mode selector chooses `auto_backend` | `autoflow/core/models.py` |
+| `threshold_scalar` | string | `pcmra` | configs/API | scalar used by the non-GUI threshold backend | `autoflow/algorithms/segmentation.py` |
+| `threshold_value` | object | manual `10%..100%` percent window | `configs/segmentation.json` or API | threshold mode and values for the non-GUI backend | `autoflow/algorithms/segmentation.py` |
+| `threshold_keep_largest_cc` | bool | `True` | `configs/segmentation.json` or API | keep largest connected component for the non-GUI backend | `autoflow/algorithms/segmentation.py` |
+| `threshold_min_component_volume_mm3` | float | `0.0` | `configs/segmentation.json` or API | remove components below threshold for the non-GUI backend | `autoflow/algorithms/segmentation.py` |
+| `threshold_closing` | bool | `True` | `configs/segmentation.json` or API | morphological closing for the non-GUI backend | `autoflow/algorithms/segmentation.py` |
+| `threshold_opening` | bool | `False` | `configs/segmentation.json` or API | morphological opening for the non-GUI backend | `autoflow/algorithms/segmentation.py` |
+| `auto_backend` / `--autoseg-backend` | string | `nnUNet4D` in the shipped config | Segmentation Parameters panel or CLI/API | automatic backend; `nnUNet4D` consumes temporal channels and returns XYZT labels; choose `nnUNet` for static 3D models | `autoflow/ui/app.py`, `autoflow/algorithms/segmentation.py` |
+| `auto_model` / `--autoseg-model` | path or `auto` | `auto` | Segmentation Parameters panel or CLI/API | GUI presets expose the detected Dataset7010 3D or Dataset7020 4D model; `auto` selects the backend-specific default; explicit 4D values also accept an orchestration `.sh`, while 3D accepts a model folder | `autoflow/algorithms/segmentation.py`, `autoflow/ui/app.py` |
+| `auto_checkpoint` / `--autoseg-checkpoint` | string or `auto` | `auto` | Segmentation Parameters panel or CLI/API | `auto` selects `checkpoint_final.pth` for Dataset7010 and `checkpoint_best.pth` for Dataset7020 | `autoflow/ui/app.py`, `autoflow/algorithms/segmentation.py` |
+| `auto_folds` / `--autoseg-folds` | string | `single` | Segmentation Parameters panel or CLI/API | choose `single`, `all`/`ensemble`, or a comma-separated fold list | `autoflow/ui/app.py`, `autoflow/algorithms/segmentation.py` |
+| `auto_device` / `--autoseg-device` | string | `auto` | Segmentation Parameters panel or CLI/API | choose the inference device; CUDA also enables GPU input and probability-export resampling by default | `autoflow/ui/app.py`, `autoflow/algorithms/segmentation.py` |
+| `auto_label_map` / `--autoseg-label-map` | JSON | empty | Segmentation Parameters panel or CLI/API | remap predicted labels | `autoflow/ui/app.py`, `autoflow/algorithms/segmentation.py` |
+| `AUTOFLOW_NNUNET4D_GROUPED` | environment string | `auto` | process environment | control grouped in-process temporal preprocessing; `0`/`false`/`subprocess` forces the standard subprocess path, while `1` enables grouped mode (the GUI overrides this to stay isolated) | `autoflow/algorithms/segmentation.py` |
 | `AUTOFLOW_NNUNET_GPU_PREPROCESSING` | environment string | `cuda` | process environment | GPU input resampling is the default when inference uses CUDA; use `0`, `false`, `off`, or `cpu` to keep nnUNet input resampling on CPU | `autoflow/algorithms/segmentation.py` |
 | `cleanup_4d_components` | bool | `False` | Segmentation dock / workspace | enable per-label, per-frame connected-component cleanup before majority voting | `autoflow/core/models.py`, `autoflow/algorithms/preprocess.py` |
 | `cleanup_4d_mode` | string | `absolute` | Segmentation dock / workspace | remove below volume or keep largest per label and frame | `autoflow/algorithms/preprocess.py` |
@@ -160,7 +159,7 @@ summary = run_case("case.h5", config=config)
 - when inference uses CUDA, AutoFlow creates a temporary model plan that uses nnUNet's `resample_torch_fornnunet` implementation for floating-point input channels; the source model and its `plans.json` are not modified
 - CUDA input and prediction-probability resampling use nnUNet's linear torch interpolation instead of the default cubic SciPy interpolation; label export remains unchanged
 - if the CUDA resampling prediction attempt fails, AutoFlow automatically retries once with the unmodified model plan and CPU input resampling; provenance records the requested and actual preprocessing devices and the fallback reason
-- `nnUNet4D` writes all cardiac phases and loads the model once per case. With grouped preprocessing enabled, temporal source maps are resampled once per case and reused by every phase; if the external grouped helper is unavailable, AutoFlow falls back to the standard nnUNet subprocess and records the reason in provenance
+- `nnUNet4D` writes all cardiac phases and loads the model once per case. The GUI explicitly runs nnUNet in an isolated subprocess so a native CUDA failure cannot terminate the Qt application. Set `AUTOFLOW_NNUNET4D_GROUPED=1` (or pass `grouped_preprocessing=True` from a controlled Python job) to use grouped in-process preprocessing outside the GUI; if that helper is unavailable, AutoFlow falls back to the standard subprocess and records the reason in provenance
 - the supplied `run_7020_4d_full_ssd_20260824.sh` is a training/batch orchestration script. AutoFlow parses its Dataset7020 result location when used as `--autoseg-model`; it does not rerun training during a case analysis
 - when that script contains an existing `PYTHON_BIN` executable, AutoFlow uses it for the nnUNet subprocess so the custom Dataset7020 trainer/resampler remains importable; otherwise it uses the active AutoFlow Python environment
 - `auto_folds=all` delegates fold averaging to nnUNet. Use `single` while validating a checkpoint, then switch to `all` when `fold_0`...`fold_4` are present
@@ -175,14 +174,14 @@ summary = run_case("case.h5", config=config)
 - the exchange directory is stable for a loaded case. When its source path, geometry, and frame count still match, the saved feature files and `segmentation.nii` are reused on the next open so Labeler edits remain available
 - the export progress dialog has one step each for `mag`, `flow_x`, `flow_y`, `flow_z`, `pcmra`, and `segmentation`; export intentionally runs in the GUI thread
 - automatic re-import requires saving the original `segmentation.nii` in Labeler; `Save As` to another directory requires the normal `Import...` action
-- the pinned upstream source is available as the `third_party/SpatioTemporalLabeler` git submodule; install the integration only with `pip install .[gui,labeler]`
+- the pinned upstream `v0.4.7` source is available as the `third_party/SpatioTemporalLabeler` git submodule; install the integration only with `pip install .[gui,labeler]`
 
 ## Where To Change Code
 
 | Change you want | Edit here | Also check | Tests |
 | --- | --- | --- | --- |
 | add a new segmentation source | `autoflow/core/models.py`, `autoflow/ui/app.py` | `autoflow/ui/segmentation.py`, `autoflow/algorithms/segmentation.py` | `tests/test_smoke_phantoms.py` |
-| change threshold behavior | `autoflow/algorithms/segmentation.py` | `autoflow/ui/segmentation.py` | `tests/test_smoke_phantoms.py` |
+| change threshold behavior | `autoflow/algorithms/segmentation.py`, `autoflow/ui/app.py` | `autoflow/core/models.py` | `tests/test_smoke_phantoms.py` |
 | change nnUNet auto segmentation | `autoflow/algorithms/segmentation.py` | `autoflow/processing.py`, `autoflow/ui/app.py` | manual verification plus smoke and phantom regression only |
 | change segmentation dock behavior | `autoflow/ui/segmentation.py`, `autoflow/ui/app.py` | `autoflow/core/models.py` | `tests/test_smoke_phantoms.py` |
 | change external editor exchange | `autoflow/algorithms/segmentation.py`, `autoflow/ui/app.py` | `autoflow/ui/segmentation.py` | NIfTI round-trip plus GUI manual verification |

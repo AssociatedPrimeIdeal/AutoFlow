@@ -18,13 +18,23 @@ For grouped multi-label segmentations, AutoFlow now:
 3. merges labels into configured groups from `configs/labels.json`
 4. filters grouped components with the configured connected-component rule, which defaults to `hybrid = max(min_cc_volume_mm3, cc_rel_min_ratio * largest_component_volume_mm3)`
 5. applies per-group preprocessing
-6. skeletonizes each group separately
+6. applies the configured special-label handling for groups containing at least two special labels
+7. skeletonizes each group separately
+
+`special_handling` selects the special-label strategy. `three_pass_merge` (the
+default) skeletonizes `A+B`, `A+C`, and so on, then merges nearby points.
+`contact_surface` keeps the previous contact-surface separation algorithm.
 
 Graph paths derived from the skeleton are split at graph nodes with degree
 `>= 3`, so fork existence does not depend on noisy or locally ambiguous flow
 directions. Flow is sampled on the segmentation-filtered path geometry to
 orient each path and assign incoming/outgoing roles after topology has been
 established.
+
+During graph generation, terminal branches shorter than `min_edge_points` graph
+edge segments are removed. The default is `3`; set it to `0` or `1` to disable
+this cleanup. This filters graph edges and derived paths while leaving the
+original skeleton mask and points available for inspection.
 
 ## When to use it
 - use it after segmentation is available
@@ -72,11 +82,14 @@ summary = run_case("case.h5", config=AutoFlowConfig(output_dir="./results/case")
 | Parameter | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
 | `remove_small_cc` | bool | `True` | `configs/skeleton.json` | remove small connected components before grouped preprocessing | `autoflow/core/models.py` |
-| `separate_special_label_contacts` | bool | `True` | `configs/skeleton.json`, GUI skeleton parameters, CLI `--separate-special-label-contacts` | separates contacts only between the configured special labels (default: `RBCT`, `CCA`, `LBCT`) | `autoflow/algorithms/preprocess.py` |
+| `special_handling` | string | `three_pass_merge` | `configs/skeleton.json`, `configs/labels.json` group override, GUI `Special Handling`, CLI `--special-handling` | choose `three_pass_merge` or `contact_surface` for groups with at least two configured special labels | `autoflow/core/pipeline.py`, `autoflow/algorithms/skeleton.py` |
+| `special_merge_radius_mm` | float | `1.5` | `configs/skeleton.json`, `configs/labels.json` group override | merge radius for nearby points in the three-pass strategy | `autoflow/algorithms/skeleton.py` |
+| `separate_special_label_contacts` | bool | `True` | `configs/skeleton.json`, Python API, CLI legacy flag | contact-separation gate used when `special_handling=contact_surface` | `autoflow/algorithms/preprocess.py` |
 | `special_contact_labels` | list[str] | `["RBCT", "CCA", "LBCT"]` | `configs/skeleton.json` | names of labels whose pairwise contacts are cut; all other label pairs are untouched | `autoflow/core/models.py` |
 | `min_cc_volume_mm3` | float | `50.0` | `configs/skeleton.json` | component-volume threshold | `autoflow/core/models.py` |
 | `cc_filter_mode` | string | `hybrid` | `configs/skeleton.json` | choose `absolute`, `relative`, `hybrid`, or `largest` connected-component filtering | `autoflow/core/models.py` |
 | `cc_rel_min_ratio` | float | `0.01` | `configs/skeleton.json` | relative threshold against the largest connected component for `relative` and `hybrid` filtering | `autoflow/core/models.py` |
+| `min_edge_points` | int | `3` | `configs/skeleton.json`, group preprocess override, GUI `Minimum Edge Count`, CLI `--min-edge-points` | remove terminal graph branches with fewer than this many edge segments; `0` or `1` disables the filter | `autoflow/algorithms/graph.py`, `autoflow/core/pipeline.py` |
 | `do_closing` | bool | `True` | `configs/skeleton.json` | global closing before skeletonization | `autoflow/algorithms/preprocess.py` |
 | `do_opening` | bool | `False` | `configs/skeleton.json` | global opening before skeletonization | `autoflow/algorithms/preprocess.py` |
 | `gaussian_sigma` | float | `0.5` | `configs/skeleton.json` | global smoothing strength | `autoflow/algorithms/preprocess.py` |
@@ -110,6 +123,7 @@ score.
 | --- | --- | --- | --- |
 | preprocessing before skeletonization | `autoflow/algorithms/preprocess.py` | `autoflow/core/models.py`, `autoflow/config.py` | `tests/test_smoke_phantoms.py` |
 | grouped skeleton pipeline flow | `autoflow/core/pipeline.py` | `autoflow/algorithms/skeleton.py` | `tests/test_smoke_phantoms.py` |
+| short terminal branch cleanup | `autoflow/algorithms/graph.py` | `autoflow/core/pipeline.py`, `autoflow/core/models.py` | `tests/test_smoke_phantoms.py` |
 | graph fork detection and flow-based path orientation | `autoflow/algorithms/branch.py`, `autoflow/algorithms/planes.py` | `autoflow/core/pipeline.py` | `tests/test_smoke_phantoms.py` |
 | interactive skeleton edit behavior | `autoflow/ui/app.py`, `autoflow/ui/editors.py` | `autoflow/core/pipeline.py` | GUI manual verification |
 
@@ -124,5 +138,5 @@ score.
 | grouped skeleton is listed in the browser but absent from the 3D view | an older viewer did not resolve grouped `skeleton_<group>` data keys | install the current editable build and run `Generate Skeleton` again |
 | skeleton contains many small branches | noisy segmentation | raise cleanup thresholds or improve segmentation |
 | one grouped vessel disappears | every component in that group fell below the active cleanup threshold | lower `min_cc_volume_mm3` or `cc_rel_min_ratio`, or improve the segmentation |
-| two special labels remain joined | contact separation is disabled or the labels are absent from `special_contact_labels` | enable `separate_special_label_contacts` and check the configured list; all non-special labels are intentionally left unchanged |
+| special-label result is unexpected | the selected strategy or special-label list does not match the group | set `special_handling` to `three_pass_merge` or `contact_surface`, then check `special_contact_labels` |
 | `Edit Skeleton` is unavailable | more than one segmentation group is active | use a single-group case or simplify `configs/labels.json` |

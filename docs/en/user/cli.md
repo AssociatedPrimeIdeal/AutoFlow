@@ -118,7 +118,7 @@ Phase unwrapping is opt-in and disabled by default. For single-VENC wrapped phas
 autoflow-run ./data/demo_data.h5 --phase-unwrap-method lap4D --phase-unwrap-device auto
 ```
 
-Choose `gc3D`, `lap4D`, or `nprs`; add `--phase-unwrap-mask all` to ignore the segmentation mask. `lap4D` uses CUDA FFT, `nprs` uses CUDA for Fourier resampling while retaining the CPU reliability solver, and `gc3D` uses CUDA only for graph construction. Dual-VENC inputs report a skip.
+Choose `gc3D`, `lap4D`, `nprs`, `pudip`, or `gust`; use `--phase-unwrap-mask segmask` or `--phase-unwrap-mask pcmra_std` for the learned-backend weight/initialization source. The `pudip` and `gust` choices use the corresponding git submodules and require their optional dependencies. Dual-VENC inputs report a skip.
 
 ```bash
 autoflow-run ./data/demo_data.h5 \
@@ -166,6 +166,11 @@ Behavior details:
 - each selected stage and each rendered video writes elapsed seconds into `summary.json`
 
 ## Parameter Tables
+
+Use `--min-edge-points N` (alias `--min-edge-count N`) to control short
+terminal-branch cleanup. The default `N=3` removes endpoint spurs shorter than
+three graph edge segments; `0` or `1` disables this filter. The same setting is
+available as `skeleton.min_edge_points` in `configs/skeleton.json`.
 
 ### Input and output
 
@@ -253,10 +258,12 @@ WSS, TKE, and pressure-analysis compute defaults are now split by metric:
 | CLI flag | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
 | `--remove-small-cc` | bool | `True` in config defaults | `configs/skeleton.json` | remove small connected components before skeletonization | `autoflow/algorithms/preprocess.py` |
+| `--special-handling {three_pass_merge,contact_surface}` | string | `three_pass_merge` | `configs/skeleton.json` | select the three-pass merge or legacy contact-surface handling for configured special-label groups | `autoflow/core/pipeline.py` |
 | `--separate-special-label-contacts` / `--no-separate-special-label-contacts` | bool | `True` | `configs/skeleton.json` | enable/disable contact separation for the configured special labels (default: `RBCT`, `CCA`, `LBCT`) | `autoflow/algorithms/preprocess.py` |
 | `--min-cc-volume` | float mm^3 | `50.0` | `configs/skeleton.json` | component-volume threshold | `autoflow/algorithms/preprocess.py` |
 | `--cc-filter-mode` | string | `hybrid` | `configs/skeleton.json` | choose `absolute`, `relative`, `hybrid`, or `largest` component filtering | `autoflow/algorithms/preprocess.py` |
 | `--cc-rel-min-ratio` | float | `0.01` | `configs/skeleton.json` | relative threshold against the largest component for `relative` and `hybrid` filtering | `autoflow/algorithms/preprocess.py` |
+| `--min-edge-points` / `--min-edge-count` | int | `3` | `configs/skeleton.json` | remove terminal graph branches shorter than this edge count; `0` or `1` disables the filter | `autoflow/algorithms/graph.py` |
 
 ### Streamlines and pathline styling
 

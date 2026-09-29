@@ -111,11 +111,19 @@ class PreprocessParams:
 @dataclass
 class SkeletonParams:
     remove_small_cc: bool = False
+    # How a configured special-label group is prepared before skeletonization.
+    # ``three_pass_merge`` is the default experiment requested for the aortic
+    # branches; ``contact_surface`` retains the previous contact-cutting path.
+    special_handling: str = "three_pass_merge"
+    special_merge_radius_mm: float = 1.5
     separate_special_label_contacts: bool = True
     special_contact_labels: List[str] = field(default_factory=lambda: ["RBCT", "CCA", "LBCT"])
     min_cc_volume_mm3: float = 50.0
     cc_filter_mode: str = "hybrid"
     cc_rel_min_ratio: float = 0.01
+    # Minimum number of graph edge segments retained in a terminal branch.
+    # Short endpoint-to-junction spurs are removed during graph generation.
+    min_edge_points: int = 3
     do_closing: bool = True
     do_opening: bool = False
     gaussian_sigma: float = 0.5
@@ -133,11 +141,14 @@ class SkeletonParams:
     def to_dict(self):
         return {
             "remove_small_cc": self.remove_small_cc,
+            "special_handling": str(self.special_handling or "three_pass_merge"),
+            "special_merge_radius_mm": float(self.special_merge_radius_mm),
             "separate_special_label_contacts": self.separate_special_label_contacts,
             "special_contact_labels": [str(value) for value in self.special_contact_labels],
             "min_cc_volume_mm3": self.min_cc_volume_mm3,
             "cc_filter_mode": str(self.cc_filter_mode),
             "cc_rel_min_ratio": float(self.cc_rel_min_ratio),
+            "min_edge_points": int(self.min_edge_points),
             "do_closing": self.do_closing,
             "do_opening": self.do_opening,
             "gaussian_sigma": self.gaussian_sigma,
@@ -194,13 +205,29 @@ class SkeletonParams:
         special_labels = [str(value).strip() for value in raw_special_labels if str(value).strip()]
         # Accept the pre-rename key when opening an older workspace/config.
         separate_special = payload.get("separate_special_label_contacts", payload.get("separate_label_contacts", True))
+        raw_special_handling = str(payload.get("special_handling", "three_pass_merge") or "three_pass_merge").strip().lower().replace("-", "_")
+        special_handling_aliases = {
+            "three_pass": "three_pass_merge",
+            "three_pass_merge": "three_pass_merge",
+            "contact": "contact_surface",
+            "contact_surface": "contact_surface",
+        }
+        special_handling = special_handling_aliases.get(raw_special_handling)
+        if special_handling is None:
+            raise ValueError(
+                "special_handling must be one of 'three_pass_merge' or 'contact_surface', "
+                f"got {raw_special_handling!r}"
+            )
         return SkeletonParams(
             remove_small_cc=bool(payload.get("remove_small_cc", False)),
+            special_handling=special_handling,
+            special_merge_radius_mm=max(0.0, float(payload.get("special_merge_radius_mm", 1.5))),
             separate_special_label_contacts=bool(separate_special),
             special_contact_labels=special_labels,
             min_cc_volume_mm3=float(payload.get("min_cc_volume_mm3", 50.0)),
             cc_filter_mode=str(payload.get("cc_filter_mode", "hybrid") or "hybrid"),
             cc_rel_min_ratio=float(payload.get("cc_rel_min_ratio", 0.01)),
+            min_edge_points=max(0, int(payload.get("min_edge_points", payload.get("min_edge_count", 3)) or 0)),
             do_closing=bool(payload.get("do_closing", True)),
             do_opening=bool(payload.get("do_opening", False)),
             gaussian_sigma=float(payload.get("gaussian_sigma", 0.5)),
@@ -242,13 +269,28 @@ class SkeletonParams:
     def params_for_group(self, group_name):
         cfg = self.label_groups.get(str(group_name), {})
         overrides = cfg.get("preprocess", {}) if isinstance(cfg.get("preprocess", {}), dict) else {}
+        overrides = dict(overrides)
+        # Allow the special strategy to be written directly on a label-group
+        # entry as well as inside its general preprocess mapping.
+        for key in (
+            "special_handling",
+            "special_merge_radius_mm",
+            "separate_special_label_contacts",
+            "special_contact_labels",
+            "min_edge_points",
+        ):
+            if key in cfg and key not in overrides:
+                overrides[key] = cfg[key]
         params = SkeletonParams(
             remove_small_cc=self.remove_small_cc,
+            special_handling=self.special_handling,
+            special_merge_radius_mm=self.special_merge_radius_mm,
             separate_special_label_contacts=self.separate_special_label_contacts,
             special_contact_labels=list(self.special_contact_labels),
             min_cc_volume_mm3=self.min_cc_volume_mm3,
             cc_filter_mode=self.cc_filter_mode,
             cc_rel_min_ratio=self.cc_rel_min_ratio,
+            min_edge_points=self.min_edge_points,
             do_closing=self.do_closing,
             do_opening=self.do_opening,
             gaussian_sigma=self.gaussian_sigma,
@@ -260,11 +302,14 @@ class SkeletonParams:
         )
         for key in [
             "remove_small_cc",
+            "special_handling",
+            "special_merge_radius_mm",
             "separate_special_label_contacts",
             "special_contact_labels",
             "min_cc_volume_mm3",
             "cc_filter_mode",
             "cc_rel_min_ratio",
+            "min_edge_points",
             "do_closing",
             "do_opening",
             "gaussian_sigma",
@@ -276,6 +321,18 @@ class SkeletonParams:
         ]:
             if key in overrides and overrides.get(key) is not None:
                 setattr(params, key, overrides.get(key))
+        params.special_handling = str(params.special_handling or "three_pass_merge").strip().lower().replace("-", "_")
+        if params.special_handling == "three_pass":
+            params.special_handling = "three_pass_merge"
+        elif params.special_handling == "contact":
+            params.special_handling = "contact_surface"
+        if params.special_handling not in {"three_pass_merge", "contact_surface"}:
+            raise ValueError(
+                "special_handling must be one of 'three_pass_merge' or 'contact_surface', "
+                f"got {params.special_handling!r}"
+            )
+        params.special_merge_radius_mm = max(0.0, float(params.special_merge_radius_mm))
+        params.min_edge_points = max(0, int(params.min_edge_points))
         # Group-level configs written before the rename remain readable.
         if "separate_special_label_contacts" not in overrides and "separate_label_contacts" in overrides:
             params.separate_special_label_contacts = bool(overrides.get("separate_label_contacts"))

@@ -113,7 +113,7 @@ Input also provides `Reload Input with Current Parameters`. An unchanged input s
 
 | Menu item | What it does | Main code |
 | --- | --- | --- |
-| `Open H5` | open an H5 or HDF5 case; prompts for a data-group path when one file contains multiple supported cases, then reuses a compatible correction cache when available | `autoflow/ui/app.py` |
+| `Open H5` | open an H5 or HDF5 case; prompts for a data-group path when one file contains multiple supported cases, asks for `LV`, `HV`, or `DV` for legacy dual-VENC data, then reuses a compatible correction cache when available | `autoflow/ui/app.py`, `autoflow/ui/dicom_confirm.py` |
 | `Import DICOM Directory` | scan a DICOM directory and choose a case | `autoflow/ui/app.py`, `autoflow/ui/dicom_confirm.py` |
 | `Clear Workspace` | clear loaded data and restore config defaults in the UI | `autoflow/ui/app.py` |
 | `Exit` | close the GUI | `autoflow/ui/app.py` |
@@ -137,12 +137,12 @@ Input also provides `Reload Input with Current Parameters`. An unchanged input s
 ## Standard Workflow
 
 1. start the GUI
-2. load a case through `Open H5` or `Import DICOM Directory`
+2. load a case through `Open H5` or `Import DICOM Directory`; when `Open H5` detects a legacy dual-VENC case, choose `LV`, `HV`, or `DV` in the source-selection dialog before the correction prompt
 3. for H5, the GUI uses an existing correction cache and embedded segmentation directly; when correction is missing, it first asks whether correction is needed and then shows a method dropdown with `MSAC` and `WRLS + ARTO`
 4. for DICOM, confirm or edit resolution, venc, spatial order, venc order, and RR
 5. check loader parameters in `Input / Background Correction`, including dual-venc ratios for legacy `Nv=7` H5 when needed
 6. in the `Segmentation` workflow stage, configure nnUNet if needed and click `Run Automatic Segmentation` explicitly
-7. optionally open `Phase Unwrapping`, choose `gc3D`, `lap4D`, or `nprs`, and click `Unwrap Phase`; method-specific parameters appear for the selected method and dual-VENC inputs are skipped automatically
+7. optionally open `Phase Unwrapping`, which defaults to `lap4D`, choose `gc3D`, `lap4D`, `nprs`, `pudip`, or `gust`, select `segmask` or `PCMRAStd` for learned-backend weighting/initialization, and click `Unwrap Phase`; method-specific parameters appear for the selected method and `DV` dual-VENC inputs are skipped automatically
 8. if phase unwrapping ran, inspect `Estimated Wrap Locations`, `Phase Wrap Count`, and the `Unwrapped − Wrapped` views to see where wraps were detected
 9. if the segmentation is a label mask, AutoFlow will reduce 4D labels to 3D by time majority vote, remove small connected components per label, merge labels by configured groups, filter grouped components with the configured skeleton cleanup rule, and then run grouped skeleton, graph, and plane generation
 10. move through the workflow stages and run the actions shown for the current stage; `Run All` is limited to the active stage
@@ -188,7 +188,8 @@ datasets. Progress still advances once per completed plane.
 | Panel | Main purpose | Main code |
 | --- | --- | --- |
 | `Input / Background Correction` | loader and DICOM settings, including the active `MSAC` or `WRLS + ARTO` correction method | `autoflow/ui/app.py`, `autoflow/config.py` |
-| `Generate Skeleton Parameters` | cleanup and morphology controls, including the `Separate Special Label Contacts` switch for `RBCT`/`CCA`/`LBCT` contacts | `autoflow/ui/app.py`, `autoflow/config.py`, `autoflow/algorithms/preprocess.py` |
+| `Segmentation Parameters` | choose 3D or 4D automatic segmentation and configure its model path, checkpoint, folds, device, and label map | `autoflow/ui/app.py`, `autoflow/core/models.py`, `autoflow/algorithms/segmentation.py` |
+| `Generate Skeleton Parameters` | cleanup and morphology controls, including `Special Handling`, `Minimum Edge Count`, and the `Separate Special Label Contacts` switch for `RBCT`/`CCA`/`LBCT` contacts | `autoflow/ui/app.py`, `autoflow/config.py`, `autoflow/algorithms/graph.py` |
 | `Generate Planes Parameters` | uniform/fixed-step layout, segmentation filter, and advanced trim controls | `autoflow/ui/app.py` |
 | `PWV Parameters` | edit groups, waveform selection, spacing, and plot styling | `autoflow/ui/app.py` |
 | `Streamline Parameters` | seed density, steps, terminal speed, colors | `autoflow/ui/app.py` |
@@ -206,9 +207,11 @@ The GUI segmentation system supports:
 
 - original segmentation
 - imported segmentation
-- threshold segmentation
-- automatic segmentation through `nnUNet`
+- automatic segmentation through `nnUNet` (3D) or `nnUNet4D` (4D)
 - external segmentation editing through the optional SpatioTemporal Labeler
+
+Threshold segmentation remains available to the non-GUI API and CLI compatibility
+paths; it is not exposed as a GUI segmentation mode.
 
 Important behavior:
 
@@ -217,13 +220,13 @@ Important behavior:
 - opening H5 checks the selected case group before loading: a reusable `corr` cache selects the cached correction method; embedded `segmask`, `segmentation`, or `seg` becomes the initial active source
 - when correction is absent, the GUI asks whether it should run; answering `Yes` opens a second dropdown for `MSAC` or `WRLS + ARTO`, while cancelling either dialog cancels the load
 - input loading never starts or asks to start automatic segmentation
-- the top menu bar has no separate `Segmentation` menu; source switching and segmentation commands are kept in the right-side `Segmentation` dock
-- use `Source -> Configure...` to save automatic-segmentation settings, then click `Run Automatic Segmentation` in the Segmentation dock; `Import...` and `Save...` are beside the source settings
+- the top menu bar has no separate `Segmentation` menu; generation settings and commands are in the `Segmentation` workflow parameter panel, while source review and editing remain in the right-side `Segmentation` dock
+- use the `Segmentation Parameters` panel to choose `3D` or `4D`, choose a detected local model preset or browse to a custom model folder, and set checkpoint, folds, device, and label map; click `Run Automatic Segmentation`. The right-side dock keeps active-source review, import, save, visibility, and label-editing controls
 - an input case's embedded segmentation is activated during loading; click `Run Automatic Segmentation` only when you want to replace it with a new model result
 - `Open in SpatioTemporal Labeler` is available when the optional `labeler` extra is installed; it exports `mag`, three flow components, `pcmra`, and the active segmentation as NIfTI files through a separate editor process
-- the shipped automatic-segmentation settings default to the Dataset7020 `nnUNet4D` script; enter a static model folder and select `nnUNet` when a 3D model is required
-- GUI auto segmentation uses the same window-modal progress dialog as other long-running GUI tasks; closing it hides progress permanently for that run and does not cancel the background worker, while completion still applies the result and failure opens an explicit error dialog
-- automatic and threshold segmentations save sidecar H5 files after a successful run
+- the shipped automatic-segmentation settings default to the local Dataset7020 `nnUNet4D` profile (with the orchestration script as fallback); enter a static model folder and select `nnUNet` when a 3D model is required
+- GUI auto segmentation uses the same window-modal progress dialog as other long-running GUI tasks; nnUNet inference runs in an isolated child process so native CUDA/nnUNet failures are reported in the dialog instead of terminating the Qt GUI. Closing the dialog hides progress permanently for that run and does not cancel the worker, while completion still applies the result and failure opens an explicit error dialog
+- automatic segmentation saves a sidecar H5 file after a successful run
 - automatic segmentation also saves the predicted segmentation NIfTI plus the feature-channel NIfTI inputs used for that run
 - the Labeler export dialog advances once for `mag`, `flow_x`, `flow_y`, `flow_z`, `pcmra`, and `segmentation`; files are uncompressed `.nii` for faster exchange
 - save the original `segmentation.nii` in Labeler with `Ctrl+S`; after Labeler exits, AutoFlow detects the changed file and offers to apply it as the `imported` source, preserving the embedded original
@@ -284,7 +287,7 @@ Use `Export > Export Videos...` for interactive offline export.
 - right-clicking an individual grouped pathline in the browser opens `Set Pathline Color`, which changes only that pathline
 - selecting a plane updates selection info, the ortho viewer, and the `Analysis` plane/path views
 - selecting a path shows its segmentation owner in the lower-right `Path` panel (for example, `label=LBCT (id=7)`); this is the label selected by the segmentation filter and does not rename or edit the graph path
-- the right-side dock initially shows `Segmentation`; its first `Source` section provides active-source switching, visibility, opacity, provenance, configuration, import, and save controls
+- the right-side dock initially shows `Segmentation`; its first `Source` section provides active-source switching, visibility, opacity, provenance, import, and save controls. Segmentation generation settings live in the workflow parameter panel
 - `Analysis` initially uses `Plane Curve`, so selecting a plane immediately exposes its available time-resolved metric series
 - `Add Plane` creates a free plane at the current ortho cursor; it can be moved anywhere and is saved with `placement_mode=manual`, so reuse does not project it onto a path
 - `Edit Plane` enables a cyan center handle plus orange and yellow in-plane-axis handles; generated plane centers remain constrained to their path, while manual plane centers are unrestricted

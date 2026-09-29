@@ -29,6 +29,7 @@
 | `auto segmentation requires loaded mag and flow data` | input is missing normalized magnitude or flow | load a supported case with `mag` and `flow` |
 | `bundled default model is missing` | the install predates wheel model packaging or was built without the required local model files | reinstall the current package, or set `--autoseg-model` or the GUI model field explicitly |
 | `unsupported auto segmentation backend` | backend is not `nnUNet` | use `nnUNet` |
+| GUI closes with `Segmentation fault (core dumped)` when starting `nnUNet4D` | an older GUI build ran grouped PyTorch inference inside the Qt process | update the GUI build; current GUI runs nnUNet in an isolated subprocess. As a temporary workaround, launch with `AUTOFLOW_NNUNET4D_GROUPED=0` |
 | nnUNet subprocess fails | missing `nnUNetv2_predict_from_modelfolder`, bad model folder, or invalid checkpoint | verify nnUNet install, model folder, and checkpoint name |
 | nnUNet fails with `numpy.dtype size changed` or another binary-compatibility error | the active GUI environment contains an incompatible nnUNet dependency build | repair the nnUNet dependencies in that environment or launch AutoFlow from a compatible environment; the GUI failure dialog shows the complete traceback and AutoFlow does not switch environments automatically |
 | bundled auto-seg model is not the expected one | an empty model setting selects the model shipped inside the installed `autoflow` package | override with `--autoseg-model` or change the GUI auto model path if you need another trainer |

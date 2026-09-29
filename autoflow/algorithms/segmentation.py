@@ -1214,8 +1214,16 @@ def _nnunet_4d_temporal_radius(channel_names):
     return radius
 
 
-def _nnunet_4d_grouped_requested(runner=None):
-    """Return whether the direct grouped predictor should be attempted."""
+def _nnunet_4d_grouped_requested(runner=None, grouped_preprocessing=None):
+    """Return whether the direct grouped predictor should be attempted.
+
+    The grouped implementation keeps a torch predictor in the caller process.
+    The GUI passes ``grouped_preprocessing=False`` so native CUDA/Qt failures
+    stay inside the nnUNet subprocess.  Other callers retain the environment
+    controlled behavior for backwards compatibility.
+    """
+    if grouped_preprocessing is not None:
+        return bool(grouped_preprocessing) and runner is None
     token = str(os.environ.get("AUTOFLOW_NNUNET4D_GROUPED", "auto") or "auto").strip().lower()
     if token in {"0", "false", "no", "off", "standard", "subprocess"}:
         return False
@@ -1602,6 +1610,7 @@ def generate_nnunet_auto_segmentation(
     artifact_prefix="",
     runner=None,
     progress_callback=None,
+    grouped_preprocessing=None,
 ):
     if str(backend or "").strip().lower() != "nnunet":
         if str(backend or "").strip().lower() in _NNUNET_4D_BACKENDS:
@@ -1621,6 +1630,7 @@ def generate_nnunet_auto_segmentation(
                 artifact_prefix=artifact_prefix,
                 runner=runner,
                 progress_callback=progress_callback,
+                grouped_preprocessing=grouped_preprocessing,
             )
         raise ValueError(f"unsupported auto segmentation backend: {backend}")
 
@@ -1901,6 +1911,7 @@ def generate_nnunet_4d_auto_segmentation(
     artifact_prefix="",
     runner=None,
     progress_callback=None,
+    grouped_preprocessing=None,
 ):
     """Run the Dataset7020 temporal model for every frame in one invocation.
 
@@ -1972,7 +1983,7 @@ def generate_nnunet_4d_auto_segmentation(
         # grouped preprocessing. This keeps custom resampling available when a
         # caller leaves the model setting empty.
         pipeline_script = grouped_script
-    if _nnunet_4d_grouped_requested(runner) and grouped_script:
+    if _nnunet_4d_grouped_requested(runner, grouped_preprocessing) and grouped_script:
         try:
             return _generate_nnunet_4d_grouped(
                 mag_nnunet,

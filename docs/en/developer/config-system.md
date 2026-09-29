@@ -9,7 +9,7 @@ AutoFlow stores repo-level defaults in per-module JSON files and applies them to
 | --- | --- |
 | `configs/batch.json` | output, skip behavior, multithreading, plane reuse |
 | `configs/loader.json` | background phase correction, dual-venc loader ratios, and DICOM read settings |
-| `configs/phase_unwrapping.json` | optional traditional phase-unwrapping method, mask, device, and algorithm parameters |
+| `configs/phase_unwrapping.json` | optional traditional or learned phase-unwrapping method, mask, device, and backend parameters |
 | `configs/skeleton.json` | skeleton cleanup and morphology defaults |
 | `configs/labels.json` | label maps, label groups, browser colors, and per-group preprocessing overrides |
 | `configs/planes.json` | plane generation defaults |
@@ -55,11 +55,14 @@ AutoFlow stores repo-level defaults in per-module JSON files and applies them to
 | Parameter | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
 | `remove_small_cc` | bool | `True` | `configs/skeleton.json` | remove small connected components before grouped preprocessing | `autoflow/core/models.py` |
-| `separate_special_label_contacts` | bool | `True` | `configs/skeleton.json`, GUI, CLI `--separate-special-label-contacts` | separate contacts only between the configured special labels | `autoflow/algorithms/preprocess.py` |
+| `special_handling` | string | `three_pass_merge` | `configs/skeleton.json`, `configs/labels.json` group override, GUI, CLI `--special-handling` | choose `three_pass_merge` or `contact_surface` for groups with at least two configured special labels | `autoflow/core/pipeline.py`, `autoflow/algorithms/skeleton.py` |
+| `special_merge_radius_mm` | float | `1.5` | `configs/skeleton.json`, `configs/labels.json` group override | merge nearby points produced by the three-pass strategy | `autoflow/algorithms/skeleton.py` |
+| `separate_special_label_contacts` | bool | `True` | `configs/skeleton.json`, Python API, CLI legacy flag | contact-separation gate used when `special_handling=contact_surface` | `autoflow/algorithms/preprocess.py` |
 | `special_contact_labels` | list[str] | `["RBCT", "CCA", "LBCT"]` | `configs/skeleton.json` | label names whose pairwise contacts are separated | `autoflow/core/models.py` |
 | `min_cc_volume_mm3` | float | `50.0` | `configs/skeleton.json` | component-volume threshold | `autoflow/core/models.py` |
 | `cc_filter_mode` | string | `hybrid` | `configs/skeleton.json` | choose `absolute`, `relative`, `hybrid`, or `largest` component filtering | `autoflow/core/models.py` |
 | `cc_rel_min_ratio` | float | `0.01` | `configs/skeleton.json` | relative threshold against the largest component for `relative` and `hybrid` filtering | `autoflow/core/models.py` |
+| `min_edge_points` | int | `3` | `configs/skeleton.json` | remove terminal graph branches shorter than this many graph edge segments; `0` or `1` disables the filter | `autoflow/algorithms/graph.py`, `autoflow/core/pipeline.py` |
 | `do_closing` | bool | `True` | `configs/skeleton.json` | morphological closing before skeletonization | `autoflow/algorithms/preprocess.py` |
 | `do_opening` | bool | `False` | `configs/skeleton.json` | morphological opening before skeletonization | `autoflow/algorithms/preprocess.py` |
 | `gaussian_sigma` | float | `0.5` | `configs/skeleton.json` | smoothing strength | `autoflow/algorithms/preprocess.py` |

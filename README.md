@@ -12,7 +12,7 @@ It currently supports:
 - normalized H5 input
 - nested-group H5 input when one case payload lives below the root and loader keys vary by case
 - direct DICOM directory input
-- segmentation from embedded masks, imported masks, thresholding, static nnUNet, and temporal nnUNet4D auto segmentation
+- segmentation from embedded masks, imported masks, CLI/API thresholding, static nnUNet, and temporal nnUNet4D auto segmentation
 - grouped multi-label segmentation with config-driven label maps, per-group preprocessing, and grouped visualization
 - skeleton, graph, branch, path, and plane generation
 - plane metrics, config-driven PWV, WSS, optional TKE, pressure-gradient fields, relative-pressure maps, vortex kinematics (vorticity, Q-criterion, and swirling strength), centerline pressure-drop analysis, streamlines, and GUI pathlines
@@ -43,8 +43,11 @@ git submodule update --init --recursive
 pip install ".[gui,labeler]"
 ```
 
-Normal and editable installs include the bundled nnUNet `dataset.json`, `plans.json`, and final checkpoint as package data. The `gui` extra also installs the nnUNet inference runtime; no separate automatic-segmentation extra or model download is required. The `labeler` extra installs the pinned SpatioTemporal Labeler `v0.4.0` interface; its upstream source remains a separate GPL-3.0 submodule.
+Normal and editable installs include the bundled nnUNet `dataset.json`, `plans.json`, and final checkpoint as package data. The `gui` extra also installs the nnUNet inference runtime; no separate automatic-segmentation extra or model download is required. The `labeler` extra installs the pinned SpatioTemporal Labeler `v0.4.7` interface; its upstream source remains a separate GPL-3.0 submodule.
 The GUI extra does not pin NumPy to the 1.x series; NumPy 2 is supported when the environment's compiled SciPy, scikit-image, h5py, matplotlib, and VTK wheels are mutually compatible.
+The optional `pudip` and `gust` phase-unwrapping backends are checked out as `third_party/PUDIP-Flow` and `third_party/GUST-Flow`; install their package dependencies only when those methods are selected.
+
+`pip install .` installs only the base dependencies. Install the learned phase-unwrapping backends with `pip install ".[pu]"`; install every optional group with `pip install ".[all]"` (or choose a smaller combination such as `.[gui,test,labeler]`).
 
 ## Quick Start
 
@@ -105,7 +108,7 @@ autoflow-gui
 ```
 
 Use `Export > Export Videos...` for interactive selective export of `plane`, `wss`, `tke`, `pg`, and `streamlines` videos.
-The GUI is organized as `Input & QC`, `Segmentation`, `Phase Unwrapping`, `Centerline & Planes`, `Hemodynamics`, and `Review & Export`. Phase unwrapping is optional and dual-VENC inputs skip it automatically. Use the top-level `Settings` menu to configure the display-only 3D axis orientation.
+The GUI is organized as `Input & QC`, `Segmentation`, `Phase Unwrapping`, `Centerline & Planes`, `Hemodynamics`, and `Review & Export`. Phase unwrapping is optional; `DV` dual-VENC inputs skip it automatically, while `LV` and `HV` selections keep their wrapped phase available. The bundled traditional backends are always available, while PUDIP-Flow and GUST-Flow appear after installing `.[pu]`. Use the top-level `Settings` menu to configure the display-only 3D axis orientation.
 The 3-D Browser also provides a phase-resolved 4D PC-MRA volume backdrop and
 per-object opacity controls; the ortho viewer has an independent
 segmentation-overlay opacity slider.

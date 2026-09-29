@@ -13,6 +13,8 @@ from autoflow.algorithms.dicom import collect_input_cases
 from autoflow.algorithms.segmentation import default_nnunet_model_folder
 from autoflow.algorithms.pwv import compute_cross_correlation_delay_ms, detect_waveform_foot_time_ms
 from autoflow.algorithms.preprocess import filter_connected_components, separate_longitudinal_label_contacts
+from autoflow.algorithms.skeleton import generate_three_pass_special_skeleton
+from autoflow.algorithms.graph import remove_short_terminal_branches
 from autoflow.algorithms.metrics import (
     compute_plane_metrics,
     compute_plane_metrics_multithread,
@@ -83,6 +85,50 @@ def test_cvi_style_contour_edit_creates_and_replaces_one_local_arc():
     edited, message = replace_contour_segment(original, open_stroke, 0.35, 1.5)
     assert edited is not None, message
     assert abs(polygon_area(edited)) > abs(polygon_area(original))
+
+
+def test_three_pass_special_skeleton_merges_configured_branch_passes():
+    labels = np.zeros((15, 15, 15), dtype=np.int16)
+    labels[7, 2:12, 7] = 1  # A: shared trunk
+    labels[7, 11:14, 7] = 2  # B
+    labels[7, 8, 8:12] = 3  # C
+    labels[8:12, 8, 7] = 4  # D
+    params = SkeletonParams(
+        remove_small_cc=False,
+        do_closing=False,
+        do_opening=False,
+        gaussian_enabled=False,
+        special_merge_radius_mm=0.5,
+    )
+
+    points, skeleton_mask = generate_three_pass_special_skeleton(
+        labels,
+        group_label_values=[1, 2, 3, 4],
+        special_label_values=[2, 3, 4],
+        params=params,
+        resolution=np.ones(3, dtype=float),
+    )
+
+    assert points.ndim == 2 and points.shape[1] == 3
+    assert len(points) > 0
+    assert skeleton_mask.shape == labels.shape
+    assert bool(np.any(skeleton_mask))
+    assert SkeletonParams.from_dict({}).special_handling == "three_pass_merge"
+    assert SkeletonParams.from_dict({"special_handling": "contact_surface"}).special_handling == "contact_surface"
+
+
+def test_short_terminal_graph_branches_use_minimum_edge_points():
+    points = np.arange(7 * 3, dtype=float).reshape(7, 3)
+    graph = GraphData(
+        points=points,
+        edges=np.asarray([[0, 1], [1, 2], [2, 3], [0, 4], [0, 5], [5, 6]], dtype=int),
+    )
+
+    filtered = remove_short_terminal_branches(graph, min_edge_points=3)
+    assert {tuple(edge) for edge in filtered.edges.tolist()} == {(0, 1), (1, 2), (2, 3)}
+    assert SkeletonParams.from_dict({}).min_edge_points == 3
+    assert SkeletonParams.from_dict({"min_edge_points": 0}).min_edge_points == 0
+    assert SkeletonParams.from_dict({"min_edge_count": 4}).min_edge_points == 4
 
 
 def test_separate_longitudinal_label_contacts_preserves_end_to_end_transition():
@@ -841,6 +887,38 @@ def test_load_h5_data_orders_dual_venc_channel_groups_by_venc(tmp_path):
     assert np.allclose(loaded.venc, high_venc)
     assert loaded.metadata["dual_venc"]["lv_channel_indices"] == [4, 5, 6]
     assert loaded.metadata["dual_venc"]["hv_channel_indices"] == [1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_venc", "expected_velocity"),
+    [
+        ("lv", 50.0, [20.0, -10.0, 5.0]),
+        ("hv", 150.0, [20.0, -10.0, 5.0]),
+        ("dv", 150.0, [20.0, -10.0, 5.0]),
+    ],
+)
+def test_load_h5_data_selects_dual_venc_source(tmp_path, mode, expected_venc, expected_velocity):
+    path = tmp_path / f"dual_venc_{mode}.h5"
+    velocity = np.asarray(expected_velocity, dtype=np.float32).reshape(1, 1, 1, 1, 3)
+    high_venc = np.full(3, 150.0, dtype=np.float32)
+    low_venc = np.full(3, 50.0, dtype=np.float32)
+    img = np.ones((1, 1, 1, 1, 7), dtype=np.complex64)
+    img[..., 1:4] = np.exp(1j * np.pi * velocity / high_venc.reshape((1, 1, 1, 1, 3)))
+    img[..., 4:7] = np.exp(1j * np.pi * velocity / low_venc.reshape((1, 1, 1, 1, 3)))
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("img", data=img)
+        handle.create_dataset("Resolution", data=np.ones(3, dtype=np.float32))
+        handle.create_dataset("VENC", data=np.concatenate([high_venc, low_venc]))
+        handle.create_dataset("SpatialOrder", data=np.asarray(["LR", "AP", "FH"], dtype="S4"))
+        handle.create_dataset("VENCOrder", data=np.asarray(["LR", "AP", "FH"], dtype="S4"))
+
+    case = discover_h5_input_cases(str(path))[0]
+    assert case.metadata["is_dual_venc"] is True
+    loaded = load_h5_data(str(path), dual_venc_mode=mode)
+
+    assert np.allclose(loaded.venc, expected_venc)
+    assert np.allclose(loaded.flow.reshape(-1, 3)[0], expected_velocity, atol=1e-4)
+    assert loaded.metadata["dual_venc"]["selected_mode"] == mode
 
 
 def test_load_h5_data_reuses_dual_venc_singleton_time_corr_cache(tmp_path, monkeypatch):

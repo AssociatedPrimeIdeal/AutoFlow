@@ -32,7 +32,7 @@ autoflow-run case.h5 --output-dir ./results/case
 | --- | --- | --- | --- |
 | Load | `File > Open H5` or `Import DICOM Directory` | positional input path | normalized `mag`, `flow`, geometry and metadata |
 | Background correction | choose it when the case has no reusable correction | `--bgc`, optionally `--bgc-method msac` | corrected velocity and correction report/cache |
-| Phase unwrapping | `Phase Unwrapping` step | `--phase-unwrap-method gc3D`, `lap4D`, or `nprs` | unwrapped velocity field when enabled |
+| Phase unwrapping | `Phase Unwrapping` step | `--phase-unwrap-method gc3D`, `lap4D`, `nprs`, `pudip`, or `gust` | unwrapped velocity field when enabled |
 | Segmentation | `Segmentation` workspace: import, threshold, auto segment, or edit | `--autoseg`; imported masks/configs can also be supplied through the API/GUI | active mask for downstream geometry |
 | Centerline | run `Skeleton`, then `Graph/Paths` | normal batch order | skeleton, graph, branches and paths |
 | Planes | configure count, anchor, spacing and direction | `--plane-mode`, `--plane-count`, `--plane-spacing-*` | `planes.json`, `planes.h5`, positions |

@@ -1,10 +1,11 @@
 {
-  "mask_source": "segmentation",
+  "mask_source": "segmask",
   "device": "auto",
   "tfc": true,
   "lap4d_ts": 2.0,
   "nprs_upsampling_factor": 2,
   "nprs_pi_unwrap": true,
   "nprs_auto_crop": true,
+  "backend_params": {},
   "write_output": true
 }

@@ -1578,6 +1578,7 @@ def load_input_data(
     dicom_read_workers=1,
     force_recompute_seg=False,
     ignore_embedded_segmentation=False,
+    dual_venc_mode="dv",
 ):
     case = resolve_input_case(input_source)
     if case.input_kind == "h5":
@@ -1588,6 +1589,7 @@ def load_input_data(
             source_group=case.source_group,
             force_recompute_seg=force_recompute_seg,
             ignore_embedded_segmentation=ignore_embedded_segmentation,
+            dual_venc_mode=dual_venc_mode,
         )
     loaded = load_dicom_case(
         case,

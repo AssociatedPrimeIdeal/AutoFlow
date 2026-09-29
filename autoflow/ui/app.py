@@ -46,6 +46,7 @@ from ..algorithms import (
     generate_pathlines_from_plane_at_t,
 )
 from ..algorithms.data import discover_h5_input_cases, inspect_h5_input_case
+from ..algorithms.phase_unwrapping import backend_available
 from ..algorithms.segmentation import (
     compute_reference_scalar,
     resolve_nnunet_model_folder,
@@ -59,9 +60,9 @@ from ..quality import build_quality_report, save_quality_report
 from ..algorithms import compute_plane_metrics, apply_internal_consistency_to_metrics, compute_plane_metrics_multithread, augment_plane_metrics_with_derived, save_plane_pixelwise_h5
 from ..algorithms.streamlines import _plane_seeds, create_pathline_temporal_source
 from .editors import PlaneEditor
-from .dicom_confirm import DicomImportDialog, H5CaseSelectDialog
+from .dicom_confirm import DicomImportDialog, DualVencSelectDialog, H5CaseSelectDialog
 from .ortho_viewer import OrthoViewer
-from .segmentation import SegmentationConfigDialog, SegmentationDock, SOURCE_LABELS
+from .segmentation import SegmentationDock, SOURCE_LABELS
 from .theme import apply_application_theme, configure_high_dpi, standard_icon
 from ..rendering import (
     render_plane_rotation_video,
@@ -293,6 +294,10 @@ class _AutoSegmentationWorker(QtCore.QObject):
                 auto_label_map=self._auto_label_map,
                 artifact_prefix=self._artifact_prefix,
                 progress_callback=self._emit_progress,
+                # Keep the GUI process free of the in-process torch predictor.
+                # Native CUDA/Qt failures must be contained by the nnUNet
+                # subprocess instead of terminating the application.
+                grouped_preprocessing=False,
             )
             seg = np.asarray(seg, dtype=np.int16)
             foreground_labels = [int(value) for value in np.unique(seg) if int(value) > 0]
@@ -731,6 +736,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._workflow_param_widgets[stage_key].append((widget, bool(advanced)))
 
         _capture_params("input", self._build_preprocess_params)
+        _capture_params("segmentation", self._build_segmentation_params)
         _capture_params("phase_unwrap", self._build_phase_unwrap_params)
         _capture_params("centerline", self._build_skeleton_params, advanced=True)
         _capture_params("centerline", self._build_plane_params)
@@ -969,6 +975,149 @@ class MainWindow(QtWidgets.QMainWindow):
         self._on_bpc_method_changed()
         self.params_layout.addWidget(grp)
 
+    def _build_segmentation_params(self):
+        grp = QtWidgets.QGroupBox("Segmentation Parameters")
+        self.segmentation_params_group = grp
+        fl = QtWidgets.QFormLayout(grp)
+
+        self.combo_seg_mode = QtWidgets.QComboBox()
+        for label, value in [
+            ("3D", "nnUNet"),
+            ("4D", "nnUNet4D"),
+        ]:
+            self.combo_seg_mode.addItem(label, value)
+        self.combo_seg_mode.currentIndexChanged.connect(self._on_segmentation_mode_param_changed)
+        self.combo_seg_auto_model = QtWidgets.QComboBox()
+        self.combo_seg_auto_model.setToolTip("Select a detected local model or enter a custom model folder below.")
+        self.combo_seg_auto_model.currentIndexChanged.connect(self._on_segmentation_model_preset_changed)
+        self.edit_seg_auto_model = QtWidgets.QLineEdit()
+        self.edit_seg_auto_model.setPlaceholderText("auto (backend-specific model)")
+        self.edit_seg_auto_model.textChanged.connect(self._on_segmentation_model_text_changed)
+        self.btn_seg_browse_model = QtWidgets.QPushButton("Browse...")
+        self.btn_seg_browse_model.clicked.connect(self._browse_segmentation_model)
+        model_row = QtWidgets.QHBoxLayout()
+        model_row.addWidget(self.edit_seg_auto_model, 1)
+        model_row.addWidget(self.btn_seg_browse_model)
+        model_widget = QtWidgets.QWidget()
+        model_widget.setLayout(model_row)
+        self.edit_seg_auto_checkpoint = QtWidgets.QLineEdit()
+        self.edit_seg_auto_checkpoint.setPlaceholderText("auto, checkpoint_best.pth, or checkpoint_final.pth")
+        self.btn_seg_browse_checkpoint = QtWidgets.QPushButton("Browse...")
+        self.btn_seg_browse_checkpoint.clicked.connect(self._browse_segmentation_checkpoint)
+        checkpoint_row = QtWidgets.QHBoxLayout()
+        checkpoint_row.addWidget(self.edit_seg_auto_checkpoint, 1)
+        checkpoint_row.addWidget(self.btn_seg_browse_checkpoint)
+        checkpoint_widget = QtWidgets.QWidget()
+        checkpoint_widget.setLayout(checkpoint_row)
+        self.edit_seg_auto_folds = QtWidgets.QLineEdit()
+        self.edit_seg_auto_folds.setPlaceholderText("single, all, or 0,1,2,3,4")
+        self.combo_seg_auto_device = QtWidgets.QComboBox()
+        for label, value in [
+            ("Auto (GPU if available)", "auto"),
+            ("CPU", "cpu"),
+            ("CUDA", "cuda"),
+        ]:
+            self.combo_seg_auto_device.addItem(label, value)
+        self.edit_seg_auto_label_map = QtWidgets.QPlainTextEdit()
+        self.edit_seg_auto_label_map.setPlaceholderText('{"aorta": 1}')
+        self.edit_seg_auto_label_map.setMaximumHeight(70)
+
+        self.btn_run_segmentation_auto = QtWidgets.QPushButton("Run Automatic Segmentation")
+        self.btn_run_segmentation_auto.setProperty("role", "primary")
+        self.btn_run_segmentation_auto.clicked.connect(self._on_run_auto_segmentation)
+
+        fl.addRow("Mode", self.combo_seg_mode)
+        fl.addRow("Model preset", self.combo_seg_auto_model)
+        fl.addRow("Model path", model_widget)
+        fl.addRow("Checkpoint", checkpoint_widget)
+        fl.addRow("Folds", self.edit_seg_auto_folds)
+        fl.addRow("Device", self.combo_seg_auto_device)
+        fl.addRow("Label map", self.edit_seg_auto_label_map)
+        fl.addRow("", self.btn_run_segmentation_auto)
+        hint = QtWidgets.QLabel(
+            "3D predicts one mask and broadcasts it to all phases. 4D predicts each phase. "
+            "The source dock remains available for reviewing or importing a segmentation."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#555;")
+        fl.addRow("", hint)
+        self.params_layout.addWidget(grp)
+        self._on_segmentation_mode_param_changed()
+
+    @staticmethod
+    def _segmentation_model_preset_entries(backend):
+        token = str(backend or "").strip().lower()
+        is_4d = token in {"nnunet4d", "nnunet_4d", "4d"}
+        resolver = resolve_nnunet_4d_model_folder if is_4d else resolve_nnunet_model_folder
+        entries = [("Automatic backend default", "auto")]
+        try:
+            resolved = str(resolver("auto"))
+        except Exception:
+            resolved = ""
+        if resolved and Path(resolved).is_dir():
+            family = "Dataset7020 4D" if is_4d else "Dataset7010 3D"
+            entries.append((f"{family} local model", resolved))
+        return entries
+
+    def _refresh_segmentation_model_presets(self, selected=None):
+        value = self.edit_seg_auto_model.text().strip() if selected is None else str(selected).strip()
+        entries = self._segmentation_model_preset_entries(self.combo_seg_mode.currentData())
+        self.combo_seg_auto_model.blockSignals(True)
+        self.combo_seg_auto_model.clear()
+        for label, path in entries:
+            self.combo_seg_auto_model.addItem(label, path)
+        self.combo_seg_auto_model.blockSignals(False)
+        self._segmentation_model_preset_values = {str(path) for _label, path in entries}
+        self._select_segmentation_model_preset(value)
+
+    def _select_segmentation_model_preset(self, value):
+        index = self.combo_seg_auto_model.findData(str(value or "").strip())
+        self.combo_seg_auto_model.blockSignals(True)
+        self.combo_seg_auto_model.setCurrentIndex(index if index >= 0 else -1)
+        self.combo_seg_auto_model.blockSignals(False)
+
+    def _on_segmentation_model_preset_changed(self, index):
+        if int(index) >= 0:
+            value = self.combo_seg_auto_model.itemData(int(index))
+            if value is not None:
+                self.edit_seg_auto_model.setText(str(value))
+
+    def _on_segmentation_model_text_changed(self, text):
+        self._select_segmentation_model_preset(text)
+
+    def _on_segmentation_mode_param_changed(self, _index=None):
+        if _index is not None and hasattr(self, "edit_seg_auto_model"):
+            previous = self.edit_seg_auto_model.text().strip()
+            presets = set(getattr(self, "_segmentation_model_preset_values", set()))
+            self._refresh_segmentation_model_presets("auto" if previous in presets else previous)
+        enabled = bool(self.workspace.data_loaded) and self._autoseg_thread is None
+        self.combo_seg_mode.setEnabled(enabled)
+        self.combo_seg_auto_model.setEnabled(enabled)
+        self.edit_seg_auto_model.setEnabled(enabled)
+        self.btn_seg_browse_model.setEnabled(enabled)
+        self.edit_seg_auto_checkpoint.setEnabled(enabled)
+        self.btn_seg_browse_checkpoint.setEnabled(enabled)
+        self.edit_seg_auto_folds.setEnabled(enabled)
+        self.combo_seg_auto_device.setEnabled(enabled)
+        self.edit_seg_auto_label_map.setEnabled(enabled)
+        self.btn_run_segmentation_auto.setEnabled(enabled)
+
+    def _browse_segmentation_model(self):
+        current = self.edit_seg_auto_model.text().strip()
+        start_dir = current if Path(current).is_dir() else ""
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select nnUNet Model Folder", start_dir)
+        if path:
+            self.edit_seg_auto_model.setText(path)
+            self._select_segmentation_model_preset(path)
+
+    def _browse_segmentation_checkpoint(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select nnUNet Checkpoint", "", "Checkpoint (*.pth);;All (*)")
+        if path:
+            checkpoint = Path(path)
+            self.edit_seg_auto_checkpoint.setText(checkpoint.name)
+            if checkpoint.parent.name.startswith("fold_"):
+                self.edit_seg_auto_model.setText(str(checkpoint.parent.parent))
+
     def _build_skeleton_params(self):
         grp = QtWidgets.QGroupBox("Generate Skeleton Parameters")
         fl = QtWidgets.QFormLayout(grp)
@@ -979,10 +1128,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_separate_special_label_contacts.setToolTip(
             "Separate contacts between RBCT, CCA, and LBCT before skeletonization."
         )
+        self.combo_special_handling = QtWidgets.QComboBox()
+        self.combo_special_handling.addItem("Three-pass merge", "three_pass_merge")
+        self.combo_special_handling.addItem("Contact surface", "contact_surface")
+        self.combo_special_handling.setToolTip(
+            "Choose how configured special labels are handled during skeletonization."
+        )
         self.combo_cc_filter_mode = QtWidgets.QComboBox()
         self.combo_cc_filter_mode.addItems(["hybrid", "absolute", "relative", "largest"])
         self.edit_min_cc_volume = QtWidgets.QLineEdit("50.0")
         self.edit_cc_rel_min_ratio = QtWidgets.QLineEdit("0.01")
+        self.edit_min_edge_points = QtWidgets.QLineEdit("3")
+        self.edit_min_edge_points.setToolTip(
+            "Remove terminal graph branches shorter than this number of edge segments."
+        )
         self.chk_closing = QtWidgets.QCheckBox()
         self.chk_closing.setChecked(True)
         self.chk_opening = QtWidgets.QCheckBox()
@@ -990,10 +1149,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_gaussian.setChecked(True)
         self.edit_gauss_sigma = QtWidgets.QLineEdit("0.5")
         fl.addRow("Remove Small CC", self.chk_remove_small_cc)
-        fl.addRow("Separate Special Label Contacts", self.chk_separate_special_label_contacts)
+        fl.addRow("Special Handling", self.combo_special_handling)
         fl.addRow("CC Filter Mode", self.combo_cc_filter_mode)
         fl.addRow(u"Min Volume (mm\u00b3)", self.edit_min_cc_volume)
         fl.addRow("Relative Min Ratio", self.edit_cc_rel_min_ratio)
+        fl.addRow("Minimum Edge Count", self.edit_min_edge_points)
         fl.addRow("Closing", self.chk_closing)
         fl.addRow("Opening", self.chk_opening)
         fl.addRow("Gaussian", self.chk_gaussian)
@@ -1004,23 +1164,26 @@ class MainWindow(QtWidgets.QMainWindow):
         grp = QtWidgets.QGroupBox("Phase Unwrapping (Optional)")
         fl = QtWidgets.QFormLayout(grp)
         self.combo_phase_unwrap_method = QtWidgets.QComboBox()
-        for label, method in [("Graph-cut 3D", "gc3D"), ("Laplacian 4D", "lap4D"), ("NPRS", "nprs")]:
+        for label, method in [
+            ("Laplacian 4D", "lap4D"),
+            ("Graph-cut 3D", "gc3D"),
+            ("NPRS", "nprs"),
+            ("PUDIP-Flow", "pudip"),
+            ("GUST-Flow", "gust"),
+        ]:
+            if method in {"pudip", "gust"} and not backend_available(method):
+                continue
             self.combo_phase_unwrap_method.addItem(label, method)
         self.combo_phase_unwrap_method.currentIndexChanged.connect(self._on_phase_unwrap_method_changed)
         self.combo_phase_unwrap_mask = QtWidgets.QComboBox()
-        self.combo_phase_unwrap_mask.addItem("Active segmentation", "segmentation")
-        self.combo_phase_unwrap_mask.addItem("All voxels", "all")
+        self.combo_phase_unwrap_mask.addItem("segmask", "segmask")
+        self.combo_phase_unwrap_mask.addItem("PCMRAStd", "pcmra_std")
         self.combo_phase_unwrap_device = QtWidgets.QComboBox()
         for label, value in [("Auto (GPU if available)", "auto"), ("CPU", "cpu"), ("CUDA", "cuda")]:
             self.combo_phase_unwrap_device.addItem(label, value)
 
-        # Keep method-specific controls in separate pages.  This avoids
-        # presenting parameters that have no effect on the selected backend.
         self.phase_unwrap_method_stack = QtWidgets.QStackedWidget()
-        gc_page = QtWidgets.QLabel("Graph-cut 3D has no additional parameters.")
-        gc_page.setWordWrap(True)
-        gc_page.setStyleSheet("color:#555;")
-        self.phase_unwrap_method_stack.addWidget(gc_page)
+        self.phase_unwrap_method_stack.addWidget(QtWidgets.QWidget())
 
         lap_page = QtWidgets.QWidget()
         lap_form = QtWidgets.QFormLayout(lap_page)
@@ -1042,14 +1205,13 @@ class MainWindow(QtWidgets.QMainWindow):
         nprs_form.addRow("Auto crop", self.chk_phase_unwrap_nprs_crop)
         self.phase_unwrap_method_stack.addWidget(nprs_page)
 
+        self.phase_unwrap_method_stack.addWidget(QtWidgets.QWidget())
+        self.phase_unwrap_method_stack.addWidget(QtWidgets.QWidget())
+
         fl.addRow("Method", self.combo_phase_unwrap_method)
-        fl.addRow("Mask", self.combo_phase_unwrap_mask)
+        fl.addRow("Mask / initialization", self.combo_phase_unwrap_mask)
         fl.addRow("Device", self.combo_phase_unwrap_device)
         fl.addRow("Method parameters", self.phase_unwrap_method_stack)
-        hint = QtWidgets.QLabel("Selecting a method opts in; nothing runs until you click Unwrap Phase. Dual‑VENC inputs are skipped automatically. Wrap Count and Estimated Wrap Locations appear in the Browser after a run.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color:#555;")
-        fl.addRow("", hint)
         self.btn_revert_phase_unwrap = QtWidgets.QPushButton("Revert to Loaded Flow")
         self.btn_revert_phase_unwrap.clicked.connect(self._revert_phase_unwrap)
         fl.addRow("", self.btn_revert_phase_unwrap)
@@ -1566,7 +1728,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if stage_key == "phase_unwrap":
             if not ws.data_loaded:
                 return "Not ready"
-            if str(ws.input_state.source_format).lower() == "legacy_h5_dual_venc" or bool((ws.input_state.metadata or {}).get("dual_venc", {}).get("enabled", False)):
+            dual_info = (ws.input_state.metadata or {}).get("dual_venc", {})
+            if not isinstance(dual_info, dict):
+                dual_info = {}
+            dual_mode = str(dual_info.get("selected_mode", dual_info.get("mode", "dv")) or "dv").lower()
+            if (
+                dual_mode == "dv"
+                and (
+                    str(ws.input_state.source_format).lower() == "legacy_h5_dual_venc"
+                    or bool(dual_info.get("enabled", False))
+                )
+            ):
                 return "Skipped (dual-VENC)"
             if not ws.input_state.capabilities.has_wrapped_phase:
                 return "Unavailable"
@@ -1777,7 +1949,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.segmentation_panel.combo_source.currentIndexChanged.connect(self._on_segmentation_source_changed)
         self.segmentation_panel.check_visible.toggled.connect(self._on_segmentation_visibility_changed)
         self.segmentation_panel.slider_opacity.valueChanged.connect(self._on_segmentation_opacity_changed)
-        self.segmentation_panel.btn_configure.clicked.connect(self._on_configure_segmentation)
         self.segmentation_panel.btn_run_auto.clicked.connect(self._on_run_auto_segmentation)
         self.segmentation_panel.btn_import.clicked.connect(self._on_import_segmentation)
         self.segmentation_panel.btn_save.clicked.connect(self._on_save_active_segmentation)
@@ -2944,8 +3115,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._labeler_process is not None
             and self._labeler_process.state() != QtCore.QProcess.ProcessState.NotRunning
         )
-        panel.btn_configure.setEnabled(bool(ws.data_loaded) and not labeler_running)
         panel.btn_run_auto.setEnabled(bool(ws.data_loaded) and not labeler_running and self._autoseg_thread is None)
+        if hasattr(self, "segmentation_params_group"):
+            self.segmentation_params_group.setEnabled(bool(ws.data_loaded) and not labeler_running)
+            self._on_segmentation_mode_param_changed()
         panel.btn_import.setEnabled(bool(ws.data_loaded) and not labeler_running)
         panel.btn_save.setEnabled(ws.get_active_segmentation() is not None and not labeler_running)
         panel.btn_external_editor.setEnabled(
@@ -3283,51 +3456,13 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         return f"threshold={float(threshold_info['min_value']):.6g}"
 
-    def _on_configure_segmentation(self):
-        if self._autoseg_running_guard("changing segmentation settings"):
-            return
-        if not self.workspace.data_loaded:
-            self.log("Load a case before configuring segmentation.")
-            return
-        dlg = SegmentationConfigDialog(self.workspace, self)
-        if dlg.exec() != QtWidgets.QDialog.Accepted:
-            return
-        values = dlg.values()
-        seg = self.workspace.segmentation
-        seg.mode = values["mode"]
-        seg.input_source = values["input_source"]
-        seg.import_path = values["import_path"]
-        seg.threshold_scalar = values["threshold_scalar"]
-        seg.threshold_value = values["threshold_value"]
-        seg.threshold_keep_largest_cc = bool(values["threshold_keep_largest_cc"])
-        seg.threshold_closing = bool(values["threshold_closing"])
-        seg.threshold_opening = bool(values["threshold_opening"])
-        seg.threshold_min_component_volume_mm3 = float(values["threshold_min_component_volume_mm3"])
-        seg.auto_backend = values["auto_backend"]
-        seg.auto_model = values["auto_model"]
-        seg.auto_checkpoint = values["auto_checkpoint"]
-        seg.auto_folds = values["auto_folds"]
-        seg.auto_device = values["auto_device"]
-        seg.auto_label_map = values["auto_label_map"]
-        if seg.mode == "input":
-            if seg.input_source == "original":
-                self._on_use_original_segmentation()
-            elif seg.import_path:
-                self._import_segmentation_path(seg.import_path)
-            else:
-                self.log("Input mode requires either original segmentation or an external file.")
-        elif seg.mode == "threshold":
-            self._run_threshold_segmentation()
-        else:
-            self.log("Automatic segmentation is configured. Click Run Automatic Segmentation to start it.")
-        self._refresh_segmentation_ui()
-
     def _on_run_auto_segmentation(self):
         if self._autoseg_running_guard("starting automatic segmentation"):
             return
         if not self.workspace.data_loaded:
             self.log("Load a case before running automatic segmentation.")
             return
+        self._sync_params_to_ws()
         self.workspace.segmentation.mode = "auto"
         self._run_auto_segmentation()
 
@@ -3572,7 +3707,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         process.setProcessEnvironment(environment)
         # Run the package installed beside AutoFlow, not an arbitrary executable
-        # found on PATH. The checked-out v0.4.0 source is selected above while
+        # found on PATH. The checked-out v0.4.7 source is selected above while
         # the optional installed dependency supplies Labeler's runtime packages.
         program = sys.executable
         arguments = ["-m", "spatiotemporal_labeler"]
@@ -3609,7 +3744,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._refresh_segmentation_ui()
         self.log(
-            f"Opened SpatioTemporal Labeler v0.4.0 ({'reused' if reuse_exchange else 'exported'} workspace): {exchange_dir}. "
+            f"Opened SpatioTemporal Labeler v0.4.7 ({'reused' if reuse_exchange else 'exported'} workspace): {exchange_dir}. "
             "Use Save/Ctrl+S before closing to return the edited segmentation to AutoFlow."
         )
 
@@ -5202,7 +5337,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not hasattr(self, "phase_unwrap_method_stack"):
             return
         method = str(self.combo_phase_unwrap_method.currentData() or "gc3D")
-        page = {"gc3D": 0, "lap4D": 1, "nprs": 2}.get(method, 0)
+        page = {"lap4D": 0, "gc3D": 1, "nprs": 2, "pudip": 3, "gust": 4}.get(method, 0)
         self.phase_unwrap_method_stack.setCurrentIndex(page)
 
     def _sync_params_to_ws(self):
@@ -5213,7 +5348,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # requests it from the CLI/configuration).
             ws.phase_unwrap_params.enabled = True
             ws.phase_unwrap_params.method = str(self.combo_phase_unwrap_method.currentData() or "gc3D")
-            ws.phase_unwrap_params.mask_source = str(self.combo_phase_unwrap_mask.currentData() or "segmentation")
+            ws.phase_unwrap_params.mask_source = str(self.combo_phase_unwrap_mask.currentData() or "segmask")
             ws.phase_unwrap_params.device = str(self.combo_phase_unwrap_device.currentData() or "auto")
             ws.phase_unwrap_params.lap4d_ts = self._float_from_text(self.edit_phase_unwrap_ts.text(), 2.0)
             ws.phase_unwrap_params.nprs_upsampling_factor = max(1, self._int_from_text(self.edit_phase_unwrap_nprs_up.text(), 2))
@@ -5234,11 +5369,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if isinstance(ws.input_state.metadata, dict):
             ws.input_state.metadata["spatial_order_raw"] = list(ws.spatial_order)
             ws.input_state.metadata["venc_order_raw"] = list(ws.venc_order)
+        if hasattr(self, "combo_seg_mode"):
+            # The GUI exposes only the two supported automatic model families.
+            # Existing original/imported/threshold sources remain available in
+            # the right-side source dock and in the CLI/API state model.
+            ws.segmentation.auto_backend = str(self.combo_seg_mode.currentData() or "nnUNet4D")
+            ws.segmentation.auto_model = self.edit_seg_auto_model.text().strip() or "auto"
+            ws.segmentation.auto_checkpoint = self.edit_seg_auto_checkpoint.text().strip() or "auto"
+            ws.segmentation.auto_folds = self.edit_seg_auto_folds.text().strip() or "single"
+            ws.segmentation.auto_device = str(self.combo_seg_auto_device.currentData() or "auto")
+            ws.segmentation.auto_label_map = self.edit_seg_auto_label_map.toPlainText().strip()
         ws.skeleton_params.remove_small_cc = self.chk_remove_small_cc.isChecked()
+        ws.skeleton_params.special_handling = str(self.combo_special_handling.currentData() or "three_pass_merge")
         ws.skeleton_params.separate_special_label_contacts = self.chk_separate_special_label_contacts.isChecked()
         ws.skeleton_params.cc_filter_mode = str(self.combo_cc_filter_mode.currentText().strip() or "hybrid")
         ws.skeleton_params.min_cc_volume_mm3 = self._float_from_text(self.edit_min_cc_volume.text(), 50.0)
         ws.skeleton_params.cc_rel_min_ratio = self._float_from_text(self.edit_cc_rel_min_ratio.text(), 0.01)
+        ws.skeleton_params.min_edge_points = max(0, self._int_from_text(self.edit_min_edge_points.text(), 3))
         ws.skeleton_params.do_closing = self.chk_closing.isChecked()
         ws.skeleton_params.do_opening = self.chk_opening.isChecked()
         ws.skeleton_params.gaussian_enabled = self.chk_gaussian.isChecked()
@@ -5369,7 +5516,10 @@ class MainWindow(QtWidgets.QMainWindow):
             # Select the first real backend when opening those workspaces;
             # unwrapping remains an explicit step in the GUI.
             self.combo_phase_unwrap_method.setCurrentIndex(max(0, idx))
-            idx = self.combo_phase_unwrap_mask.findData(str(ws.phase_unwrap_params.mask_source))
+            mask_source = str(ws.phase_unwrap_params.mask_source or "segmask")
+            if mask_source in {"segmentation", "active_segmentation", "seg", "mask"}:
+                mask_source = "segmask"
+            idx = self.combo_phase_unwrap_mask.findData(mask_source)
             self.combo_phase_unwrap_mask.setCurrentIndex(max(0, idx))
             idx = self.combo_phase_unwrap_device.findData(str(ws.phase_unwrap_params.device))
             self.combo_phase_unwrap_device.setCurrentIndex(max(0, idx))
@@ -5388,11 +5538,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.edit_input_venc.setText(", ".join(f"{float(x):.6g}" for x in np.asarray(ws.venc, dtype=float).reshape(-1)[:3]))
         self.edit_input_spatial_order.setText(", ".join(str(x) for x in ws.spatial_order[:3]))
         self.edit_input_venc_order.setText(", ".join(str(x) for x in ws.venc_order[:3]))
+        if hasattr(self, "combo_seg_mode"):
+            self.combo_seg_mode.blockSignals(True)
+            self.combo_seg_mode.setCurrentIndex(max(self.combo_seg_mode.findData(str(ws.segmentation.auto_backend or "nnUNet4D")), 0))
+            self.combo_seg_mode.blockSignals(False)
+            self.edit_seg_auto_model.setText(str(ws.segmentation.auto_model or "auto"))
+            self._refresh_segmentation_model_presets(ws.segmentation.auto_model or "auto")
+            self.edit_seg_auto_checkpoint.setText(str(ws.segmentation.auto_checkpoint or "auto"))
+            self.edit_seg_auto_folds.setText(str(ws.segmentation.auto_folds or "single"))
+            self.combo_seg_auto_device.blockSignals(True)
+            self.combo_seg_auto_device.setCurrentIndex(max(self.combo_seg_auto_device.findData(str(ws.segmentation.auto_device or "auto")), 0))
+            self.combo_seg_auto_device.blockSignals(False)
+            self.edit_seg_auto_label_map.setPlainText(str(ws.segmentation.auto_label_map or ""))
+            self._on_segmentation_mode_param_changed()
         self.chk_remove_small_cc.setChecked(ws.skeleton_params.remove_small_cc)
+        idx = self.combo_special_handling.findData(str(getattr(ws.skeleton_params, "special_handling", "three_pass_merge") or "three_pass_merge"))
+        self.combo_special_handling.setCurrentIndex(max(idx, 0))
         self.chk_separate_special_label_contacts.setChecked(bool(getattr(ws.skeleton_params, "separate_special_label_contacts", True)))
         self.combo_cc_filter_mode.setCurrentText(str(getattr(ws.skeleton_params, "cc_filter_mode", "hybrid") or "hybrid"))
         self.edit_min_cc_volume.setText(str(ws.skeleton_params.min_cc_volume_mm3))
         self.edit_cc_rel_min_ratio.setText(str(getattr(ws.skeleton_params, "cc_rel_min_ratio", 0.01)))
+        self.edit_min_edge_points.setText(str(getattr(ws.skeleton_params, "min_edge_points", 3)))
         self.chk_closing.setChecked(ws.skeleton_params.do_closing)
         self.chk_opening.setChecked(ws.skeleton_params.do_opening)
         self.chk_gaussian.setChecked(ws.skeleton_params.gaussian_enabled)
@@ -6604,7 +6770,41 @@ class MainWindow(QtWidgets.QMainWindow):
             "venc": self.edit_input_venc.text().strip(),
             "spatial_order": self.edit_input_spatial_order.text().strip(),
             "venc_order": self.edit_input_venc_order.text().strip(),
+            "dual_venc_mode": dict(getattr(self._active_input_case, "metadata", {}) or {}).get("dual_venc_mode", "dv"),
         }, sort_keys=True, default=str)
+
+    def _prompt_dual_venc_choice(self, case):
+        """Ask which LV/HV/DV source to expose for a dual-VENC H5 case."""
+        resolved = resolve_input_case(case)
+        if resolved.input_kind != "h5":
+            return resolved
+        features = dict(resolved.metadata or {})
+        if "is_dual_venc" not in features:
+            try:
+                inspected = inspect_h5_input_case(resolved)
+            except Exception:
+                inspected = {}
+            features.update(inspected)
+            resolved.metadata.update(inspected)
+        dual_info = features.get("dual_venc", {})
+        if not bool(features.get("is_dual_venc", False) or (isinstance(dual_info, dict) and dual_info.get("enabled", False))):
+            return resolved
+        dialog = DualVencSelectDialog(
+            lv_venc=dual_info.get("lv_venc") if isinstance(dual_info, dict) else None,
+            hv_venc=dual_info.get("hv_venc") if isinstance(dual_info, dict) else None,
+            parent=self,
+        )
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            self.log(f"Load cancelled: dual-VENC source selection for {resolved.display_name or resolved.input_path}")
+            return None
+        mode = dialog.selected_mode()
+        resolved.metadata = dict(resolved.metadata or {})
+        resolved.metadata["dual_venc_mode"] = mode
+        selected_dual_info = dict(dual_info) if isinstance(dual_info, dict) else {}
+        selected_dual_info.update(selected_mode=mode, mode=mode, enabled=True)
+        resolved.metadata["dual_venc"] = selected_dual_info
+        self.log(f"Dual-VENC source: {mode.upper()}")
+        return resolved
 
     def _reload_input_case(self):
         if self._active_input_case is None:
@@ -6629,7 +6829,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if resolved.input_kind == "h5":
             features = dict(resolved.metadata or {})
             if "has_background_correction_cache" not in features:
-                features.update(inspect_h5_input_case(resolved))
+                inspected = inspect_h5_input_case(resolved)
+                existing_dual = features.get("dual_venc")
+                features.update(inspected)
+                if isinstance(existing_dual, dict) and isinstance(features.get("dual_venc"), dict):
+                    merged_dual = dict(features["dual_venc"])
+                    merged_dual.update(existing_dual)
+                    features["dual_venc"] = merged_dual
                 resolved.metadata.update(features)
             if bool(features.get("has_background_correction_cache", False)):
                 self.chk_bpc_enabled.setChecked(True)
@@ -6694,6 +6900,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if selected is None:
                 return
             resolved = selected
+        resolved = self._prompt_dual_venc_choice(resolved)
+        if resolved is None:
+            return
         resolved = self._prompt_background_phase_choice(resolved)
         if resolved is None:
             return

@@ -1,6 +1,7 @@
 import argparse
 
 from .api import AutoFlowConfig, run_batch
+from .algorithms.phase_unwrapping import backend_available
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -116,6 +117,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--remove-small-cc", action="store_true", help="Remove small connected components before skeletonization.")
     parser.add_argument(
+        "--special-handling",
+        choices=["three_pass_merge", "contact_surface"],
+        default=None,
+        help="Special-label skeleton handling: three-pass merge (default) or legacy contact-surface separation.",
+    )
+    parser.add_argument(
         "--separate-special-label-contacts",
         "--separate-label-contacts",
         dest="separate_special_label_contacts",
@@ -133,6 +140,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-cc-volume", type=float, default=None, help="Minimum component volume in mm^3 when removal is enabled.")
     parser.add_argument("--cc-filter-mode", choices=["absolute", "relative", "hybrid", "largest"], default=None, help="Connected-component filtering mode used during skeleton preprocessing.")
     parser.add_argument("--cc-rel-min-ratio", type=float, default=None, help="Relative component threshold ratio against the largest connected component when using relative or hybrid filtering.")
+    parser.add_argument(
+        "--min-edge-points",
+        "--min-edge-count",
+        dest="min_edge_points",
+        type=int,
+        default=None,
+        help="Minimum number of graph edge segments in a terminal branch; shorter endpoint spurs are removed (default: 3).",
+    )
 
     parser.add_argument("--seed-ratio", type=float, default=None, help="Seed ratio for streamline rendering.")
     parser.add_argument("--tube-radius", type=float, default=None, help="Tube radius used in streamline rendering.")
@@ -169,8 +184,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Stop after loading or generating segmentation; skip skeleton, planes, metrics, and videos.",
     )
-    parser.add_argument("--phase-unwrap-method", choices=["none", "gc3D", "lap4D", "nprs"], default=None, help="Optional traditional phase-unwrapping method (disabled by default).")
-    parser.add_argument("--phase-unwrap-mask", choices=["segmentation", "all"], default=None, help="Mask used for phase unwrapping.")
+    phase_unwrap_methods = ["none", "gc3D", "lap4D", "nprs"]
+    phase_unwrap_methods.extend(method for method in ("pudip", "gust") if backend_available(method))
+    parser.add_argument(
+        "--phase-unwrap-method",
+        choices=phase_unwrap_methods,
+        default=None,
+        help="Optional phase-unwrapping method (pudip and gust require their git-submodule backends).",
+    )
+    parser.add_argument(
+        "--phase-unwrap-mask",
+        choices=["segmask", "pcmra_std"],
+        default=None,
+        help="Segmentation mask or PC-MRA temporal standard deviation used by phase unwrapping.",
+    )
     parser.add_argument("--phase-unwrap-device", choices=["auto", "cpu", "cuda"], default=None, help="Device for phase unwrapping; lap4D uses CUDA when available.")
 
     parser.add_argument(
@@ -204,7 +231,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
     config = AutoFlowConfig.from_config_dir(args.config_dir, inputs=args.inputs)
 
     overrides = {
@@ -248,9 +276,11 @@ def main() -> None:
         "plane_spacing_ratio": args.plane_spacing_ratio,
         "segmentation_filter": args.segmentation_filter,
         "min_cc_volume": args.min_cc_volume,
+        "special_handling": args.special_handling,
         "separate_special_label_contacts": args.separate_special_label_contacts,
         "cc_filter_mode": args.cc_filter_mode,
         "cc_rel_min_ratio": args.cc_rel_min_ratio,
+        "min_edge_points": args.min_edge_points,
         "seed_ratio": args.seed_ratio,
         "tube_radius": args.tube_radius,
         "pressure_method": args.pressure_method,
@@ -299,6 +329,14 @@ def main() -> None:
         config.add_plane_idx = True
     if args.autoseg:
         config.autoseg = True
+
+    selected_method = str(config.phase_unwrap_method or "").strip().lower()
+    if selected_method in {"pudip", "pudip-flow", "pudipflow", "gust", "gust-flow", "gustflow"}:
+        if not backend_available(config.phase_unwrap_method):
+            parser.error(
+                f"phase unwrapping method {config.phase_unwrap_method!r} requires the optional backends; "
+                "install them with pip install .[pu]"
+            )
 
     run_batch(config)
 

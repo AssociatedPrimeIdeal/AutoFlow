@@ -313,7 +313,7 @@ def process_single(
     segmentation_only=False,
     phase_unwrap_enabled=False,
     phase_unwrap_method="none",
-    phase_unwrap_mask="segmentation",
+    phase_unwrap_mask="segmask",
     phase_unwrap_device="auto",
     phase_unwrap_tfc=True,
     phase_unwrap_lap4d_ts=2.0,
@@ -356,6 +356,7 @@ def process_single(
     dynamic_time_repeat=1,
     shared_colorbar_show=True,
     shared_colorbar_bar_cfg=None,
+    phase_unwrap_backend_params=None,
 ):
     case = resolve_input_case(input_source)
     input_label = case.display_name or case.input_path
@@ -392,13 +393,15 @@ def process_single(
     ws.derived_params.use_multithread = use_multithread
     ws.phase_unwrap_params.enabled = bool(phase_unwrap_enabled)
     ws.phase_unwrap_params.method = str(phase_unwrap_method or "none")
-    ws.phase_unwrap_params.mask_source = str(phase_unwrap_mask or "segmentation")
+    ws.phase_unwrap_params.mask_source = str(phase_unwrap_mask or "segmask")
     ws.phase_unwrap_params.device = str(phase_unwrap_device or "auto")
     ws.phase_unwrap_params.tfc = bool(phase_unwrap_tfc)
     ws.phase_unwrap_params.lap4d_ts = float(phase_unwrap_lap4d_ts)
     ws.phase_unwrap_params.nprs_upsampling_factor = int(phase_unwrap_nprs_upsampling_factor)
     ws.phase_unwrap_params.nprs_pi_unwrap = bool(phase_unwrap_nprs_pi_unwrap)
     ws.phase_unwrap_params.nprs_auto_crop = bool(phase_unwrap_nprs_auto_crop)
+    if phase_unwrap_backend_params:
+        ws.phase_unwrap_params.backend_params = copy.deepcopy(phase_unwrap_backend_params)
     engine = PipelineEngine()
     logger = lambda msg: None
     import time as _time

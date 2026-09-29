@@ -55,9 +55,11 @@ with h5py.File("case.h5", "r") as handle:
 - classic legacy complex H5 uses `img_complex[..., 0]` as the magnitude reference and `img_complex[..., 1:4]` as three velocity encodes
 - complex-valued `img[..., 0:4]` is treated the same as `img_complex[..., 0:4]`
 - legacy dual-venc H5 with `img_complex.shape[-1] == 7` is supported when the file stores one reference plus six velocity encodes ordered by `VENCOrder`
-- for `Nv=7`, `VENC` contains two consecutive three-axis triplets corresponding to channel groups `1:4` and `4:7`; AutoFlow compares the triplets component-wise to identify the low-venc and high-venc groups, keeps each triplet paired with its source channels, applies background phase correction separately, runs dual-venc alias reconstruction, and publishes the reconstructed flow field as the final `flow`
+- for `Nv=7`, `VENC` contains two consecutive three-axis triplets corresponding to channel groups `1:4` and `4:7`; AutoFlow compares the triplets component-wise to identify the low-venc and high-venc groups, keeps each triplet paired with its source channels, and applies background phase correction separately
+- the GUI asks whether to load `LV` (low-VENC flow), `HV` (high-VENC flow), or `DV` (dual-VENC alias reconstruction) when a dual-VENC H5 is opened; `DV` remains the default for direct loader calls
+- Python callers can pass `dual_venc_mode="lv"`, `"hv"`, or `"dv"` to `load_h5_data()` or `load_input_data()`; the selected source is returned as `LoadedCase.flow` and its matching VENC is returned as `LoadedCase.venc`
 - the two `Nv=7` VENC triplets may be stored high-first or low-first; equal triplets or conflicting per-axis ordering are rejected because the low/high channel mapping would be ambiguous
-- the final loader `venc` for `Nv=7` is the high-venc triplet
+- `DV` uses the high-venc triplet as `LoadedCase.venc`; `LV` and `HV` use their selected triplet
 - dual-venc thresholds use `configs/loader.json -> background_phase_correction -> dual_venc_ratio1` and `dual_venc_ratio2`; when both remain `0.0`, AutoFlow derives them from the high/low venc ratio
 
 ## H5 Layout Resolution
@@ -101,7 +103,7 @@ with h5py.File("case.h5", "r") as handle:
 - the GUI labels the normalized render axes and ortho views with `LR, AP, FH`; `spatial_order_raw` describes the source layout and must not be interpreted as the post-load array-axis order.
 - opposite-direction labels such as `RL`, `PA`, and `HF` trigger spatial flips and velocity sign flips so the final `flow` stays physically consistent after reordering.
 - for real-valued `img[..., 1:4]`, AutoFlow treats values near the full `[-pi, pi]` phase range as phase radians and rescales them to physical velocity with `flow / pi * VENC` during load.
-- complex single-VENC H5 inputs retain canonical `phase_wrapped` for the optional phase-unwrapping stage; dual-VENC inputs retain low/high wrapped phases for audit but the workflow skips unwrapping.
+- complex single-VENC H5 inputs retain canonical `phase_wrapped` for the optional phase-unwrapping stage; dual-VENC inputs retain low/high wrapped phases for audit, and only the `DV` selection skips unwrapping.
 - for real-valued H5 inputs, this normalization reorders spatial axes and flow components but does not rescale the stored magnitude values.
 - `LoadedCase.metadata["spatial_order_raw"]` and `LoadedCase.metadata["venc_order_raw"]` preserve the source labels read from the H5 file.
 
