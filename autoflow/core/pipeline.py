@@ -22,15 +22,16 @@ from ..algorithms import (
     compute_pwv_groups,
     save_pwv_results,
     segmentation_timestamp,
+    detect_willis_ring,
 )
 from ..algorithms.phase_unwrapping import unwrap_phase
 from ..plane_io import build_plane_records, save_planes_h5, save_planes_json, save_pwv_h5
 
 
 _DERIVED_ALGORITHM_VERSIONS = {
-    "wss": "wss-geometry-cache-v1",
+    "wss": "wss-vector-derivative-v2",
     "tke": "tke-v1",
-    "pressure": "pressure-periodic-time-v1",
+    "pressure": "pressure-stencil-flux-v2",
     "vortex": "vortex-kinematics-v1",
 }
 
@@ -94,6 +95,64 @@ class PipelineEngine:
             if value in group_values and value not in values:
                 values.append(value)
         return values
+
+    def _update_willis_ring_overlay(self, ws):
+        """Detect and register the optional intracranial Willis-ring overlay.
+
+        This is intentionally outside ``group_order`` and ``multilabel_groups``:
+        the ring overlaps the source arterial labels and must not create a
+        second set of planes or metrics.
+        """
+        ws.remove_object_by_data_key("willis_ring_graph")
+        ws.willis_ring_status = {"status": "indeterminate", "reason": "intracranial_groups_unavailable"}
+        ws.willis_ring_graph = GraphData()
+        configured_groups = dict(getattr(ws.skeleton_params, "label_groups", {}) or {})
+
+        def _role_group(role, fallback):
+            for name, cfg in configured_groups.items():
+                if isinstance(cfg, dict) and str(cfg.get("willis_ring_role", "") or "").strip().lower() == role:
+                    return str(name)
+            return fallback
+
+        anterior_name = _role_group("anterior", "intracranial_anterior_arteries")
+        posterior_name = _role_group("posterior", "vertebrobasilar_arteries")
+        anterior_state = ws.multilabel_groups.get(anterior_name, {})
+        posterior_state = ws.multilabel_groups.get(posterior_name, {})
+        anterior_values = list(anterior_state.get("labels", []) or [])
+        posterior_values = list(posterior_state.get("labels", []) or [])
+        anterior_mask = anterior_state.get("segmask_3d")
+        posterior_mask = posterior_state.get("segmask_3d")
+        if anterior_mask is None or posterior_mask is None:
+            return
+        candidate_mask = np.asarray(anterior_mask, dtype=bool) | np.asarray(posterior_mask, dtype=bool)
+        report = detect_willis_ring(
+            ws.segmask_labels_3d,
+            spacing=ws.resolution,
+            anterior_label_values=anterior_values,
+            posterior_label_values=posterior_values,
+            candidate_mask=candidate_mask,
+        )
+        ws.willis_ring_status = {
+            str(key): value
+            for key, value in report.items()
+            if key not in {"points", "edges"}
+        }
+        points = np.asarray(report.get("points", []), dtype=float).reshape(-1, 3)
+        edges = np.asarray(report.get("edges", []), dtype=int).reshape(-1, 2)
+        if str(report.get("status", "")) != "detected" or len(points) == 0 or len(edges) == 0:
+            return
+        ws.willis_ring_graph = GraphData(points=points, edges=edges)
+        ws.add_object(
+            name="Willis ring",
+            kind=ObjectKind.GRAPH,
+            data_key="willis_ring_graph",
+            group_name="willis_ring",
+            browser_color="#ff00ff",
+            visible=True,
+            opacity=1.0,
+            color="#ff00ff",
+            line_width=4,
+        )
 
     def _indexed_object_name(self, prefix, index):
         label_map = {
@@ -361,6 +420,8 @@ class PipelineEngine:
         if dicom_overrides:
             load_kwargs["parameter_overrides"] = dicom_overrides
         load_kwargs["dicom_read_workers"] = int(getattr(ws.loader_params, "dicom_read_workers", 1) or 1)
+        load_kwargs["dicom_backend"] = getattr(ws.loader_params, "dicom_backend", "native")
+        load_kwargs["dicom_h5_dir"] = getattr(ws.loader_params, "dicom_h5_dir", "")
         source_metadata = getattr(load_target, "metadata", {}) if not isinstance(load_target, (str, bytes, os.PathLike)) else {}
         if isinstance(source_metadata, dict) and source_metadata.get("dual_venc_mode"):
             load_kwargs["dual_venc_mode"] = str(source_metadata["dual_venc_mode"])
@@ -862,6 +923,9 @@ class PipelineEngine:
         self.preprocess(ws)
         points_all = []
         skeleton_mask = np.zeros_like(ws.segmask_3d, dtype=bool)
+        ws.remove_object_by_data_key("willis_ring_graph")
+        ws.willis_ring_status = {"status": "indeterminate", "reason": "graph_not_generated"}
+        ws.willis_ring_graph = GraphData()
         ws.remove_object_by_data_key("skeleton_points")
         ws.remove_object_by_data_key("skeleton_mask_surface")
         ws.remove_object_by_data_key("segmask_3d_surface")
@@ -1036,11 +1100,13 @@ class PipelineEngine:
         ws.path_info = path_info
         ws.forks = forks
         ws.selected_path_index = -1
+        self._update_willis_ring_overlay(ws)
 
         ws.pipeline.mark_done(StepId.GENERATE_GRAPH)
+        willis_status = str(getattr(ws, "willis_ring_status", {}).get("status", "indeterminate"))
         return StepResult(StepId.GENERATE_GRAPH, True, False,
                           f"Graph: {len(ws.graph.points)} nodes, {len(ws.graph.edges)} edges | "
-                          f"paths={len(ws.centerline_paths)} forks={len(ws.forks)}")
+                          f"paths={len(ws.centerline_paths)} forks={len(ws.forks)} willis_ring={willis_status}")
 
     def _step_edit_graph(self, ws):
         ws.pipeline.mark_done(StepId.EDIT_GRAPH, skipped=True)
@@ -1218,7 +1284,10 @@ class PipelineEngine:
             step_size=dp.step_size,
             tube_radius=dp.tube_radius,
             rho=dp.rho,
-            save_pixelwise=save_pixelwise,
+            # These payloads are views of the computed arrays, not file writes.
+            # Cache them even during plane preparation so a later export or
+            # addition of another family does not recompute valid WSS/pressure.
+            save_pixelwise=True,
             tke_array=source_tke,
             sigma=source_sigma,
             rr=ws.rr,

@@ -34,10 +34,11 @@ git submodule update --init --recursive
 pip install -e ".[gui,labeler]"
 ```
 
-Known working test environment in this repo:
+Known working environment in this repo (activate before CLI, GUI or tests):
 
 ```bash
-~/miniconda3/envs/ryy/bin/python -m pytest tests/test_smoke_phantoms.py tests/test_pressure_gradient_phantom.py -q
+conda activate autoflow311
+python -m pytest tests/test_smoke_phantoms.py tests/test_pressure_gradient_phantom.py -q
 ```
 
 ## Run One H5 Case From The CLI
@@ -53,7 +54,7 @@ What this does:
 3. generate graph
 4. generate planes
 5. calculate plane metrics
-6. only run PWV, WSS, TKE, or pressure gradient when requested
+6. requested WSS/TKE/pressure fields are prepared before derived plane sampling and reused in volume export; PWV runs after plane metrics
 7. only export videos when requested
 
 Typical outputs under `./results/demo/<case_name>/`:
@@ -147,3 +148,5 @@ autoflow-run ./data/demo_data.h5 \
 - [Inputs](inputs.md)
 - [Outputs](outputs.md)
 - [Troubleshooting](troubleshooting.md)
+
+[Functional workflow](../features/index.md) explains each module. [Configuration parameters](parameters.md) explains all defaults.

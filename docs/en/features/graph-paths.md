@@ -54,10 +54,7 @@ Use the standard batch or single-case pipeline. Graph generation is part of the 
 
 ## Parameters
 
-| Parameter | Type | Default | Where set | Effect | Code owner |
-| --- | --- | --- | --- | --- | --- |
-| graph step trigger | step | fixed | GUI step or batch order | build nodes, edges, branches, and paths | `autoflow/core/pipeline.py` |
-| edit mode | GUI mode | off | GUI only | drag nodes, toggle edges, delete nodes or edges | `autoflow/ui/app.py` |
+See [skeleton parameters](../user/parameters.md#skeleton), [labels parameters](../user/parameters.md#labels), [CLI flags](../user/cli-parameters.md), and [API fields](../user/api-parameters.md) for complete type/default/unit/effect/owner tables. Dictionary controls are expanded in [Structured parameters](../user/parameter-schemas.md).
 
 ## Outputs
 
@@ -82,7 +79,7 @@ Use the standard batch or single-case pipeline. Graph generation is part of the 
 
 ## Tests
 
-- `~/miniconda3/envs/ryy/bin/python -m pytest tests/test_smoke_phantoms.py -q`
+- `/home/renyuyang/miniconda3/envs/autoflow311/bin/python -m pytest tests/test_smoke_phantoms.py -q`
 
 ## Common Problems
 

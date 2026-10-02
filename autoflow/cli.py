@@ -94,6 +94,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Do not write newly computed correction or automatic-segmentation caches back to the input H5 (useful for read-only benchmarks).",
     )
+    parser.add_argument("--dicom-backend", choices=("native", "dicom2h5"), default=None, help="DICOM loader: direct native loading or conversion through the optional Dicom2H5 submodule. H5 files load normally.")
+    parser.add_argument("--dicom-h5-dir", default=None, help="Directory for new Dicom2H5 outputs; defaults to OUTPUT_DIR/_dicom_h5. Existing H5 files are never replaced.")
     parser.add_argument("--dicom-read-workers", type=int, default=None, help="Worker count for direct DICOM loading; use 0 to pick an automatic thread count.")
     parser.set_defaults(use_multithread=None)
     parser.set_defaults(background_phase_correction=None)
@@ -263,6 +265,8 @@ def main() -> None:
             False if args.background_phase_write_cache is False else None
         ),
         "dicom_read_workers": args.dicom_read_workers,
+        "dicom_backend": args.dicom_backend,
+        "dicom_h5_dir": args.dicom_h5_dir,
         "plane_mode": args.plane_mode,
         "plane_count": args.plane_count,
         "use_center_plane": args.use_center_plane,

@@ -20,6 +20,8 @@ jobs:
           python-version: "3.11"
       - name: Install documentation tools
         run: python -m pip install -e ".[docs]"
+      - name: Check parameter documentation
+        run: python tools/build_parameter_reference.py --check
       - name: Build site
         run: mkdocs build --strict
       - name: Check out organization Pages repository

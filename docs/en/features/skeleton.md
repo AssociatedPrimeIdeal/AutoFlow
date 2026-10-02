@@ -21,6 +21,19 @@ For grouped multi-label segmentations, AutoFlow now:
 6. applies the configured special-label handling for groups containing at least two special labels
 7. skeletonizes each group separately
 
+The built-in label groups keep the non-cranial workflows unchanged. Cranial
+labels are organized as `intracranial_anterior_arteries` (`LICA`, `RICA`,
+`ACA`, `LMCA`, `RMCA`), `vertebrobasilar_arteries` (`LVA`, `RVA`, `BA`,
+`LPCA`, `RPCA`), `intracranial_veins` (`LTS`, `SSS`, `RTS`, `StrS`), and
+`jugular_veins` (`LIJV`, `RIJV`).
+
+After graph generation, AutoFlow performs a conservative Willis-ring check on
+the two arterial masks. A detected cycle containing labels from both arterial
+groups is exposed as a derived `willis_ring` graph overlay. The overlay does
+not replace source labels, ordinary groups, planes, or metrics. Cases without
+a reliable mixed arterial cycle are reported as `not_detected` and keep their
+anterior and vertebrobasilar graphs separate.
+
 `special_handling` selects the special-label strategy. `three_pass_merge` (the
 default) skeletonizes `A+B`, `A+C`, and so on, then merges nearby points.
 `contact_surface` keeps the previous contact-surface separation algorithm.
@@ -79,25 +92,7 @@ summary = run_case("case.h5", config=AutoFlowConfig(output_dir="./results/case")
 
 ## Parameters
 
-| Parameter | Type | Default | Where configured | Effect | Code owner |
-| --- | --- | --- | --- | --- | --- |
-| `remove_small_cc` | bool | `True` | `configs/skeleton.json` | remove small connected components before grouped preprocessing | `autoflow/core/models.py` |
-| `special_handling` | string | `three_pass_merge` | `configs/skeleton.json`, `configs/labels.json` group override, GUI `Special Handling`, CLI `--special-handling` | choose `three_pass_merge` or `contact_surface` for groups with at least two configured special labels | `autoflow/core/pipeline.py`, `autoflow/algorithms/skeleton.py` |
-| `special_merge_radius_mm` | float | `1.5` | `configs/skeleton.json`, `configs/labels.json` group override | merge radius for nearby points in the three-pass strategy | `autoflow/algorithms/skeleton.py` |
-| `separate_special_label_contacts` | bool | `True` | `configs/skeleton.json`, Python API, CLI legacy flag | contact-separation gate used when `special_handling=contact_surface` | `autoflow/algorithms/preprocess.py` |
-| `special_contact_labels` | list[str] | `["RBCT", "CCA", "LBCT"]` | `configs/skeleton.json` | names of labels whose pairwise contacts are cut; all other label pairs are untouched | `autoflow/core/models.py` |
-| `min_cc_volume_mm3` | float | `50.0` | `configs/skeleton.json` | component-volume threshold | `autoflow/core/models.py` |
-| `cc_filter_mode` | string | `hybrid` | `configs/skeleton.json` | choose `absolute`, `relative`, `hybrid`, or `largest` connected-component filtering | `autoflow/core/models.py` |
-| `cc_rel_min_ratio` | float | `0.01` | `configs/skeleton.json` | relative threshold against the largest connected component for `relative` and `hybrid` filtering | `autoflow/core/models.py` |
-| `min_edge_points` | int | `3` | `configs/skeleton.json`, group preprocess override, GUI `Minimum Edge Count`, CLI `--min-edge-points` | remove terminal graph branches with fewer than this many edge segments; `0` or `1` disables the filter | `autoflow/algorithms/graph.py`, `autoflow/core/pipeline.py` |
-| `do_closing` | bool | `True` | `configs/skeleton.json` | global closing before skeletonization | `autoflow/algorithms/preprocess.py` |
-| `do_opening` | bool | `False` | `configs/skeleton.json` | global opening before skeletonization | `autoflow/algorithms/preprocess.py` |
-| `gaussian_sigma` | float | `0.5` | `configs/skeleton.json` | global smoothing strength | `autoflow/algorithms/preprocess.py` |
-| `gaussian_enabled` | bool | `True` | `configs/skeleton.json` | enable or disable global Gaussian smoothing | `autoflow/algorithms/preprocess.py` |
-| `label_map` | mapping | built-in vessel defaults | `configs/labels.json` | maps symbolic vessel names to integer label values | `autoflow/config.py` |
-| `label_groups` | mapping | built-in vessel groups | `configs/labels.json` | merges labels into named groups and defines colors plus preprocessing overrides | `autoflow/core/models.py` |
-| `label_groups.<group>.preprocess` | mapping | `{}` | `configs/labels.json` | per-group preprocessing overrides before skeletonization | `autoflow/algorithms/preprocess.py` |
-| `single_label_group_name` | string | `single_label` | `configs/labels.json` | fallback group name for binary or one-label inputs | `autoflow/core/models.py` |
+See [skeleton parameters](../user/parameters.md#skeleton), [labels parameters](../user/parameters.md#labels), [CLI flags](../user/cli-parameters.md), and [API fields](../user/api-parameters.md) for complete type/default/unit/effect/owner tables. Dictionary controls are expanded in [Structured parameters](../user/parameter-schemas.md).
 
 Fork detection is topology-based and therefore remains stable when flow near a
 junction is weak. Path direction is still flow-informed, but uses the path
@@ -110,6 +105,8 @@ score.
 | --- | --- | --- |
 | workspace skeleton points | skeleton step succeeds | centerline-like skeleton representation |
 | skeleton scene object | GUI skeleton step succeeds | grouped skeleton object such as `skeleton_aorta_systemic_branches` |
+| `willis_ring_status` and optional `willis_ring_graph` | graph step succeeds for the cranial arterial groups | topology-only Willis-ring status and overlay; source labels and metrics remain unchanged |
+| `summary.json -> willis_ring` | CLI/batch processing completes | persisted status, cycle rank, component details, and member label IDs |
 
 ## Limitations
 - segmentation is required
@@ -123,12 +120,13 @@ score.
 | --- | --- | --- | --- |
 | preprocessing before skeletonization | `autoflow/algorithms/preprocess.py` | `autoflow/core/models.py`, `autoflow/config.py` | `tests/test_smoke_phantoms.py` |
 | grouped skeleton pipeline flow | `autoflow/core/pipeline.py` | `autoflow/algorithms/skeleton.py` | `tests/test_smoke_phantoms.py` |
+| Willis-ring topology check | `autoflow/algorithms/intracranial.py`, `autoflow/core/pipeline.py` | `autoflow/core/models.py`, `autoflow/ui/viewer.py` | `tests/test_smoke_phantoms.py` |
 | short terminal branch cleanup | `autoflow/algorithms/graph.py` | `autoflow/core/pipeline.py`, `autoflow/core/models.py` | `tests/test_smoke_phantoms.py` |
 | graph fork detection and flow-based path orientation | `autoflow/algorithms/branch.py`, `autoflow/algorithms/planes.py` | `autoflow/core/pipeline.py` | `tests/test_smoke_phantoms.py` |
 | interactive skeleton edit behavior | `autoflow/ui/app.py`, `autoflow/ui/editors.py` | `autoflow/core/pipeline.py` | GUI manual verification |
 
 ## Tests
-- `~/miniconda3/envs/ryy/bin/python -m pytest tests/test_smoke_phantoms.py -q`
+- `/home/renyuyang/miniconda3/envs/autoflow311/bin/python -m pytest tests/test_smoke_phantoms.py -q`
 
 ## Common problems
 
@@ -139,4 +137,5 @@ score.
 | skeleton contains many small branches | noisy segmentation | raise cleanup thresholds or improve segmentation |
 | one grouped vessel disappears | every component in that group fell below the active cleanup threshold | lower `min_cc_volume_mm3` or `cc_rel_min_ratio`, or improve the segmentation |
 | special-label result is unexpected | the selected strategy or special-label list does not match the group | set `special_handling` to `three_pass_merge` or `contact_surface`, then check `special_contact_labels` |
+| `willis_ring` is not shown | no reliable mixed anterior/posterior arterial cycle was found, or one cranial arterial group is missing | inspect the source labels and graph connectivity; `not_detected` does not modify the three fixed cranial groups |
 | `Edit Skeleton` is unavailable | more than one segmentation group is active | use a single-group case or simplify `configs/labels.json` |

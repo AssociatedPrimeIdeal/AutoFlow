@@ -7,9 +7,10 @@
 | `GUI dependencies are not installed` | GUI extras missing | run `pip install -e ".[gui]"` |
 | import error for `PySide6`, `pyqtgraph`, `pyvistaqt`, `vtk`, or `matplotlib` | GUI stack missing | install GUI extras in the same environment |
 | `Cannot connect to DISPLAY=...` | the inherited X11 display or SSH-forwarding session is unavailable | use one of the local displays listed by the error, or reconnect with `ssh -Y` and verify `xdpyinfo` succeeds |
-| SSH launch previously stopped at a forwarded `DISPLAY`, or reports `Could not create shader object`, `Could not find a decent config`, or `Failed to initialize OpenGL functions` | forwarded X11 can show Qt widgets but cannot provide a reliable embedded OpenGL context for VTK on this host | install the current build and reconnect with `ssh -Y`; AutoFlow detects `localhost:N.0` and uses interactive EGL off-screen rendering automatically |
+| SSH launch previously stopped at a forwarded `DISPLAY`, or reports `Could not create shader object`, `Could not find a decent config`, or `Failed to initialize OpenGL functions` | forwarded X11 can show Qt widgets but cannot provide a reliable embedded OpenGL context for VTK on this host | install the current build and reconnect with `ssh -Y`; AutoFlow probes EGL off-screen rendering and falls back to software if the probe fails. To explicitly force software rendering, run `VTK_DEFAULT_OPENGL_WINDOW=vtkOSOpenGLRenderWindow autoflow-gui` |
 | the SSH 3D panel is black and the terminal repeatedly reports `BufferError: memoryview: underlying buffer is not C-contiguous` | an older SSH renderer exposed the RGB channels of a PyVista RGBA screenshot as a non-contiguous view | reinstall the current editable build; the renderer now packs screenshots into a contiguous RGB buffer before creating the Qt image |
 | the SSH 3D view feels less responsive than a local display | each rendered RGB frame must be transferred through X11 | reduce the window size while rotating, or use a local `DISPLAY=:1` session for full native frame rate; data processing and numerical results are unchanged |
+| PC-MRA playback remains slow on a machine with a GPU | an explicit software render-window override is set, or the EGL probe cannot create a context | check `echo "$VTK_DEFAULT_OPENGL_WINDOW"`; remove an unintended override with `unset VTK_DEFAULT_OPENGL_WINDOW` and restart. GPU rendering requires a working VTK/OpenGL context as well as an installed GPU driver |
 | the 3D panel is white except for axes or a colorbar after loading data | an older build reset the camera before the first data actor existed, leaving the actor outside the view | reinstall the current build; the camera now fits the first visible actor after an empty scene is populated |
 | `inotify_add_watch(...) failed: (No space left on device)` while the disks still have free space | the per-user Linux inotify watch quota is exhausted, commonly by several VS Code Remote file watchers | close unused remote VS Code sessions or ask an administrator to raise `fs.inotify.max_user_watches`; this is a file-watcher quota, not an AutoFlow data or disk-space error |
 | `qt.svg.draw: The requested buffer size is too big` at GUI startup | a scalable system-theme icon was requested at an invalid effective SSH display size | reinstall the current build, which eagerly rasterizes standard controls to fixed 16 px icons |
@@ -72,3 +73,16 @@
 - segmentation issues: `autoflow/algorithms/segmentation.py`, `autoflow/ui/app.py`
 - pipeline behavior: `autoflow/core/pipeline.py`, `autoflow/processing.py`
 - rendering issues: `autoflow/rendering/videos.py`
+
+## CLI/GUI or tests use an older installation
+
+Activate the intended environment and check the imported source:
+
+```bash
+conda activate autoflow311
+python -c "import autoflow.algorithms.metrics as m; print(m.__file__)"
+python -m pip install -e .
+python -m pytest tests/test_smoke_phantoms.py tests/test_pressure_gradient_phantom.py -q
+```
+
+From a source checkout, the imported path should point to this repository. An editable install also directs console CLI/GUI entries to the current checkout. The GUI must be restarted to load changed Python modules.

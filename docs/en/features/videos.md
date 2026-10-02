@@ -52,43 +52,7 @@ Use `Export > Export Videos...`, choose an output directory, then select any com
 
 ## Parameters
 
-| Parameter | Type | Default | Where set | Effect |
-| --- | --- | --- | --- | --- |
-| `requested_videos` / `--video` | csv | empty | command line or `AutoFlowConfig` | enable one or more of `plane`, `wss`, `tke`, `pg`, `streamlines` |
-| `Export > Export Videos...` | GUI action | none | GUI menu | choose output directory and selected video items interactively |
-| `plane_video.show_skeleton` | bool | `True` | `configs/video_exporting.json` | show or hide skeleton points in plane videos |
-| `plane_video.skeleton_point_size` | float | `10.0` | `configs/video_exporting.json` | skeleton point size in plane videos |
-| `plane_video.default.skeleton_color` | string | empty | `configs/video_exporting.json` | fallback skeleton color when a group override is missing |
-| `plane_video.default.plane_size` | float or null | `null` | `configs/video_exporting.json` | fallback plane size; `null` uses the automatic scene-based size |
-| `plane_video.default.plane_color` | string | `yellow` | `configs/video_exporting.json` | fallback plane color when a group override is missing |
-| `plane_video.default.plane_opacity` | float | `0.75` | `configs/video_exporting.json` | fallback plane opacity |
-| `plane_video.label.prefix` | string | `planeidx=` | `configs/video_exporting.json` | plane-video index label prefix before the plane number |
-| `plane_video.label.font_size` | int | `28` | `configs/video_exporting.json` | plane-video index label font size |
-| `plane_video.label.text_color` | string | `black` | `configs/video_exporting.json` | plane-video index label text color |
-| `plane_video.label.shape_color` | string | `yellow` | `configs/video_exporting.json` | plane-video index label background color |
-| `plane_video.label.shape_opacity` | float | `0.85` | `configs/video_exporting.json` | plane-video index label background opacity |
-| `plane_video.groups.<group>.skeleton_color` | string | group fallback | `configs/video_exporting.json` | per-group skeleton color in the plane video |
-| `plane_video.groups.<group>.plane_size` | float or null | `null` | `configs/video_exporting.json` | per-group plane size in the plane video |
-| `plane_video.groups.<group>.plane_color` | string | group fallback | `configs/video_exporting.json` | per-group plane color in the plane video |
-| `plane_video.groups.<group>.plane_opacity` | float | `0.75` | `configs/video_exporting.json` | per-group plane opacity in the plane video |
-| `fps` / `--fps` | int | `12` | `configs/video_exporting.json` | output frame rate |
-| `plane_rotation_frames` / `--plane-rotation-frames` | int | `180` | `configs/video_exporting.json` | plane video rotation length |
-| `window_size` | list[int, int] | `[1600, 1200]` | `configs/video_exporting.json` | output render size; this is the main replacement for a Matplotlib-style `figsize` |
-| `camera_view` / `--camera-view` | string | `right` | `configs/video_exporting.json` | camera preset |
-| `camera_distance_scale` / `--camera-distance-scale` | float | `1.5` | `configs/video_exporting.json` | scale camera distance |
-| `rotate_dynamic_video` | bool | `True` | `configs/video_exporting.json` | rotate dynamic videos; set `False` to keep WSS, TKE, pressure-gradient, relative-pressure, and streamline videos fixed |
-| `dynamic_rotation_frames` | int | `180` | `configs/video_exporting.json` | rotation frame count for dynamic videos |
-| `dynamic_rotation_elevation_deg` | float | `10.0` | `configs/video_exporting.json` | dynamic rotation elevation |
-| `dynamic_time_repeat` | int | `3` | `configs/video_exporting.json` | repeat each time frame |
-| `add_plane_idx` | bool | `True` | `configs/video_exporting.json` | annotate plane indices as `planeidx=<index>` in the plane video |
-| `add_path_idx` | bool | `False` | `configs/video_exporting.json` | annotate path indices |
-| `wss.render.show_scalar_bar` | bool | `True` | `configs/wss.json` | show or hide the WSS colorbar |
-| `tke.render.show_scalar_bar` | bool | `True` | `configs/tke.json` | show or hide the TKE colorbar |
-| `pressure_gradient.render.clim` | list[float, float] or `null` | `null` | `configs/pressure_gradient.json` | explicit pressure-gradient color range; `null` keeps the auto range |
-| `pressure_gradient.render.show_scalar_bar` | bool | `True` | `configs/pressure_gradient.json` | show or hide the pressure-gradient colorbar |
-| `pressure_gradient.render.relative_pressure_clim` | list[float, float] or `null` | `null` | `configs/pressure_gradient.json` | explicit relative-pressure color range; `null` keeps the symmetric auto range |
-| `pressure_gradient.render.relative_pressure_show_scalar_bar` | bool | `True` | `configs/pressure_gradient.json` | show or hide the relative-pressure colorbar |
-| `streamlines.render.show_scalar_bar` | bool | `True` | `configs/streamlines.json` | show or hide the streamline colorbar |
+See [video exporting parameters](../user/parameters.md#video_exporting), [colorbar parameters](../user/parameters.md#colorbar), [CLI flags](../user/cli-parameters.md), and [API fields](../user/api-parameters.md) for complete type/default/unit/effect/owner tables. Dictionary controls are expanded in [Structured parameters](../user/parameter-schemas.md).
 
 ## Outputs
 
@@ -119,7 +83,7 @@ Use `Export > Export Videos...`, choose an output directory, then select any com
 
 ## Tests
 
-- `~/miniconda3/envs/ryy/bin/python -m pytest tests/test_smoke_phantoms.py -q`
+- `/home/renyuyang/miniconda3/envs/autoflow311/bin/python -m pytest tests/test_smoke_phantoms.py -q`
 
 ## Common Problems
 

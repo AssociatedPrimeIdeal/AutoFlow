@@ -2,7 +2,8 @@
 
 Qt's regular widgets work over forwarded X11 on systems where QOpenGLWidget
 cannot obtain a usable GLX context.  This widget keeps VTK on an off-screen
-software render window and transfers completed RGB frames into a normal QWidget.
+EGL render window (or software fallback) and transfers completed RGB frames
+into a normal QWidget.
 """
 
 from __future__ import annotations
@@ -15,8 +16,9 @@ import time
 import numpy as np
 
 if os.environ.get("AUTOFLOW_SSH_RENDERING") == "1":
-    os.environ["VTK_DEFAULT_OPENGL_WINDOW"] = "vtkOSOpenGLRenderWindow"
-    os.environ["QT_X11_NO_MITSHM"] = "1"
+    from .launcher import _configure_ssh_rendering
+
+    _configure_ssh_rendering()
 
 import pyvista as pv
 from PySide6 import QtCore, QtGui, QtWidgets

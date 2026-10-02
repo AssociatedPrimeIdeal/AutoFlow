@@ -31,28 +31,20 @@
         "plane_color": "#b2f2bb",
         "plane_opacity": 0.75
       },
-      "carotid_arteries": {
+      "intracranial_anterior_arteries": {
         "plane_color": "#e599f7",
         "plane_opacity": 0.75
       },
-      "vertebral_arteries": {
+      "vertebrobasilar_arteries": {
         "plane_color": "#d0bfff",
         "plane_opacity": 0.75
       },
-      "basilar_artery": {
-        "plane_color": "#bac8ff",
-        "plane_opacity": 0.75
-      },
-      "dural_sinuses": {
+      "intracranial_veins": {
         "plane_color": "#99e9f2",
         "plane_opacity": 0.75
       },
       "jugular_veins": {
         "plane_color": "#dee2e6",
-        "plane_opacity": 0.75
-      },
-      "intracranial_arterial_branches": {
-        "plane_color": "#ffec99",
         "plane_opacity": 0.75
       }
     }

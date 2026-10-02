@@ -647,7 +647,9 @@ def scan_dicom_cases(root, progress_callback=None):
     return sorted(cases, key=lambda case: case.display_name.lower())
 
 
-def resolve_input_case(input_source):
+def resolve_input_case(input_source, dicom_backend="native", dicom_h5_dir=""):
+    if dicom_backend not in {"native", "dicom2h5"}:
+        raise ValueError(f"Unknown DICOM backend: {dicom_backend}")
     if isinstance(input_source, InputCase):
         return input_source
 
@@ -666,6 +668,13 @@ def resolve_input_case(input_source):
     if not root:
         raise ValueError(f"unsupported input path: {path}")
 
+    if dicom_backend == "dicom2h5":
+        from .dicom_conversion import converted_input_cases
+        cases = converted_input_cases(path, dicom_h5_dir or "./results/_dicom_h5")
+        if len(cases) != 1:
+            raise ValueError("Multiple converted H5 groups found. Load the saved H5 and select a group, or use run_batch().")
+        return cases[0]
+
     cases = scan_dicom_cases(root)
     if os.path.isfile(path):
         cases = [
@@ -682,7 +691,10 @@ def resolve_input_case(input_source):
     return cases[0]
 
 
-def collect_input_cases(inputs):
+def collect_input_cases(inputs, dicom_backend="native", dicom_h5_dir=""):
+    converted_roots = set()
+    if dicom_backend not in {"native", "dicom2h5"}:
+        raise ValueError(f"Unknown DICOM backend: {dicom_backend}")
     discovered = []
     seen = set()
 
@@ -693,10 +705,22 @@ def collect_input_cases(inputs):
             discovered.append(case)
 
     for item in inputs:
+        if isinstance(item, InputCase):
+            _append(item)
+            continue
         path = os.path.abspath(str(item))
         if _is_h5_path(path):
             for case in discover_h5_input_cases(path):
                 _append(case)
+            continue
+        if os.path.isdir(path) and dicom_backend == "dicom2h5":
+            root_key = os.path.realpath(path)
+            if root_key in converted_roots:
+                continue
+            from .dicom_conversion import converted_input_cases
+            for case in converted_input_cases(path, dicom_h5_dir or "./results/_dicom_h5"):
+                _append(case)
+            converted_roots.add(root_key)
             continue
         if os.path.isdir(path):
             for h5_path in _collect_h5_files_from_dir(path):
@@ -1579,10 +1603,12 @@ def load_input_data(
     force_recompute_seg=False,
     ignore_embedded_segmentation=False,
     dual_venc_mode="dv",
+    dicom_backend="native",
+    dicom_h5_dir="",
 ):
-    case = resolve_input_case(input_source)
+    case = resolve_input_case(input_source, dicom_backend, dicom_h5_dir)
     if case.input_kind == "h5":
-        return load_h5_data(
+        loaded = load_h5_data(
             case.input_path,
             correction_config=correction_config,
             progress_callback=progress_callback,
@@ -1591,6 +1617,9 @@ def load_input_data(
             ignore_embedded_segmentation=ignore_embedded_segmentation,
             dual_venc_mode=dual_venc_mode,
         )
+        if case.metadata.get("dicom_backend"):
+            loaded.metadata.update({key: case.metadata[key] for key in ("dicom_backend", "dicom_source_directory", "converted_h5")})
+        return loaded
     loaded = load_dicom_case(
         case,
         correction_config=correction_config,

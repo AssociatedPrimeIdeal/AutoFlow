@@ -86,6 +86,8 @@ from .branch import (
     segment_vessels_from_graph_and_mask,
 )
 
+from .intracranial import detect_willis_ring
+
 from .planes import (
     filter_paths_by_segmentation,
     generate_planes_from_paths,
@@ -208,6 +210,7 @@ __all__ = [
     "find_path_forks",
     "build_path_info",
     "segment_vessels_from_graph_and_mask",
+    "detect_willis_ring",
     "filter_paths_by_segmentation",
     "generate_planes_from_paths",
     "build_multilabel_surface",

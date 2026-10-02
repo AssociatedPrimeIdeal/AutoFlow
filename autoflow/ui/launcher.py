@@ -49,6 +49,36 @@ def _reachable_local_displays() -> list[str]:
     return candidates
 
 
+def _configure_ssh_rendering() -> None:
+    """Prefer a working EGL context while keeping a safe software fallback."""
+    os.environ["AUTOFLOW_SSH_RENDERING"] = "1"
+    os.environ["QT_X11_NO_MITSHM"] = "1"
+    if os.environ.get("VTK_DEFAULT_OPENGL_WINDOW"):
+        return
+    # Probe in a child process: an unavailable EGL driver can abort inside VTK.
+    # The forwarded DISPLAY must remain available to the main Qt application.
+    probe = (
+        "from vtkmodules.vtkRenderingOpenGL2 import vtkEGLRenderWindow; "
+        "w = vtkEGLRenderWindow(); w.SetOffScreenRendering(1); "
+        "w.SetSize(16, 16); w.Render(); ok = w.SupportsOpenGL(); "
+        "w.Finalize(); raise SystemExit(0 if ok else 1)"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=8.0,
+            check=False,
+        )
+        egl_available = result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        egl_available = False
+    os.environ["VTK_DEFAULT_OPENGL_WINDOW"] = (
+        "vtkEGLRenderWindow" if egl_available else "vtkOSOpenGLRenderWindow"
+    )
+
+
 def validate_display() -> None:
     if not sys.platform.startswith("linux"):
         return
@@ -62,9 +92,7 @@ def validate_display() -> None:
         _is_forwarded_x11(display) or bool(os.environ.get("SSH_CONNECTION"))
     )
     if forwarded:
-        os.environ["AUTOFLOW_SSH_RENDERING"] = "1"
-        os.environ["VTK_DEFAULT_OPENGL_WINDOW"] = "vtkOSOpenGLRenderWindow"
-        os.environ["QT_X11_NO_MITSHM"] = "1"
+        _configure_ssh_rendering()
         return
     if display and _display_is_reachable(display):
         return

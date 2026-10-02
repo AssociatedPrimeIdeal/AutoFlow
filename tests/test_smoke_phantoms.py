@@ -14,12 +14,15 @@ from autoflow.algorithms.segmentation import default_nnunet_model_folder
 from autoflow.algorithms.pwv import compute_cross_correlation_delay_ms, detect_waveform_foot_time_ms
 from autoflow.algorithms.preprocess import filter_connected_components, separate_longitudinal_label_contacts
 from autoflow.algorithms.skeleton import generate_three_pass_special_skeleton
+from autoflow.algorithms.intracranial import detect_willis_ring
 from autoflow.algorithms.graph import remove_short_terminal_branches
 from autoflow.algorithms.metrics import (
     compute_plane_metrics,
     compute_plane_metrics_multithread,
     compute_vortex_metrics,
     compute_wss_metrics,
+    cal_wss_from_surf,
+    calculate_gradient,
     filter_planes_by_branch_support,
 )
 from autoflow.algorithms.planes import filter_paths_by_segmentation, generate_planes_from_paths
@@ -85,6 +88,30 @@ def test_cvi_style_contour_edit_creates_and_replaces_one_local_arc():
     edited, message = replace_contour_segment(original, open_stroke, 0.35, 1.5)
     assert edited is not None, message
     assert abs(polygon_area(edited)) > abs(polygon_area(original))
+
+
+def test_willis_ring_detection_requires_a_mixed_arterial_cycle():
+    size = 41
+    labels = np.zeros((size, size, 3), dtype=np.int16)
+    yy, xx = np.indices((size, size))
+    radius = np.sqrt((xx - 20) ** 2 + (yy - 20) ** 2)
+    ring = (radius > 8.0) & (radius < 11.0)
+    labels[:, :, 1][ring & (xx < 20)] = 17  # LICA/anterior side
+    labels[:, :, 1][ring & (xx >= 20)] = 26  # PCA/posterior side
+    detected = detect_willis_ring(labels, spacing=(1.0, 1.0, 1.0),
+                                  anterior_label_values=[17],
+                                  posterior_label_values=[26])
+    assert detected["status"] == "detected"
+    assert detected["cycle_rank"] >= 1
+    assert set(detected["member_labels"]) == {17, 26}
+
+    disconnected = np.zeros((24, 24, 3), dtype=np.int16)
+    disconnected[3:19, 5, 1] = 17
+    disconnected[3:19, 17, 1] = 26
+    absent = detect_willis_ring(disconnected, spacing=(1.0, 1.0, 1.0),
+                                anterior_label_values=[17],
+                                posterior_label_values=[26])
+    assert absent["status"] == "not_detected"
 
 
 def test_three_pass_special_skeleton_merges_configured_branch_passes():
@@ -259,9 +286,13 @@ def test_internal_consistency_marks_missing_path_metrics_undefined():
     assert metrics[0]["path_ic"] is None
 
 
-def test_vortex_kinematics_matches_rigid_rotation_and_rejects_pure_shear():
+@pytest.mark.parametrize("sparse_mask", [False, True])
+def test_vortex_kinematics_matches_rigid_rotation_and_rejects_pure_shear(sparse_mask):
     shape = (11, 11, 11, 2)
     mask = np.ones(shape, dtype=bool)
+    if sparse_mask:
+        mask[:] = False
+        mask[2:9, 2:9, 2:9, :] = True
     x, y, _z = np.meshgrid(
         np.arange(shape[0], dtype=np.float32),
         np.arange(shape[1], dtype=np.float32),
@@ -280,6 +311,9 @@ def test_vortex_kinematics_matches_rigid_rotation_and_rejects_pure_shear():
     assert float(result["q_criterion_array"][center]) == pytest.approx(omega ** 2)
     assert float(result["swirling_strength_array"][center]) == pytest.approx(omega)
     assert not np.any(result["vortex_support_mask"][0])
+    outside_support = result["vortex_support_mask"] == 0
+    for name in ("vorticity_array", "vorticity_magnitude", "q_criterion_array", "swirling_strength_array"):
+        assert not np.any(result[name][outside_support])
 
     shear_rate = 30.0
     shear = np.zeros_like(rotation)
@@ -576,6 +610,51 @@ def test_segmentation_plane_filter_uses_free_endpoint_run_and_clips_path():
     assert float(filtered[0][0, 0]) >= 7.5  # first retained sample rounds to label 5
 
 
+@pytest.mark.parametrize("a,b,c,d", [(0.4, -0.04, 0.2, 0.03), (-1.0, 1.0, 0.0, 0.0)])
+def test_wss_vector_matches_analytic_quadratic_wall_shear(a, b, c, d):
+    import pyvista as pv
+
+    grid = pv.ImageData(dimensions=(61, 9, 9), spacing=(0.1, 0.5, 0.5), origin=(-3, -2, -2))
+    s = np.abs(grid.points[:, 0])
+    grid.point_data["u"] = np.zeros(len(s))
+    grid.point_data["v"] = a * s + b * s**2
+    grid.point_data["w"] = c * s + d * s**2
+    wall = pv.Plane(center=(0, 0, 0), direction=(1, 0, 0), i_size=1, j_size=1,
+                    i_resolution=2, j_resolution=2)
+    result = cal_wss_from_surf(wall, grid, inward_distance=1.0, viscosity=4.0)
+    np.testing.assert_allclose(result["wss_vectors"], np.tile([0, 4*a, 4*c], (wall.n_points, 1)), atol=1e-10)
+    np.testing.assert_allclose(result["wss"], 4 * np.hypot(a, c), atol=1e-10)
+    assert np.all(result["wss_valid"])
+
+
+def test_wss_interpolates_cell_velocity_continuously_and_retains_signed_components():
+    import pyvista as pv
+    from autoflow.algorithms.surfaces import create_uniform_vector
+
+    v = 0.1 * (np.arange(8, dtype=float) + 0.5)[:, None, None] * np.ones((1, 8, 8))
+    grid = create_uniform_vector(np.zeros_like(v), v, np.zeros_like(v), (1, 1, 1))
+    wall = pv.Plane(center=(3, 3, 3), direction=(1, 0, 0), i_size=1, j_size=1,
+                    i_resolution=2, j_resolution=2)
+    result = cal_wss_from_surf(wall, grid, inward_distance=0.3, viscosity=4.0, no_slip_condition=False)
+    np.testing.assert_allclose(result["wss"], 0.4, atol=1e-10)
+    # An open plane has no geometric inside: its supplied mesh winding defines
+    # the normal. The analytic directional derivative is 0.1 * normal_x.
+    np.testing.assert_allclose(result["wss_vectors"][:, 1], 0.4 * result.point_normals[:, 0], atol=1e-10)
+
+
+def test_wss_linear_mode_and_invalid_wall_normal_samples():
+    np.testing.assert_allclose(calculate_gradient([0.0], [0.3], [0.4], 1.0, use_parabolic=False), [0.3])
+    mask = np.zeros((8, 8, 8, 2), dtype=bool)
+    mask[2:6, 2:6, 2:6] = True
+    flow = np.zeros(mask.shape + (3,), dtype=np.float32)
+    result = compute_wss_metrics(mask, flow, (1, 1, 1), smoothing_iteration=0, inward_distance=10)
+    for wall in result["wss_surfaces"]:
+        assert not np.any(wall["wss_valid"])
+        assert np.isnan(wall["wss"]).all()
+        assert np.isnan(wall["wss_vectors"]).all()
+    assert np.isnan(result["wss_volume"]).any()
+
+
 def test_static_masks_reuse_plane_and_wss_geometry(monkeypatch):
     import autoflow.algorithms.metrics as metrics_module
 
@@ -614,6 +693,9 @@ def test_static_masks_reuse_plane_and_wss_geometry(monkeypatch):
     )
     assert surface_calls == 1
     assert len(result["wss_surfaces"]) == mask.shape[3]
+    for wall in result["wss_surfaces"]:
+        assert np.all(wall["wss_valid"])
+        assert np.all(np.sum((wall.points - np.array([4, 4, 4])) * wall.point_normals, axis=1) < 0)
 
 
 def test_derived_cache_signature_invalidates_changed_wss_parameters(monkeypatch):
@@ -629,10 +711,11 @@ def test_derived_cache_signature_invalidates_changed_wss_parameters(monkeypatch)
 
     def fake_compute_derived_metrics(**kwargs):
         calls.append(float(kwargs["wss_viscosity"]))
+        volume = np.full(workspace.segmask_binary.shape, calls[-1], dtype=np.float32)
         return {
             "wss_surfaces": [object(), object()],
-            "wss_volume": np.full(workspace.segmask_binary.shape, calls[-1], dtype=np.float32),
-            "pixelwise_export": {},
+            "wss_volume": volume,
+            "pixelwise_export": {"wss": volume} if kwargs["save_pixelwise"] else {},
         }
 
     monkeypatch.setattr(pipeline_module, "compute_derived_metrics", fake_compute_derived_metrics)
@@ -642,6 +725,11 @@ def test_derived_cache_signature_invalidates_changed_wss_parameters(monkeypatch)
     engine._ensure_derived_metrics(
         workspace, compute_wss=True, compute_tke=False, compute_pressure_gradient=False,
     )
+    engine._ensure_derived_metrics(
+        workspace, save_pixelwise=True, compute_wss=True, compute_tke=False, compute_pressure_gradient=False,
+    )
+    assert calls == [4.0]
+    assert workspace.derived.pixelwise_export["wss"] is workspace.derived.wss_volume
     workspace.derived_params.wss_viscosity = 5.0
     engine._ensure_derived_metrics(
         workspace, compute_wss=True, compute_tke=False, compute_pressure_gradient=False,
@@ -649,6 +737,7 @@ def test_derived_cache_signature_invalidates_changed_wss_parameters(monkeypatch)
 
     assert calls == [4.0, 5.0]
     assert float(workspace.derived.wss_volume[0, 0, 0, 0]) == pytest.approx(5.0)
+    assert workspace.derived.pixelwise_export["wss"] is workspace.derived.wss_volume
 
 
 def test_streamline_auto_clim_uses_segmented_velocity_across_time():
@@ -979,6 +1068,8 @@ def test_load_h5_data_runs_dual_venc_corrections_concurrently(tmp_path, monkeypa
         with worker_names_lock:
             worker_names.add(threading.current_thread().name)
         barrier.wait(timeout=2.0)
+        if progress_callback:
+            progress_callback({"stage":"background_phase_done","message":source_mode})
         return values, None, {
             "enabled": True,
             "applied": False,
@@ -989,7 +1080,12 @@ def test_load_h5_data_runs_dual_venc_corrections_concurrently(tmp_path, monkeypa
         }
 
     monkeypatch.setattr("autoflow.algorithms.data.apply_background_phase_correction_to_complex", fake_apply)
-    loaded = load_h5_data(str(path), correction_config={"enabled": True})
+    callback_threads = []
+    caller_thread = threading.get_ident()
+    loaded = load_h5_data(str(path), correction_config={"enabled": True},
+                          progress_callback=lambda payload: callback_threads.append(threading.get_ident()))
+    assert callback_threads
+    assert set(callback_threads) == {caller_thread}
 
     assert len(worker_names) == 2
     assert all(name.startswith("autoflow-bgc") for name in worker_names)
@@ -1812,14 +1908,19 @@ def test_nnunet_autoseg_progress_callback_reports_stage_updates(monkeypatch, tmp
     assert all("elapsed_sec" in event for event in events)
 
 
-def test_nnunet4d_auto_profile_uses_best_checkpoint_and_keeps_frames(monkeypatch, tmp_path):
+@pytest.mark.parametrize("hard_links", [True, False])
+def test_nnunet4d_auto_profile_uses_best_checkpoint_and_keeps_frames(monkeypatch, tmp_path, hard_links):
+    if not hard_links:
+        def unavailable_link(*args, **kwargs):
+            raise OSError("hard links unavailable")
+        monkeypatch.setattr("autoflow.algorithms.segmentation.os.link", unavailable_link)
     model_dir = tmp_path / "temporal_model"
     fold_dir = model_dir / "fold_all"
     fold_dir.mkdir(parents=True)
     (fold_dir / "checkpoint_best.pth").write_bytes(b"checkpoint")
     (model_dir / "dataset.json").write_text(
         json.dumps({
-            "channel_names": {"0": "tp0_mag"},
+            "channel_names": {"0": "mag_mean_xyz", "1": "tm1_mag", "2": "tp0_mag", "3": "tp1_mag"},
             "labels": {"background": 0, "vessel": 1},
             "file_ending": ".nii.gz",
         }),
@@ -1828,6 +1929,16 @@ def test_nnunet4d_auto_profile_uses_best_checkpoint_and_keeps_frames(monkeypatch
     (model_dir / "plans.json").write_text(json.dumps({"plans": "ok"}), encoding="utf-8")
 
     def fake_runner(command, **_kwargs):
+        import nibabel as nib
+        assert "configure_exact_inference_runtime" in command[command.index("-c") + 1]
+        input_dir = Path(command[command.index("-i") + 1])
+        inputs = sorted(input_dir.glob("*.nii.gz"))
+        assert len(inputs) == 12
+        for path in inputs:
+            frame = int(path.name.split("_t", 1)[1].split("_", 1)[0])
+            channel = int(path.name.split("_", 3)[-1].split(".", 1)[0])
+            expected = 2.0 if channel == 0 else float(((frame + channel - 2) % 3) + 1)
+            assert np.all(np.asarray(nib.load(path).dataobj) == expected)
         output_dir = Path(command[command.index("-o") + 1])
         for frame in range(3):
             (output_dir / f"autoflow_case_t{frame:03d}.nii.gz").write_bytes(b"fake")
@@ -1839,7 +1950,7 @@ def test_nnunet4d_auto_profile_uses_best_checkpoint_and_keeps_frames(monkeypatch
 
     monkeypatch.setattr("autoflow.algorithms.segmentation._read_nifti_segmentation", fake_read)
     seg, provenance = generate_nnunet_auto_segmentation(
-        mag=np.ones((2, 2, 2, 3), dtype=np.float32),
+        mag=np.broadcast_to(np.arange(1, 4, dtype=np.float32), (2, 2, 2, 3)),
         flow=np.zeros((2, 2, 2, 3, 3), dtype=np.float32),
         resolution=(1.0, 1.0, 1.0),
         origin=(0.0, 0.0, 0.0),
@@ -1855,6 +1966,91 @@ def test_nnunet4d_auto_profile_uses_best_checkpoint_and_keeps_frames(monkeypatch
     assert [int(seg[..., frame].flat[0]) for frame in range(3)] == [1, 2, 3]
     assert provenance["backend"] == "nnUNet4D"
     assert provenance["checkpoint"] == "checkpoint_best.pth"
+
+
+def test_labeler_exchange_preserves_edits_and_refreshes_changed_seed(tmp_path):
+    from autoflow.algorithms.segmentation import load_segmentation_file, save_segmentation_file
+    from autoflow.ui.labeler_exchange import export_labeler_exchange
+
+    mag = np.arange(48, dtype=np.float32).reshape(2, 3, 4, 2)
+    flow = np.zeros((*mag.shape, 3), dtype=np.float32)
+    seed = np.ones(mag.shape, dtype=np.int16)
+    metadata = {"source_id": "phantom", "resolution": [1.0, 2.0, 3.0]}
+    spacing, origin = (1.0, 2.0, 3.0), (4.0, 5.0, 6.0)
+    first = export_labeler_exchange(tmp_path, metadata, mag, flow, seed, spacing, origin)
+    assert first["written_files"] == 6
+    feature_stats = [Path(path).stat().st_mtime_ns for path in first["feature_paths"]]
+    edited = seed.copy()
+    edited[0, 0, 0, 0] = 2
+    save_segmentation_file(first["label_path"], edited, resolution=spacing, origin=origin)
+    # Reopening without applying an edit retains the saved Labeler working mask.
+    reopened = export_labeler_exchange(tmp_path, metadata, mag, flow, seed, spacing, origin)
+    assert reopened["written_files"] == 0
+    # Applying it also retains the file, including Labeler's label metadata.
+    accepted = export_labeler_exchange(tmp_path, metadata, mag, flow, edited, spacing, origin)
+    assert accepted["written_files"] == 0
+    # A different automatic/manual seed refreshes only the mask.
+    next_seed = seed.copy()
+    next_seed[1, 1, 1, 1] = 3
+    refreshed = export_labeler_exchange(tmp_path, metadata, mag, flow, next_seed, spacing, origin)
+    assert refreshed["written_files"] == 1
+    previous, _ = load_segmentation_file(refreshed["previous_label_path"], spatial_shape=seed.shape[:3], time_count=2)
+    assert np.array_equal(previous, edited)
+    actual, _ = load_segmentation_file(first["label_path"], spatial_shape=seed.shape[:3], time_count=2)
+    assert np.array_equal(actual, next_seed)
+    assert feature_stats == [Path(path).stat().st_mtime_ns for path in first["feature_paths"]]
+    # A same-shape input with changed values must invalidate the image cache.
+    changed_mag = mag.copy()
+    changed_mag[0, 0, 0, 0] += 1
+    changed = export_labeler_exchange(tmp_path, metadata, changed_mag, flow, next_seed, spacing, origin)
+    assert changed["written_files"] == 5
+    # Older manifests cannot identify their seed: preserve edited work before migration.
+    manifest = tmp_path / "exchange.json"
+    legacy_metadata = json.loads(manifest.read_text(encoding="utf-8"))
+    legacy_metadata["schema_version"] = 2
+    legacy_metadata.pop("image_digest")
+    legacy_metadata.pop("seed_digest")
+    manifest.write_text(json.dumps(legacy_metadata), encoding="utf-8")
+    legacy_edit = next_seed.copy()
+    legacy_edit[0, 0, 0, 0] = 4
+    save_segmentation_file(first["label_path"], legacy_edit, resolution=spacing, origin=origin)
+    migrated = export_labeler_exchange(tmp_path, metadata, changed_mag, flow, next_seed, spacing, origin)
+    previous, _ = load_segmentation_file(migrated["previous_label_path"], spatial_shape=seed.shape[:3], time_count=2)
+    assert np.array_equal(previous, legacy_edit)
+    assert migrated["written_files"] == 6
+
+
+def test_nnunet_runtime_keeps_cpu_and_allocation_failure_fallbacks():
+    from autoflow.nnunet_runtime import _gpu_first_predict
+
+    class AllocationError(RuntimeError):
+        pass
+
+    class Input:
+        device = SimpleNamespace(type="cpu")
+        shape = (3, 4, 5, 6)
+        def numel(self): return 360
+        def element_size(self): return 4
+        def to(self, device): raise AllocationError("allocation failed")
+
+    image = Input()
+    seen = []
+    cleared = []
+    def original(predictor, value):
+        seen.append(value)
+        return "original-result"
+    cuda = SimpleNamespace(mem_get_info=lambda device: (0, 0),
+                           OutOfMemoryError=AllocationError, empty_cache=lambda: cleared.append(True))
+    torch = SimpleNamespace(cuda=cuda)
+    predictor = SimpleNamespace(device=SimpleNamespace(type="cpu"), perform_everything_on_device=True,
+                                configuration_manager=SimpleNamespace(patch_size=[8, 8, 8]))
+    assert _gpu_first_predict(original, predictor, image, torch) == "original-result"
+    predictor.device = SimpleNamespace(type="cuda")
+    assert _gpu_first_predict(original, predictor, image, torch) == "original-result"
+    cuda.mem_get_info = lambda device: (100 * 1024**3, 100 * 1024**3)
+    assert _gpu_first_predict(original, predictor, image, torch) == "original-result"
+    assert seen == [image, image, image]
+    assert cleared == [True]
 
 
 def test_nnunet_autoseg_prefers_gpu_resampling_and_falls_back_to_cpu(monkeypatch, tmp_path):
@@ -2945,6 +3141,57 @@ def test_scene_controller_builds_grouped_skeleton_graph_and_forks():
     assert controller._build_dataset("graph_lines").n_lines == 2
 
 
+@pytest.mark.parametrize("static_magnitude", [False, True])
+def test_pcmra_phantom_phase_updates_preserve_window_opacity_and_actor(static_magnitude):
+    from contextlib import closing
+    import pyvista as pv
+    from autoflow.core.models import ObjectKind, SceneObject
+    from autoflow.ui.viewer import SceneController
+
+    magnitude = np.arange(1, 126, dtype=np.float64).reshape(5, 5, 5)
+    flow = np.zeros((5, 5, 5, 3, 3), dtype=np.float64)
+    flow[..., 0, 0], flow[..., 1, 0], flow[..., 2, 0] = 1.0, 2.0, 4.0
+    workspace = Workspace()
+    workspace.mag_raw = magnitude if static_magnitude else np.repeat(magnitude[..., None], 3, axis=3)
+    workspace.flow_raw = flow
+    original_mag, original_flow = workspace.mag_raw.copy(), flow.copy()
+    obj = SceneObject("pcmra", "PC-MRA", ObjectKind.AUX, "pcmra_volume",
+                      scalars="PC-MRA", cmap="gray", opacity=0.8, dynamic=True)
+    workspace.scene_objects[obj.uid] = obj
+    errors = []
+    with closing(pv.Plotter(off_screen=True)) as plotter:
+        controller = SceneController(plotter, workspace, errors.append)
+        controller.render_all()
+        actor = obj.actor
+        assert actor is not None
+        for phase, speed in enumerate((1.0, 2.0, 4.0)):
+            controller.update_time(phase)
+            assert obj.actor is actor
+            dataset = actor.GetMapper().dataset
+            assert dataset.active_scalars_name == "PC-MRA"
+            assert np.isclose(dataset.get_data_range("PC-MRA")[1], magnitude.max() * speed)
+            expected = np.percentile(magnitude * speed, (5.0, 99.0))
+            assert np.allclose(controller._volume_scalar_range(obj, dataset), expected)
+            prop = actor.GetProperty()
+            assert np.allclose(prop.GetRGBTransferFunction(0).GetRange(), expected)
+            # A LUT update must not restore PyVista's default linear opacity.
+            assert np.isclose(prop.GetScalarOpacity(0).GetValue(expected[1]), 0.42 * 0.8)
+        controller._apply_volume_window_level(obj, (20.0, 80.0), render=False)
+        controller.update_time(1)
+        assert np.allclose(actor.GetProperty().GetRGBTransferFunction(0).GetRange(), (20.0, 80.0))
+        controller.invalidate_cache("streamlines")
+        assert controller.reset_volume_window_level()
+        assert obj.actor is actor
+        assert np.allclose(actor.GetProperty().GetRGBTransferFunction(0).GetRange(),
+                           np.percentile(magnitude * 2.0, (5.0, 99.0)))
+        obj.opacity = 0.0
+        controller.apply_object_properties(obj, render=False)
+        assert actor.GetProperty().GetScalarOpacity(0).GetValue(80.0) == 0.0
+    assert not errors
+    assert np.array_equal(workspace.mag_raw, original_mag)
+    assert np.array_equal(workspace.flow_raw, original_flow)
+
+
 def test_scene_display_axis_orientation_mirrors_points_without_mutating_world_data():
     from autoflow.ui.viewer import SceneController
 
@@ -2967,3 +3214,87 @@ def test_scene_display_axis_orientation_mirrors_points_without_mutating_world_da
     displayed = controller.world_to_display_points(world)
     assert np.allclose(displayed, [[10.0, 10.0, 15.0], [0.0, 10.0, 15.0]])
     assert np.allclose(controller.display_to_world_points(displayed), world)
+
+
+def test_dicom2h5_groups_route_through_h5_loader(tmp_path, monkeypatch):
+    from autoflow.algorithms import dicom_conversion as conversion
+    from autoflow.algorithms.dicom import load_input_data
+    root = tmp_path / "dicom"
+    root.mkdir()
+    original = root / "source.dcm"
+    original.write_bytes(b"read-only-source")
+    def convert(source, destination):
+        assert Path(source) == root
+        with h5py.File(destination, "w") as h5:
+            for name in ("sequence_a", "sequence_b"):
+                group = h5.create_group(name)
+                group["mag"] = np.ones((4, 5, 6, 2), dtype=np.float32)
+                group["flow"] = np.full((4, 5, 6, 2, 3), 12.0, dtype=np.float32)
+                group["segmask"] = np.ones((4, 5, 6), dtype=np.int16)
+                group["Resolution"] = [1.0, 2.0, 3.0]
+                group["Origin"] = [0.0, 0.0, 0.0]
+                group["VENC"] = [150.0, 150.0, 150.0]
+                group["RR"] = 900.0
+                group["SpatialOrder"] = np.asarray(["LR", "AP", "FH"], dtype=h5py.string_dtype())
+                group["VENCOrder"] = np.asarray(["LR", "AP", "FH"], dtype=h5py.string_dtype())
+    backend = SimpleNamespace(convert_dicom_to_h5=convert, validate_native_h5=lambda _: {"valid": True, "groups": ["sequence_a", "sequence_b"]})
+    monkeypatch.setattr(conversion, "_converter_module", lambda: backend)
+    cases = collect_input_cases([str(root), str(root)], dicom_backend="dicom2h5", dicom_h5_dir=str(tmp_path / "converted"))
+    assert len(cases) == 2
+    assert {case.source_group for case in cases} == {"sequence_a", "sequence_b"}
+    assert cases[0].input_kind == "h5"
+    assert ".dicom2h5-" not in cases[0].output_name
+    loaded = load_input_data(cases[0], dicom_backend="dicom2h5")
+    assert loaded.flow.shape == (4, 5, 6, 2, 3)
+    np.testing.assert_allclose(loaded.flow, 12.0)
+    assert loaded.metadata["dicom_backend"] == "dicom2h5"
+    assert loaded.tke_array is None and not loaded.capabilities.has_tke
+    result = run_case(cases[0], output_dir=str(tmp_path / "results"), config=AutoFlowConfig(segmentation_only=True, background_phase_write_cache=False))
+    assert result["segmentation_only"] and result["source_group"] == "sequence_a"
+    assert original.read_bytes() == b"read-only-source"
+    assert not list((tmp_path / "converted").glob(".dicom2h5-*"))
+
+
+def test_dicom2h5_failed_conversion_never_publishes_or_replaces(tmp_path, monkeypatch):
+    from autoflow.algorithms import dicom_conversion as conversion
+    root = tmp_path / "dicom"
+    root.mkdir()
+    target = tmp_path / "result.h5"
+    target.write_bytes(b"existing-result")
+    monkeypatch.setattr(conversion, "_converter_module", lambda: (_ for _ in ()).throw(AssertionError("existing output must fail before converter starts")))
+    with pytest.raises(FileExistsError):
+        conversion.convert_dicom_input(root, target)
+    assert target.read_bytes() == b"existing-result"
+    target.unlink()
+    def convert(_source, destination):
+        with h5py.File(destination, "w"):
+            pass
+    monkeypatch.setattr(conversion, "_converter_module", lambda: SimpleNamespace(convert_dicom_to_h5=convert, validate_native_h5=lambda _: {"valid": False, "groups": [], "errors": ["no flow"]}))
+    with pytest.raises(ValueError, match="no valid flow cases"):
+        conversion.convert_dicom_input(root, target)
+    assert not target.exists()
+    assert not list(tmp_path.glob(".dicom2h5-*"))
+    def invalid_calibration(_source, destination):
+        with h5py.File(destination, "w") as h5:
+            h5["RR"] = np.nan
+            h5["Resolution"] = [1.0, 1.0, 1.0]
+            h5["VENC"] = [150.0, 150.0, 150.0]
+            h5["Origin"] = [0.0, 0.0, 0.0]
+    monkeypatch.setattr(conversion, "_converter_module", lambda: SimpleNamespace(convert_dicom_to_h5=invalid_calibration, validate_native_h5=lambda _: {"valid": True, "groups": [""]}))
+    with pytest.raises(ValueError, match="invalid RR"):
+        conversion.convert_dicom_input(root, target)
+    assert not target.exists()
+    assert not list(tmp_path.glob(".dicom2h5-*"))
+
+
+def test_dicom2h5_loader_config_and_cli_selection():
+    from autoflow.cli import build_parser
+    from autoflow.core.models import LoaderParams
+    config = AutoFlowConfig(dicom_backend="dicom2h5", dicom_h5_dir="converted")
+    workspace = build_workspace(config)
+    restored = LoaderParams.from_dict(workspace.loader_params.to_dict())
+    assert restored.dicom_backend == "dicom2h5" and restored.dicom_h5_dir == "converted"
+    args = build_parser().parse_args(["dicom-root", "--dicom-backend", "dicom2h5", "--dicom-h5-dir", "converted"])
+    assert args.dicom_backend == "dicom2h5" and args.dicom_h5_dir == "converted"
+    with pytest.raises(ValueError, match="Unknown DICOM backend"):
+        collect_input_cases([], dicom_backend="unsupported")

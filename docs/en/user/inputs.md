@@ -1,36 +1,19 @@
 # Inputs
 
-## 先从“软件需要什么”开始
+## Required information
 
-AutoFlow 不把一份 4D Flow 检查简单地当成一张图片。它至少需要四类信息：
+AutoFlow needs anatomy (`mag`), velocity (`flow` or complex encodes), spatial geometry (`resolution`, `origin`, axis/component directions), and velocity/time calibration (`VENC`, RR and phase count). Canonical velocity is cm/s, spacing is mm and RR is ms.
 
-1. **解剖信号**：`mag`，用于看血管和构造 PC-MRA。
-2. **速度编码**：`flow`，或 legacy complex 数据中可转换得到的三方向速度。
-3. **空间几何**：`Resolution`、`Origin` 和空间轴方向，否则 mm、法向量和压力梯度都可能错位。
-4. **时间与速度标尺**：`RR`、时间帧数和 `VENC`，否则 phase 间隔和速度量级无法正确解释。
+Segmentation and background correction are separate optional inputs. Segmentation defines the vessel analysis domain; correction removes static-tissue velocity offsets. Missing segmentation must be imported or generated before geometry/metrics.
 
-分割 `seg` 是后续血管分析的空间范围；校正缓存 `corr` 是可复用的背景相位校正结果。**二者都是可选输入，但不应被混为一谈**：没有 `seg` 时要先准备分割，没有 `corr` 时可在冷启动流程中显式运行背景相位校正。
+## Cold validation and inspection
 
-## 推荐的冷启动思路
+Use [the read-only benchmark](../developer/performance.md) to recompute correction and segmentation without source cache writes. A normal CLI run with `--bgc --autoseg` may reuse compatible caches and write H5 cache fields; it is not automatically a cold benchmark. [Worked example](demo-case.md) describes review and output checks.
 
-如果你要验证 AutoFlow 本身，而不是验证某次历史处理结果，请使用没有 `corr`、没有 `segmask`/`segmentation` 的工作副本：
-
-```bash
-autoflow-run case_without_cache.h5 \
-  --output-dir ./results/cold_start \
-  --bgc \
-  --autoseg
-```
-
-原始文件不要直接删除字段；先备份或复制工作副本。完整演示见[冷启动示例](demo-case.md)。
-
-## 用 H5 浏览器快速检查
-
-在 Python 中可以先不运行分析，只检查数据集名称和维度：
+Inspect H5 dataset names and shapes before processing:
 
 ```python
 import h5py
-
 with h5py.File("case.h5", "r") as handle:
     def show(name, value):
         if isinstance(value, h5py.Dataset):
@@ -38,7 +21,9 @@ with h5py.File("case.h5", "r") as handle:
     handle.visititems(show)
 ```
 
-看到 `img_complex` 或 `img` 后，再核对通道是否位于最后一维。单 VENC complex 和实数合并格式必须是 `XYZT4`，dual-VENC complex 必须是 `XYZT7`。看到 `mag` 和 `flow` 时，核对 `mag` 是 `XYZT`、`flow` 是 `XYZT3`。通道首维格式不会自动转置，而是在加载时直接报错。不要只看文件扩展名判断格式。
+Legacy complex data must be channels-last `XYZT4` (single VENC) or `XYZT7` (dual VENC). Real combined `img` is `XYZT4`; normalized `mag` is `XYZT` and `flow` is `XYZT3`. Channels-first layouts are rejected, not silently transposed.
+
+[Loader parameters](parameters.md#loader) and [DICOM override schema](parameter-schemas.md#dicom-metadata-overrides) explain every supported setting.
 
 ## Supported Inputs
 
@@ -47,6 +32,7 @@ with h5py.File("case.h5", "r") as handle:
 | legacy complex H5 | yes | CLI, GUI, Python API | requires channels-last `XYZT4` or `XYZT7`; can provide segmentation and complex-derived sigma |
 | normalized H5 with `mag` and `flow` | yes | CLI, GUI, Python API | preferred normalized path |
 | normalized H5 with real-valued `img[..., 0:4]` | yes | CLI, GUI, Python API | requires `XYZT4` and is interpreted as `mag + flow_xyz` |
+| DICOM-to-H5 conversion | optional backend | CLI, GUI, Python API | [Pinned converter](../features/dicom-loading.md); preserves normalized H5 groups for reuse |
 | direct DICOM directory | yes | CLI, GUI, Python API | scanned into importable cases |
 | single DICOM file | yes for case collection | CLI | resolved through case collection logic |
 

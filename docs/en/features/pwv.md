@@ -63,33 +63,7 @@ summary = run_case("case.h5", config=config)
 
 ## Parameters
 
-| Parameter | Type | Default | Where configured | Effect | Code owner |
-| --- | --- | --- | --- | --- | --- |
-| `enabled` | bool | `False` | `configs/pwv.json` (CLI/API compatibility) | legacy batch gate; the GUI `Compute PWV` action enables the step for the current workspace | `autoflow/core/pipeline.py` |
-| `groups` | list | `[]` | `configs/pwv.json` or GUI `PWV Parameters` | each item defines one PWV label combination | `autoflow/core/models.py` |
-| `groups[].name` | string | generated name | `configs/pwv.json` or GUI `PWV Parameters` | display name in results and GUI | `autoflow/core/models.py` |
-| `groups[].labels` | list[int or symbol] | required per group | `configs/pwv.json` or GUI `PWV Parameters` | labels merged into one PWV mask | `autoflow/core/models.py` |
-| `plane_interval_mm` | float | `10.0` | `configs/pwv.json` or GUI `PWV Parameters` | spacing between PWV planes | `autoflow/algorithms/pwv.py` |
-| `start_distance` | float | `0.0` | `configs/pwv.json` or GUI `PWV Parameters` | offset from the path start | `autoflow/algorithms/pwv.py` |
-| `end_distance` | float | `0.0` | `configs/pwv.json` or GUI `PWV Parameters` | offset from the path end | `autoflow/algorithms/pwv.py` |
-| `smoothing_window` | int | `15` | `configs/pwv.json` or GUI `PWV Parameters` | path smoothing window before PWV planes are generated | `autoflow/algorithms/pwv.py` |
-| `smoothing_polyorder` | int | `2` | `configs/pwv.json` or GUI `PWV Parameters` | path smoothing polyorder before PWV planes are generated | `autoflow/algorithms/pwv.py` |
-| `inter_time` | int | `10` | `configs/pwv.json` or GUI `PWV Parameters` | path interpolation multiplier before PWV plane generation | `autoflow/algorithms/pwv.py` |
-| `waveform_key` | string | `flowrate_mL_s` | `configs/pwv.json` or GUI `PWV Parameters` | metric waveform used for foot-to-foot detection and as the default waveform family for PWV timing | `autoflow/algorithms/pwv.py` |
-| `transit_time_method` | string | `foot_to_foot` | `configs/pwv.json` or GUI `PWV Parameters` | choose `foot_to_foot` or `cross_correlation` transit-time estimation | `autoflow/algorithms/pwv.py` |
-| `foot_method` | string | `tangent` | `configs/pwv.json` or GUI `PWV Parameters` | choose `tangent` or `threshold` foot definition for `foot_to_foot` mode | `autoflow/algorithms/pwv.py` |
-| `foot_savgol_window` | int | `5` | `configs/pwv.json` or GUI `PWV Parameters` | waveform smoothing window | `autoflow/algorithms/pwv.py` |
-| `foot_savgol_polyorder` | int | `2` | `configs/pwv.json` or GUI `PWV Parameters` | waveform smoothing polynomial order | `autoflow/algorithms/pwv.py` |
-| `foot_threshold_percent` | float | `10.0` | `configs/pwv.json` or GUI `PWV Parameters` | threshold percentage used when `foot_method=threshold` | `autoflow/algorithms/pwv.py` |
-| `xcorr_window` | string | `full` | `configs/pwv.json` or GUI `PWV Parameters` | choose `full` waveform or `upstroke` window for cross-correlation | `autoflow/algorithms/pwv.py` |
-| `xcorr_interp_factor` | int | `10` | `configs/pwv.json` or GUI `PWV Parameters` | cyclic waveform interpolation factor used before cross-correlation delay estimation | `autoflow/algorithms/pwv.py` |
-| `allow_cycle_wrap` | bool | `True` | `configs/pwv.json` or GUI `PWV Parameters` | allow one-cycle wrap correction and cycle-aware foot detection when the upstroke crosses the frame boundary | `autoflow/algorithms/pwv.py` |
-| `minimum_valid_planes` | int | `2` | `configs/pwv.json` or GUI `PWV Parameters` | minimum valid planes required to fit PWV | `autoflow/algorithms/pwv.py` |
-| `scene_visible` | bool | `True` | `configs/pwv.json` or GUI `PWV Parameters` | show or hide the grouped `PWV planes` scene object by default | `autoflow/core/pipeline.py` |
-| `scene_color` | string | `#ffd43b` | `configs/pwv.json` or GUI `PWV Parameters` | PWV plane scene color | `autoflow/core/pipeline.py` |
-| `plot_color` | string | `#2b8a3e` | `configs/pwv.json` or GUI `PWV Parameters` | scatter color in saved PWV plots and `Analysis -> PWV` | `autoflow/algorithms/pwv.py` |
-| `fit_color` | string | `#f08c00` | `configs/pwv.json` or GUI `PWV Parameters` | fit line color in saved PWV plots and `Analysis -> PWV` | `autoflow/algorithms/pwv.py` |
-| `plot_dpi` | int | `160` | `configs/pwv.json` or GUI `PWV Parameters` | PNG export resolution for saved PWV plots | `autoflow/algorithms/pwv.py` |
+See [pwv parameters](../user/parameters.md#pwv), [CLI flags](../user/cli-parameters.md), and [API fields](../user/api-parameters.md) for complete type/default/unit/effect/owner tables. Dictionary controls are expanded in [Structured parameters](../user/parameter-schemas.md).
 
 ## Outputs
 
@@ -116,7 +90,7 @@ summary = run_case("case.h5", config=config)
 | Analysis dock, PWV panel, plane curves, and internal-consistency views | `autoflow/ui/app.py` | `autoflow/algorithms/pwv.py`, `autoflow/algorithms/metrics.py` | GUI manual verification |
 
 ## Tests
-- `~/miniconda3/envs/ryy/bin/python -m pytest tests/test_smoke_phantoms.py tests/test_pressure_gradient_phantom.py -q`
+- `/home/renyuyang/miniconda3/envs/autoflow311/bin/python -m pytest tests/test_smoke_phantoms.py tests/test_pressure_gradient_phantom.py -q`
 
 ## Common problems
 

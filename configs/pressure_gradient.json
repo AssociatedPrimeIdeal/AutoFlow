@@ -1,7 +1,7 @@
 {
   "method": "least_squares",
   "smoothing_sigma": 0.0,
-  "support_erosion_iters": 0,
+  "support_erosion_iters": 1,
   "layer_opacity": 0.6,
   "relative_pressure_opacity": 0.6,
   "use_convective_acceleration": true,

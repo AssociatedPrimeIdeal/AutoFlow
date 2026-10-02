@@ -28,12 +28,14 @@ Segmentation gives AutoFlow the lumen mask needed for skeletons, graphs, planes,
 ## Quick Use
 
 ### GUI
+
+The GUI respects `configs/segmentation.json -> write_auto_cache`: false preserves the source H5 while retaining prediction sidecars for review.
 1. load a case
 2. open the `Segmentation` workflow stage; loading never starts automatic segmentation
 3. in the `Segmentation Parameters` panel, choose `3D` or `4D`, then set the model path, checkpoint, folds, device, and label map
 4. click `Run Automatic Segmentation` to start nnUNet
 5. wait for the auto-segmentation progress dialog to finish
-6. click `Open in SpatioTemporal Labeler`; AutoFlow exports six exchange files one feature per progress step and opens the separately installed GPL-3.0 editor
+6. click `Open in SpatioTemporal Labeler`; AutoFlow prepares six exchange files in background workers and opens the separately installed GPL-3.0 editor
 7. in Labeler, save `segmentation.nii` with `Ctrl+S` before closing; AutoFlow detects the changed file and offers to apply it as the imported segmentation source
 
 The right dock opens on `Segmentation`. Its first `Source` section contains active-source switching, visibility, opacity, provenance, `Import...`, and `Save...`; its `Edit` section retains the automatic-run shortcut, review, and cleanup actions. Segmentation generation settings are kept with the other workflow parameters in the main window. The top menu bar does not duplicate these commands in a separate `Segmentation` menu.
@@ -111,28 +113,7 @@ summary = run_case("case.h5", config=config)
 
 ## Parameters
 
-| Parameter | Type | Default | Where configured | Effect | Code owner |
-| --- | --- | --- | --- | --- | --- |
-| `mode` | string | `auto` | workspace/API | internal source mode; the GUI's Mode selector chooses `auto_backend` | `autoflow/core/models.py` |
-| `threshold_scalar` | string | `pcmra` | configs/API | scalar used by the non-GUI threshold backend | `autoflow/algorithms/segmentation.py` |
-| `threshold_value` | object | manual `10%..100%` percent window | `configs/segmentation.json` or API | threshold mode and values for the non-GUI backend | `autoflow/algorithms/segmentation.py` |
-| `threshold_keep_largest_cc` | bool | `True` | `configs/segmentation.json` or API | keep largest connected component for the non-GUI backend | `autoflow/algorithms/segmentation.py` |
-| `threshold_min_component_volume_mm3` | float | `0.0` | `configs/segmentation.json` or API | remove components below threshold for the non-GUI backend | `autoflow/algorithms/segmentation.py` |
-| `threshold_closing` | bool | `True` | `configs/segmentation.json` or API | morphological closing for the non-GUI backend | `autoflow/algorithms/segmentation.py` |
-| `threshold_opening` | bool | `False` | `configs/segmentation.json` or API | morphological opening for the non-GUI backend | `autoflow/algorithms/segmentation.py` |
-| `auto_backend` / `--autoseg-backend` | string | `nnUNet4D` in the shipped config | Segmentation Parameters panel or CLI/API | automatic backend; `nnUNet4D` consumes temporal channels and returns XYZT labels; choose `nnUNet` for static 3D models | `autoflow/ui/app.py`, `autoflow/algorithms/segmentation.py` |
-| `auto_model` / `--autoseg-model` | path or `auto` | `auto` | Segmentation Parameters panel or CLI/API | GUI presets expose the detected Dataset7010 3D or Dataset7020 4D model; `auto` selects the backend-specific default; explicit 4D values also accept an orchestration `.sh`, while 3D accepts a model folder | `autoflow/algorithms/segmentation.py`, `autoflow/ui/app.py` |
-| `auto_checkpoint` / `--autoseg-checkpoint` | string or `auto` | `auto` | Segmentation Parameters panel or CLI/API | `auto` selects `checkpoint_final.pth` for Dataset7010 and `checkpoint_best.pth` for Dataset7020 | `autoflow/ui/app.py`, `autoflow/algorithms/segmentation.py` |
-| `auto_folds` / `--autoseg-folds` | string | `single` | Segmentation Parameters panel or CLI/API | choose `single`, `all`/`ensemble`, or a comma-separated fold list | `autoflow/ui/app.py`, `autoflow/algorithms/segmentation.py` |
-| `auto_device` / `--autoseg-device` | string | `auto` | Segmentation Parameters panel or CLI/API | choose the inference device; CUDA also enables GPU input and probability-export resampling by default | `autoflow/ui/app.py`, `autoflow/algorithms/segmentation.py` |
-| `auto_label_map` / `--autoseg-label-map` | JSON | empty | Segmentation Parameters panel or CLI/API | remap predicted labels | `autoflow/ui/app.py`, `autoflow/algorithms/segmentation.py` |
-| `AUTOFLOW_NNUNET4D_GROUPED` | environment string | `auto` | process environment | control grouped in-process temporal preprocessing; `0`/`false`/`subprocess` forces the standard subprocess path, while `1` enables grouped mode (the GUI overrides this to stay isolated) | `autoflow/algorithms/segmentation.py` |
-| `AUTOFLOW_NNUNET_GPU_PREPROCESSING` | environment string | `cuda` | process environment | GPU input resampling is the default when inference uses CUDA; use `0`, `false`, `off`, or `cpu` to keep nnUNet input resampling on CPU | `autoflow/algorithms/segmentation.py` |
-| `cleanup_4d_components` | bool | `False` | Segmentation dock / workspace | enable per-label, per-frame connected-component cleanup before majority voting | `autoflow/core/models.py`, `autoflow/algorithms/preprocess.py` |
-| `cleanup_4d_mode` | string | `absolute` | Segmentation dock / workspace | remove below volume or keep largest per label and frame | `autoflow/algorithms/preprocess.py` |
-| `cleanup_4d_min_volume_mm3` | float | `50.0` | Segmentation dock / workspace | minimum physical component volume for absolute mode | `autoflow/algorithms/preprocess.py` |
-| `colorbar.show` | bool | `True` | `configs/colorbar.json` | show or hide the shared 3D GUI colorbar used by segmentation labels | `autoflow/ui/viewer.py` |
-| `colorbar.bar_cfg` | object | built-in default | `configs/colorbar.json` | configure the shared 3D GUI colorbar placement and fonts | `autoflow/ui/viewer.py` |
+See [segmentation parameters](../user/parameters.md#segmentation), [labels parameters](../user/parameters.md#labels), [CLI flags](../user/cli-parameters.md), and [API fields](../user/api-parameters.md) for complete type/default/unit/effect/owner tables. Dictionary controls are expanded in [Structured parameters](../user/parameter-schemas.md).
 
 ## Outputs
 
@@ -147,6 +128,8 @@ summary = run_case("case.h5", config=config)
 | saved NIfTI chosen by user | dock `Source -> Save...` or external-editor exchange | label sequence for external review/editing |
 | provenance metadata | segmentation source changes | backend, model, save provenance, requested/actual preprocessing device, resampler, and GPU fallback details |
 | imported `int16 XYZT` label source | Labeler result is applied | edited copy committed to `imported`; embedded `original` remains unchanged |
+| `spatiotemporal_labeler/<case>/exchange.json` | Labeler exchange is prepared | source/geometry metadata, image digests, and active seed digest for safe reuse |
+| `segmentation.previous.<timestamp_ns>.nii` | a different or legacy exchange mask must be replaced | recoverable copy of previous Labeler work |
 
 ## Limitations
 - automatic backends are `nnUNet` (3D/static) and `nnUNet4D` (Dataset7020 temporal-channel model)
@@ -171,8 +154,12 @@ summary = run_case("case.h5", config=config)
 - TKE availability is independent of segmentation availability
 - the optional SpatioTemporal Labeler bridge launches a separate process and exchanges six uncompressed 4D NIfTI files; it is not embedded into the AutoFlow Qt process. It uses the checked-out `third_party/SpatioTemporalLabeler` source with AutoFlow's Python/Qt/VTK runtime, so install `pip install ".[gui,labeler]"` in that environment
 - when AutoFlow is running through forwarded X11, it clears AutoFlow's EGL/off-screen VTK environment variables only for the separate Labeler process. Labeler's unmodified embedded VTK view then uses native X11/GLX rendering instead of opening with a blank 3D panel
-- the exchange directory is stable for a loaded case. When its source path, geometry, and frame count still match, the saved feature files and `segmentation.nii` are reused on the next open so Labeler edits remain available
-- the export progress dialog has one step each for `mag`, `flow_x`, `flow_y`, `flow_z`, `pcmra`, and `segmentation`; export intentionally runs in the GUI thread
+- the exchange directory is stable for a loaded case. Image reuse checks source metadata, geometry, and digests of the actual magnitude/flow arrays. An unchanged active seed retains Labeler's saved working mask; applying that exact edited mask also retains its file and label definitions. A different active segmentation refreshes only `segmentation.nii`, avoiding a full image export and stale labels after another automatic run
+- the export progress dialog advances as files finish. Export and digest calculation run outside the GUI thread, with at most two concurrent NIfTI writers; no worker accesses Qt widgets. The five features and segmentation remain uncompressed `.nii`, with unchanged float32/int16 values and spatial affines
+- before replacing a different or legacy exchange mask, AutoFlow preserves it as `segmentation.previous.<timestamp_ns>.nii`; saved manual revisions remain recoverable. Existing schema-2 workspaces refresh their feature manifest once
+- GUI 4D nnUNet preparation encodes each distinct feature map once and links the usual per-frame channel filenames to it, falling back to byte copies when hard links are unavailable. For 20 phases and 37 channels this encodes 112 maps rather than 740. Channel order, per-sample cropping/normalization, folds, checkpoint, sliding-window settings, TTA, and precision are unchanged; the CLI grouped path remains separate
+- the standard Python 4D subprocess moves unpadded tensors to CUDA before nnUNet's original padding and inference when enough memory is free, and skips an inspected preprocessing copy whose pinned result is discarded. CPU inference, CPU accumulation, low-memory devices, and CUDA allocation failures use the original padding path. Model arithmetic and labels are unchanged; the standalone frozen predictor retains its existing path
+- independent CUDA launches can exhibit small label differences in the existing nnUNet runtime. Equality validation must fix the input and execution settings; see the [segmentation and Labeler performance validation](../developer/segmentation-performance.md)
 - automatic re-import requires saving the original `segmentation.nii` in Labeler; `Save As` to another directory requires the normal `Import...` action
 - the pinned upstream `v0.4.7` source is available as the `third_party/SpatioTemporalLabeler` git submodule; install the integration only with `pip install .[gui,labeler]`
 
@@ -182,14 +169,14 @@ summary = run_case("case.h5", config=config)
 | --- | --- | --- | --- |
 | add a new segmentation source | `autoflow/core/models.py`, `autoflow/ui/app.py` | `autoflow/ui/segmentation.py`, `autoflow/algorithms/segmentation.py` | `tests/test_smoke_phantoms.py` |
 | change threshold behavior | `autoflow/algorithms/segmentation.py`, `autoflow/ui/app.py` | `autoflow/core/models.py` | `tests/test_smoke_phantoms.py` |
-| change nnUNet auto segmentation | `autoflow/algorithms/segmentation.py` | `autoflow/processing.py`, `autoflow/ui/app.py` | manual verification plus smoke and phantom regression only |
+| change nnUNet auto segmentation | `autoflow/algorithms/segmentation.py`, `autoflow/nnunet_runtime.py` | `autoflow/processing.py`, `autoflow/ui/app.py` | manual verification plus smoke and phantom regression only |
 | change segmentation dock behavior | `autoflow/ui/segmentation.py`, `autoflow/ui/app.py` | `autoflow/core/models.py` | `tests/test_smoke_phantoms.py` |
-| change external editor exchange | `autoflow/algorithms/segmentation.py`, `autoflow/ui/app.py` | `autoflow/ui/segmentation.py` | NIfTI round-trip plus GUI manual verification |
+| change external editor exchange | `autoflow/ui/labeler_exchange.py`, `autoflow/ui/app.py` | `autoflow/algorithms/segmentation.py`, `third_party/SpatioTemporalLabeler/src/spatiotemporal_labeler/io/nrrd_sequence.py` | NIfTI round-trip plus GUI manual verification |
 
 ## Tests
 
-- `~/miniconda3/envs/ryy/bin/python -m pytest tests/test_smoke_phantoms.py -q`
-- `~/miniconda3/envs/ryy/bin/python -m pytest tests/test_pressure_gradient_phantom.py -q`
+- `conda activate autoflow311`
+- `pytest tests/test_smoke_phantoms.py tests/test_pressure_gradient_phantom.py -q`
 - segmentation-specific changes beyond this retained regression suite require manual verification
 
 ## Common Problems

@@ -24,6 +24,18 @@ autoflow-run ./data/demo_data.h5 --output-dir ./results/demo
 autoflow-run /path/to/dicom_root --output-dir ./results/dicom_batch
 ```
 
+### Convert a DICOM root to reusable H5
+
+Install the optional converter as described in [DICOM loading](../features/dicom-loading.md), then run:
+
+```bash
+autoflow-run /path/to/dicom_root --dicom-backend dicom2h5 \
+  --dicom-h5-dir ./results/converted-h5 --output-dir ./results/dicom_batch \
+  --autoseg --bgc --with wss,pg --no-cache-write
+```
+
+Each recognized acquisition becomes an H5 case group. Existing conversion destinations are never overwritten; pass the saved H5 to reuse it. The default direct route is `--dicom-backend native`.
+
 ### Import and export plane coordinates
 
 ```bash
@@ -199,12 +211,12 @@ available as `skeleton.min_edge_points` in `configs/skeleton.json`.
 | `--bgc` | bool | `False` | `configs/loader.json` | enable background phase correction; H5 inputs reuse or write a compatible `corr` cache | `autoflow/algorithms/phase_correction.py`, `autoflow/algorithms/data.py` |
 | `--bgc-method` | choice | `wrls_arto` | `configs/loader.json` | choose `msac` or `wrls_arto` | `autoflow/algorithms/phase_correction.py` |
 | `--bgc-fit-order` | int | `3` | `configs/loader.json` | polynomial fit order for correction | `autoflow/algorithms/phase_correction.py` |
-| `--bgc-threshold` | float | `0.1` | `configs/loader.json` | MSAC venc-space threshold for the stationary-tissue mask | `autoflow/algorithms/phase_correction.py` |
+| `--bgc-threshold` | float | `0.2` | `configs/loader.json` | MSAC venc-space threshold for the stationary-tissue mask | `autoflow/algorithms/phase_correction.py` |
 | `--bgc-wrls-lambda` | float | `5.0` | `configs/loader.json` | WRLS L1 regularization strength | `autoflow/algorithms/phase_correction.py` |
 | `--bgc-wrls-magnitude-threshold` | float | `0.04` | `configs/loader.json` | per-slice reference-magnitude fraction used to form WRLS candidates | `autoflow/algorithms/phase_correction.py` |
 | `--bgc-wrls-mid-fov-fraction` | float | `0.5` | `configs/loader.json` | middle in-plane FOV fraction used by the first-order initialization | `autoflow/algorithms/phase_correction.py` |
 | `--bgc-wrls-mid-slice-fraction` | float | `0.65` | `configs/loader.json` | middle through-plane fraction used by the initialization | `autoflow/algorithms/phase_correction.py` |
-| `--bgc-wrls-arto-iterations` | int | `2` | `configs/loader.json` | ARTO exclusion and refit count | `autoflow/algorithms/phase_correction.py` |
+| `--bgc-wrls-arto-iterations` | int | `4` | `configs/loader.json` | ARTO exclusion and refit count | `autoflow/algorithms/phase_correction.py` |
 | `--bgc-wrls-tau` | float | `3.0` | `configs/loader.json` | central-Gaussian inclusion width in standard deviations | `autoflow/algorithms/phase_correction.py` |
 | `--bgc-wrls-delta` | float | `2.0` | `configs/loader.json` | minimum side-Gaussian separation | `autoflow/algorithms/phase_correction.py` |
 | `--bgc-wrls-central-probability` | float | `0.5` | `configs/loader.json` | minimum central-Gaussian prior | `autoflow/algorithms/phase_correction.py` |
@@ -336,3 +348,7 @@ Typical CLI outputs are documented in [Outputs](outputs.md).
 - public config and API: `autoflow/api.py`
 - batch orchestration: `autoflow/processing.py`
 - pipeline steps: `autoflow/core/pipeline.py`
+
+## Complete flag reference
+
+[All CLI arguments](cli-parameters.md) lists every accepted option, alias, parser type, allowed choices and effect. Omitted overrides inherit [module defaults](parameters.md).

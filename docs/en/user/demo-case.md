@@ -1,185 +1,270 @@
-# 冷启动示例：主动脉 H5
+# Worked example: the DV H5 case from load to export
 
-## 目标
+This is a reproducible, step by step walkthrough using the local validation case:
 
-这是一条**从没有 `corr`、没有 `seg` 开始**的演示路径。它故意不把文件中可能存在的校正缓存或分割缓存当成前提，帮助你理解从原始 4D Flow 数据到可审阅结果的完整流程。
+    /nas-data2/ryy/CMR4DFlow2026/Segdata/qingtian_h5/DV/
+    DV_heart_2026.03.01_B-01220711V013.h5
 
-> 示例图来自用户提供的 Aorta 数据。仓库只保存派生的说明图，不保存原始医学 H5。运行时请替换为你有权限访问的本机路径。
+On Windows the same file is available as:
 
-## 示例输入
+    X:\ryy\CMR4DFlow2026\Segdata\qingtian_h5\DV\DV_heart_2026.03.01_B-01220711V013.h5
 
-Linux/NAS 上的实际文件路径为：
+The screenshots in this page are unedited captures from autoflow-gui running on a private server display. Every operation is also shown as a CLI command. The exact counts below are from the run captured on 2026-10-02; counts can change after mask edits or configuration changes.
 
-```text
-/nas-data2/ryy/CMR4DFlow2026/Segdata/data4seg_test/h5s_autoflow/Aorta_Center003_GE_15T_Voyager_Exam32324-12224896-C17-0021.h5
-```
+## Before you start
 
-如果你的挂载点不同，只需替换路径；文件名可以保持不变。这个示例是 legacy complex H5，典型字段包括：
+    conda activate autoflow311
+    CASE=/nas-data2/ryy/CMR4DFlow2026/Segdata/qingtian_h5/DV/DV_heart_2026.03.01_B-01220711V013.h5
+    OUT=./results/dv-worked-example
+    mkdir -p "$OUT"
 
-| 字段 | 形状 | 说明 |
+The case is a legacy complex dual-VENC H5. It has 20 cardiac phases, low VENC 50 cm/s, high VENC 150 cm/s, and 2.5 mm isotropic resolution. It has no RR or Origin key, so AutoFlow uses the compatibility values RR=1000 ms and Origin=[0,0,0] mm. Treat those as defaults and verify the acquisition metadata before using quantitative timing or world coordinates.
+
+## 1. Inspect the H5 keys before loading
+
+**GUI.** Start autoflow-gui, choose **File > Open H5**, and select the case. The dual-VENC dialog appears before loading. Choose **DV (combine low and high VENC)**.
+
+![Initial AutoFlow GUI](../../assets/images/dv-gui/00-start.png)
+
+![Open H5 dialog](../../assets/images/dv-gui/01-open-h5.png)
+
+![Dual-VENC source selection](../../assets/images/dv-gui/02-dual-venc-source.png)
+
+**CLI.** Inspect the H5 without reading the large image array:
+
+    python - <<'PY'
+    import h5py
+    case = r"/nas-data2/ryy/CMR4DFlow2026/Segdata/qingtian_h5/DV/DV_heart_2026.03.01_B-01220711V013.h5"
+    with h5py.File(case, "r") as f:
+        for name, item in f.items():
+            print(name, getattr(item, "shape", "group"), getattr(item, "dtype", ""))
+        for name in ("Resolution", "VENC", "SpatialOrder", "VENCOrder"):
+            if name in f:
+                print(name, f[name][()])
+    PY
+
+The actual root keys are:
+
+| Key | Shape and value in this case | Required for loading? |
 | --- | --- | --- |
-| `img_complex` | `108 × 112 × 36 × 18 × 4` | 空间 × 时间 × 通道；通道 0 是 magnitude，通道 1–3 是三方向复数速度编码 |
-| `Resolution` | `3` | 三个空间方向的体素间距，单位通常为 mm |
-| `Origin` | `3` | 体数据原点 |
-| `VENC` | `3` | 三个速度编码方向的 VENC |
-| `RR` | scalar | 心动周期相关元数据 |
-| `segmask` | `108 × 112 × 36 × 18` | 本示例文件可能包含的 4D 分割；冷启动时我们不依赖它 |
-| `corr` | `108 × 112 × 36 × 1 × 3` | 本示例文件可能包含的背景校正缓存；冷启动时我们不依赖它 |
+| img_complex | (144, 44, 158, 20, 7), complex64; reference plus three low-VENC and three high-VENC encodes | Yes for this legacy dual-VENC layout |
+| Resolution | (3,), [2.5, 2.5, 2.5] mm | Required for calibrated geometry; missing values fall back to 1 mm |
+| VENC | (6,), [50,50,50,150,150,150] cm/s | Required to decode velocity; missing values fall back to 150 cm/s |
+| SpatialOrder | HF, AP, RL | Optional compatibility metadata; check axis direction |
+| VENCOrder | HF, AP, RL | Optional compatibility metadata; check encoded component direction |
+| corr_low | (144,44,158,1,3) float32 | Optional low-VENC correction cache |
+| corr_high | (144,44,158,1,3) float32 | Optional high-VENC correction cache |
+| RR | absent | Optional loader field; this run uses 1000 ms |
+| Origin | absent | Optional loader field; this run uses [0,0,0] mm |
+| segmentation | absent | Optional for loading; required before vessel geometry and metrics |
+| sigma/TKE | absent | Optional; TKE is skipped when no valid sigma is available |
 
-## A. 创建真正的冷启动工作副本
+mag and flow are normalized internally from img_complex. DICOM-derived normalized H5 uses mag and flow instead; it does not need a complex reference and does not provide TKE by itself.
 
-不要直接在原始数据上删除字段，也不要在原始数据目录旁边复用以前的输出目录。先复制一份工作副本，并递归移除所有常见的校正/分割缓存：
+## 2. Load, combine dual VENC, and correct background phase
 
-```bash
-RAW_CASE=/nas-data2/ryy/CMR4DFlow2026/Segdata/data4seg_test/h5s_autoflow/Aorta_Center003_GE_15T_Voyager_Exam32324-12224896-C17-0021.h5
-CASE=./work/aorta_center003_without_cache.h5
-OUT=./results/aorta_center003_cold_start
-mkdir -p ./work
-mkdir -p "$OUT"
-```
+![Background correction in progress](../../assets/images/dv-gui/03-background-correction.png)
 
-用下面的脚本复制数据集；它保留原始属性和其它输入，只跳过名字为 `corr`、`corr_low`、`corr_high`、`segmask`、`segmentation` 或 `seg` 的节点：
+**GUI.** After choosing DV, AutoFlow applies the low and high correction paths. Then select **Input & QC** and inspect the normalized fields. The captured run used WRLS + ARTO with a forced recomputation, and the source H5 remained unchanged.
 
-```bash
-python - <<'PY'
-import h5py
+![Loaded input and normalized data](../../assets/images/dv-gui/04-loaded-input.png)
 
-source_path = "/nas-data2/ryy/CMR4DFlow2026/Segdata/data4seg_test/h5s_autoflow/Aorta_Center003_GE_15T_Voyager_Exam32324-12224896-C17-0021.h5"
-target_path = "./work/aorta_center003_without_cache.h5"
-removed_names = {"corr", "corr_low", "corr_high", "segmask", "segmentation", "seg"}
+**CLI.** The equivalent load and correction command is:
 
-def copy_group(source_group, target_group):
-    for name, item in source_group.items():
-        if name.lower() in removed_names:
-            continue
-        if isinstance(item, h5py.Group):
-            target_child = target_group.create_group(name)
-            for key, value in item.attrs.items():
-                target_child.attrs[key] = value
-            copy_group(item, target_child)
-        else:
-            source_group.copy(item, target_group, name=name)
+    autoflow-run "$CASE" --output-dir "$OUT/load" \
+      --bgc --force-recompute-corr --no-cache-write --segmentation-only
 
-with h5py.File(source_path, "r") as source_file, h5py.File(target_path, "w") as target_file:
-    for key, value in source_file.attrs.items():
-        target_file.attrs[key] = value
-    copy_group(source_file, target_file)
+--no-cache-write prevents correction or generated segmentation from being written back into the medical H5. The canonical loaded arrays in this case are mag=(158,44,144,20) and flow=(158,44,144,20,3), with 20 phases and 2.5 mm spacing.
 
-print(f"Created cold-start case: {target_path}")
-PY
-```
+## 3. Generate and review segmentation
 
-后面的命令都对 `CASE` 工作副本运行。原始文件保持不变；如果你的输入包含别的缓存命名，请先用 H5 浏览器检查并确认。
+This file has no embedded segmentation, so vessel analysis cannot continue until a mask is generated or imported. The captured GUI run used the configured Dataset7020 4D nnUNet model.
 
-## B. 先检查输入，不急着跑全流程
+![Automatic segmentation running](../../assets/images/dv-gui/05-segmentation-running.png)
 
-```bash
-autoflow-run "$CASE" \
-  --output-dir "$OUT/input_check" \
-  --skip-derived \
-  --skip-plane-metrics
-```
+**GUI.** Open the **Segmentation** stage, set **Mode: 4D**, leave **Model preset: Automatic backend default**, and click **Run Automatic Segmentation**. Review the mask at several timeline positions, adjust labels or import a reviewed mask when needed, then use **Save...** to write a sidecar.
 
-这一步的意义是验证 loader 能读出 `mag`、`flow`、`resolution`、`origin`、`venc` 和 `rr`。如果这里失败，先看[输入格式](inputs.md)，不要从分割或压力算法开始排查。
+![Completed segmentation and source review](../../assets/images/dv-gui/06-segmentation-complete.png)
 
-## C. 冷启动：显式运行校正和分割
+**CLI.** Run the same model route without modifying the source H5:
 
-在没有可用 `corr` / `seg` 的工作副本上运行：
+    autoflow-run "$CASE" --output-dir "$OUT/segmentation" \
+      --bgc --force-recompute-corr --autoseg \
+      --autoseg-backend nnUNet4D --autoseg-model auto \
+      --autoseg-checkpoint auto --autoseg-folds single \
+      --segmentation-only --no-cache-write
 
-```bash
-autoflow-run "$CASE" \
-  --output-dir "$OUT/full" \
-  --bgc \
-  --autoseg \
-  --with pwv,wss,pg,vortex \
-  --video plane,wss,pg
-```
+The run produced a 4D mask with shape (158,44,144,20), 16 labels and 7 connected foreground components. The generated NIfTI and the saved H5 sidecar are review artifacts, not replacements for the source file.
 
-各选项的医学含义：
+## 4. Optional phase unwrapping
 
-| 选项 | 作用 | 第一次使用时怎么理解 |
-| --- | --- | --- |
-| `--bgc` | 启用背景相位校正 | 去除静止组织导致的速度偏置；不是对分割做修改 |
-| `--autoseg` | 没有活动分割时运行自动分割 | 自动结果必须人工审阅，不能默认视为金标准 |
-| `--with pwv,wss,pg,vortex` | 额外计算派生量 | 计算时间更长，建议确认几何后再开启 |
-| `--video plane,wss,pg` | 导出动态视频 | 需要渲染环境和额外磁盘空间 |
+![Phase unwrapping result](../../assets/images/dv-gui/07-phase-unwrapping.png)
 
-> **TKE 说明**：本示例用于强调冷启动原则。如果输入只有 `mag + flow`，AutoFlow 不会从速度大小伪造 TKE；只有输入实际提供 TKE 或复杂数据能推导所需 sigma 时，TKE 才会计算。
+**GUI.** Choose **Phase Unwrapping > Unwrap Phase** when the input is single-VENC or when a supported method is appropriate. For this dual-VENC case the action is intentionally skipped because the dual-VENC reconstruction already resolves the selected source.
 
-## D. GUI 中的等价流程
+**CLI.** The matching explicit command is:
 
-```bash
-autoflow-gui --config-dir ./configs
-```
+    autoflow-run "$CASE" --output-dir "$OUT/unwrap" \
+      --bgc --autoseg --phase-unwrap-method none --no-cache-write
 
-1. `File > Open H5`，选择示例文件。
-2. 在 `Input & QC` 中确认 18 个时间 phase、空间分辨率和 VENC；不要只凭画面方向判断坐标是否正确。
-3. 对没有校正缓存的工作副本，选择运行背景相位校正；方法默认来自 `configs/loader.json`。
-4. 切换到 `Segmentation`，运行 `Run Automatic Segmentation`，等待结果出现。
-5. 在切片视图逐层检查血管边界；必要时用刷子/编辑器修订并保存可复用的分割文件。
-6. 运行骨架、图和路径；检查中心线有没有断裂、穿出血管或错误跨接分支。
-7. 生成截面后检查平面是否垂直于局部中心线，位置是否避开分叉和边界。
-8. 最后再启用 WSS、压力、PWV、涡旋和视频。
+Use --phase-unwrap-method lap4D (or another supported method) only after reviewing the method and mask requirements in [phase unwrapping](../features/phase-unwrapping.md). The captured result records skipped: true, reason: dual_venc.
 
-![示例数据的幅度图、速度大小与分割包络](../../assets/images/demo/flow-segmentation.png)
+## 5. Generate the centerline skeleton
 
-## E. 这个病例应该看到什么
+![Generated skeleton](../../assets/images/dv-gui/08-skeleton.png)
 
-示例体数据为 `108 × 112 × 36` 的空间网格、18 个心动 phase 和 4 个复数通道。以下图像只是帮助你建立视觉对应关系：
+**GUI.** Choose **Centerline & Planes > Generate Skeleton**. Toggle groups in the Browser and compare the colored centerline with the segmentation and PC-MRA. **Edit Skeleton** is optional; save edits before continuing because it invalidates downstream graph and plane data.
 
-![示例数据的维度与元数据摘要](../../assets/images/demo/metadata-strip.png)
+**CLI.** There is no separate skeleton-only flag. Run the geometry part of the pipeline and skip expensive derived families:
 
-![示例数据的时间覆盖](../../assets/images/demo/temporal-profile.png)
+    autoflow-run "$CASE" --output-dir "$OUT/geometry" \
+      --bgc --autoseg --skip-derived --skip-plane-metrics \
+      --no-cache-write
 
-- **幅度图**用于确认解剖覆盖和信号质量。
-- **速度大小**用于发现明显的流动区域和异常高值；它不是最终的临床结论。
-- **分割包络**显示哪些区域会进入后续几何和血流分析。
-- **时间曲线**用于发现某个 phase 完全为空、分割体积跳变或时间顺序异常。
+The captured GUI run generated 570 skeleton points. Missing branches, points outside the lumen, and shortcuts across touching labels must be corrected before graph generation.
 
-上面的分割叠加图是从示例文件的历史结果生成的说明素材；它不参与冷启动命令。冷启动副本会先移除 `segmask`，再由你选择的分割方法重新产生活动分割。
+## 6. Build the graph and centerline paths
 
-## F. 验证输出
+![Generated graph](../../assets/images/dv-gui/09-graph.png)
 
-在 `$OUT/full/<case_name>/` 中优先检查：
+**GUI.** Click **Generate Graph**. Expand **Graph**, **Forks**, and path entries in the Browser. Use **Edit Graph** to repair a connection and save the edit; downstream paths, planes, and metrics are then rebuilt.
 
-```text
-summary.json
-quality_report.json
-planes.json
-planes.h5
-plane_metrics.json
-plane_qc.json
-```
+**CLI.** The same geometry command in step 5 builds graph topology. Read the log for node, edge, path, and fork counts.
 
-然后再看可选输出：
+The captured result had 569 graph nodes, 566 edges, and 37 centerline paths. The QC report later flags three disconnected components; do not treat a completed graph as proof that topology is anatomically correct.
 
-```text
-pwv.json
-pwv_<group>.png
-*_wss*.npz / *_wss*.h5
-*_pressure*.npz / *_pressure*.h5
-*.mp4
-```
+## 7. Generate and inspect cross-section planes
 
-`summary.json` 用于确认哪些阶段实际运行、耗时多少；`quality_report.json` 用于查看输入、分割、拓扑、平面、流量一致性和 PWV 检查；`plane_qc.json` 用于逐个截面审阅。
+![Generated planes](../../assets/images/dv-gui/10-planes.png)
 
-## G. 如果自动分割不可用
+**GUI.** Choose **Generate Planes**. Select planes in the Browser and inspect the U×V, V×N, and U×N views. Use **Edit Plane** for a local adjustment and **Export > Export Plane Coordinates...** to save reviewed positions.
 
-这不是流程终点。可以按可信度和可控性选择：
+**CLI.** Geometry generation is included in step 5. To reuse reviewed coordinates in a later run:
 
-1. 导入已有外部 segmentation 文件。
-2. 用 PCMRA/magnitude 阈值生成初始掩膜，再手工清理。
-3. 使用 GUI 的分割编辑器或可选的 SpatioTemporal Labeler。
-4. 保存分割后重新运行骨架和下游分析。
+    autoflow-run "$CASE" --output-dir "$OUT/reviewed-planes" \
+      --bgc --autoseg --import-planes "$OUT/gui/reviewed-plane-positions.json" \
+      --plane-import-mode world --no-cache-write
 
-自动分割、外部分割、内嵌分割和人工修订的边界见[分割与修订](../features/segmentation.md)。
+The captured run generated 104 planes. Review the plane normal, ownership, and contour at multiple phases before measuring flow.
 
-## 冷启动验收清单
+## 8. Calculate plane metrics
 
-- [ ] 工作副本在运行前没有可复用的 `corr`。
-- [ ] 工作副本在运行前没有可复用的 `segmask` / `segmentation`。
-- [ ] 日志或 `summary.json` 能证明校正和分割阶段实际执行。
-- [ ] 分割在至少三个正交方向和多个 phase 上通过人工检查。
-- [ ] 骨架、路径和截面没有明显跨出目标血管。
-- [ ] 派生指标只在几何检查通过后开启。
-- [ ] 原始文件保持只读或有独立备份。
+![Plane metrics](../../assets/images/dv-gui/11-plane-metrics.png)
+
+**GUI.** Open **Hemodynamics** and click **Calculate & Save Metrics**. Select a plane, choose a curve in the Analysis dock, and use **Through-plane Flow (cm/s)** in the viewer to check the sign and alignment.
+
+**CLI.** Plane metrics are the default hemodynamic output:
+
+    autoflow-run "$CASE" --output-dir "$OUT/plane-metrics" \
+      --bgc --autoseg --no-cache-write
+
+This writes plane_metrics.json, plane_metrics_pixelwise.h5, and plane_qc.json. The captured run computed metrics for all 104 planes. Flow is signed by the plane normal; negative samples can be real reflux.
+
+## 9. Compute PWV (optional and quality dependent)
+
+![PWV panel](../../assets/images/dv-gui/12-pwv.png)
+
+**GUI.** Configure a PWV vessel group in the Analysis dock, then click **Compute PWV**. Inspect the arrival-time curve and fit status. In this case the Portal Vein request produced a plot but the fit was marked skipped because the waveform did not meet the fit criteria.
+
+**CLI.** Request PWV together with the normal analysis:
+
+    autoflow-run "$CASE" --output-dir "$OUT/pwv" \
+      --bgc --autoseg --with pwv --no-cache-write
+
+Treat a failed fit as a review result. Check plane order, cycle wrapping, waveform quality, and outliers before changing thresholds.
+
+## 10. Compute WSS, pressure, and vortex fields
+
+![WSS, pressure, vortex and QC layers](../../assets/images/dv-gui/13-derived-metrics.png)
+
+**GUI.** Click **WSS / TKE / Pressure / Vortex** in **Hemodynamics**. Toggle WSS, Pressure Gradient, Relative Pressure, and Q-Criterion in the Browser and choose each field in the Content selector.
+
+**CLI.** Request the supported derived families explicitly:
+
+    autoflow-run "$CASE" --output-dir "$OUT/derived" \
+      --bgc --autoseg --with wss,pg,vortex --no-cache-write
+
+The captured result populated WSS, pressure, and vortex fields. TKE stayed unavailable because this DV file has no sigma/TKE input; AutoFlow does not synthesize TKE from velocity magnitude. The CLI writes derived_metrics_pixelwise.npz and the usual summaries.
+
+## 11. Generate streamlines and pathlines
+
+![Streamlines](../../assets/images/dv-gui/14-streamlines.png)
+
+**GUI.** Click **Generate Streamlines**. Then select a plane in the Browser and click **Pathlines**; the captured run used plane 0.
+
+![Pathlines](../../assets/images/dv-gui/15-pathlines.png)
+
+**CLI.** Streamline rendering can be requested with videos or from Python. The batch numerical command is:
+
+    autoflow-run "$CASE" --output-dir "$OUT/flow" \
+      --bgc --autoseg --with wss,pg --no-cache-write
+
+The GUI created one plane pathline set. Pathlines are time dependent and can take substantially longer than the static streamline layer; inspect seed coverage and terminal points.
+
+## 12. Run QC and export review artifacts
+
+![Quality report](../../assets/images/dv-gui/16-quality-report.png)
+
+**GUI.** Choose **Review & Export**, click **Refresh Quality**, and inspect every warning or failure. Then use **Segmentation > Save...**, **Export > Export Plane Coordinates...**, and **Export > Export QC Report**.
+
+![Save segmentation dialog](../../assets/images/dv-gui/17-save-segmentation.png)
+
+![Export plane coordinates](../../assets/images/dv-gui/18-export-planes.png)
+
+![Export quality report](../../assets/images/dv-gui/19-export-quality.png)
+
+**CLI.** Export plane coordinates during a batch run:
+
+    autoflow-run "$CASE" --output-dir "$OUT/export" \
+      --bgc --autoseg --export-planes "$OUT/export/plane_positions.json" \
+      --with wss,pg,vortex --no-cache-write
+
+The GUI run wrote reviewed-segmentation.h5, reviewed-plane-positions.json, quality_report.json, plane_qc.json, planes.json, and the metric files under results/dv-gui-guide-20261002/analysis.
+
+The captured quality report is **not ready**: 7 checks passed, 2 warned, and 2 failed. The failures are flow internal consistency and PWV fit. Inspect the disconnected centerline components, plane ownership, mask labels, and signed waveforms before using the numbers clinically.
+
+## 13. Export videos
+
+![Video export options](../../assets/images/dv-gui/17-video-options.png)
+
+**GUI.** Choose **Export > Export Videos**, select Plane, WSS, Pressure Gradient, Relative Pressure, and Streamlines, choose an output directory, and accept. TKE is offered by the dialog but is skipped for this input because no TKE volume exists.
+
+![Completed video export](../../assets/images/dv-gui/21-videos-complete.png)
+
+**CLI.** Request the same families and use a small frame count for a quick review:
+
+    autoflow-run "$CASE" --output-dir "$OUT/videos" \
+      --bgc --autoseg --with wss,pg --video plane,wss,pg,streamlines \
+      --plane-rotation-frames 24 --fps 12 --no-cache-write
+
+The captured GUI export produced planes_rotate.mp4, wss_video.mp4, pressure_gradient_video.mp4, relative_pressure_video.mp4, and streamlines_video.mp4. It did not produce a TKE video.
+
+## 14. DICOM is another input route
+
+The same workflow accepts a DICOM directory directly or through the optional [4DFlow_Dicom2H5 converter](../features/dicom-loading.md). The converter is pinned as the third_party/4DFlow_Dicom2H5 submodule.
+
+    git submodule update --init third_party/4DFlow_Dicom2H5
+    pip install -e ".[dicom]"
+
+    autoflow-run /path/to/dicom --output-dir "$OUT/dicom-native" \
+      --dicom-backend native --bgc --autoseg --no-cache-write
+
+    autoflow-run /path/to/dicom --output-dir "$OUT/dicom-converted" \
+      --dicom-backend dicom2h5 --dicom-h5-dir "$OUT/converted-h5" \
+      --bgc --autoseg --with wss,pg --no-cache-write
+
+In the GUI use **File > Import DICOM Directory** for native loading, or **File > Import DICOM via Dicom2H5...** to create a new H5 and then load it. Conversion never overwrites an existing destination. Converted magnitude plus velocity inputs support skeletons, graphs, planes, metrics, WSS, pressure and streamlines; TKE remains optional.
+
+## Output checklist
+
+| Stage | Main outputs |
+| --- | --- |
+| Segmentation | *_auto_segmentation.nii.gz, optional reviewed segmentation H5 |
+| Centerline and planes | planes.json, planes.h5, plane position JSON |
+| Plane metrics | plane_metrics.json, plane_metrics_pixelwise.h5, plane_qc.json |
+| PWV | pwv.json, pwv.h5, fit plots |
+| Derived fields | derived_metrics_pixelwise.npz, WSS/pressure/vortex summaries |
+| Review | quality_report.json |
+| Videos | planes_rotate.mp4, WSS/pressure/streamline videos when the input supports them |
+
+For parameter definitions and API equivalents see [CLI](cli.md), [parameter reference](parameters.md), [Python API](python-api.md), and [outputs](outputs.md).

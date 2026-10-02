@@ -358,7 +358,8 @@ def process_single(
     shared_colorbar_bar_cfg=None,
     phase_unwrap_backend_params=None,
 ):
-    case = resolve_input_case(input_source)
+    loader = getattr(workspace, "loader_params", None)
+    case = resolve_input_case(input_source, getattr(loader, "dicom_backend", "native"), getattr(loader, "dicom_h5_dir", ""))
     input_label = case.display_name or case.input_path
 
     metric_flags = _requested_metric_flags(
@@ -922,6 +923,7 @@ def process_single(
         "n_graph_edges": len(ws.graph.edges),
         "n_paths": len(ws.centerline_paths_smooth),
         "n_forks": len(ws.forks),
+        "willis_ring": dict(getattr(ws, "willis_ring_status", {}) or {}),
         "path_info": ws.path_info,
         "forks": ws.forks,
         "plane_metrics": ws.derived.plane_metrics,
@@ -971,8 +973,8 @@ def collect_h5_files(inputs):
     return sorted(dict.fromkeys(files))
 
 
-def collect_input_items(inputs):
-    return collect_input_cases(inputs)
+def collect_input_items(inputs, dicom_backend="native", dicom_h5_dir=""):
+    return collect_input_cases(inputs, dicom_backend, dicom_h5_dir)
 
 
 def build_base_workspace():

@@ -13,6 +13,8 @@ Plane metrics compute time-resolved cross-sectional measurements for each plane 
 
 For each unique segmentation phase, plane metrics build one thresholded VTK support mesh and reuse it across all planes. Each plane still has its own slice and connectivity selection, while repeated cardiac phases reuse the resulting slice specification. Large parallel jobs use independent loky worker processes with memory-mapped arrays because concurrently slicing a shared VTK dataset from Python threads is unsafe. Plane centers remain local physical coordinates and are shifted by `origin` only for VTK slicing.
 
+Support meshes are constructed inside the occupied mask's bounding box. They retain the full image's voxel identifiers and physical coordinates, so plane sampling and contour edits still address the original volume while avoiding background grid construction.
+
 Generated planes are filtered before metric integration when their requested
 branch has no cells in the segmentation-filtered cross-section. The exclusion
 criterion is missing geometric support (`area_mm2 == 0` after branch
@@ -61,10 +63,7 @@ Use the standard `run_case()` or `run_batch()` flow. Plane metrics run unless `s
 
 ## Parameters
 
-| Parameter | Type | Default | Where set | Effect | Code owner |
-| --- | --- | --- | --- | --- | --- |
-| `skip_plane_metrics` | bool | `False` | batch config or CLI/API | disable the whole plane-metric export step | `autoflow/processing.py` |
-| `use_multithread` | bool | `True` | `configs/batch.json` | compatibility-named parallel switch; sets below 128 planes stay serial, while larger sets use up to eight independent worker processes with memory-mapped arrays | `autoflow/core/pipeline.py`, `autoflow/algorithms/metrics.py` |
+See [batch parameters](../user/parameters.md#batch), [planes parameters](../user/parameters.md#planes), [CLI flags](../user/cli-parameters.md), and [API fields](../user/api-parameters.md) for complete type/default/unit/effect/owner tables. Dictionary controls are expanded in [Structured parameters](../user/parameter-schemas.md).
 
 ## Outputs
 
@@ -108,6 +107,8 @@ Use the standard `run_case()` or `run_batch()` flow. Plane metrics run unless `s
 - fields ending in `_mean`, `_peak`, or `_p95` are scalar summaries over the sampled plane data
 - `forward` and `reverse` use the resolved local forward direction; `signed` keeps that sign convention in one curve
 
+Process parallelism now accounts for temporal workload: below 128 planes, 1920 or more plane-phase evaluations use up to four processes; smaller workloads remain serial. At least 128 planes retain up to eight processes. Shared input memmaps avoid copying full arrays into each worker. The controlled 96-plane/20-phase comparison preserved metric and QC results; see [Performance](../developer/performance.md).
+
 ## Limitations
 - segmentation is required
 - plane metrics depend on valid plane placement
@@ -116,7 +117,7 @@ Use the standard `run_case()` or `run_batch()` flow. Plane metrics run unless `s
 - `WSS / TKE / Pressure / Vortex` augments existing GUI plane metrics with WSS, TKE, and pressure summaries after computing missing derived families; vortex fields are whole-volume only and do not add plane summaries
 - interactive plane edits defer the complete pixelwise H5 resampling pass until the explicit metric-save step
 - support-mesh reuse assumes identical mask bytes represent identical geometry; changing segmentation content creates a new support mesh
-- the compatibility setting is still named `use_multithread`, but large jobs use processes to isolate VTK state; process startup can make small jobs slower, so fewer than 128 planes remain serial
+- the compatibility setting is still named `use_multithread`, but large jobs use processes to isolate VTK state; process startup can make small jobs slower, so small plane-phase workloads remain serial
 
 ## Where To Change Code
 
@@ -128,8 +129,8 @@ Use the standard `run_case()` or `run_batch()` flow. Plane metrics run unless `s
 
 ## Tests
 
-- `~/miniconda3/envs/ryy/bin/python -m pytest tests/test_smoke_phantoms.py -q`
-- `~/miniconda3/envs/ryy/bin/python -m pytest tests/test_pressure_gradient_phantom.py -q`
+- `/home/renyuyang/miniconda3/envs/autoflow311/bin/python -m pytest tests/test_smoke_phantoms.py -q`
+- `/home/renyuyang/miniconda3/envs/autoflow311/bin/python -m pytest tests/test_pressure_gradient_phantom.py -q`
 
 ## Common Problems
 

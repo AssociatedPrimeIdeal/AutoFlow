@@ -7,3 +7,6 @@
 [submodule "third_party/GUST-Flow"]
 	path = third_party/GUST-Flow
 	url = https://github.com/AssociatedPrimeIdeal/GUST-Flow.git
+[submodule "third_party/4DFlow_Dicom2H5"]
+	path = third_party/4DFlow_Dicom2H5
+	url = https://github.com/AssociatedPrimeIdeal/4DFlow_Dicom2H5.git

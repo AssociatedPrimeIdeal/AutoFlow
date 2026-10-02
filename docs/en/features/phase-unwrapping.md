@@ -36,16 +36,7 @@ The loader must provide canonical `phase_wrapped` (`X,Y,Z,T,3`). For normalized 
 
 ## Parameters
 
-| Parameter | Type | Default | Where configured | Effect | Code owner |
-| --- | --- | --- | --- | --- | --- |
-| `phase_unwrap_method` | enum | `lap4D` in GUI; omitted in CLI/API | Config/CLI/GUI | Select `gc3D`, `lap4D`, `nprs`, `pudip`, or `gust`; selecting a method opts in | `autoflow/algorithms/phase_unwrapping.py` |
-| `phase_unwrap_device` | enum | `auto` | Config/CLI/GUI | CPU or CUDA (`lap4D` FFT, `nprs` FFT, `gc3D` graph construction, or learned backend training) | same |
-| `phase_unwrap_mask` | enum | `segmask` | Config/CLI/GUI | `segmask` or temporal PC-MRA standard deviation (`pcmra_std`) for learned-backend weighting/initialization | `autoflow/core/pipeline.py`, `autoflow/algorithms/phase_unwrapping.py` |
-| `lap4d_ts` | float | `2.0` | Config/GUI (shown only for `lap4D`) | Temporal weighting for lap4D | `phase_unwrapping.py` |
-| `nprs_upsampling_factor` | int | `2` | Config/GUI (shown only for `nprs`) | NPRS spatial upsampling factor | `phase_unwrapping.py` |
-| `nprs_pi_unwrap` | bool | `true` | Config/GUI (shown only for `nprs`) | Enable NPRS π-unwrapping pass | `phase_unwrapping.py` |
-| `nprs_auto_crop` | bool | `true` | Config/GUI (shown only for `nprs`) | Crop NPRS FFT padding before returning | `phase_unwrapping.py` |
-| `backend_params` | object | `{}` | `configs/phase_unwrapping.json` | Backend-specific PUDIP-Flow or GUST-Flow constructor options such as `num_iter`, `lr`, and `num_primitives` | `phase_unwrapping.py` |
+See [phase unwrapping parameters](../user/parameters.md#phase_unwrapping), [CLI flags](../user/cli-parameters.md), and [API fields](../user/api-parameters.md) for complete type/default/unit/effect/owner tables. Dictionary controls are expanded in [Structured parameters](../user/parameter-schemas.md).
 
 When omitted, the learned backends use the upstream notebook settings: PUDIP-Flow uses `level=4`, `features=128`, `input_depth=128`, `lr=1e-3`, `num_iter=1000`, unit TV weights, `loss_type="l1"`, cosine scheduling, `div_weight=0`, and `reshape_mode="bt_as_channel"`; GUST-Flow uses `num_iter=1000` and `num_primitives=8192`.
 

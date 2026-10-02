@@ -43,12 +43,12 @@ class AutoFlowConfig:
     background_phase_correction: bool = False
     background_phase_method: str = "wrls_arto"
     background_phase_corr_fit_order: int = 3
-    background_phase_threshold: float = 0.1
+    background_phase_threshold: float = 0.2
     background_phase_wrls_lambda: float = 5.0
     background_phase_wrls_magnitude_threshold: float = 0.04
     background_phase_wrls_mid_fov_fraction: float = 0.5
     background_phase_wrls_mid_slice_fraction: float = 0.65
-    background_phase_wrls_arto_iterations: int = 2
+    background_phase_wrls_arto_iterations: int = 4
     background_phase_wrls_tau: float = 3.0
     background_phase_wrls_delta: float = 2.0
     background_phase_wrls_central_probability: float = 0.5
@@ -59,6 +59,8 @@ class AutoFlowConfig:
     force_recompute_corr: bool = False
     background_phase_write_cache: bool = True
     dicom_read_workers: int = 1
+    dicom_backend: str = "native"
+    dicom_h5_dir: str = ""
     ignore_embedded_segmentation: bool = False
     phase_unwrap_enabled: bool = False
     phase_unwrap_method: str = "none"
@@ -206,6 +208,8 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
     ws.loader_params.background_phase_correction.force_recompute = bool(cfg.force_recompute_corr)
     ws.loader_params.background_phase_correction.write_cache = bool(cfg.background_phase_write_cache)
     ws.loader_params.dicom_read_workers = int(cfg.dicom_read_workers)
+    ws.loader_params.dicom_backend = str(cfg.dicom_backend)
+    ws.loader_params.dicom_h5_dir = str(cfg.dicom_h5_dir or os.path.join(cfg.output_dir, "_dicom_h5"))
     ws.loader_params.ignore_embedded_segmentation = bool(cfg.ignore_embedded_segmentation)
     ws.phase_unwrap_params.enabled = bool(cfg.phase_unwrap_enabled)
     ws.phase_unwrap_params.method = str(cfg.phase_unwrap_method or "none")
@@ -376,7 +380,7 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
     if not config.inputs:
         raise ValueError("AutoFlowConfig.inputs is empty.")
 
-    input_cases = collect_input_items(list(config.inputs))
+    input_cases = collect_input_items(list(config.inputs), config.dicom_backend, config.dicom_h5_dir or os.path.join(config.output_dir, "_dicom_h5"))
     if not input_cases:
         print("No supported H5 or DICOM inputs found.")
         return [], ""
@@ -438,6 +442,8 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 force_recompute_corr=config.force_recompute_corr,
                 background_phase_write_cache=config.background_phase_write_cache,
                 dicom_read_workers=config.dicom_read_workers,
+                dicom_backend=config.dicom_backend,
+                dicom_h5_dir=config.dicom_h5_dir,
                 ignore_embedded_segmentation=config.ignore_embedded_segmentation,
                 phase_unwrap_enabled=config.phase_unwrap_enabled,
                 phase_unwrap_method=config.phase_unwrap_method,

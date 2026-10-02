@@ -54,22 +54,7 @@ WRLS+ARTO requires at least two time frames because it estimates temporal standa
 
 ## Parameters
 
-| Parameter or flag | Type | Default | Where configured | Effect | Code owner |
-| --- | --- | --- | --- | --- | --- |
-| `method`, `--bgc-method` | string | `wrls_arto` | `configs/loader.json`, GUI, CLI, Python API | choose `msac` or `wrls_arto` | `autoflow/algorithms/phase_correction.py` |
-| `corr_fit_order`, `--bgc-fit-order` | int | `3` | `configs/loader.json`, GUI, CLI, Python API | polynomial order of the final correction | `autoflow/algorithms/phase_correction.py` |
-| `threshold`, `--bgc-threshold` | float | `0.1` | `configs/loader.json`, GUI, CLI, Python API | MSAC stationary-tissue threshold in venc units | `autoflow/algorithms/phase_correction.py` |
-| `wrls_lambda`, `--bgc-wrls-lambda` | float | `5.0` | `configs/loader.json`, CLI, Python API | L1 regularization strength | `autoflow/algorithms/phase_correction.py` |
-| `wrls_magnitude_threshold`, `--bgc-wrls-magnitude-threshold` | float | `0.04` | `configs/loader.json`, CLI, Python API | per-slice reference-magnitude fraction | `autoflow/algorithms/phase_correction.py` |
-| `wrls_mid_fov_fraction`, `--bgc-wrls-mid-fov-fraction` | float | `0.5` | `configs/loader.json`, CLI, Python API | middle in-plane FOV fraction for initialization | `autoflow/algorithms/phase_correction.py` |
-| `wrls_mid_slice_fraction`, `--bgc-wrls-mid-slice-fraction` | float | `0.65` | `configs/loader.json`, CLI, Python API | middle through-plane fraction for initialization | `autoflow/algorithms/phase_correction.py` |
-| `wrls_arto_iterations`, `--bgc-wrls-arto-iterations` | int | `2` | `configs/loader.json`, CLI, Python API | ARTO exclusion and refit count | `autoflow/algorithms/phase_correction.py` |
-| `wrls_tau`, `--bgc-wrls-tau` | float | `3.0` | `configs/loader.json`, CLI, Python API | central-Gaussian inclusion width | `autoflow/algorithms/phase_correction.py` |
-| `wrls_delta`, `--bgc-wrls-delta` | float | `2.0` | `configs/loader.json`, CLI, Python API | minimum side-Gaussian separation | `autoflow/algorithms/phase_correction.py` |
-| `wrls_central_probability`, `--bgc-wrls-central-probability` | float | `0.5` | `configs/loader.json`, CLI, Python API | minimum central-Gaussian prior | `autoflow/algorithms/phase_correction.py` |
-| `wrls_fista_iterations`, `--bgc-wrls-fista-iterations` | int | `5000` | `configs/loader.json`, CLI, Python API | maximum FISTA iterations per fit | `autoflow/algorithms/phase_correction.py` |
-| `wrls_gmm_iterations`, `--bgc-wrls-gmm-iterations` | int | `1000` | `configs/loader.json`, CLI, Python API | maximum GMM EM iterations per ARTO pass | `autoflow/algorithms/phase_correction.py` |
-| `force_recompute`, `--force-recompute-corr` | bool | `False` | `configs/loader.json`, CLI, Python API | ignore a compatible H5 correction cache | `autoflow/algorithms/data.py` |
+See [loader parameters](../user/parameters.md#loader), [CLI flags](../user/cli-parameters.md), and [API fields](../user/api-parameters.md) for complete type/default/unit/effect/owner tables. Dictionary controls are expanded in [Structured parameters](../user/parameter-schemas.md).
 
 ## Outputs
 
@@ -100,7 +85,7 @@ Runtime metadata records whether correction was applied, whether a cache was reu
 Smoke coverage is in `tests/test_smoke_phantoms.py`. It covers MSAC progress and cache reuse, WRLS polynomial recovery, method-specific cache isolation, and concurrent dual-venc correction. Run the supported suite with:
 
 ```bash
-~/miniconda3/envs/ryy/bin/python -m pytest \
+/home/renyuyang/miniconda3/envs/autoflow311/bin/python -m pytest \
   tests/test_smoke_phantoms.py \
   tests/test_pressure_gradient_phantom.py -q
 ```
@@ -111,3 +96,5 @@ Smoke coverage is in `tests/test_smoke_phantoms.py`. It covers MSAC progress and
 - A cache is recomputed: inspect the H5 correction attributes for a method, fit-order, version, or WRLS-parameter mismatch.
 - The WRLS threshold cannot be edited in the GUI: `MSAC Threshold` is method-specific; WRLS tuning values are read from `configs/loader.json`.
 - Dual-venc output changes substantially in a few voxels: review those locations near wrap boundaries because different background fields can change the selected alias branch.
+
+Dual-VENC low/high correction jobs run concurrently. Progress callbacks are delivered on the calling thread, so GUI progress updates stay on the Qt main thread. With `force_recompute=true`, opening an H5 preserves the selected correction method and ignores embedded correction caches.

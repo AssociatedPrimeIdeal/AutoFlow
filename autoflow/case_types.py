@@ -44,12 +44,12 @@ class BackgroundPhaseCorrectionConfig:
     enabled: bool = True
     method: str = "wrls_arto"
     corr_fit_order: int = 3
-    threshold: float = 0.1
+    threshold: float = 0.2
     wrls_lambda: float = 5.0
     wrls_magnitude_threshold: float = 0.04
     wrls_mid_fov_fraction: float = 0.5
     wrls_mid_slice_fraction: float = 0.65
-    wrls_arto_iterations: int = 2
+    wrls_arto_iterations: int = 4
     wrls_tau: float = 3.0
     wrls_delta: float = 2.0
     wrls_central_probability: float = 0.5
@@ -92,12 +92,12 @@ class BackgroundPhaseCorrectionConfig:
             # bundles use WRLS+ARTO as the new default.
             method=str(payload.get("method", "msac" if "method" not in payload else "wrls_arto") or "wrls_arto").strip().lower(),
             corr_fit_order=int(payload.get("corr_fit_order", 3)),
-            threshold=float(payload.get("threshold", 0.1)),
+            threshold=float(payload.get("threshold", 0.2)),
             wrls_lambda=float(payload.get("wrls_lambda", 5.0)),
             wrls_magnitude_threshold=float(payload.get("wrls_magnitude_threshold", 0.04)),
             wrls_mid_fov_fraction=float(payload.get("wrls_mid_fov_fraction", 0.5)),
             wrls_mid_slice_fraction=float(payload.get("wrls_mid_slice_fraction", 0.65)),
-            wrls_arto_iterations=int(payload.get("wrls_arto_iterations", 2)),
+            wrls_arto_iterations=int(payload.get("wrls_arto_iterations", 4)),
             wrls_tau=float(payload.get("wrls_tau", 3.0)),
             wrls_delta=float(payload.get("wrls_delta", 2.0)),
             wrls_central_probability=float(payload.get("wrls_central_probability", 0.5)),

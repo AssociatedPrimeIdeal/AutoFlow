@@ -129,6 +129,22 @@ class SceneController:
         """Return whether *obj* should be drawn with VTK volume rendering."""
         return str(getattr(obj, "data_key", "")) == "pcmra_volume"
 
+    @staticmethod
+    def _foreground_volume_range(values):
+        finite = values[np.isfinite(values) & (values > 0.0)]
+        if not finite.size:
+            return 0.0, 1.0
+        lo, hi = (float(value) for value in np.percentile(finite, (5.0, 99.0)))
+        return lo, hi if hi > lo else lo + 1.0
+
+    def _volume_mapper_name(self):
+        try:
+            if self.plotter.render_window.GetClassName() == "vtkOSOpenGLRenderWindow":
+                return "fixed_point"
+        except AttributeError:
+            pass
+        return "smart"
+
     def _volume_scalar_range(self, obj, data, respect_clim=True):
         """Resolve the PC-MRA window from the current frame foreground."""
         if respect_clim and getattr(obj, "clim", None) is not None:
@@ -139,25 +155,16 @@ class SceneController:
                 cached = self._volume_range_cache.get(key)
                 if cached is not None:
                     return cached
-                try:
-                    mag_arr = np.asarray(self.workspace.mag_raw, dtype=np.float32)
-                    flow_arr = np.asarray(self.workspace.flow_raw, dtype=np.float32)
-                    mag_arr = mag_arr[..., None] if mag_arr.ndim == 3 else mag_arr
-                    nt = min(int(mag_arr.shape[3]), int(flow_arr.shape[3]))
-                    frame = min(max(0, int(self.workspace.current_t)), max(0, nt - 1))
-                    values_t = mag_arr[..., frame] * np.linalg.norm(flow_arr[..., frame, :], axis=-1)
-                    finite_t = np.asarray(values_t, dtype=float)
-                    finite_t = finite_t[np.isfinite(finite_t) & (finite_t > 0.0)]
-                except Exception:
-                    finite_t = np.empty(0)
-                if finite_t.size:
-                    lo = float(np.percentile(finite_t, 5.0))
-                    hi = float(np.percentile(finite_t, 99.0))
-                else:
-                    lo, hi = 0.0, 1.0
-                result = (lo, float(hi if np.isfinite(hi) and hi > lo else lo + 1.0))
-                self._volume_range_cache[key] = result
-                return result
+                # Dataset construction computes the raw-frame range before
+                # cell-to-point interpolation; reuse it instead of calculating
+                # magnitude * speed a second time for every new phase.
+                volume = self._build_dataset(obj.data_key)
+                cached = self._volume_range_cache.get(key)
+                if cached is None and volume is not None and "PC-MRA display range" in volume.field_data:
+                    cached = tuple(float(value) for value in volume.field_data["PC-MRA display range"])
+                    self._volume_range_cache[key] = cached
+                if cached is not None:
+                    return cached
             values = None
             name = str(getattr(obj, "scalars", "") or "PC-MRA")
             try:
@@ -177,15 +184,12 @@ class SceneController:
         return float(lo), float(hi)
 
     def _set_volume_opacity(self, obj, data=None):
-        """Apply the browser opacity to a volume's scalar opacity transfer function."""
+        """Update window/level and opacity without recreating the volume actor."""
         actor = getattr(obj, "actor", None)
         if actor is None or not self._is_volume_object(obj):
             return
         try:
             prop = actor.GetProperty()
-            transfer = prop.GetScalarOpacity(0)
-            if transfer is None:
-                return
             if data is None:
                 data = self._build_dataset(obj.data_key)
             if data is None:
@@ -197,6 +201,16 @@ class SceneController:
             except Exception:
                 pass
             try:
+                # Changing the LUT range makes PyVista replace both transfer
+                # functions. Fetch them afterwards to avoid modifying an old
+                # opacity function that is no longer attached to the actor.
+                transfer = prop.GetScalarOpacity(0)
+                if transfer is None:
+                    return
+                colors = prop.GetRGBTransferFunction(0)
+                colors.RemoveAllPoints()
+                for fraction in (0.0, 0.18, 0.42, 0.68, 1.0):
+                    colors.AddRGBPoint(lo + (hi - lo) * fraction, fraction, fraction, fraction)
                 prop.SetInterpolationTypeToNearest()
                 prop.SetScalarOpacityUnitDistance(max(float(np.mean(np.asarray(self.workspace.resolution, dtype=float))), 0.1))
                 transfer.RemoveAllPoints()
@@ -489,11 +503,6 @@ class SceneController:
         actor = getattr(obj, "actor", None)
         if actor is not None:
             try:
-                transfer = actor.GetProperty().GetRGBTransferFunction(0)
-                transfer.RemoveAllPoints()
-                for fraction in (0.0, 0.18, 0.42, 0.68, 1.0):
-                    value = low + (high - low) * fraction
-                    transfer.AddRGBPoint(value, fraction, fraction, fraction)
                 self._set_volume_opacity(obj)
                 actor.GetProperty().Modified()
             except Exception:
@@ -510,7 +519,7 @@ class SceneController:
         if obj is None:
             return False
         obj.clim = None
-        self.readd_object(obj, refresh_scalar_bar=False)
+        self._update_dynamic_object(obj)
         try:
             self.plotter.render()
         except Exception:
@@ -766,7 +775,7 @@ class SceneController:
             actor = self._tracked_actors.pop(uid, None)
             if actor is not None:
                 try:
-                    self.plotter.remove_actor(actor)
+                    self.plotter.remove_actor(actor, render=False)
                 except Exception:
                     try:
                         self.plotter.renderer.RemoveActor(actor)
@@ -859,14 +868,15 @@ class SceneController:
         if obj.actor is None:
             self._render_object(obj, refresh_scalar_bar=False)
             return
-        if self._is_volume_object(obj):
-            self.readd_object(obj, refresh_scalar_bar=False)
-            return
         try:
             self._segmentation_category_metadata(obj, data)
             data_show = self._display_dataset(obj, data)
             data_show = self._transform_display_dataset(data_show)
             mapper = obj.actor.GetMapper()
+            if self._is_volume_object(obj):
+                # Select the scalar explicitly on each cached volume. Meshes
+                # keep the PyVista mapper pipeline below for LUT colors.
+                data_show.set_active_scalars(str(obj.scalars or "PC-MRA"), preference="point")
             # Preserve PyVista's active-scalar pipeline when swapping phases.
             # Raw VTK SetInputData leaves the mapper's scalar texture connected
             # to the previous dataset and renders much of the new mesh black.
@@ -915,7 +925,9 @@ class SceneController:
 
     def apply_object_properties(self, obj, *, render=True, refresh_scalar_bar=True):
         if obj.actor is None:
-            self._render_object(obj, refresh_scalar_bar=True)
+            self._render_object(obj, refresh_scalar_bar=refresh_scalar_bar)
+            if render:
+                self.plotter.render()
             return
         was_visible = False
         try:
@@ -1196,7 +1208,7 @@ class SceneController:
                 except Exception:
                     pass
             try:
-                self.plotter.remove_actor(obj.actor)
+                self.plotter.remove_actor(obj.actor, render=False)
             except Exception:
                 try:
                     self.plotter.renderer.RemoveActor(obj.actor)
@@ -1204,7 +1216,7 @@ class SceneController:
                     pass
         if getattr(obj, "label_actor", None) is not None:
             try:
-                self.plotter.remove_actor(obj.label_actor)
+                self.plotter.remove_actor(obj.label_actor, render=False)
             except Exception:
                 try:
                     self.plotter.renderer.RemoveActor(obj.label_actor)
@@ -1283,11 +1295,13 @@ class SceneController:
                 "specular_power": 8.0,
                 "shade": False,
                 "blending": "composite",
-                "mapper": "fixed_point",
+                "mapper": self._volume_mapper_name(),
                 "opacity_unit_distance": max(float(np.mean(np.asarray(self.workspace.resolution, dtype=float))), 0.1),
                 "show_scalar_bar": False,
+                "render": False,
+                "reset_camera": False,
             }
-        kw = {"opacity": float(obj.opacity), "show_scalar_bar": False}
+        kw = {"opacity": float(obj.opacity), "show_scalar_bar": False, "render": False, "reset_camera": False}
         use_scalars = False
         if obj.scalars:
             if hasattr(data, "point_data") and obj.scalars in data.point_data:
@@ -1521,20 +1535,23 @@ class SceneController:
         if data_key == "pcmra_volume":
             if ws.mag_raw is None or ws.flow_raw is None:
                 return None
-            mag = np.asarray(ws.mag_raw, dtype=np.float32)
-            flow = np.asarray(ws.flow_raw, dtype=np.float32)
+            mag = np.asarray(ws.mag_raw)
+            flow = np.asarray(ws.flow_raw)
             if flow.ndim != 5 or mag.ndim not in (3, 4):
                 return None
             cache_key = f"pcmra_volume_{id(ws.mag_raw)}_{id(ws.flow_raw)}"
             def _build_pcmra():
-                mag_t = mag[..., None] if mag.ndim == 3 else mag
-                if mag_t.shape[:3] != flow.shape[:3]:
+                if mag.shape[:3] != flow.shape[:3]:
                     return None
-                nt = min(int(mag_t.shape[3]), int(flow.shape[3]))
+                nt = int(flow.shape[3]) if mag.ndim == 3 else min(int(mag.shape[3]), int(flow.shape[3]))
                 if nt <= 0:
                     return None
                 tidx = min(max(0, int(t)), nt - 1)
-                values = mag_t[..., tidx] * np.linalg.norm(flow[..., tidx, :], axis=-1)
+                mag_t = np.asarray(mag if mag.ndim == 3 else mag[..., tidx], dtype=np.float32)
+                flow_t = np.asarray(flow[..., tidx, :], dtype=np.float32)
+                values = mag_t * np.linalg.norm(flow_t, axis=-1)
+                range_key = (id(ws.mag_raw), id(ws.flow_raw), int(t))
+                self._volume_range_cache[range_key] = self._foreground_volume_range(values)
                 values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
                 grid = pv.ImageData(
                     dimensions=tuple((np.asarray(values.shape, dtype=int) + 1).tolist()),
@@ -1542,6 +1559,7 @@ class SceneController:
                     origin=tuple(np.asarray(org, dtype=float).reshape(-1)[:3].tolist()),
                 )
                 grid.cell_data["PC-MRA"] = values.flatten(order="F")
+                grid.field_data["PC-MRA display range"] = self._volume_range_cache[range_key]
                 # Volume mappers consume point scalars.  Convert once here so
                 # timeline updates can swap mapper input directly instead of
                 # recreating the VTK volume actor for every cardiac frame.
@@ -1630,6 +1648,16 @@ class SceneController:
                 np.asarray(ws.graph.points, dtype=float)
                 + np.asarray(org, dtype=float).reshape(1, 3),
                 ws.graph.edges,
+            )
+
+        if data_key == "willis_ring_graph":
+            graph = getattr(ws, "willis_ring_graph", None)
+            if graph is None or len(getattr(graph, "points", [])) == 0:
+                return None
+            return graph_to_polydata(
+                np.asarray(graph.points, dtype=float)
+                + np.asarray(org, dtype=float).reshape(1, 3),
+                graph.edges,
             )
 
         if isinstance(data_key, str) and data_key.startswith("graph_"):

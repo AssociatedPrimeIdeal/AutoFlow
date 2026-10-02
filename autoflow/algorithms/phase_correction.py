@@ -692,7 +692,7 @@ def _execute_wrls_arto_impl(
     magnitude_threshold=0.04,
     mid_fov_fraction=0.5,
     mid_slice_fraction=0.65,
-    arto_iterations=2,
+    arto_iterations=4,
     tau=3.0,
     delta=2.0,
     central_probability=0.5,
@@ -883,7 +883,7 @@ def _execute_wrls_arto_gpu(
     magnitude_threshold=0.04,
     mid_fov_fraction=0.5,
     mid_slice_fraction=0.65,
-    arto_iterations=2,
+    arto_iterations=4,
     tau=3.0,
     delta=2.0,
     central_probability=0.5,
@@ -991,7 +991,7 @@ def execute_wrls_arto(
     magnitude_threshold=0.04,
     mid_fov_fraction=0.5,
     mid_slice_fraction=0.65,
-    arto_iterations=2,
+    arto_iterations=4,
     tau=3.0,
     delta=2.0,
     central_probability=0.5,
@@ -1022,7 +1022,7 @@ def execute_wrls_arto(
     return _execute_wrls_arto_impl(im, **kwargs)
 
 
-def execute_msac(im, corr_fit_order=3, th=0.1, progress_callback=None):
+def execute_msac(im, corr_fit_order=3, th=0.2, progress_callback=None):
     rng = np.random.RandomState(274612)
     raw = np.asarray(im)
     zero_corr = _zero_corr_nvtzyx(raw.shape)

@@ -482,7 +482,7 @@ class DerivedMetricsParams:
     wss_viscosity: float = 4.0
     wss_inward_distance: Optional[float] = None
     wss_parabolic_fitting: bool = True
-    wss_no_slip_condition: bool = False
+    wss_no_slip_condition: bool = True
     tke_rho: float = 1060.0
     pressure_gradient_rho: float = 1060.0
     pressure_gradient_viscosity: float = 4.0
@@ -540,7 +540,7 @@ class DerivedMetricsParams:
             wss_viscosity=float(payload.get("wss_viscosity", legacy_viscosity)),
             wss_inward_distance=inward_distance,
             wss_parabolic_fitting=bool(payload.get("wss_parabolic_fitting", payload.get("parabolic_fitting", True))),
-            wss_no_slip_condition=bool(payload.get("wss_no_slip_condition", payload.get("no_slip_condition", False))),
+            wss_no_slip_condition=bool(payload.get("wss_no_slip_condition", payload.get("no_slip_condition", True))),
             tke_rho=float(payload.get("tke_rho", legacy_rho)),
             pressure_gradient_rho=float(payload.get("pressure_gradient_rho", legacy_rho)),
             pressure_gradient_viscosity=float(payload.get("pressure_gradient_viscosity", legacy_viscosity)),
@@ -894,6 +894,8 @@ class LoaderParams:
         default_factory=lambda: DicomParameterOverrides()
     )
     dicom_read_workers: int = 1
+    dicom_backend: str = "native"
+    dicom_h5_dir: str = ""
     # Explicitly bypass segmentation embedded in an input file.  This is
     # useful for cold-start benchmarks and for forcing the model/threshold
     # segmentation branch without changing the source file.
@@ -904,6 +906,8 @@ class LoaderParams:
             "background_phase_correction": self.background_phase_correction.to_dict(),
             "dicom_parameter_overrides": self.dicom_parameter_overrides.to_dict(),
             "dicom_read_workers": int(self.dicom_read_workers),
+            "dicom_backend": str(self.dicom_backend),
+            "dicom_h5_dir": str(self.dicom_h5_dir),
             "ignore_embedded_segmentation": bool(self.ignore_embedded_segmentation),
         }
 
@@ -918,6 +922,8 @@ class LoaderParams:
                 payload.get("dicom_parameter_overrides", {})
             ),
             dicom_read_workers=int(payload.get("dicom_read_workers", 1) or 1),
+            dicom_backend=str(payload.get("dicom_backend", "native")),
+            dicom_h5_dir=str(payload.get("dicom_h5_dir", "")),
             ignore_embedded_segmentation=bool(payload.get("ignore_embedded_segmentation", False)),
         )
 
@@ -1234,6 +1240,10 @@ class Workspace:
     segmask_3d: Optional[np.ndarray] = None
     group_order: List[str] = field(default_factory=list)
     multilabel_groups: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Optional runtime topology overlay. It overlaps source labels and is
+    # therefore kept outside the ordinary segmentation groups/metrics.
+    willis_ring_status: Dict[str, Any] = field(default_factory=dict)
+    willis_ring_graph: GraphData = field(default_factory=GraphData)
 
     mag_raw: Optional[np.ndarray] = None
     source_sigma: Optional[np.ndarray] = None
@@ -1454,6 +1464,8 @@ class Workspace:
             setattr(self, attr, None)
         self.group_order = []
         self.multilabel_groups = {}
+        self.willis_ring_status = {}
+        self.willis_ring_graph = GraphData()
         self.graph = GraphData()
         self.centerline_paths = []
         self.centerline_node_paths = []
@@ -1473,6 +1485,7 @@ class Workspace:
         self.remove_object_by_data_key("skeleton_mask_surface")
         self.remove_object_by_data_key("segmask_3d_surface")
         self.remove_object_by_data_key("graph_lines")
+        self.remove_object_by_data_key("willis_ring_graph")
         self.remove_object_by_data_key("fork_markers")
         self.remove_objects_by_prefix("segmask_group_")
         self.remove_objects_by_prefix("skeleton_")
@@ -1517,6 +1530,8 @@ class Workspace:
             setattr(self, attr, None)
         self.group_order = []
         self.multilabel_groups = {}
+        self.willis_ring_status = {}
+        self.willis_ring_graph = GraphData()
         self.graph = GraphData()
         self.centerline_paths = []
         self.centerline_node_paths = []
@@ -1600,6 +1615,8 @@ class Workspace:
             "segmask_3d": arr(self.segmask_3d),
             "group_order": [str(x) for x in self.group_order],
             "multilabel_groups": group_payload,
+            "willis_ring_status": copy.deepcopy(self.willis_ring_status),
+            "willis_ring_graph": {"points": arr(self.willis_ring_graph.points), "edges": arr(self.willis_ring_graph.edges)},
             "mag_raw": arr(self.mag_raw),
             "source_sigma": arr(self.source_sigma),
             "source_tke_array": arr(self.source_tke_array),
@@ -1692,6 +1709,12 @@ class Workspace:
         self.segmask_binary = None if d.get("segmask_binary") is None else np.asarray(d["segmask_binary"], dtype=bool)
         self.segmask_3d = None if d.get("segmask_3d") is None else np.asarray(d["segmask_3d"], dtype=bool)
         self.group_order = [str(x) for x in d.get("group_order", [])]
+        self.willis_ring_status = copy.deepcopy(d.get("willis_ring_status", {}))
+        wr = d.get("willis_ring_graph", {}) or {}
+        self.willis_ring_graph = GraphData(
+            points=np.asarray(wr.get("points", []), dtype=float).reshape(-1, 3) if wr.get("points") else np.empty((0, 3)),
+            edges=np.asarray(wr.get("edges", []), dtype=int).reshape(-1, 2) if wr.get("edges") else np.empty((0, 2), dtype=int),
+        )
         self.multilabel_groups = {}
         for group_name, state in dict(d.get("multilabel_groups", {})).items():
             graph_state = state.get("graph", {}) if isinstance(state, dict) else {}

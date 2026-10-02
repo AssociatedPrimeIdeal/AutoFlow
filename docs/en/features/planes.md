@@ -109,28 +109,7 @@ summary = run_case("case.h5", config=config)
 
 ## Parameters
 
-| Parameter | Type | Default | Where set | Effect | Code owner |
-| --- | --- | --- | --- | --- | --- |
-| `plane_mode` | string | `fixed_step` | `configs/planes.json` or CLI/API | `uniform` distributes planes; `fixed_step` uses anchor, direction, and spacing | `autoflow/algorithms/planes.py` |
-| `plane_count` | int | `3` | `configs/planes.json` or CLI/API | requested planes; `-1` fills positions that fit. Even symmetric counts omit the center plane | `autoflow/algorithms/planes.py` |
-| `cross_section_distance` / `cross_section_dist` | float mm | `5.0` | `configs/planes.json` or CLI/API | fixed-step spacing when spacing mode is distance | `autoflow/algorithms/planes.py` |
-| `spacing_mode` / `plane_spacing_mode` | string | `fraction` | `configs/planes.json` or CLI/API | use `distance` (mm) or `fraction` of the usable centerline length | `autoflow/algorithms/planes.py` |
-| `spacing_ratio` / `plane_spacing_ratio` | float | `0.25` | `configs/planes.json` or CLI/API | fraction of the current filtered centerline length per step | `autoflow/algorithms/planes.py` |
-| `direction` / `plane_direction` | string | `both` | `configs/planes.json` or CLI/API | `toward_start`, `toward_end`, or `both` | `autoflow/algorithms/planes.py` |
-| `segmentation_filter` | bool | `true` | `configs/planes.json` or CLI/API | topology-aware owner label selection, path clipping, and metric mask filtering | `autoflow/algorithms/planes.py`, `autoflow/algorithms/metrics.py` |
-| `start_distance` / `start_dist` | float mm | `0.0` | `configs/planes.json` or CLI/API | advanced trim from path start before placement | `autoflow/algorithms/planes.py` |
-| `end_distance` / `end_dist` | float mm | `0.0` | `configs/planes.json` or CLI/API | offset from path end | `autoflow/algorithms/planes.py` |
-| `anchor` / `plane_anchor` | string | `center` | `configs/planes.json` or CLI/API | `start`, `center`, `end`, or `junction` placement anchor | `autoflow/algorithms/planes.py` |
-| `anchor_offset_mm` / `plane_offset_mm` | float mm | `5.0` | `configs/planes.json` or CLI/API | first distance from the junction in `anchored_offset` mode | `autoflow/algorithms/planes.py` |
-| `smoothing_window` | int | `15` | `configs/planes.json` | path smoothing window | `autoflow/core/models.py` |
-| `smoothing_polyorder` | int | `2` | `configs/planes.json` | smoothing polynomial order | `autoflow/core/models.py` |
-| `inter_time` | int | `10` | `configs/planes.json` | interpolation time setting used by plane code | `autoflow/core/models.py` |
-| `--import-planes` / `reuse_planes` | path | empty | CLI or `AutoFlowConfig` | load a v2 or legacy plane-coordinate file before metrics | `autoflow/plane_io.py` |
-| `--plane-import-mode` / `plane_import_mode` | string | `world` | CLI or `AutoFlowConfig` | choose world, local, or relative-centerline cross-case mapping | `autoflow/plane_io.py` |
-| `--export-planes` / `export_planes` | path | empty | CLI or `AutoFlowConfig` | write an additional portable coordinate file | `autoflow/processing.py` |
-| `roi_polygon_uv_mm` | list of `[u, v]` mm points | empty | imported or existing plane metadata | legacy plane-local polygon limit applied to every frame | `autoflow/algorithms/metrics.py`, `autoflow/plane_io.py` |
-| `roi_edit_operations` | map of frame index to operations | empty | GUI `Edit contour` or imported plane metadata | frame-local `replace` operations store the final hand-edited contour; legacy `add`/`remove` operations remain readable | `autoflow/algorithms/metrics.py`, `autoflow/ui/ortho_viewer.py` |
-| `slice_default_view_fraction` | float, 0.1–1.0 | `0.5` | GUI `Settings -> Ortho Viewer Display` | initial physical view range fraction for all three viewers; `0.5` is a 2x view-only zoom | `autoflow/ui/ortho_viewer.py`, `autoflow/ui/slice_view.py` |
+See [planes parameters](../user/parameters.md#planes), [labels parameters](../user/parameters.md#labels), [CLI flags](../user/cli-parameters.md), and [API fields](../user/api-parameters.md) for complete type/default/unit/effect/owner tables. Dictionary controls are expanded in [Structured parameters](../user/parameter-schemas.md).
 
 ## Outputs
 
@@ -169,8 +148,8 @@ For cross-case import, `world` preserves `center_world_mm` and requires register
 
 ## Tests
 
-- `~/miniconda3/envs/ryy/bin/python -m pytest tests/test_smoke_phantoms.py -q`
-- `~/miniconda3/envs/ryy/bin/python -m pytest tests/test_pressure_gradient_phantom.py -q`
+- `/home/renyuyang/miniconda3/envs/autoflow311/bin/python -m pytest tests/test_smoke_phantoms.py -q`
+- `/home/renyuyang/miniconda3/envs/autoflow311/bin/python -m pytest tests/test_pressure_gradient_phantom.py -q`
 
 ## Common Problems
 

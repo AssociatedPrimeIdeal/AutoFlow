@@ -1,6 +1,7 @@
 import os
 import re
-import threading
+import time
+from queue import SimpleQueue
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -1158,15 +1159,15 @@ def _load_legacy_dual_venc_h5(
             "cache_name": "corr_low/high",
         }
 
-    progress_lock = threading.Lock()
+    # Worker threads enqueue progress; callbacks (including Qt widgets) run
+    # on the calling thread while it waits for the two correction jobs.
+    progress_events = SimpleQueue()
+    callback = progress_events.put if progress_callback is not None else None
 
-    def _locked_progress(payload):
-        if progress_callback is None:
-            return
-        with progress_lock:
-            progress_callback(payload)
+    def drain_progress():
+        while not progress_events.empty():
+            progress_callback(progress_events.get())
 
-    callback = _locked_progress if progress_callback is not None else None
     lv_kwargs = {
         "config": cfg,
         "progress_callback": _progress_prefix(callback, "h5_dual_lv_"),
@@ -1191,6 +1192,10 @@ def _load_legacy_dual_venc_h5(
                 hv_complex,
                 **hv_kwargs,
             )
+            while not (lv_future.done() and hv_future.done()):
+                drain_progress()
+                time.sleep(0.01)
+            drain_progress()
             lv_corr, _lv_stationary, lv_report = lv_future.result()
             hv_corr, _hv_stationary, hv_report = hv_future.result()
     else:

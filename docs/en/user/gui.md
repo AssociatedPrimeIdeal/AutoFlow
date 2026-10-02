@@ -37,7 +37,11 @@ autoflow-gui
 
 When `DISPLAY` has the forwarded `localhost:N.0` form, AutoFlow automatically
 renders VTK through off-screen EGL and transfers the completed 3D image into a
-normal Qt widget. In the 3-D view, VTK's default trackball-camera mapping is
+normal Qt widget. Startup probes EGL in a separate process and falls back to
+software rendering if it is unavailable. A pre-set `VTK_DEFAULT_OPENGL_WINDOW`
+is respected; use `VTK_DEFAULT_OPENGL_WINDOW=vtkOSOpenGLRenderWindow autoflow-gui`
+to force the software path when diagnosing driver problems.
+In the 3-D view, VTK's default trackball-camera mapping is
 used: left-drag rotates, middle-drag pans, right-drag performs dolly/zoom, and
 the mouse wheel zooms. When PC-MRA is visible, `Shift`+left-drag adjusts its
 window/level. Existing 3D picking and edit controls remain available. A local
@@ -70,7 +74,12 @@ The left browser is group-aware and path-aware. When the loaded segmentation pro
 When magnitude and flow are loaded, `Global → PC-MRA (4D)` is available as a
 grayscale VTK volume backdrop. It is phase-resolved (`magnitude_t × speed_t`)
 and updates with the timeline/playback, with a low-intensity transfer function
-to suppress background noise. The default volume color transfer is grayscale
+to suppress background noise. The volume uses GPU rendering when supported,
+with a CPU mapper for the software SSH fallback. Cached cardiac frames share
+one volume actor; phase changes update its input and transfer functions instead
+of removing and recreating it. Each timeline update draws the completed scene
+once. A static 3-D magnitude volume is reused for every velocity frame.
+The default volume color transfer is grayscale
 with white high intensities, and the default 3-D background is black. Select any Browser object to adjust its
 individual `Opacity` with the slider below the tree; the context menu also has
 `Set Opacity…` and `Reset Opacity (100%)`. Selecting a group applies the slider
@@ -114,7 +123,8 @@ Input also provides `Reload Input with Current Parameters`. An unchanged input s
 | Menu item | What it does | Main code |
 | --- | --- | --- |
 | `Open H5` | open an H5 or HDF5 case; prompts for a data-group path when one file contains multiple supported cases, asks for `LV`, `HV`, or `DV` for legacy dual-VENC data, then reuses a compatible correction cache when available | `autoflow/ui/app.py`, `autoflow/ui/dicom_confirm.py` |
-| `Import DICOM Directory` | scan a DICOM directory and choose a case | `autoflow/ui/app.py`, `autoflow/ui/dicom_confirm.py` |
+| `Import DICOM Directory` | scan a DICOM directory and choose a case using the native loader | `autoflow/ui/app.py`, `autoflow/ui/dicom_confirm.py` |
+| `Import DICOM via Dicom2H5...` | convert to a new reusable H5 in a background worker, validate it, select a group if needed, and load it | `autoflow/ui/app.py`, `autoflow/algorithms/dicom_conversion.py` |
 | `Clear Workspace` | clear loaded data and restore config defaults in the UI | `autoflow/ui/app.py` |
 | `Exit` | close the GUI | `autoflow/ui/app.py` |
 
@@ -173,8 +183,9 @@ Input also provides `Reload Input with Current Parameters`. An unchanged input s
 
 Compute-oriented pipeline buttons execute in Qt workers. Plane metric progress advances once for each completed plane, and pathline integration also runs in its own worker before the GUI creates its VTK scene actors, so slow integration does not block the application window. The progress dialog remains responsive while algorithms run. The Browser `Planes` and `Pathlines` visibility switches show or hide every object of that type at once; a partially checked switch indicates mixed visibility. After completion, the GUI invalidates and rebuilds only scene objects affected by those steps instead of recreating every VTK actor. Closing the window is blocked while a task is active so the workspace cannot be destroyed during a calculation.
 
-`Parallel Plane Metrics` keeps small jobs serial and runs jobs with at least
-128 planes in up to eight isolated worker processes. The process isolation is
+`Parallel Plane Metrics` keeps small plane-phase workloads serial. Below 128
+planes, at least 1920 plane-phase evaluations use up to four processes; jobs
+with at least 128 planes retain up to eight isolated worker processes. The process isolation is
 required because VTK slicing is not safe against concurrent access to shared
 datasets. Progress still advances once per completed plane.
 
@@ -228,7 +239,7 @@ Important behavior:
 - GUI auto segmentation uses the same window-modal progress dialog as other long-running GUI tasks; nnUNet inference runs in an isolated child process so native CUDA/nnUNet failures are reported in the dialog instead of terminating the Qt GUI. Closing the dialog hides progress permanently for that run and does not cancel the worker, while completion still applies the result and failure opens an explicit error dialog
 - automatic segmentation saves a sidecar H5 file after a successful run
 - automatic segmentation also saves the predicted segmentation NIfTI plus the feature-channel NIfTI inputs used for that run
-- the Labeler export dialog advances once for `mag`, `flow_x`, `flow_y`, `flow_z`, `pcmra`, and `segmentation`; files are uncompressed `.nii` for faster exchange
+- the Labeler export dialog advances as the six background exports finish; unchanged images are reused, and changing the active segmentation refreshes only the label file. Files remain uncompressed `.nii`
 - save the original `segmentation.nii` in Labeler with `Ctrl+S`; after Labeler exits, AutoFlow detects the changed file and offers to apply it as the `imported` source, preserving the embedded original
 - optional 4D connected-component cleanup removes components below a physical volume or keeps the largest component per label and frame
 
@@ -365,7 +376,7 @@ geometry without changing the saved contour.
 
 ## External Segmentation Editor
 
-The optional SpatioTemporal Labeler is launched from the Segmentation dock. It receives `mag`, `flow_x`, `flow_y`, `flow_z`, `pcmra`, and the active label sequence as matching 4D NIfTI files. The case-specific exchange directory is reused on later opens, so Labeler can continue from its saved `segmentation.nii` instead of overwriting it. AutoFlow keeps the exchange process separate, blocks closing AutoFlow until Labeler exits, and imports the saved label only after its file timestamp changes.
+The optional SpatioTemporal Labeler is launched from the Segmentation dock. It receives `mag`, `flow_x`, `flow_y`, `flow_z`, `pcmra`, and the active label sequence as matching 4D NIfTI files. Export runs in background workers. The case-specific exchange directory reuses identical images and retains saved Labeler edits while the active seed is unchanged. If a new active segmentation differs from both the previous seed and the saved Labeler mask, only `segmentation.nii` is replaced; the previous file is preserved as `segmentation.previous.<timestamp_ns>.nii`. Applying a saved edit preserves its file and label definitions. AutoFlow keeps the exchange process separate, blocks closing AutoFlow during export and until Labeler exits, and offers to import the saved label only after its file timestamp changes.
 
 ## When To Use The GUI
 
@@ -400,3 +411,5 @@ Current popup behavior:
 - a progress bar and status text show load progress while GT and VAA volumes are prepared
 - display-only transforms include `Rotate 90 deg`, `Flip H`, and `Flip V`
 - the transform controls only affect the rendered preview and do not modify source data on disk
+
+The GUI uses `batch.output_dir` from the selected config directory as its output root, with a case-named subdirectory for analysis and generated segmentation sidecars. Video export has its own destination picker. Set `loader.background_phase_correction.write_cache=false` and `segmentation.write_auto_cache=false` to preserve source H5 files.

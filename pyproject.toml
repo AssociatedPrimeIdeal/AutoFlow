@@ -25,6 +25,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+dicom = [
+  "dicom2h5 @ git+https://github.com/AssociatedPrimeIdeal/4DFlow_Dicom2H5.git@c6693c07f51255cd1004beb5bce9704a8f219e5c",
+]
 docs = [
   "mkdocs-material>=9.5,<10",
 ]
@@ -47,6 +50,7 @@ pu = [
   "gustflow @ git+https://github.com/AssociatedPrimeIdeal/GUST-Flow.git@e68d90deb083a6fdf772fdc7cdcbe8dc71370c25 ; python_version >= '3.10'",
 ]
 all = [
+  "dicom2h5 @ git+https://github.com/AssociatedPrimeIdeal/4DFlow_Dicom2H5.git@c6693c07f51255cd1004beb5bce9704a8f219e5c",
   "mkdocs-material>=9.5,<10",
   "pytest",
   "PySide6>=6.6",

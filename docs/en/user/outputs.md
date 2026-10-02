@@ -42,7 +42,8 @@
 
 ## Notes
 
-- `derived_metrics_pixelwise.npz` stores whole-volume derived arrays
+- `derived_metrics_pixelwise.npz` stores whole-volume derived arrays. WSS is in Pa; rasterized invalid wall samples are NaN and non-wall voxels are zero. Workspace WSS surfaces additionally carry signed `wss_vectors` in Pa and `wss_valid`.
+- Pressure gradients are in Pa/m and relative pressure is in Pa. Use `pressure_gradient_support_mask` to identify evaluated voxels; values outside support are zero placeholders. Each disconnected support component has its own zero-pressure reference. Recompute exports from older pressure reconstruction versions rather than rescaling them.
 - When `vortex` is requested, `derived_metrics_pixelwise.npz` includes `vorticity`, `vorticity_magnitude`, `q_criterion`, `swirling_strength`, their phase-peak arrays, and `vortex_support_mask`.
 - `plane_metrics_pixelwise.h5` stores per-plane slice-cellwise samples
 - TKE outputs remain optional and are absent for inputs that do not carry TKE
@@ -58,3 +59,7 @@
 - PWV scene planes are represented as one grouped browser object named `PWV planes`
 - `plane_positions.json` uses schema `autoflow.plane_positions.v2`; `center_world_mm` is meaningful across cases only when their AutoFlow canonical world-mm frames are registered
 - offline video export writes MP4 only; no GIF fallback is generated
+
+## Preserved DICOM conversion
+
+The optional Dicom2H5 route saves a new H5 before analysis, under `dicom_h5_dir` (default `output_dir/_dicom_h5`). It contains normalized `mag + flow` acquisition groups and geometry/patient/scanner/acquisition metadata. Existing destinations are never overwritten. Subsequent analysis uses ordinary H5 case output directories. See [DICOM loading and conversion](../features/dicom-loading.md).

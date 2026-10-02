@@ -2,6 +2,7 @@ import hashlib
 import json
 import copy
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import importlib.util
 import os
@@ -12,6 +13,7 @@ import time
 import traceback
 from functools import partial
 from pathlib import Path
+from queue import SimpleQueue
 
 os.environ["QT_API"] = "pyside6"
 
@@ -36,7 +38,6 @@ from ..algorithms import (
     generate_threshold_segmentation,
     generate_nnunet_auto_segmentation,
     save_segmentation_file,
-    save_nifti_volume,
     save_segmentation_to_source_h5,
     segmentation_timestamp,
     _plot_plane_flowrate_axes,
@@ -46,9 +47,9 @@ from ..algorithms import (
     generate_pathlines_from_plane_at_t,
 )
 from ..algorithms.data import discover_h5_input_cases, inspect_h5_input_case
+from ..algorithms.dicom_conversion import convert_dicom_input
 from ..algorithms.phase_unwrapping import backend_available
 from ..algorithms.segmentation import (
-    compute_reference_scalar,
     resolve_nnunet_model_folder,
     resolve_nnunet_4d_model_folder,
 )
@@ -73,6 +74,7 @@ from ..rendering import (
     render_wss_video,
 )
 from .viewer import SceneController
+from .labeler_exchange import export_labeler_exchange
 
 
 # Additional item data roles used by the Browser for non-object path nodes.
@@ -352,6 +354,23 @@ class _AutoSegmentationWorker(QtCore.QObject):
             self.failed.emit(traceback.format_exc())
 
 
+class _DicomConversionWorker(QtCore.QObject):
+    finished = QtCore.Signal(object)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, root, output_h5):
+        super().__init__()
+        self.root = root
+        self.output_h5 = output_h5
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            self.finished.emit(convert_dicom_input(self.root, self.output_h5))
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
 class _PipelineTaskWorker(QtCore.QObject):
     progress = QtCore.Signal(dict)
     finished = QtCore.Signal(object)
@@ -590,6 +609,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._autoseg_progress_dialog = None
         self._autoseg_started_at = None
         self._pipeline_thread = None
+        self._dicom_conversion_thread = None
+        self._dicom_conversion_worker = None
+        self._dicom_conversion_progress = None
         self._pipeline_worker = None
         self._pipeline_progress_dialog = None
         self._pipeline_task_label = ""
@@ -599,6 +621,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pathline_progress_dialog = None
         self._pathline_selected_plane_idx = None
         self._labeler_process = None
+        self._labeler_export_running = False
         self._labeler_segmentation_path = ""
         self._labeler_segmentation_mtime_ns = None
         self._labeler_process_output = {"stdout": "", "stderr": ""}
@@ -943,7 +966,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_bpc_threshold.setDecimals(3)
         self.spin_bpc_threshold.setRange(0.001, 10.0)
         self.spin_bpc_threshold.setSingleStep(0.01)
-        self.spin_bpc_threshold.setValue(0.1)
+        self.spin_bpc_threshold.setValue(0.2)
         self.spin_dual_venc_ratio1 = QtWidgets.QDoubleSpinBox()
         self.spin_dual_venc_ratio1.setDecimals(4)
         self.spin_dual_venc_ratio1.setRange(-10.0, 10.0)
@@ -2493,6 +2516,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for label, slot in [
             ("Open H5", self._on_open_h5),
             ("Import DICOM Directory", self._on_import_dicom_directory),
+            ("Import DICOM via Dicom2H5...", self._on_import_dicom2h5),
             ("Clear Workspace", self._on_close_workspace),
             ("Exit", self.close),
         ]:
@@ -3310,7 +3334,7 @@ class MainWindow(QtWidgets.QMainWindow):
             and str(seg_state.auto_model or "").lower().endswith((".sh", ".bash"))
             else resolved_model
         )
-        cache_path = ws.paths.flow_path if str(ws.input_state.source_format or "").lower().endswith("h5") else ""
+        cache_path = ws.paths.flow_path if (str(ws.input_state.source_format or "").lower().endswith("h5") and bool(seg_state.write_auto_cache)) else ""
         artifact_prefix = os.path.splitext(self._default_segmentation_sidecar_path("auto"))[0]
         self._autoseg_started_at = time.perf_counter()
         self._autoseg_progress_dialog = self._create_progress_dialog("Auto Segmentation", "Preparing auto segmentation...")
@@ -3523,7 +3547,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         source_id = os.path.abspath(source_path) if source_path else "unsaved_workspace"
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "source_id": source_id,
             "input_signature": str(self._input_signature or ""),
             "mag_shape": [int(v) for v in np.asarray(ws.mag_raw).shape],
@@ -3542,18 +3566,11 @@ class MainWindow(QtWidgets.QMainWindow):
         source_hash = hashlib.sha1(source_id.encode("utf-8")).hexdigest()[:12]
         return os.path.join(output_dir, "spatiotemporal_labeler", f"{safe_stem}_{source_hash}")
 
-    @staticmethod
-    def _can_reuse_labeler_exchange(exchange_dir, metadata, required_paths):
-        manifest_path = os.path.join(exchange_dir, "exchange.json")
-        try:
-            with open(manifest_path, "r", encoding="utf-8") as handle:
-                saved_metadata = json.load(handle)
-        except (OSError, ValueError, TypeError):
-            return False
-        return saved_metadata == metadata and all(os.path.isfile(path) for path in required_paths)
-
     def _open_external_segmentation_editor(self):
         """Prepare a reusable exchange directory, launch Labeler, and re-import on exit."""
+        if self._labeler_export_running:
+            self.log("SpatioTemporal Labeler export is already running.")
+            return
         ws = self.workspace
         segmentation = ws.segmentation_display_4d()
         if segmentation is None or ws.mag_raw is None or ws.flow_raw is None:
@@ -3584,6 +3601,7 @@ class MainWindow(QtWidgets.QMainWindow):
         progress.setValue(0)
         progress.show()
         QtWidgets.QApplication.processEvents()
+        self._labeler_export_running = True
         try:
             segmentation = np.asarray(segmentation, dtype=np.int16)
             mag = np.asarray(ws.mag_raw, dtype=np.float32)
@@ -3605,70 +3623,34 @@ class MainWindow(QtWidgets.QMainWindow):
             metadata = self._labeler_exchange_metadata(segmentation)
             exchange_dir = self._labeler_exchange_directory(metadata)
             os.makedirs(exchange_dir, exist_ok=True)
-            feature_paths = [
-                os.path.join(exchange_dir, "mag.nii"),
-                os.path.join(exchange_dir, "flow_x.nii"),
-                os.path.join(exchange_dir, "flow_y.nii"),
-                os.path.join(exchange_dir, "flow_z.nii"),
-                os.path.join(exchange_dir, "pcmra.nii"),
-            ]
-            label_path = os.path.join(exchange_dir, "segmentation.nii")
-            required_paths = [*feature_paths, label_path]
-            reuse_exchange = self._can_reuse_labeler_exchange(exchange_dir, metadata, required_paths)
-            pcmra = None
-            if not reuse_exchange:
-                pcmra_3d = compute_reference_scalar(mag, flow, "pcmra")
-                pcmra = np.repeat(pcmra_3d[..., None], segmentation.shape[3], axis=3)
-            export_steps = [
-                ("Magnitude", lambda: save_nifti_volume(
-                    feature_paths[0], mag, resolution=ws.resolution, origin=ws.origin
-                )),
-                ("Flow X (LR)", lambda: save_nifti_volume(
-                    feature_paths[1], flow[..., 0], resolution=ws.resolution, origin=ws.origin
-                )),
-                ("Flow Y (AP)", lambda: save_nifti_volume(
-                    feature_paths[2], flow[..., 1], resolution=ws.resolution, origin=ws.origin
-                )),
-                ("Flow Z (FH)", lambda: save_nifti_volume(
-                    feature_paths[3], flow[..., 2], resolution=ws.resolution, origin=ws.origin
-                )),
-                ("PC-MRA", lambda: save_nifti_volume(
-                    feature_paths[4], pcmra,
-                    resolution=ws.resolution,
-                    origin=ws.origin,
-                )),
-                ("Segmentation", lambda: save_segmentation_file(
-                    label_path,
-                    segmentation,
-                    resolution=ws.resolution,
-                    origin=ws.origin,
-                    provenance={
-                        "source": "autoflow_spatiotemporal_labeler_exchange",
-                        "created_at": segmentation_timestamp(),
-                    },
-                )),
-            ]
-            for step_index, (feature_name, writer) in enumerate(export_steps, start=1):
-                progress.setLabelText(
-                    f"Exporting {feature_name} ({step_index}/{len(export_steps)})..."
+            completed = SimpleQueue()
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="autoflow-labeler-export") as pool:
+                future = pool.submit(
+                    export_labeler_exchange, exchange_dir, metadata, mag, flow, segmentation,
+                    ws.resolution, ws.origin, completed.put,
                 )
-                progress.setValue(step_index - 1)
-                QtWidgets.QApplication.processEvents()
-                if not reuse_exchange:
-                    writer()
-                progress.setValue(step_index)
-                progress.setLabelText(
-                    f"{'Reusing' if reuse_exchange else 'Exported'} {feature_name} "
-                    f"({step_index}/{len(export_steps)})"
-                )
-                QtWidgets.QApplication.processEvents()
-            if not reuse_exchange:
-                with open(os.path.join(exchange_dir, "exchange.json"), "w", encoding="utf-8") as handle:
-                    json.dump(metadata, handle, indent=2, sort_keys=True)
+                count = 0
+                while not future.done():
+                    while not completed.empty():
+                        name = completed.get()
+                        count += 1
+                        progress.setValue(count)
+                        progress.setLabelText(f"Exported {name} ({count}/6)...")
+                    QtWidgets.QApplication.processEvents()
+                    time.sleep(0.01)
+                exported = future.result()
+            feature_paths = exported["feature_paths"]
+            label_path = exported["label_path"]
+            reuse_exchange = exported["reused_features"] and exported["reused_labels"]
+            if exported["previous_label_path"]:
+                self.log(f"Preserved previous Labeler mask: {exported['previous_label_path']}")
+            progress.setValue(6)
         except Exception as exc:
             self._close_progress_dialog(progress)
             self.log(f"Could not launch SpatioTemporal Labeler: {type(exc).__name__}: {exc}")
             return
+        finally:
+            self._labeler_export_running = False
         self._close_progress_dialog(progress)
 
         process = QtCore.QProcess(self)
@@ -5187,6 +5169,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.text_path_info.setPlainText(msg)
 
     def _autoseg_running_guard(self, action_text):
+        if getattr(self, "_dicom_conversion_thread", None) is not None:
+            self.log(f"DICOM conversion is running. Wait before {action_text}.")
+            return True
         if self._autoseg_thread is None:
             return False
         self.log(f"Auto segmentation is running. Wait for it to finish before {action_text}.")
@@ -6692,7 +6677,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log(f"VIEW ERROR: {type(e).__name__}: {e}")
 
     def _load_selected_input_case(self, case, dicom_parameter_overrides=None):
-        if self._autoseg_running_guard("loading another case"):
+        if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
             return
         progress_dialog = None
         load_succeeded = False
@@ -6714,9 +6699,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._sync_params_to_ws()
             self.workspace.paths.segmask_path = resolved.input_path
             self.workspace.paths.flow_path = resolved.input_path
+            configured_out = str(self._config_bundle.get("batch", {}).get("output_dir", "") or "").strip()
+            if configured_out:
+                self.workspace.paths.output_dir = os.path.join(configured_out, resolved.output_name or Path(resolved.input_path).stem)
             if resolved.input_kind == "dicom":
                 out_name = resolved.output_name or "dicom_case"
-                self.workspace.paths.output_dir = os.path.join(resolved.input_path, f"autoflow_{out_name}")
+                if not configured_out:
+                    self.workspace.paths.output_dir = os.path.join(resolved.input_path, f"autoflow_{out_name}")
                 self.workspace.loader_params.dicom_parameter_overrides = DicomParameterOverrides.from_dict(
                     dicom_parameter_overrides or {}
                 )
@@ -6837,6 +6826,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     merged_dual.update(existing_dual)
                     features["dual_venc"] = merged_dual
                 resolved.metadata.update(features)
+            if self.workspace.loader_params.background_phase_correction.force_recompute:
+                self.chk_bpc_enabled.setChecked(True)
+                self.log(f"Recomputing background correction with {self.combo_bpc_method.currentText()}: {label}")
+                return resolved
             if bool(features.get("has_background_correction_cache", False)):
                 self.chk_bpc_enabled.setChecked(True)
                 method = str(features.get("background_correction_method", "wrls_arto") or "wrls_arto")
@@ -6882,7 +6875,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return resolved
 
     def _on_open_h5(self):
-        if self._autoseg_running_guard("loading another case"):
+        if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
             return
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open H5", "", "H5 (*.h5 *.hdf5);;All (*)")
         if not path:
@@ -6909,7 +6902,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._load_selected_input_case(resolved)
 
     def _on_import_dicom_directory(self):
-        if self._autoseg_running_guard("loading another case"):
+        if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
             return
         root = QtWidgets.QFileDialog.getExistingDirectory(self, "Import DICOM Directory", "")
         if not root:
@@ -6936,6 +6929,66 @@ class MainWindow(QtWidgets.QMainWindow):
         if resolved is None:
             return
         self._load_selected_input_case(resolved, dicom_parameter_overrides=dialog.parameter_overrides())
+
+    def _on_import_dicom2h5(self):
+        if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
+            return
+        root = QtWidgets.QFileDialog.getExistingDirectory(self, "Import DICOM via Dicom2H5", "")
+        if not root:
+            return
+        target, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Converted H5", os.path.join(root, "../converted-flow.h5"),
+            "H5 (*.h5 *.hdf5)",
+            options=QtWidgets.QFileDialog.Option.DontConfirmOverwrite,
+        )
+        if not target:
+            return
+        if not target.lower().endswith((".h5", ".hdf5")):
+            target += ".h5"
+        if os.path.exists(target):
+            self.log(f"DICOM CONVERSION ERROR: destination exists: {target}. Choose a new filename or Open H5.")
+            return
+        self._dicom_conversion_progress = self._create_progress_dialog(
+            "Dicom2H5", "Converting DICOM and validating H5..."
+        )
+        self._dicom_conversion_progress.setRange(0, 0)
+        self._dicom_conversion_thread = QtCore.QThread(self)
+        self._dicom_conversion_worker = _DicomConversionWorker(root, target)
+        self._dicom_conversion_worker.moveToThread(self._dicom_conversion_thread)
+        self._dicom_conversion_thread.started.connect(self._dicom_conversion_worker.run)
+        self._dicom_conversion_worker.finished.connect(self._on_dicom_conversion_finished)
+        self._dicom_conversion_worker.failed.connect(self._on_dicom_conversion_failed)
+        self._dicom_conversion_worker.finished.connect(self._dicom_conversion_thread.quit)
+        self._dicom_conversion_worker.failed.connect(self._dicom_conversion_thread.quit)
+        self._dicom_conversion_thread.finished.connect(self._dicom_conversion_worker.deleteLater)
+        self._dicom_conversion_thread.finished.connect(self._cleanup_dicom_conversion)
+        self.log(f"Dicom2H5: {root} -> {target}")
+        self._dicom_conversion_thread.start()
+
+    def _on_dicom_conversion_finished(self, cases):
+        self._close_progress_dialog(self._dicom_conversion_progress)
+        self.log(f"Dicom2H5 saved {len(cases)} case(s): {cases[0].input_path}")
+        selected = cases[0]
+        if len(cases) > 1:
+            dialog = H5CaseSelectDialog(cases, self)
+            if dialog.exec() != QtWidgets.QDialog.Accepted:
+                return
+            selected = dialog.selected_case()
+            if selected is None:
+                return
+        selected = self._prompt_background_phase_choice(selected)
+        if selected is not None:
+            self._load_selected_input_case(selected)
+
+    def _on_dicom_conversion_failed(self, details):
+        self._close_progress_dialog(self._dicom_conversion_progress)
+        self.log(f"DICOM CONVERSION ERROR: {details}")
+
+    def _cleanup_dicom_conversion(self):
+        self._dicom_conversion_thread.deleteLater()
+        self._dicom_conversion_worker = None
+        self._dicom_conversion_thread = None
+        self._dicom_conversion_progress = None
 
     def _inspect_dicom_case_preview(self, case):
         progress_dialog = self._create_progress_dialog("Inspect DICOM", "Reading DICOM load parameters...")
@@ -7323,13 +7376,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log("Workspace cleared")
 
     def _pipeline_running_guard(self, action_text):
+        if getattr(self, "_dicom_conversion_thread", None) is not None:
+            self.log(f"DICOM conversion is running. Wait before {action_text}.")
+            return True
         if self._pipeline_thread is None:
             return False
         self.log(f"A pipeline task is running. Wait for it to finish before {action_text}.")
         return True
 
     def _start_pipeline_task(self, steps, task_label):
-        if self._pipeline_thread is not None:
+        if self._pipeline_running_guard("starting another pipeline task"):
             return False
         steps = list(steps)
         if not steps:
@@ -8538,6 +8594,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log("Edit Graph: no graph nodes are available for a vessel group.")
 
     def closeEvent(self, event):
+        if self._dicom_conversion_thread is not None:
+            self.log("Wait for DICOM conversion to finish before closing the GUI.")
+            event.ignore()
+            return
+        if self._labeler_export_running:
+            self.log("Wait for the Labeler export to finish before closing AutoFlow.")
+            event.ignore()
+            return
         if (
             self._labeler_process is not None
             and self._labeler_process.state() != QtCore.QProcess.ProcessState.NotRunning

@@ -2,7 +2,7 @@
   "smoothing_iteration": 200,
   "inward_distance": "auto",
   "parabolic_fitting": true,
-  "no_slip_condition": false,
+  "no_slip_condition": true,
   "render": {
     "clim": [
       0.0,

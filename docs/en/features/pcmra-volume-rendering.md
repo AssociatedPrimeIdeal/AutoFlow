@@ -15,7 +15,14 @@ for every cardiac frame: `magnitude_t × ||velocity_t||`. It renders the current
 frame with VTK's grayscale composite volume mapper. The automatic display range
 uses the positive finite foreground values from that frame: `L=P5` and `H=P99`,
 then `WL=(L+H)/2` and `WW=H-L`. The timeline and playback update the 3-D volume
-actor.
+actor in place. The cached image and its raw-frame display range are reused on
+later cycles; changing phase, opacity, or window/level keeps the same volume
+actor. Scene changes are batched into one render per timeline update.
+
+The normal volume path uses VTK's smart mapper to select GPU rendering when
+supported. SSH-forwarded sessions probe EGL off-screen rendering at startup
+and use a software render window with the CPU fixed-point mapper if EGL is
+unavailable. A static 3-D magnitude image is used for every velocity phase.
 
 ## When to use it
 
@@ -63,6 +70,8 @@ through the volume; selecting a plane adds a magenta highlight.
 | `Window` slider | normalized slider | automatic current-frame width | GUI | changes PC-MRA window width | `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
 | `Level` slider | normalized slider | automatic current-frame center | GUI | changes PC-MRA window level | `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
 | volume blend/shading | mapper options | composite, no shading | code | displays the raw grayscale volume without added surface lighting | `autoflow/ui/viewer.py` |
+| volume mapper | mapper name | smart; fixed-point on the software render window | automatic, based on VTK render window | selects GPU volume rendering when supported and retains CPU fallback | `autoflow/ui/viewer.py` |
+| `VTK_DEFAULT_OPENGL_WINDOW` | environment string | EGL probe with software fallback for SSH | environment before GUI startup | overrides automatic render-window selection, e.g. `vtkOSOpenGLRenderWindow` to force software | `autoflow/ui/launcher.py`, `autoflow/ui/remote_plotter.py` |
 | 3-D background color | color string | `#000000` | Settings → 3D Background Color | controls the backdrop independently of PC-MRA transfer functions | `autoflow/config.py`, `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
 
 ## Outputs
@@ -83,13 +92,18 @@ opacity. The 3-D actor is a VTK volume actor, not a polygon surface.
 | Change you want | Edit here | Also check | Tests |
 | --- | --- | --- | --- |
 | PC-MRA calculation and VTK image | `autoflow/ui/viewer.py` (`_build_dataset`) | `autoflow/core/pipeline.py` registration | smoke test and GUI manual check |
+| GPU selection and SSH fallback | `autoflow/ui/launcher.py`, `autoflow/ui/remote_plotter.py`, `autoflow/ui/viewer.py` | forwarded X11 and off-screen OpenGL driver | GUI manual check |
 | Browser visibility/opacity controls | `autoflow/ui/app.py` | `autoflow/core/models.py` persistence | GUI manual check |
 | 2-D segmentation overlay opacity | `autoflow/ui/ortho_viewer.py` | `autoflow/ui/app.py` segmentation dock | GUI manual check |
 
 ## Tests
 
-- `~/miniconda3/envs/ryy/bin/python -m pytest tests/test_smoke_phantoms.py -q`
-- `~/miniconda3/envs/ryy/bin/python -m pytest tests/test_pressure_gradient_phantom.py -q`
+- Activate the known working environment with `conda activate autoflow311`.
+- Run `pytest tests/test_smoke_phantoms.py tests/test_pressure_gradient_phantom.py -q`.
+- The PC-MRA phantom smoke check covers phase-dependent image values, actor reuse,
+  automatic and manual window/level, opacity after LUT range changes, and static
+  3-D magnitude input. Check camera interaction and combined volume/mesh display
+  manually in the GUI.
 
 ## Common problems
 

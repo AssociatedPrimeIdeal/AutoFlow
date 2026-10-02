@@ -957,11 +957,13 @@ def _nnunet_inference_command(
     disable_tta,
     python_executable=None,
     bootstrap_resampler_path=None,
+    optimize_transfers=False,
 ):
     command = [
         *_nnunet_predict_command(
             python_executable=python_executable,
             bootstrap_resampler_path=bootstrap_resampler_path,
+            optimize_transfers=optimize_transfers,
         ),
         "-i", str(input_dir),
         "-o", str(output_dir),
@@ -1539,7 +1541,7 @@ def _resolve_nnunet_folds(model_path, folds=None):
     return list(dict.fromkeys(values))
 
 
-def _nnunet_predict_command(python_executable=None, bootstrap_resampler_path=None):
+def _nnunet_predict_command(python_executable=None, bootstrap_resampler_path=None, optimize_transfers=False):
     if getattr(sys, "frozen", False):
         return [sys.executable, "--autoflow-internal-nnunet-predict"]
     code = (
@@ -1556,6 +1558,15 @@ def _nnunet_predict_command(python_executable=None, bootstrap_resampler_path=Non
             "from nnunetv2.inference.predict_from_raw_data import "
             "predict_entry_point_modelfolder as main; main()"
         )
+    if optimize_transfers:
+        # The predictor may use a separate interpreter and working directory.
+        # Load the runtime helper from this AutoFlow checkout/package explicitly.
+        runtime_root = repr(str(Path(__file__).resolve().parents[2]))
+        code = code[:-6] + (
+            f"import sys; sys.path.insert(0, {runtime_root}); "
+            "from autoflow.nnunet_runtime import configure_exact_inference_runtime; "
+            "configure_exact_inference_runtime(); main()"
+        )
     if python_executable and Path(str(python_executable)).is_file():
         return [
             str(python_executable),
@@ -1564,7 +1575,7 @@ def _nnunet_predict_command(python_executable=None, bootstrap_resampler_path=Non
         ]
     executable = shutil.which("nnUNetv2_predict_from_modelfolder")
     if executable:
-        if bootstrap_resampler_path:
+        if bootstrap_resampler_path or optimize_transfers:
             # The console entry point cannot execute the bootstrap prelude;
             # use the active interpreter so the child can install the helper.
             return [sys.executable, "-c", code]
@@ -2050,7 +2061,13 @@ def generate_nnunet_4d_auto_segmentation(
             detail_total=time_count,
         )
 
-        def _write_frame(frame_index):
+        # Temporal neighbours and cycle statistics recur across samples. Encode
+        # each feature map once, then retain the standard per-frame channel
+        # filenames through hard links (or byte copies on other filesystems).
+        # nnUNet still performs its original, independent sample preprocessing.
+        source_jobs = {}
+        channel_links = []
+        for frame_index in range(time_count):
             volumes = _nnunet_4d_channel_volumes(
                 channel_names,
                 mag_nnunet,
@@ -2060,16 +2077,33 @@ def generate_nnunet_4d_auto_segmentation(
                 temporal_cache=temporal_cache,
             )
             frame_id = f"{safe_case_id}_t{int(frame_index):03d}"
-            for channel_index, volume in enumerate(volumes):
+            for channel_index, (raw_name, volume) in enumerate(zip(channel_names, volumes)):
+                name = _nnunet_normalize_channel_name(raw_name)
+                temporal = _parse_nnunet_temporal_channel(name)
+                if name in global_by_name:
+                    source_key = ("global", name)
+                elif temporal is not None:
+                    offset, feature = temporal
+                    source_key = ("temporal", feature, (frame_index + offset) % time_count)
+                else:
+                    source_key = ("global", global_names[channel_index])
                 path = input_dir / f"{frame_id}_{channel_index:04d}{file_ending}"
-                _write_nifti_volume(volume, affine, path)
-            return frame_id
+                if source_key not in source_jobs:
+                    source_jobs[source_key] = (path, volume)
+                else:
+                    channel_links.append((source_jobs[source_key][0], path))
 
-        # NIfTI encoding is independent per phase and releases the GIL.  A
+        def _write_source(job):
+            path, volume = job
+            _write_nifti_volume(volume, affine, path)
+
+        # NIfTI encoding is independent per feature and releases the GIL. A
         # small pool avoids serial gzip overhead without competing with nnUNet.
         worker_count = min(4, max(1, time_count))
         with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="autoflow-nnunet4d-nifti") as executor:
-            list(executor.map(_write_frame, range(time_count)))
+            list(executor.map(_write_source, source_jobs.values()))
+        for source, destination in channel_links:
+            _link_or_copy_file(source, destination)
         for frame_index in range(time_count):
             _emit_progress(
                 progress_callback,
@@ -2100,6 +2134,7 @@ def generate_nnunet_4d_auto_segmentation(
                 if pipeline_script
                 else None
             ),
+            optimize_transfers=True,
         )
         _emit_progress(
             progress_callback,

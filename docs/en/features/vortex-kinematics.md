@@ -14,6 +14,8 @@ Vortex kinematics derives spatial velocity-gradient fields from the normalized 4
 
 The feature creates a separate `vortex_support_mask`. It is an eroded copy of the lumen mask used only for these spatial derivatives; it never changes the loaded segmentation or WSS surface.
 
+Mask preparation and optional smoothing operate inside the union vessel bounding box with a one-voxel halo. Velocity-gradient tensors, Q, and eigenvalue calculations then run only at valid support voxels. The output arrays retain the full image shape and are zero outside support, reducing background computation and temporary memory without changing the derivative stencil or metric definitions.
+
 ## When to use it
 
 Use it to inspect rotational flow structures after a segmentation is available. Use the support mask and smoothing setting when comparing cases, and avoid interpreting a small isolated signal at the vessel boundary as a vortex.
@@ -54,11 +56,7 @@ summary = run_case("case.h5", config=config)
 
 ## Parameters
 
-| Parameter or flag | Type | Default | Where configured | Effect | Code owner |
-| --- | --- | --- | --- | --- | --- |
-| `--with vortex` / `requested_metrics=["vortex"]` | csv/list | off | CLI or Python API | enables the independent batch export family | `autoflow/processing.py` |
-| `smoothing_sigma` | float voxels | `0.0` | `configs/vortex.json` or GUI | optional spatial Gaussian smoothing before differentiation; time is not smoothed | `autoflow/algorithms/metrics.py` |
-| `support_erosion_iters` | int voxels | `1` | `configs/vortex.json` or GUI | inward mask erosion used for valid derivative voxels; `0` disables it | `autoflow/algorithms/metrics.py` |
+See [vortex parameters](../user/parameters.md#vortex), [CLI flags](../user/cli-parameters.md), and [API fields](../user/api-parameters.md) for complete type/default/unit/effect/owner tables. Dictionary controls are expanded in [Structured parameters](../user/parameter-schemas.md).
 
 ## Outputs
 
@@ -91,7 +89,7 @@ summary = run_case("case.h5", config=config)
 
 ## Tests
 
-- `~/miniconda3/envs/ryy/bin/python -m pytest tests/test_smoke_phantoms.py tests/test_pressure_gradient_phantom.py -q`
+- `conda activate autoflow311`, then `python -m pytest tests/test_smoke_phantoms.py tests/test_pressure_gradient_phantom.py -q`
 - The smoke suite checks rigid-body rotation (`|ω|=2ω0`, `Q=ω0²`, `λci=ω0`) and verifies that pure shear has zero Q and `λci`.
 
 ## Common problems

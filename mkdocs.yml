@@ -1,5 +1,5 @@
 site_name: AutoFlow · 4D Flow MRI
-site_description: 面向 4D Flow MRI 的加载、分割、血流分析与质量控制文档
+site_description: Functional guides and complete parameter references for 4D flow MRI processing
 site_author: AutoFlow contributors
 site_url: https://associatedprimeideal.github.io/autoflow-docs/
 repo_url: https://github.com/AssociatedPrimeIdeal/AutoFlow
@@ -11,7 +11,7 @@ copyright: Copyright © AutoFlow contributors
 
 theme:
   name: material
-  language: zh
+  language: en
   logo: assets/logo.svg
   favicon: assets/logo.svg
   font: false
@@ -33,14 +33,14 @@ theme:
       scheme: default
       toggle:
         icon: material/brightness-7
-        name: 切换到深色模式
+        name: Switch to dark mode
       primary: custom
       accent: teal
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
       toggle:
         icon: material/brightness-4
-        name: 切换到浅色模式
+        name: Switch to light mode
       primary: custom
       accent: teal
 
@@ -81,38 +81,58 @@ markdown_extensions:
       permalink: true
 
 nav:
-  - 首页: index.md
-  - 中文:
-      - 用户指南: zh/user-guide.md
-      - 示例：主动脉 H5: zh/example.md
-      - 输入与输出: zh/input-output.md
-      - 功能清单: en/features/index.md
-  - English:
-      - User Guide: en/user-guide.md
-      - "Example: Aorta H5": en/example.md
-      - Input & Output: en/input-output.md
-      - Feature Map: en/features/index.md
-  - 开发者:
-      - 架构: en/developer/architecture.md
-      - 功能到代码: en/developer/feature-to-code-map.md
-      - 配置系统: en/developer/config-system.md
-      - 修改配方: en/developer/change-recipes.md
-      - 测试: en/developer/testing.md
-  - Reference:
-      - GUI details: en/user/gui.md
-      - CLI details: en/user/cli.md
-      - Python API details: en/user/python-api.md
-      - Segmentation: en/features/segmentation.md
-      - Planes and metrics: en/features/planes.md
-      - WSS, TKE and pressure: en/features/wss-tke-pressure.md
-      - Streamlines and pathlines: en/features/streamlines.md
-      - Videos: en/features/videos.md
+  - Home: index.md
+  - Start:
+      - Quickstart: en/user/quickstart.md
+      - Worked example: en/user/demo-case.md
+      - GUI workflow: en/user/gui.md
+      - CLI workflow: en/user/cli.md
+      - Python API: en/user/python-api.md
+      - Inputs and units: en/user/inputs.md
+      - Outputs: en/user/outputs.md
       - Troubleshooting: en/user/troubleshooting.md
+  - Features:
+      - Functional workflow: en/features/index.md
+      - Data preparation:
+          - DICOM loading and conversion: en/features/dicom-loading.md
+          - Background phase correction: en/features/background-phase-correction.md
+          - Phase unwrapping: en/features/phase-unwrapping.md
+          - Segmentation and review: en/features/segmentation.md
+      - Vessel geometry:
+          - Skeleton: en/features/skeleton.md
+          - Graph and paths: en/features/graph-paths.md
+          - Cross-section planes: en/features/planes.md
+      - Haemodynamics:
+          - Plane metrics: en/features/metrics.md
+          - Wall shear stress: en/features/wss.md
+          - Turbulent kinetic energy: en/features/tke.md
+          - Pressure and pressure gradient: en/features/pressure.md
+          - Pulse wave velocity: en/features/pwv.md
+          - Vortex kinematics: en/features/vortex-kinematics.md
+      - Visualization and delivery:
+          - Streamlines: en/features/streamlines.md
+          - Pathlines: en/features/pathlines.md
+          - PC-MRA: en/features/pcmra-volume-rendering.md
+          - Quality control: en/features/quality-control.md
+          - Videos: en/features/videos.md
+  - Parameters:
+      - Configuration by module: en/user/parameters.md
+      - Structured dictionaries: en/user/parameter-schemas.md
+      - CLI flags: en/user/cli-parameters.md
+      - Python API fields: en/user/api-parameters.md
+  - Development:
+      - Architecture: en/developer/architecture.md
+      - Modules and code owners: en/developer/feature-to-code-map.md
+      - Configuration system: en/developer/config-system.md
+      - Change recipes: en/developer/change-recipes.md
+      - Testing and documentation checks: en/developer/testing.md
+      - Current pipeline performance: en/developer/performance.md
+      - Segmentation performance history: en/developer/segmentation-performance.md
 
 plugins:
   - search
 
 validation:
-  omitted_files: ignore
+  omitted_files: warn
   absolute_links: warn
   unrecognized_links: warn

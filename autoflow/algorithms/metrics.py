@@ -3,7 +3,7 @@ import os
 import h5py
 import numpy as np
 import pyvista as pv
-from scipy.ndimage import binary_erosion, gaussian_filter
+from scipy.ndimage import binary_erosion, gaussian_filter, generate_binary_structure, label
 from scipy.sparse import csc_matrix, csr_matrix, diags
 from scipy.sparse.linalg import cg, factorized
 
@@ -56,39 +56,81 @@ def align_tangential_samples(reference_vectors, target_vectors):
 
 def resolve_wss_inward_distance(spacing, inward_distance=None):
     spacing_mm = np.asarray(spacing, dtype=float).reshape(3)
+    if not np.all(np.isfinite(spacing_mm)) or np.any(spacing_mm <= 0):
+        raise ValueError("WSS spacing must be finite and positive (mm)")
     if inward_distance is None:
         inward_distance = float(np.min(spacing_mm))
-    return max(float(inward_distance), 0.01)
+    distance = float(inward_distance)
+    if not np.isfinite(distance) or distance <= 0:
+        raise ValueError("WSS inward distance must be finite and positive (mm)")
+    return distance
 
 
 def calculate_gradient(pc0_tangent_mag, pc1_tangent_mag, pc2_tangent_mag, inward_distance, use_parabolic=True):
-    x = np.array([0, 1, 2], dtype=float) * float(inward_distance)
-    y = np.stack((pc0_tangent_mag, pc1_tangent_mag, pc2_tangent_mag), axis=1).T
-    z = np.polynomial.polynomial.polyfit(x, y, len(x) - 1)
-    x_new = np.linspace(x[0], x[-1], len(x) * 5) if use_parabolic else x
-    y_new = np.polynomial.polynomial.polyval(x_new, z)
-    return np.gradient(y_new, x_new, axis=1)[:, 0]
+    """Derivative at zero of equidistant scalar or vector wall samples."""
+    distance = float(inward_distance)
+    if not np.isfinite(distance) or distance <= 0:
+        raise ValueError("WSS inward distance must be finite and positive (mm)")
+    v0, v1, v2 = (np.asarray(v, dtype=float) for v in
+                  (pc0_tangent_mag, pc1_tangent_mag, pc2_tangent_mag))
+    if use_parabolic:
+        return (-3.0 * v0 + 4.0 * v1 - v2) / (2.0 * distance)
+    return (v1 - v0) / distance
 
 
 def cal_wss_from_surf(surf, velocity, viscosity=4.0, inward_distance=0.6,
-                      parabolic_fitting=True, no_slip_condition=True):
-    surf.compute_normals(point_normals=True, cell_normals=True, inplace=True, flip_normals=True)
+                      parabolic_fitting=True, no_slip_condition=True, support_grid=None):
+    """Compute tangential WSS vectors (Pa) using inward-normal derivatives.
+
+    Cell-centred velocity is first interpolated to points for continuous probing.
+    Invalid probes or wall-normal segments leaving the lumen produce NaNs.
+    """
+    distance = float(inward_distance)
+    if not np.isfinite(distance) or distance <= 0:
+        raise ValueError("WSS inward distance must be finite and positive (mm)")
+    viscosity = float(viscosity)
+    if not np.isfinite(viscosity) or viscosity < 0:
+        raise ValueError("WSS viscosity must be finite and nonnegative (mPa s)")
+    if not all(key in velocity.point_data for key in ("u", "v", "w")):
+        velocity = velocity.cell_data_to_point_data(pass_cell_data=False)
+    surf.compute_normals(point_normals=True, cell_normals=True, inplace=True,
+                         consistent_normals=True, auto_orient_normals=(surf.n_open_edges == 0),
+                         flip_normals=True)
+    normals = np.asarray(surf.point_normals, dtype=float)
+    normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12)
     pc0 = pv.PolyData(surf.points).sample(velocity)
-    pc1 = pv.PolyData(pc0.points + float(inward_distance) * surf.point_normals).sample(velocity)
-    pc2 = pv.PolyData(pc0.points + 2.0 * float(inward_distance) * surf.point_normals).sample(velocity)
+    pc1 = pv.PolyData(pc0.points + distance * normals).sample(velocity)
+    pc2 = pv.PolyData(pc0.points + 2.0 * distance * normals).sample(velocity)
 
     if no_slip_condition:
-        t0 = np.zeros(len(pc0.points))
+        tang0 = np.zeros((len(pc0.points), 3), dtype=float)
     else:
-        _, tang0 = get_orthogonal_vectors(extract_vectors(pc0), surf.point_normals)
-        t0 = get_vector_magnitude(tang0)
+        _, tang0 = get_orthogonal_vectors(extract_vectors(pc0), normals)
 
-    _, tang1 = get_orthogonal_vectors(extract_vectors(pc1), surf.point_normals)
-    t1 = get_vector_magnitude(tang1)
-    _, tang2 = get_orthogonal_vectors(extract_vectors(pc2), surf.point_normals)
-    t2 = align_tangential_samples(tang1, tang2)
-    surf["wss"] = calculate_gradient(t0, t1, t2, inward_distance, use_parabolic=parabolic_fitting) * float(viscosity)
-    surf["wss_vectors"] = tang1
+    _, tang1 = get_orthogonal_vectors(extract_vectors(pc1), normals)
+    _, tang2 = get_orthogonal_vectors(extract_vectors(pc2), normals)
+    required = [pc1] + ([pc2] if parabolic_fitting else [])
+    if not no_slip_condition:
+        required.append(pc0)
+    valid = np.all(np.isfinite(normals), axis=1) & (np.linalg.norm(normals, axis=1) > 0.5)
+    for probe in required:
+        valid &= np.asarray(probe["vtkValidPointMask"], dtype=bool)
+        valid &= np.all(np.isfinite(extract_vectors(probe)), axis=1)
+    if support_grid is not None:
+        # Check intermediate locations too: endpoints alone can miss a crossing
+        # through background into another branch or the opposite vessel wall.
+        fractions = (0.25, 0.5, 1.0, 1.5, 2.0) if parabolic_fitting else (0.25, 0.5, 1.0)
+        for fraction in fractions:
+            probe = pv.PolyData(pc0.points + fraction * distance * normals).sample(support_grid)
+            valid &= np.asarray(probe["vtkValidPointMask"], dtype=bool)
+            valid &= np.asarray(probe["wss_lumen"], dtype=float) > 0.5
+    # mPa s * (m/s)/mm is numerically Pa; keep signed vector components.
+    vectors = calculate_gradient(tang0, tang1, tang2, distance,
+                                 use_parabolic=parabolic_fitting) * viscosity
+    vectors[~valid] = np.nan
+    surf["wss_vectors"] = vectors
+    surf["wss"] = get_vector_magnitude(vectors)
+    surf["wss_valid"] = valid.astype(np.uint8)
     return surf
 
 
@@ -342,8 +384,22 @@ def _build_plane_support_mesh(mask_xyz, spacing, origin):
     mask_xyz = np.asarray(mask_xyz, dtype=bool)
     if not np.any(mask_xyz):
         return None
-    grid = create_uniform_field_grid(mask_xyz.astype(np.uint8), spacing, origin=origin, name="mask")
-    grid.cell_data["_cell_id"] = np.arange(mask_xyz.size, dtype=np.int32)
+    # Only occupied cells are retained by thresholding. Build their bounding
+    # box directly while preserving the full volume's voxel ids and origin.
+    bounds = [
+        np.flatnonzero(np.any(mask_xyz, axis=tuple(other for other in range(3) if other != axis)))
+        for axis in range(3)
+    ]
+    lower = np.asarray([int(values[0]) for values in bounds])
+    upper = np.asarray([int(values[-1]) + 1 for values in bounds])
+    local_mask = mask_xyz[tuple(slice(int(lo), int(hi)) for lo, hi in zip(lower, upper))]
+    local_origin = np.asarray(origin, dtype=float) + lower * np.asarray(spacing, dtype=float)
+    grid = create_uniform_field_grid(local_mask.astype(np.uint8), spacing, origin=local_origin, name="mask")
+    x, y, z = [np.arange(int(lo), int(hi), dtype=np.int32) for lo, hi in zip(lower, upper)]
+    cell_ids = x[:, None, None] + mask_xyz.shape[0] * (
+        y[None, :, None] + mask_xyz.shape[1] * z[None, None, :]
+    )
+    grid.cell_data["_cell_id"] = cell_ids.ravel(order="F")
     mesh = grid.threshold(0.1, scalars="mask")
     if mesh is None or mesh.n_cells == 0:
         return None
@@ -1188,13 +1244,13 @@ def compute_tke_metrics(mask4d, spacing, origin=(0, 0, 0), tke_array=None, sigma
 def compute_wss_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
                         smoothing_iteration=200, viscosity=4.0,
                         inward_distance=None, parabolic_fitting=True,
-                        no_slip_condition=False):
+                        no_slip_condition=True):
     mask4d = _ensure_mask4d(mask4d)
-    flow = np.asarray(flow, dtype=float)
+    flow = np.asarray(flow)
     if flow.ndim != 5 or flow.shape[-1] != 3:
         raise ValueError(f"flow must be XYZTV, got {flow.shape}")
-    if flow.shape[3] != mask4d.shape[3]:
-        raise ValueError(f"flow time dimension {flow.shape[3]} does not match mask {mask4d.shape[3]}")
+    if flow.shape[:4] != mask4d.shape:
+        raise ValueError(f"flow shape {flow.shape[:4]} does not match mask {mask4d.shape}")
 
     spacing = np.asarray(spacing, dtype=float).reshape(3)
     inward_distance = resolve_wss_inward_distance(spacing, inward_distance)
@@ -1202,32 +1258,42 @@ def compute_wss_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
     wss_volume = np.zeros(mask4d.shape, dtype=np.float32)
     mask_phase_lookup = _build_mask_phase_lookup(mask4d)
     surface_cache = {}
+    support_cache = {}
     surfs = []
     for showt in range(int(mask4d.shape[-1])):
-        velocity = create_uniform_vector(
-            flow[..., showt, 0] / 100.0, flow[..., showt, 1] / 100.0,
-            flow[..., showt, 2] / 100.0, spacing, origin=origin)
         rep_t = int(mask_phase_lookup[showt])
         if rep_t not in surface_cache:
-            mesh = create_uniform_grid(mask4d[..., rep_t] > 0, spacing, origin=origin)
+            support_cache[rep_t] = create_uniform_grid(
+                (mask4d[..., rep_t] > 0).astype(np.uint8), spacing, origin=origin, name="wss_lumen")
+            mesh = support_cache[rep_t]
             mesh = mesh.threshold(0.1)
             if mesh is None or mesh.n_cells == 0:
                 surface_cache[rep_t] = None
                 surfs.append(None)
                 continue
-            surface_cache[rep_t] = _extract_surface(mesh).smooth(n_iter=int(smoothing_iteration))
+            base_surface = _extract_surface(mesh)
+            if int(smoothing_iteration) > 0:
+                base_surface = base_surface.smooth_taubin(n_iter=int(smoothing_iteration), pass_band=0.1)
+            surface_cache[rep_t] = base_surface
         base_surface = surface_cache[rep_t]
         if base_surface is None:
             surfs.append(None)
             continue
+        # Preserve double-precision sampling without duplicating the whole
+        # multi-phase velocity field just to process one phase at a time.
+        flow_t = np.asarray(flow[..., showt, :], dtype=float)
+        velocity = create_uniform_vector(
+            flow_t[..., 0] / 100.0, flow_t[..., 1] / 100.0,
+            flow_t[..., 2] / 100.0, spacing, origin=origin)
         # cal_wss_from_surf writes phase-specific point data, so each phase
         # gets a cheap geometry copy while the expensive surface preparation
         # remains shared for identical masks.
         surf = base_surface.copy(deep=True)
         surf = cal_wss_from_surf(surf, velocity, viscosity=viscosity,
                                  inward_distance=inward_distance,
-                                 parabolic_fitting=parabolic_fitting,
-                                 no_slip_condition=no_slip_condition)
+                                  parabolic_fitting=parabolic_fitting,
+                                  no_slip_condition=no_slip_condition,
+                                  support_grid=support_cache[rep_t])
         surfs.append(surf)
         if surf.n_points > 0 and "wss" in surf.point_data:
             pts = np.asarray(surf.points, dtype=float)
@@ -1237,7 +1303,9 @@ def compute_wss_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
                 vox[:, k] = np.clip(vox[:, k], 0, mask4d.shape[k] - 1)
             flat = np.ravel_multi_index((vox[:, 0], vox[:, 1], vox[:, 2]), mask4d.shape[:3])
             tgt = wss_volume[..., showt].reshape(-1)
-            np.maximum.at(tgt, flat, vals)
+            valid = np.isfinite(vals)
+            tgt[flat[~valid]] = np.nan
+            np.fmax.at(tgt, flat[valid], vals[valid])
 
     return {
         "wss_surfaces": surfs,
@@ -1287,7 +1355,9 @@ def _solve_reconstruction_system(system, rhs, *, tol=1e-5, max_iter=2000):
     n = int(matrix.shape[0])
     if n <= 0:
         return np.zeros(0, dtype=np.float32)
-    rhs = np.asarray(rhs, dtype=np.float64).reshape(n)
+    rhs = np.asarray(rhs, dtype=np.float64).reshape(n).copy()
+    anchors = np.asarray(system.get("anchor_indices", [system.get("anchor_index", 0)]), dtype=int)
+    rhs[anchors] = 0.0
     if n == 1:
         return np.zeros(1, dtype=np.float32)
 
@@ -1333,11 +1403,7 @@ def _solve_reconstruction_system(system, rhs, *, tol=1e-5, max_iter=2000):
         sol = np.asarray(sol, dtype=np.float64).reshape(n)
     system["last_solution"] = sol
 
-    anchor_index = int(system.get("anchor_index", 0))
-    if 0 <= anchor_index < n:
-        sol -= float(sol[anchor_index])
-    else:
-        sol -= float(np.mean(sol))
+    sol[anchors] = 0.0
     return sol.astype(np.float32)
 
 
@@ -1379,13 +1445,22 @@ def _build_least_squares_system(mask_t, spacing_m):
     pairs = np.vstack(edge_pairs).astype(np.int32, copy=False) if edge_pairs else np.zeros((0, 2), dtype=np.int32)
     axes = np.concatenate(edge_axes) if edge_axes else np.zeros(0, dtype=np.int8)
     scales = np.concatenate(edge_scales) if edge_scales else np.zeros(0, dtype=np.float64)
-    edge_rows = np.arange(1, len(pairs) + 1, dtype=np.int32)
-    rows = np.concatenate((np.zeros(1, dtype=np.int32), np.repeat(edge_rows, 2)))
-    cols = np.concatenate((np.zeros(1, dtype=np.int32), pairs.reshape(-1)))
-    data = np.concatenate((np.ones(1, dtype=np.float64), np.column_stack((-scales, scales)).reshape(-1)))
-    incidence = csr_matrix((data, (rows, cols)), shape=(len(pairs) + 1, n), dtype=np.float64)
+    rows = np.repeat(np.arange(len(pairs), dtype=np.int32), 2)
+    cols = pairs.reshape(-1)
+    data = np.column_stack((-scales, scales)).reshape(-1)
+    incidence = csr_matrix((data, (rows, cols)), shape=(len(pairs), n), dtype=np.float64)
     matrix = (incidence.T @ incidence).tocsr()
-    matrix = matrix + diags([1e-6], [0], shape=(n, n), dtype=np.float64)
+    # Fix one pressure gauge in EACH connected component. Eliminate both rows
+    # and columns to retain the symmetric positive-definite system needed by CG.
+    components, count = label(mask_t, structure=generate_binary_structure(3, 1))
+    component_ids = components[mask_t] - 1
+    anchors = np.full(count, n, dtype=np.int32)
+    np.minimum.at(anchors, component_ids, np.arange(n, dtype=np.int32))
+    keep = np.ones(n, dtype=np.float64)
+    keep[anchors] = 0.0
+    gauge_scale = max(float(np.max(matrix.diagonal())), 1.0)
+    selector = diags(keep, format="csr")
+    matrix = selector @ matrix @ selector + diags((1.0 - keep) * gauge_scale, format="csr")
     return {
         "coords": coords,
         "index_map": index_map,
@@ -1395,87 +1470,45 @@ def _build_least_squares_system(mask_t, spacing_m):
         "edge_axes": axes,
         "edge_scales": scales,
         "anchor_index": 0,
+        "anchor_indices": anchors,
     }
 
 
 def _build_ppe_system(mask_t, spacing_m):
-    coords = np.argwhere(mask_t)
-    n = int(len(coords))
-    if n == 0:
-        return {
-            "coords": coords,
-            "index_map": -np.ones(mask_t.shape, dtype=np.int32),
-            "matrix": csr_matrix((0, 0), dtype=np.float64),
-            "anchor_index": 0,
-        }
+    """Finite-volume negative Laplacian with gradient boundary fluxes.
 
-    index_map = -np.ones(mask_t.shape, dtype=np.int32)
-    index_map[mask_t] = np.arange(n, dtype=np.int32)
-    rows = []
-    cols = []
-    data = []
-    dx, dy, dz = [float(v) for v in spacing_m]
-    for voxel_idx, (ix, iy, iz) in enumerate(coords):
-        if voxel_idx == 0:
-            rows.append(voxel_idx)
-            cols.append(voxel_idx)
-            data.append(1.0)
-            continue
-        diag = 0.0
-        for sx, sy, sz in _neighbor_shifts():
-            jx, jy, jz = ix + sx, iy + sy, iz + sz
-            if not (0 <= jx < mask_t.shape[0] and 0 <= jy < mask_t.shape[1] and 0 <= jz < mask_t.shape[2]):
-                continue
-            if not mask_t[jx, jy, jz]:
-                continue
-            step = dx if sx != 0 else dy if sy != 0 else dz
-            weight = 1.0 / (step * step)
-            rows.append(voxel_idx)
-            cols.append(int(index_map[jx, jy, jz]))
-            data.append(-weight)
-            diag += weight
-        rows.append(voxel_idx)
-        cols.append(voxel_idx)
-        data.append(diag if diag > 0.0 else 1.0)
-
-    matrix = csr_matrix((np.asarray(data, dtype=np.float64), (np.asarray(rows, dtype=np.int32), np.asarray(cols, dtype=np.int32))), shape=(n, n), dtype=np.float64)
-    return {
-        "coords": coords,
-        "index_map": index_map,
-        "matrix": matrix.tocsr(),
-        "anchor_index": 0,
-    }
+    On this Cartesian grid its matrix equals the edge-gradient LS normal
+    matrix. Use the same gauge elimination and construct the RHS as fluxes.
+    """
+    system = _build_least_squares_system(mask_t, spacing_m)
+    system.pop("rhs_operator", None)
+    return system
 
 
 def _least_squares_rhs(grad_t, system):
     edge_pairs = system["edge_pairs"]
     if edge_pairs.size == 0:
-        rhs = np.zeros(system["matrix"].shape[0], dtype=np.float64)
-        if rhs.size:
-            rhs[0] = 0.0
-        return rhs
+        return np.zeros(0, dtype=np.float64)
     edge_axes = system["edge_axes"]
     coords = system["coords"]
-    edge_scales = system["edge_scales"]
-    rhs_rows = np.zeros(int(edge_pairs.shape[0]) + 1, dtype=np.float64)
-    rhs_rows[1:] = -np.asarray(grad_t[coords[edge_pairs[:, 0], 0], coords[edge_pairs[:, 0], 1], coords[edge_pairs[:, 0], 2], edge_axes], dtype=np.float64) * edge_scales
-    return rhs_rows
+    src = coords[edge_pairs[:, 0]]
+    dst = coords[edge_pairs[:, 1]]
+    # D already contains 1/h. Its target is the face-averaged gradient in Pa/m,
+    # with no additional scale or minus sign. Averaging integrates linear PG
+    # exactly and avoids a one-sided pressure bias for varying gradients.
+    return 0.5 * (np.asarray(grad_t[src[:, 0], src[:, 1], src[:, 2], edge_axes], dtype=np.float64)
+                  + np.asarray(grad_t[dst[:, 0], dst[:, 1], dst[:, 2], edge_axes], dtype=np.float64))
 
 
 def _ppe_rhs(grad_t, mask_t, spacing_m, system):
-    dx, dy, dz = [float(v) for v in spacing_m]
-    divergence = np.zeros(mask_t.shape, dtype=np.float64)
-    gx_field = np.asarray(grad_t[..., 0], dtype=np.float64)
-    gy_field = np.asarray(grad_t[..., 1], dtype=np.float64)
-    gz_field = np.asarray(grad_t[..., 2], dtype=np.float64)
-    divergence[1:-1, :, :] += (gx_field[2:, :, :] - gx_field[:-2, :, :]) / (2.0 * dx)
-    divergence[:, 1:-1, :] += (gy_field[:, 2:, :] - gy_field[:, :-2, :]) / (2.0 * dy)
-    divergence[:, :, 1:-1] += (gz_field[:, :, 2:] - gz_field[:, :, :-2]) / (2.0 * dz)
     rhs = np.zeros(system["matrix"].shape[0], dtype=np.float64)
-    coords = system["coords"]
-    if len(coords):
-        rhs[:] = divergence[coords[:, 0], coords[:, 1], coords[:, 2]]
-        rhs[0] = 0.0
+    pairs = system["edge_pairs"]
+    if pairs.size:
+        flux = _least_squares_rhs(grad_t, system) * system["edge_scales"]
+        np.add.at(rhs, pairs[:, 0], -flux)
+        np.add.at(rhs, pairs[:, 1], flux)
+    # Boundary rows retain the matching normal-gradient contribution instead
+    # of implicitly imposing zero Neumann data and losing constant gradients.
     return rhs
 
 
@@ -1489,7 +1522,11 @@ def reconstruct_relative_pressure_map(pressure_gradient_array, support_mask, spa
         raise ValueError(f"support_mask shape {support.shape} does not match {grad.shape[:4]}")
 
     spacing_m = np.asarray(spacing, dtype=float).reshape(3) / 1000.0
-    dx, dy, dz = [float(max(v, 1e-12)) for v in spacing_m]
+    if not np.all(np.isfinite(spacing_m)) or np.any(spacing_m <= 0):
+        raise ValueError("Pressure spacing must be finite and positive (mm)")
+    if not np.all(np.isfinite(grad[support])):
+        raise ValueError("Pressure gradients must be finite inside the support mask")
+    dx, dy, dz = spacing_m.tolist()
     nt = grad.shape[3]
     pressure = np.zeros(grad.shape[:4], dtype=np.float32)
 
@@ -1735,22 +1772,23 @@ def compute_vortex_metrics(mask4d, flow, spacing, *, smoothing_sigma=0.0,
 
     spacing_m = np.asarray(spacing, dtype=float).reshape(3) / 1000.0
     dx, dy, dz = [float(max(value, 1e-12)) for value in spacing_m]
-    inner_shape = velocity.shape[:3]
-    jacobian = np.empty((inner_shape[0] - 2, inner_shape[1] - 2, inner_shape[2] - 2, velocity.shape[3], 3, 3), dtype=np.float32)
+    # The descriptors outside support are zero by definition. Gather the
+    # same central-difference neighbours only for valid voxels so background
+    # tensors, eigensolves, and their large intermediate arrays are avoided.
+    support_indices = np.nonzero(support_inner)
+    centers = tuple(index + 1 for index in support_indices[:3]) + (support_indices[3],)
+    jacobian = np.empty((len(support_indices[0]), 3, 3), dtype=np.float32)
     spacings = (dx, dy, dz)
-    for component in range(3):
-        jacobian[..., component, 0] = (
-            velocity[2:, 1:-1, 1:-1, :, component]
-            - velocity[:-2, 1:-1, 1:-1, :, component]
-        ) / (2.0 * spacings[0])
-        jacobian[..., component, 1] = (
-            velocity[1:-1, 2:, 1:-1, :, component]
-            - velocity[1:-1, :-2, 1:-1, :, component]
-        ) / (2.0 * spacings[1])
-        jacobian[..., component, 2] = (
-            velocity[1:-1, 1:-1, 2:, :, component]
-            - velocity[1:-1, 1:-1, :-2, :, component]
-        ) / (2.0 * spacings[2])
+    for axis, step in enumerate(spacings):
+        before = list(centers)
+        after = list(centers)
+        before[axis] = before[axis] - 1
+        after[axis] = after[axis] + 1
+        for component in range(3):
+            jacobian[..., component, axis] = (
+                velocity[tuple(after) + (component,)]
+                - velocity[tuple(before) + (component,)]
+            ) / (2.0 * step)
 
     vort_inner = np.empty(jacobian.shape[:-2] + (3,), dtype=np.float32)
     vort_inner[..., 0] = jacobian[..., 2, 1] - jacobian[..., 1, 2]
@@ -1767,33 +1805,15 @@ def compute_vortex_metrics(mask4d, flow, spacing, *, smoothing_sigma=0.0,
 
     # λci is the positive imaginary part of the complex-conjugate eigenvalue
     # pair of the local velocity-gradient tensor.  It is zero for pure shear.
-    flat_jacobian = jacobian.reshape(-1, 3, 3)
-    eigvals = np.linalg.eigvals(flat_jacobian)
-    lambda_ci_inner = np.max(np.abs(np.imag(eigvals)), axis=1).reshape(q_inner.shape).astype(np.float32)
+    eigvals = np.linalg.eigvals(jacobian)
+    lambda_ci_inner = np.max(np.abs(np.imag(eigvals)), axis=1).astype(np.float32)
 
-    valid = support_inner.astype(np.float32)
-    vort_inner *= valid[..., None]
-    vortmag_inner *= valid
-    q_inner = np.asarray(q_inner, dtype=np.float32) * valid
-    lambda_ci_inner *= valid
-
-    work_vorticity = np.zeros_like(work_flow, dtype=np.float32)
-    valid_work = np.zeros_like(support_work, dtype=bool)
-    valid_work[1:-1, 1:-1, 1:-1, :] = support_inner
-    work_vorticity[1:-1, 1:-1, 1:-1, :, :] = vort_inner
-    work_vorticity *= valid_work[..., None]
-    work_vortmag = np.zeros(work_mask.shape, dtype=np.float32)
-    work_vortmag[1:-1, 1:-1, 1:-1, :] = vortmag_inner
-    work_q = np.zeros(work_mask.shape, dtype=np.float32)
-    work_q[1:-1, 1:-1, 1:-1, :] = q_inner
-    work_lambda_ci = np.zeros(work_mask.shape, dtype=np.float32)
-    work_lambda_ci[1:-1, 1:-1, 1:-1, :] = lambda_ci_inner
-
-    vorticity[spatial_slices + (slice(None), slice(None))] = work_vorticity
-    vorticity_magnitude[spatial_slices + (slice(None),)] = work_vortmag
-    q_criterion[spatial_slices + (slice(None),)] = work_q
-    swirling_strength[spatial_slices + (slice(None),)] = work_lambda_ci
-    support[spatial_slices + (slice(None),)] = valid_work
+    output_slices = tuple(slice(part.start + 1, part.stop - 1) for part in spatial_slices) + (slice(None),)
+    vorticity[output_slices][support_inner] = vort_inner
+    vorticity_magnitude[output_slices][support_inner] = vortmag_inner
+    q_criterion[output_slices][support_inner] = q_inner
+    swirling_strength[output_slices][support_inner] = lambda_ci_inner
+    support[output_slices] = support_inner
     return {
         "vorticity_array": vorticity,
         "vorticity_magnitude": vorticity_magnitude,
@@ -1814,14 +1834,22 @@ def compute_pressure_gradient_metrics(mask4d, flow, spacing, rr, rho=1060.0, vis
     flow = np.asarray(flow, dtype=np.float32)
     if flow.ndim != 5 or flow.shape[-1] != 3:
         raise ValueError(f"flow must be XYZTV, got {flow.shape}")
-    if flow.shape[3] != mask4d.shape[3]:
-        raise ValueError(f"flow time dimension {flow.shape[3]} does not match mask {mask4d.shape[3]}")
+    if flow.shape[:4] != mask4d.shape:
+        raise ValueError(f"flow shape {flow.shape[:4]} does not match mask {mask4d.shape}")
 
     spacing_mm = np.asarray(spacing, dtype=float).reshape(3)
+    if not np.all(np.isfinite(spacing_mm)) or np.any(spacing_mm <= 0):
+        raise ValueError("Pressure spacing must be finite and positive (mm)")
+    if flow.shape[3] == 0 or not np.isfinite(rr) or float(rr) <= 0:
+        raise ValueError("Pressure analysis requires at least one phase and a positive RR (ms)")
     spacing_m = spacing_mm / 1000.0
     dt_s = float(rr) / 1000.0 / float(flow.shape[3])
     rho = float(rho)
     mu_pa_s = float(viscosity) / 1000.0
+    if not np.isfinite(rho) or rho <= 0 or not np.isfinite(mu_pa_s) or mu_pa_s < 0:
+        raise ValueError("Pressure density must be positive and viscosity nonnegative and finite")
+    if not np.isfinite(smoothing_sigma):
+        raise ValueError("Pressure smoothing sigma must be finite")
     sigma = max(float(smoothing_sigma), 0.0)
 
     # Spatial derivatives only need the vessel extent plus one stencil voxel.
@@ -1841,17 +1869,20 @@ def compute_pressure_gradient_metrics(mask4d, flow, spacing, rr, rho=1060.0, vis
 
     work_mask = mask4d[spatial_slices + (slice(None),)]
     work_flow = flow[spatial_slices + (slice(None), slice(None))]
-    velocity = np.asarray(work_flow, dtype=np.float32) / 100.0
-    mask_float = work_mask.astype(np.float32)
-    velocity = velocity * mask_float[..., None]
+    finite_velocity = np.all(np.isfinite(work_flow), axis=-1)
+    valid_samples = work_mask & finite_velocity
+    velocity = np.where(finite_velocity[..., None], work_flow, 0.0).astype(np.float32) / 100.0
     if sigma > 0.0:
+        weights = valid_samples.astype(np.float32)
+        denominator = gaussian_filter(weights, sigma=(sigma, sigma, sigma, 0.0), mode='constant')
         for comp in range(3):
-            velocity[..., comp] = gaussian_filter(
-                velocity[..., comp],
+            numerator = gaussian_filter(
+                velocity[..., comp] * weights,
                 sigma=(sigma, sigma, sigma, 0.0),
-                mode='nearest',
+                mode='constant',
             )
-        velocity = velocity * mask_float[..., None]
+            velocity[..., comp] = np.divide(
+                numerator, denominator, out=np.zeros_like(numerator), where=denominator > 1e-12)
 
     dx, dy, dz = [float(max(s, 1e-12)) for s in spacing_m]
     vc = velocity[1:-1, 1:-1, 1:-1, :, :]
@@ -1892,26 +1923,32 @@ def compute_pressure_gradient_metrics(mask4d, flow, spacing, rr, rho=1060.0, vis
         lap[..., comp] = d2u_dx2 + d2u_dy2 + d2u_dz2
 
     grad_inner = -rho * (du_dt + conv) + mu_pa_s * lap
-    support_work = np.asarray(work_mask, dtype=bool).copy()
+    # Always require the actual six-neighbour spatial derivative stencil to be
+    # measured inside the lumen, even when optional extra erosion is disabled.
+    # Also require both temporal neighbours; segmentation flicker must not be
+    # interpreted as acceleration from setting a phase's velocity to zero.
+    support_work = np.zeros(work_mask.shape, dtype=bool)
+    stencil = generate_binary_structure(3, 1)
+    for tidx in range(work_mask.shape[3]):
+        support_work[..., tidx] = binary_erosion(valid_samples[..., tidx], structure=stencil, border_value=0)
+    if work_mask.shape[3] > 1:
+        support_work &= np.roll(valid_samples, -1, axis=3) & np.roll(valid_samples, 1, axis=3)
     erosion_iters = max(int(support_erosion_iters), 0)
     if erosion_iters > 0:
         structure = np.ones((3, 3, 3), dtype=bool)
         for tidx in range(work_mask.shape[3]):
-            support_work[..., tidx] = binary_erosion(
+            support_work[..., tidx] &= binary_erosion(
                 work_mask[..., tidx],
                 structure=structure,
                 iterations=erosion_iters,
                 border_value=0,
             )
-    support_inner = support_work[1:-1, 1:-1, 1:-1, :]
-
     grad_work = np.zeros(work_flow.shape, dtype=np.float32)
     grad_work[1:-1, 1:-1, 1:-1, :, :] = grad_inner.astype(np.float32)
     grad_work *= support_work.astype(np.float32)[..., None]
     grad_mag_work = np.sqrt(np.sum(np.square(grad_work, dtype=np.float32), axis=-1)).astype(np.float32)
 
-    finite_inner = grad_inner[np.isfinite(grad_inner) & support_inner[..., None]]
-    display_upper = _finite_percentile_abs(finite_inner, 99.0, default=1.0)
+    display_upper = _finite_percentile_abs(grad_mag_work[support_work], 99.0, default=1.0)
     display_upper = display_upper if display_upper > 0 else 1.0
 
     pressure_result_work = reconstruct_relative_pressure_map(
@@ -1960,7 +1997,7 @@ def compute_pressure_gradient_metrics(mask4d, flow, spacing, rr, rho=1060.0, vis
 def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
                             smoothing_iteration=200, viscosity=4.0,
                             inward_distance=None, parabolic_fitting=True,
-                            no_slip_condition=False, step_size=5,
+                            no_slip_condition=True, step_size=5,
                             tube_radius=0.1, rho=1060.0,
                             save_pixelwise=False, tke_array=None, sigma=None,
                             rr=1000.0, pressure_gradient_smoothing_sigma=0.0,
@@ -2415,9 +2452,16 @@ def compute_plane_metrics_multithread(flow_xyzt3, segmask_binary_4d, spacing, or
 
     if max_workers is None:
         import os as _os
-        # Separate worker processes avoid unsafe concurrent access to shared
-        # VTK datasets. Process startup only pays off for large plane sets.
-        max_workers = 1 if len(planes) < 128 else min(len(planes), 8, max(1, _os.cpu_count() or 4))
+        # Separate processes avoid concurrent access to shared VTK datasets.
+        # Temporal workloads can be expensive even below 128 planes: the
+        # controlled 96-plane/20-phase case benefits from four workers.
+        # Keep short/small jobs serial to avoid startup and memmap overhead.
+        plane_phase_work = len(planes) * int(flow.shape[3])
+        if len(planes) < 128 and plane_phase_work < 1920:
+            max_workers = 1
+        else:
+            worker_limit = 4 if len(planes) < 128 else 8
+            max_workers = min(len(planes), worker_limit, max(1, _os.cpu_count() or 4))
     if int(max_workers) <= 1:
         result = compute_plane_metrics(
             flow, mask, spacing, origin, planes, RR=RR,

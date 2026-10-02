@@ -7,12 +7,105 @@ import numpy as np
 import pytest
 
 from autoflow import AutoFlowConfig, run_batch
-from autoflow.algorithms.metrics import _periodic_central_difference, compute_centerline_pressure_profiles
+from autoflow.algorithms.metrics import (
+    _periodic_central_difference,
+    compute_centerline_pressure_profiles,
+    compute_pressure_gradient_metrics,
+    reconstruct_relative_pressure_map,
+)
 
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 REL_TOL = 0.05
 PLANE_SPACING_MM = 15.0
+
+
+@pytest.mark.parametrize("method", ["least_squares", "ppe"])
+@pytest.mark.parametrize("spacing", [(0.5, 0.5, 0.5), (1.0, 1.0, 1.0), (0.5, 1.5, 2.0)])
+def test_pressure_reconstruction_matches_constant_gradient_in_pa(method, spacing):
+    shape = (5, 6, 7, 3)
+    gradient = np.zeros(shape + (3,), dtype=np.float32)
+    coordinates_m = np.indices(shape[:3]).transpose(1, 2, 3, 0) * np.asarray(spacing) / 1000.0
+    support = np.ones(shape, dtype=bool)
+    expected = np.zeros(shape, dtype=float)
+    for tidx in range(shape[3]):
+        g = np.array([100.0, -30.0, 250.0]) * (tidx + 1)
+        gradient[..., tidx, :] = g
+        expected[..., tidx] = coordinates_m @ g
+    actual = reconstruct_relative_pressure_map(gradient, support, spacing, method=method)
+    np.testing.assert_allclose(actual["relative_pressure_array"], expected, rtol=2e-4, atol=2e-5)
+
+
+@pytest.mark.parametrize("method", ["least_squares", "ppe"])
+def test_pressure_reconstruction_integrates_quadratic_pressure_on_irregular_support(method):
+    spacing = np.array([0.8, 1.2, 1.7])
+    xyz = np.indices((6, 6, 6)).transpose(1, 2, 3, 0) * spacing / 1000.0
+    x, y, z = np.moveaxis(xyz, -1, 0)
+    truth = 20000 * x**2 - 10000 * y**2 + 5000 * z**2 + 3000 * x * y
+    gradient = np.stack((40000 * x + 3000 * y, -20000 * y + 3000 * x, 10000 * z), axis=-1)
+    support = np.ones((6, 6, 6, 1), dtype=bool)
+    support[2:4, 2:4, 2:4] = False
+    actual = reconstruct_relative_pressure_map(gradient[..., None, :], support, spacing, method=method)
+    np.testing.assert_allclose(actual["relative_pressure_array"][..., 0][support[..., 0]],
+                               truth[support[..., 0]], rtol=3e-4, atol=3e-5)
+
+
+@pytest.mark.parametrize("method", ["least_squares", "ppe"])
+def test_pressure_reconstruction_anchors_each_disconnected_component(method):
+    support = np.zeros((11, 4, 4, 1), dtype=bool)
+    support[0:3, :, :, :] = True
+    support[5:8, :, :, :] = True
+    # A separate isolated voxel must have a well-defined zero reference.
+    support[10, 3, 3, :] = True
+    gradient = np.zeros(support.shape + (3,), dtype=np.float32)
+    gradient[..., 0] = 100.0
+    actual = reconstruct_relative_pressure_map(gradient, support, (1, 1, 1), method=method)
+    p = actual["relative_pressure_array"][..., 0]
+    assert p[2, 1, 1] - p[0, 1, 1] == pytest.approx(0.2, abs=2e-5)
+    assert p[7, 1, 1] - p[5, 1, 1] == pytest.approx(0.2, abs=2e-5)
+    assert p[0, 0, 0] == p[5, 0, 0] == p[10, 3, 3] == 0.0
+
+
+@pytest.mark.parametrize("erosion", [0, 1])
+@pytest.mark.parametrize("smoothing", [0.0, 1.0])
+def test_uniform_flow_has_no_pg_from_zero_background_or_mask_smoothing(erosion, smoothing):
+    mask = np.zeros((9, 9, 9, 8), dtype=bool)
+    mask[2:7, 2:7, 2:7] = True
+    flow = np.zeros(mask.shape + (3,), dtype=np.float32)
+    flow[mask, 0] = 100.0
+    result = compute_pressure_gradient_metrics(mask, flow, (1, 1, 1), rr=800,
+                                               support_erosion_iters=erosion, smoothing_sigma=smoothing)
+    assert np.any(result["pressure_gradient_support_mask"])
+    assert not np.any(result["pressure_gradient_support_mask"][2, :, :])
+    assert float(np.max(result["pressure_gradient_magnitude"])) < 0.2
+
+
+def test_pressure_support_rejects_missing_temporal_and_nonfinite_spatial_samples():
+    mask = np.zeros((9, 9, 9, 8), dtype=bool)
+    mask[2:7, 2:7, 2:7] = True
+    mask[4, 4, 4, 2] = False
+    flow = np.zeros(mask.shape + (3,), dtype=np.float32)
+    flow[..., 0] = 100.0
+    flow[3, 3, 3, 5, 0] = np.nan
+    result = compute_pressure_gradient_metrics(mask, flow, (1, 1, 1), rr=800, support_erosion_iters=0)
+    support = result["pressure_gradient_support_mask"]
+    assert support[4, 4, 4, 1] == support[4, 4, 4, 3] == 0
+    assert support[4, 3, 3, 5] == 0
+    assert np.isfinite(result["pressure_gradient_array"]).all()
+    assert np.isfinite(result["relative_pressure_array"]).all()
+
+
+def test_pressure_gradient_matches_analytic_periodic_acceleration():
+    nt = 32
+    mask = np.zeros((9, 9, 9, nt), dtype=bool)
+    mask[2:7, 2:7, 2:7] = True
+    phase = np.arange(nt) * 2.0 * np.pi / nt
+    flow = np.zeros(mask.shape + (3,), dtype=np.float32)
+    flow[..., 2] = 100.0 + 10.0 * np.sin(phase)
+    result = compute_pressure_gradient_metrics(mask, flow, (1, 1, 1), rr=800)
+    truth = -1060.0 * 0.1 * (2.0 * np.pi / 0.8) * np.cos(phase)
+    measured = result["pressure_gradient_array"][4, 4, 4, :, 2]
+    assert np.sqrt(np.mean((measured - truth)**2) / np.mean(truth**2)) < 0.01
 
 
 def test_pressure_temporal_derivative_wraps_first_and_last_phases():

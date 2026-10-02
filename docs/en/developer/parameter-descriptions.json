@@ -1,0 +1,768 @@
+{
+  "modules": {
+    "batch": {
+      "output_dir": "Root directory for per-case exports. Relative paths resolve from the process working directory.",
+      "skip_derived": "Suppress requested WSS, TKE and pressure analysis and their exports; optional metrics otherwise remain opt-in.",
+      "skip_wss": "Suppress WSS only, including volume export and derived plane summaries.",
+      "skip_tke": "Suppress TKE only; does not manufacture TKE for unsupported inputs.",
+      "skip_pressure_gradient": "Suppress PG, relative-pressure reconstruction and centreline pressure-drop outputs.",
+      "skip_plane_metrics": "Suppress plane metric calculation and its JSON/H5 exports. PWV also needs plane metrics.",
+      "use_multithread": "Enable process plane metrics with memory-mapped inputs: below 128 planes, use four workers only at 1920 or more plane-phase evaluations; smaller jobs stay serial. At least 128 planes use up to eight workers. CPU/plane counts cap workers.",
+      "reuse_planes": "Path to a plane-position JSON or per-case directory to reuse. Empty string generates planes normally."
+    },
+    "ui": {
+      "background_color": "Background colour of the 3D scene, as a VTK colour name or hexadecimal RGB. Changes display only."
+    },
+    "loader": {
+      "background_phase_correction.enabled": "Enable correction of static-tissue velocity offsets during loading. A compatible embedded correction may be reused unless force_recompute is true.",
+      "background_phase_correction.method": "Correction backend: wrls_arto uses robust weighted regression with automatic rejection; msac uses polynomial sample consensus.",
+      "background_phase_correction.corr_fit_order": "Polynomial order for MSAC correction. Higher orders add spatial flexibility and fitting cost; not the WRLS fixed basis order.",
+      "background_phase_correction.threshold": "MSAC residual threshold as a fraction of VENC; controls static-tissue inlier acceptance.",
+      "background_phase_correction.wrls_lambda": "L1 penalty on WRLS polynomial coefficients; larger values impose stronger regularization.",
+      "background_phase_correction.wrls_magnitude_threshold": "Minimum reference-magnitude fraction for the static-tissue fitting mask; low-signal voxels are discarded.",
+      "background_phase_correction.wrls_mid_fov_fraction": "Fraction of the two in-plane axes used for the central fitting region; restricts initial static-tissue support.",
+      "background_phase_correction.wrls_mid_slice_fraction": "Fraction of the slice axis retained for the central fitting region.",
+      "background_phase_correction.wrls_arto_iterations": "Number of automatic rejection/refitting rounds after the initial WRLS estimate.",
+      "background_phase_correction.wrls_tau": "Residual acceptance width in multiples of the fitted central Gaussian standard deviation.",
+      "background_phase_correction.wrls_delta": "Initial separation of the outer ARTO Gaussian means from zero, in residual standard deviations.",
+      "background_phase_correction.wrls_central_probability": "Prior/minimum mixture probability for the static-tissue central Gaussian; lies between zero and one.",
+      "background_phase_correction.wrls_fista_iterations": "Maximum iterations of the sparse WRLS coefficient solver; increases fitting work without changing polynomial degree.",
+      "background_phase_correction.wrls_gmm_iterations": "Maximum EM iterations per ARTO Gaussian-mixture fit; early convergence may stop sooner.",
+      "background_phase_correction.dual_venc_ratio1": "Dual-VENC decision threshold used in the 2*LV alias-shift stage. Zero derives the threshold from high/low VENC.",
+      "background_phase_correction.dual_venc_ratio2": "Dual-VENC decision threshold used in the 4*LV alias-shift stage. Zero derives the threshold from high/low VENC.",
+      "background_phase_correction.force_recompute": "Ignore reusable embedded correction and estimate a fresh field; needed for a cold algorithm benchmark.",
+      "background_phase_correction.write_cache": "Allow newly computed correction to be stored in the source H5. Set false for read-only measurements.",
+      "dicom_parameter_overrides": "Object of explicit DICOM metadata replacements; see the supported keys and units in the input contract. Does not rewrite DICOM files.",
+      "dicom_read_workers": "Number of concurrent DICOM file readers. One is conservative for network storage; more readers can increase I/O contention.",
+      "ignore_embedded_segmentation": "Ignore source H5 segmentation while retaining image/velocity input; use to test a fresh segmentation path.",
+      "dicom_backend": "DICOM directory route: native loads recognized cases directly; dicom2h5 converts through the optional pinned converter and processes all resulting H5 groups. Explicit H5 files are unaffected.",
+      "dicom_h5_dir": "Destination directory for preserved Dicom2H5 outputs. Empty uses output_dir/_dicom_h5. Existing files cause an error; reopen the saved H5 to reuse it."
+    },
+    "phase_unwrapping": {
+      "mask_source": "Learned-backend support/confidence: segmask uses segmentation; pcmra_std uses temporal PC-MRA standard deviation for weighting and Gaussian-centre confidence.",
+      "device": "Compute device selector: auto, cpu, or cuda. Backend-specific CPU work can remain even with cuda selected.",
+      "tfc": "Temporal flow consistency option of supported traditional methods; couples recovery across cardiac phases.",
+      "lap4d_ts": "Temporal-axis scaling in the lap4D Laplacian operator; controls the balance of temporal and spatial constraints.",
+      "nprs_upsampling_factor": "Spatial Fourier upsampling factor used only by NPRS; larger factors increase memory and resampling cost.",
+      "nprs_pi_unwrap": "Enable the additional pi-unwrapping pass of NPRS.",
+      "nprs_auto_crop": "Return NPRS output cropped to the original array extent after FFT padding.",
+      "backend_params": "Backend-specific nested objects, e.g. pudip and gust; supported adapter keys are listed below rather than passed blindly.",
+      "write_output": "Write phase_unwrap.npz when phase recovery runs; has no effect when the method is disabled or DV input skips recovery."
+    },
+    "skeleton": {
+      "remove_small_cc": "Filter small connected components before skeletonization.",
+      "special_handling": "Special systemic-branch strategy: three_pass_merge separates and merges branch skeleton passes; other supported modes are described in the skeleton guide.",
+      "special_merge_radius_mm": "Maximum physical distance in mm for joining the special-handling skeleton passes.",
+      "separate_special_label_contacts": "Separate configured special labels where they touch before skeleton generation.",
+      "special_contact_labels": "Anatomical label names subject to the contact-separation rule; resolve IDs through labels.label_map.",
+      "min_cc_volume_mm3": "Absolute connected-component volume threshold in cubic millimetres.",
+      "cc_filter_mode": "Component retention rule: absolute, relative or hybrid combines physical volume and a fraction of the largest component.",
+      "cc_rel_min_ratio": "Smallest retained component as a fraction of the largest component in relative/hybrid filtering.",
+      "min_edge_points": "Minimum graph-edge point count retained during graph cleanup; controls short terminal-edge removal.",
+      "do_closing": "Legacy Boolean binary-closing switch used in default preprocessing.",
+      "do_opening": "Legacy Boolean binary-opening switch used in default preprocessing.",
+      "gaussian_sigma": "Gaussian mask smoothing width in voxels before binary thresholding.",
+      "gaussian_enabled": "Enable Gaussian mask smoothing; per-group overrides in labels.label_groups can replace this value.",
+      "dilation_iters": "Number of binary dilation iterations; expands support and can connect nearby vessels. Zero disables this operation.",
+      "erosion_iters": "Number of binary erosion iterations; shrinks support and can remove narrow structures.",
+      "opening_iters": "Number of explicit binary opening iterations; removes small protrusions/components.",
+      "closing_iters": "Number of explicit binary closing iterations; fills small gaps and holes."
+    },
+    "labels": {
+      "single_label_group_name": "Group name for a binary/single-label input in the GUI browser and grouped analysis.",
+      "single_label_browser_color": "Display colour for the single-label group.",
+      "default_group_browser_color": "Fallback colour for a group without an explicit colour.",
+      "label_map": "Dictionary from anatomical label names to integer IDs; background is zero. The configured mapping must match the segmentation/model.",
+      "label_groups": "Named group definitions containing member labels, colours and optional preprocessing overrides; each group is processed independently."
+    },
+    "planes": {
+      "plane_mode": "Placement rule: count, distance, anchored_offset, uniform or fixed_step. Controls which spacing/anchor parameters are active.",
+      "plane_count": "Number of planes in count/fixed-step placement; -1 requests all available valid locations where supported.",
+      "cross_section_distance": "Physical separation in mm used by distance/fixed-step layouts.",
+      "start_distance": "Millimetres trimmed from the start of each usable path before plane placement.",
+      "end_distance": "Millimetres trimmed from the end of each usable path before plane placement.",
+      "anchor": "Reference location: start, center, end or junction. Defines the origin for anchored placement.",
+      "anchor_offset_mm": "Physical offset in mm from the selected anchor toward the chosen direction.",
+      "direction": "Placement direction from the anchor: toward_start, toward_end or both.",
+      "spacing_mode": "Anchor-layout spacing interpretation: distance in mm or fraction of usable path length.",
+      "spacing_ratio": "Dimensionless usable-path-length fraction between anchored planes when spacing_mode=fraction.",
+      "segmentation_filter": "Discard candidate planes whose centreline location lacks compatible segmentation support.",
+      "smoothing_window": "Savitzky-Golay window length for centreline smoothing; must admit the selected polynomial order.",
+      "smoothing_polyorder": "Polynomial degree of centreline Savitzky-Golay smoothing.",
+      "inter_time": "Centreline interpolation density multiplier; increases resampled path points before plane generation."
+    },
+    "streamlines": {
+      "seed_ratio": "Fraction of slice support locations sampled as streamline seeds; min_seeds sets a lower target when possible.",
+      "max_steps": "Maximum integration steps for each instantaneous streamline.",
+      "min_seeds": "Minimum desired seed count per valid plane, limited by available support.",
+      "terminal_speed": "Velocity threshold in m/s for terminating streamline integration (input cm/s is converted to m/s).",
+      "rng_seed": "Random seed for reproducible seed subsampling.",
+      "tube_radius": "Rendered tube radius in physical mm; affects display geometry, not integration."
+    },
+    "pathlines": {
+      "seed_ratio": "Support fraction used only by ratio seeding.",
+      "max_steps": "Maximum temporal integration steps per pathline.",
+      "min_seeds": "Minimum desired seed count in ratio mode.",
+      "seed_mode": "fixed uses seed_count; ratio uses seed_ratio and min_seeds.",
+      "seed_count": "Maximum desired seeds per plane in fixed mode; support limits the actual count.",
+      "terminal_speed": "Velocity threshold in m/s for terminating temporal integration; the VTK temporal source uses mm/s and converts this threshold.",
+      "rng_seed": "Random seed for reproducible pathline seed placement.",
+      "tube_radius": "Rendered pathline tube radius in mm.",
+      "color": "Uniform colour used when color_mode=uniform.",
+      "color_mode": "uniform, per_plane or per_group colour assignment; affects display only.",
+      "temporal_cache_mb": "Memory limit in MiB for prepared temporal velocity grids; larger limits can accelerate repeated GUI phase changes."
+    },
+    "fluid": {
+      "rho": "Blood density in kg/m^3, shared by pressure and TKE unless their module overrides it.",
+      "viscosity": "Dynamic viscosity in mPa*s, shared by WSS and pressure unless their module overrides it."
+    },
+    "wss": {
+      "smoothing_iteration": "Taubin surface-smoothing iterations before normal sampling; zero retains the extracted voxel surface.",
+      "inward_distance": "Wall-normal sampling step h in mm; auto uses the minimum voxel spacing. Parabolic fitting also probes 2h.",
+      "parabolic_fitting": "True computes the exact wall derivative of a three-point quadratic vector fit; false uses the first-segment linear slope.",
+      "no_slip_condition": "Set the wall velocity vector to zero by default. False samples the measured wall vector and increases sensitivity to partial volume and surface placement."
+    },
+    "tke": {
+      "rho": "Optional TKE density override in kg/m^3; absent uses fluid.rho."
+    },
+    "pressure_gradient": {
+      "rho": "Optional pressure density override in kg/m^3; absent uses fluid.rho.",
+      "viscosity": "Optional pressure viscosity override in mPa*s; absent uses fluid.viscosity.",
+      "method": "Relative-pressure reconstruction: least_squares integrates face-averaged PG; ppe balances finite-volume gradient fluxes. Their Cartesian discrete equations are equivalent.",
+      "smoothing_sigma": "Spatial Gaussian smoothing width in voxels. Zero disables smoothing; valid-mask normalization prevents boundary attenuation.",
+      "support_erosion_iters": "Additional conservative 26-neighbour erosion margin. Complete measured spatial and temporal derivative stencils are mandatory even at zero.",
+      "layer_opacity": "PG layer opacity between zero (transparent) and one (opaque), affecting display only.",
+      "relative_pressure_opacity": "Relative-pressure layer opacity between zero and one.",
+      "use_convective_acceleration": "Include (v dot grad)v in Navier-Stokes PG. Disabling omits real convective effects and is an explicit approximation."
+    },
+    "vortex": {
+      "smoothing_sigma": "Spatial Gaussian velocity smoothing width in voxels before vortex derivatives; zero disables smoothing.",
+      "support_erosion_iters": "Lumen-mask erosion iterations defining valid vortex derivative support. Zero disables the optional erosion."
+    },
+    "pwv": {
+      "enabled": "Enable the configured PWV workflow; CLI/API must still request pwv as an optional metric.",
+      "groups": "List of PWV group objects: name identifies the result; labels selects the anatomical members.",
+      "plane_interval_mm": "Physical separation in mm between PWV sampling planes.",
+      "start_distance": "Millimetres trimmed from the path start for PWV plane placement.",
+      "end_distance": "Millimetres trimmed from the path end for PWV plane placement.",
+      "smoothing_window": "Savitzky-Golay centreline-smoothing window length for PWV plane generation.",
+      "smoothing_polyorder": "Polynomial degree for PWV centreline smoothing.",
+      "inter_time": "Centreline interpolation density for PWV distance sampling.",
+      "waveform_key": "Time-resolved plane metric used as the propagation waveform, e.g. flowrate_mL_s.",
+      "transit_time_method": "Delay estimator: foot_to_foot uses waveform feet; supported cross-correlation mode aligns complete waveforms.",
+      "foot_method": "Foot detector, such as tangent or threshold; applies to foot_to_foot delay estimation.",
+      "foot_savgol_window": "Odd smoothing window in cardiac samples used before waveform-foot detection.",
+      "foot_savgol_polyorder": "Polynomial degree of foot-detection waveform smoothing.",
+      "foot_threshold_percent": "Percentage of the waveform upstroke range used by threshold foot detection.",
+      "xcorr_window": "Waveform window used for cross-correlation; full uses the complete sampled cycle.",
+      "xcorr_interp_factor": "Sub-frame temporal interpolation multiplier for cross-correlation lag resolution.",
+      "allow_cycle_wrap": "Allow propagation delays across the end/start boundary of the cardiac cycle.",
+      "minimum_valid_planes": "Minimum successfully sampled planes needed to fit distance against arrival time.",
+      "scene_visible": "Initial GUI visibility of the generated PWV planes.",
+      "scene_color": "Display colour of PWV planes.",
+      "plot_color": "Colour of measured arrival-time/distance points.",
+      "fit_color": "Colour of the fitted PWV regression line.",
+      "plot_dpi": "Resolution in dots per inch of exported PWV plots."
+    },
+    "segmentation": {
+      "visible": "Initial visibility of segmentation surfaces in the 3D scene.",
+      "opacity": "Segmentation surface opacity between zero and one.",
+      "active_label": "Integer label painted or modified by the editor.",
+      "editing_enabled": "Initial enable state of segmentation editing; enables correction controls.",
+      "tool": "Editor tool selector, e.g. brush; controls how mouse edits modify the active mask.",
+      "brush_radius": "Brush radius in voxel/pixel units of the editing slice.",
+      "edit_all_timepoints": "Apply a mask edit across all cardiac phases instead of the current phase only.",
+      "cleanup_4d_components": "Enable connected-component cleanup of the 4D segmentation.",
+      "cleanup_4d_mode": "Component cleanup policy; absolute uses a physical-volume threshold.",
+      "cleanup_4d_min_volume_mm3": "Minimum physical component volume in mm^3 for configured 4D cleanup.",
+      "mode": "Segmentation workflow mode: use input, import an external mask, threshold scalar data, or run the automatic backend.",
+      "input_source": "Choose which already loaded segmentation source becomes active; original refers to embedded input segmentation.",
+      "import_path": "External H5/NPY/NPZ/NIfTI segmentation path; empty leaves import unconfigured.",
+      "threshold_scalar": "Scalar field thresholded to create a mask, such as pcmra, mag or velocity magnitude.",
+      "threshold_value.mode": "manual uses explicit scalar-range percentages; supported automatic modes choose thresholds from the image.",
+      "threshold_value.min_percent": "Lower cutoff as a percentage of the selected scalar range.",
+      "threshold_value.max_percent": "Upper cutoff as a percentage of the selected scalar range.",
+      "threshold_keep_largest_cc": "Keep only the largest threshold-derived connected component when enabled.",
+      "threshold_min_component_volume_mm3": "Remove threshold-derived components below this physical volume in mm^3.",
+      "threshold_closing": "Apply binary closing to the threshold-derived mask.",
+      "threshold_opening": "Apply binary opening to the threshold-derived mask.",
+      "auto_backend": "Automatic backend: nnUNet4D predicts phase-resolved temporal masks; nnUNet predicts a static mask copied over phases.",
+      "auto_model": "Model directory or auto profile. Auto resolves the backend-specific Dataset7020 temporal or Dataset7010 static model.",
+      "auto_checkpoint": "Checkpoint basename or auto. Auto chooses the profile's checkpoint; does not download a model.",
+      "auto_folds": "single selects fold_all or the first available fold; all selects all numeric folds when available; a comma list selects explicit folds.",
+      "auto_device": "Inference device: auto selects CUDA when available, otherwise CPU.",
+      "auto_label_map": "Optional file/string label mapping used to interpret automatic model output.",
+      "force_recompute_auto_cache": "Ignore previous automatic-segmentation artifacts and produce a new prediction.",
+      "write_auto_cache": "Permit segmentation-cache writes into supported source H5 files. Set false for read-only benchmarking."
+    },
+    "colorbar": {
+      "show": "Default shared GUI scalar-bar visibility; metric visibility still follows its active layer."
+    },
+    "video_exporting": {
+      "fps": "Output video frame rate in frames per second; sets playback speed independently of acquired RR.",
+      "plane_rotation_frames": "Number of camera-rotation frames in the plane video.",
+      "make_plane_video": "Request a plane video without requiring a separate requested_videos entry.",
+      "make_wss_video": "Request WSS computation/rendering and a WSS video.",
+      "make_pressure_gradient_video": "Request pressure computation and PG/relative-pressure videos.",
+      "make_streamlines_video": "Request the streamline video.",
+      "make_tke_video": "Request the TKE video when supported input TKE exists.",
+      "camera_view": "Initial camera direction, such as right; controls exported viewing orientation.",
+      "camera_distance_scale": "Multiplier of scene-based camera distance; larger values make the vessel appear smaller.",
+      "rotate_dynamic_video": "Rotate the camera during dynamic metric videos; false retains a fixed view.",
+      "dynamic_rotation_frames": "Frames for one dynamic camera rotation cycle.",
+      "dynamic_rotation_elevation_deg": "Elevation in degrees for the dynamic camera orbit; null uses the renderer's standard setting.",
+      "dynamic_time_repeat": "Number of cardiac playback repeats within the dynamic export.",
+      "add_plane_idx": "Annotate the plane index in plane-video labels.",
+      "add_path_idx": "Annotate the owning path index in plane-video labels.",
+      "window_size": "Render canvas [width,height] in pixels; larger dimensions increase rendering and encoding cost.",
+      "plane_video.show_skeleton": "Show the skeleton in plane videos.",
+      "plane_video.skeleton_point_size": "Rendered skeleton-point size in pixels.",
+      "plane_video.label.prefix": "Text prepended to each plane-video label.",
+      "plane_video.label.font_size": "Plane-label font size in points.",
+      "plane_video.label.text_color": "Plane-label text colour.",
+      "plane_video.label.shape_color": "Background/outline colour of the plane-label shape.",
+      "plane_video.label.shape_opacity": "Opacity of the plane-label shape between zero and one.",
+      "plane_video.default.skeleton_color": "Skeleton-colour override for plane videos; empty uses the group/default scene colour.",
+      "plane_video.default.plane_size": "Physical side length in mm of the displayed plane square.",
+      "plane_video.default.plane_color": "Plane-video default colour; group settings can override it.",
+      "plane_video.default.plane_opacity": "Default plane-video opacity between zero and one.",
+      "plane_video.groups": "Per-group plane-video overrides; each group may supply skeleton_color, plane_size, plane_color and plane_opacity."
+    }
+  },
+  "render": {
+    "clim": "Displayed scalar limits [lower,upper] in the metric's units; null selects the automatic range. Changes colours only, never numerical results.",
+    "show_scalar_bar": "Show the metric scalar bar in the GUI/offline renderer.",
+    "relative_pressure_clim": "Displayed relative-pressure range [lower,upper] in Pa; null uses an automatic symmetric range.",
+    "relative_pressure_show_scalar_bar": "Show the relative-pressure scalar bar.",
+    "position_x": "Horizontal scalar-bar origin as a viewport fraction between zero and one.",
+    "position_y": "Vertical scalar-bar origin as a viewport fraction between zero and one.",
+    "height": "Scalar-bar height as a viewport fraction.",
+    "width": "Scalar-bar width as a viewport fraction.",
+    "title_font_size": "Scalar-bar title font size in points.",
+    "label_font_size": "Scalar-bar tick-label font size in points.",
+    "plane_color": "Plane display colour for the default or named anatomical group.",
+    "plane_opacity": "Plane display opacity between zero and one for the default or named anatomical group."
+  },
+  "api": {
+    "inputs": {
+      "path": null,
+      "effect": "H5/HDF5 or DICOM files/directories to discover. H5 directory discovery is top-level; nested H5 case groups become separate cases."
+    },
+    "config_dir": {
+      "path": null,
+      "effect": "Directory containing module JSON defaults. None resolves installed/repository defaults; explicit AutoFlowConfig fields override bundle-mapped fields."
+    },
+    "output_dir": {
+      "path": "batch.output_dir",
+      "effect": "Root directory for per-case exports. Relative paths resolve from the process working directory."
+    },
+    "skip_derived": {
+      "path": "batch.skip_derived",
+      "effect": "Suppress requested WSS, TKE and pressure analysis and their exports; optional metrics otherwise remain opt-in."
+    },
+    "skip_wss": {
+      "path": "batch.skip_wss",
+      "effect": "Suppress WSS only, including volume export and derived plane summaries."
+    },
+    "skip_tke": {
+      "path": "batch.skip_tke",
+      "effect": "Suppress TKE only; does not manufacture TKE for unsupported inputs."
+    },
+    "skip_pressure_gradient": {
+      "path": "batch.skip_pressure_gradient",
+      "effect": "Suppress PG, relative-pressure reconstruction and centreline pressure-drop outputs."
+    },
+    "skip_plane_metrics": {
+      "path": "batch.skip_plane_metrics",
+      "effect": "Suppress plane metric calculation and its JSON/H5 exports. PWV also needs plane metrics."
+    },
+    "use_multithread": {
+      "path": "batch.use_multithread",
+      "effect": "Enable process plane metrics with memory-mapped inputs: below 128 planes, use four workers only at 1920 or more plane-phase evaluations; smaller jobs stay serial. At least 128 planes use up to eight workers. CPU/plane counts cap workers."
+    },
+    "reuse_planes": {
+      "path": "batch.reuse_planes",
+      "effect": "Path to a plane-position JSON or per-case directory to reuse. Empty string generates planes normally."
+    },
+    "plane_import_mode": {
+      "path": null,
+      "effect": "Coordinate interpretation for imported planes: world (canonical world mm), local (local physical mm), or path_relative (fractional centreline position)."
+    },
+    "export_planes": {
+      "path": null,
+      "effect": "Additional plane-position JSON path; empty disables this extra copy. Use a directory for a multi-case batch."
+    },
+    "background_phase_correction": {
+      "path": "loader.background_phase_correction.enabled",
+      "effect": "Enable correction of static-tissue velocity offsets during loading. A compatible embedded correction may be reused unless force_recompute is true."
+    },
+    "background_phase_method": {
+      "path": "loader.background_phase_correction.method",
+      "effect": "Correction backend: wrls_arto uses robust weighted regression with automatic rejection; msac uses polynomial sample consensus."
+    },
+    "background_phase_corr_fit_order": {
+      "path": "loader.background_phase_correction.corr_fit_order",
+      "effect": "Polynomial order for MSAC correction. Higher orders add spatial flexibility and fitting cost; not the WRLS fixed basis order."
+    },
+    "background_phase_threshold": {
+      "path": "loader.background_phase_correction.threshold",
+      "effect": "MSAC residual threshold as a fraction of VENC; controls static-tissue inlier acceptance."
+    },
+    "background_phase_wrls_lambda": {
+      "path": "loader.background_phase_correction.wrls_lambda",
+      "effect": "L1 penalty on WRLS polynomial coefficients; larger values impose stronger regularization."
+    },
+    "background_phase_wrls_magnitude_threshold": {
+      "path": "loader.background_phase_correction.wrls_magnitude_threshold",
+      "effect": "Minimum reference-magnitude fraction for the static-tissue fitting mask; low-signal voxels are discarded."
+    },
+    "background_phase_wrls_mid_fov_fraction": {
+      "path": "loader.background_phase_correction.wrls_mid_fov_fraction",
+      "effect": "Fraction of the two in-plane axes used for the central fitting region; restricts initial static-tissue support."
+    },
+    "background_phase_wrls_mid_slice_fraction": {
+      "path": "loader.background_phase_correction.wrls_mid_slice_fraction",
+      "effect": "Fraction of the slice axis retained for the central fitting region."
+    },
+    "background_phase_wrls_arto_iterations": {
+      "path": "loader.background_phase_correction.wrls_arto_iterations",
+      "effect": "Number of automatic rejection/refitting rounds after the initial WRLS estimate."
+    },
+    "background_phase_wrls_tau": {
+      "path": "loader.background_phase_correction.wrls_tau",
+      "effect": "Residual acceptance width in multiples of the fitted central Gaussian standard deviation."
+    },
+    "background_phase_wrls_delta": {
+      "path": "loader.background_phase_correction.wrls_delta",
+      "effect": "Initial separation of the outer ARTO Gaussian means from zero, in residual standard deviations."
+    },
+    "background_phase_wrls_central_probability": {
+      "path": "loader.background_phase_correction.wrls_central_probability",
+      "effect": "Prior/minimum mixture probability for the static-tissue central Gaussian; lies between zero and one."
+    },
+    "background_phase_wrls_fista_iterations": {
+      "path": "loader.background_phase_correction.wrls_fista_iterations",
+      "effect": "Maximum iterations of the sparse WRLS coefficient solver; increases fitting work without changing polynomial degree."
+    },
+    "background_phase_wrls_gmm_iterations": {
+      "path": "loader.background_phase_correction.wrls_gmm_iterations",
+      "effect": "Maximum EM iterations per ARTO Gaussian-mixture fit; early convergence may stop sooner."
+    },
+    "dual_venc_ratio1": {
+      "path": "loader.background_phase_correction.dual_venc_ratio1",
+      "effect": "Dual-VENC decision threshold used in the 2*LV alias-shift stage. Zero derives the threshold from high/low VENC."
+    },
+    "dual_venc_ratio2": {
+      "path": "loader.background_phase_correction.dual_venc_ratio2",
+      "effect": "Dual-VENC decision threshold used in the 4*LV alias-shift stage. Zero derives the threshold from high/low VENC."
+    },
+    "force_recompute_corr": {
+      "path": "loader.background_phase_correction.force_recompute",
+      "effect": "Ignore reusable embedded correction and estimate a fresh field; needed for a cold algorithm benchmark."
+    },
+    "background_phase_write_cache": {
+      "path": "loader.background_phase_correction.write_cache",
+      "effect": "Allow newly computed correction to be stored in the source H5. Set false for read-only measurements."
+    },
+    "dicom_read_workers": {
+      "path": "loader.dicom_read_workers",
+      "effect": "Number of concurrent DICOM file readers. One is conservative for network storage; more readers can increase I/O contention."
+    },
+    "ignore_embedded_segmentation": {
+      "path": "loader.ignore_embedded_segmentation",
+      "effect": "Ignore source H5 segmentation while retaining image/velocity input; use to test a fresh segmentation path."
+    },
+    "phase_unwrap_enabled": {
+      "path": "phase_unwrapping.enabled",
+      "effect": "Legacy enable switch. Selecting a nonempty phase_unwrap_method is the public opt-in action; leave method none to skip."
+    },
+    "phase_unwrap_method": {
+      "path": "phase_unwrapping.method",
+      "effect": "Select none, gc3D, lap4D, nprs, pudip or gust. A selected method opts in; DV dual-VENC inputs skip this step."
+    },
+    "phase_unwrap_mask": {
+      "path": "phase_unwrapping.mask_source",
+      "effect": "Learned-backend support/confidence: segmask uses segmentation; pcmra_std uses temporal PC-MRA standard deviation for weighting and Gaussian-centre confidence."
+    },
+    "phase_unwrap_device": {
+      "path": "phase_unwrapping.device",
+      "effect": "Compute device selector: auto, cpu, or cuda. Backend-specific CPU work can remain even with cuda selected."
+    },
+    "phase_unwrap_tfc": {
+      "path": "phase_unwrapping.tfc",
+      "effect": "Temporal flow consistency option of supported traditional methods; couples recovery across cardiac phases."
+    },
+    "phase_unwrap_lap4d_ts": {
+      "path": "phase_unwrapping.lap4d_ts",
+      "effect": "Temporal-axis scaling in the lap4D Laplacian operator; controls the balance of temporal and spatial constraints."
+    },
+    "phase_unwrap_nprs_upsampling_factor": {
+      "path": "phase_unwrapping.nprs_upsampling_factor",
+      "effect": "Spatial Fourier upsampling factor used only by NPRS; larger factors increase memory and resampling cost."
+    },
+    "phase_unwrap_nprs_pi_unwrap": {
+      "path": "phase_unwrapping.nprs_pi_unwrap",
+      "effect": "Enable the additional pi-unwrapping pass of NPRS."
+    },
+    "phase_unwrap_nprs_auto_crop": {
+      "path": "phase_unwrapping.nprs_auto_crop",
+      "effect": "Return NPRS output cropped to the original array extent after FFT padding."
+    },
+    "plane_mode": {
+      "path": "planes.plane_mode",
+      "effect": "Placement rule: count, distance, anchored_offset, uniform or fixed_step. Controls which spacing/anchor parameters are active."
+    },
+    "plane_count": {
+      "path": "planes.plane_count",
+      "effect": "Number of planes in count/fixed-step placement; -1 requests all available valid locations where supported."
+    },
+    "cross_section_dist": {
+      "path": "planes.cross_section_distance",
+      "effect": "Physical separation in mm used by distance/fixed-step layouts."
+    },
+    "start_dist": {
+      "path": "planes.start_distance",
+      "effect": "Millimetres trimmed from the start of each usable path before plane placement."
+    },
+    "end_dist": {
+      "path": "planes.end_distance",
+      "effect": "Millimetres trimmed from the end of each usable path before plane placement."
+    },
+    "plane_anchor": {
+      "path": "planes.anchor",
+      "effect": "Reference location: start, center, end or junction. Defines the origin for anchored placement."
+    },
+    "plane_offset_mm": {
+      "path": "planes.anchor_offset_mm",
+      "effect": "Physical offset in mm from the selected anchor toward the chosen direction."
+    },
+    "plane_direction": {
+      "path": "planes.direction",
+      "effect": "Placement direction from the anchor: toward_start, toward_end or both."
+    },
+    "plane_spacing_mode": {
+      "path": "planes.spacing_mode",
+      "effect": "Anchor-layout spacing interpretation: distance in mm or fraction of usable path length."
+    },
+    "plane_spacing_ratio": {
+      "path": "planes.spacing_ratio",
+      "effect": "Dimensionless usable-path-length fraction between anchored planes when spacing_mode=fraction."
+    },
+    "segmentation_filter": {
+      "path": "planes.segmentation_filter",
+      "effect": "Discard candidate planes whose centreline location lacks compatible segmentation support."
+    },
+    "use_center_plane": {
+      "path": "planes.use_center_plane",
+      "effect": "Legacy centre-plane override for older layouts; None leaves the configured layout unchanged. Prefer fixed_step anchor/direction/spacing controls."
+    },
+    "remove_small_cc": {
+      "path": "skeleton.remove_small_cc",
+      "effect": "Filter small connected components before skeletonization."
+    },
+    "special_handling": {
+      "path": "skeleton.special_handling",
+      "effect": "Special systemic-branch strategy: three_pass_merge separates and merges branch skeleton passes; other supported modes are described in the skeleton guide."
+    },
+    "special_merge_radius_mm": {
+      "path": "skeleton.special_merge_radius_mm",
+      "effect": "Maximum physical distance in mm for joining the special-handling skeleton passes."
+    },
+    "separate_special_label_contacts": {
+      "path": "skeleton.separate_special_label_contacts",
+      "effect": "Separate configured special labels where they touch before skeleton generation."
+    },
+    "special_contact_labels": {
+      "path": "skeleton.special_contact_labels",
+      "effect": "Anatomical label names subject to the contact-separation rule; resolve IDs through labels.label_map."
+    },
+    "min_cc_volume": {
+      "path": "skeleton.min_cc_volume_mm3",
+      "effect": "Absolute connected-component volume threshold in cubic millimetres."
+    },
+    "cc_filter_mode": {
+      "path": "skeleton.cc_filter_mode",
+      "effect": "Component retention rule: absolute, relative or hybrid combines physical volume and a fraction of the largest component."
+    },
+    "cc_rel_min_ratio": {
+      "path": "skeleton.cc_rel_min_ratio",
+      "effect": "Smallest retained component as a fraction of the largest component in relative/hybrid filtering."
+    },
+    "min_edge_points": {
+      "path": "skeleton.min_edge_points",
+      "effect": "Minimum graph-edge point count retained during graph cleanup; controls short terminal-edge removal."
+    },
+    "seed_ratio": {
+      "path": "streamlines.seed_ratio",
+      "effect": "Fraction of slice support locations sampled as streamline seeds; min_seeds sets a lower target when possible."
+    },
+    "max_steps": {
+      "path": "streamlines.max_steps",
+      "effect": "Maximum integration steps for each instantaneous streamline."
+    },
+    "min_seeds": {
+      "path": "streamlines.min_seeds",
+      "effect": "Minimum desired seed count per valid plane, limited by available support."
+    },
+    "pathline_seed_ratio": {
+      "path": "pathlines.seed_ratio",
+      "effect": "Support fraction used only by ratio seeding."
+    },
+    "pathline_max_steps": {
+      "path": "pathlines.max_steps",
+      "effect": "Maximum temporal integration steps per pathline."
+    },
+    "pathline_min_seeds": {
+      "path": "pathlines.min_seeds",
+      "effect": "Minimum desired seed count in ratio mode."
+    },
+    "pathline_seed_mode": {
+      "path": "pathlines.seed_mode",
+      "effect": "fixed uses seed_count; ratio uses seed_ratio and min_seeds."
+    },
+    "pathline_max_seeds": {
+      "path": "pathlines.seed_count",
+      "effect": "Maximum desired seeds per plane in fixed mode; support limits the actual count."
+    },
+    "pathline_terminal_speed": {
+      "path": "pathlines.terminal_speed",
+      "effect": "Velocity threshold in m/s for terminating temporal integration; the VTK temporal source uses mm/s and converts this threshold."
+    },
+    "pathline_rng_seed": {
+      "path": "pathlines.rng_seed",
+      "effect": "Random seed for reproducible pathline seed placement."
+    },
+    "pathline_tube_radius": {
+      "path": "pathlines.tube_radius",
+      "effect": "Rendered pathline tube radius in mm."
+    },
+    "terminal_speed": {
+      "path": "streamlines.terminal_speed",
+      "effect": "Velocity threshold in m/s for terminating streamline integration (input cm/s is converted to m/s)."
+    },
+    "rng_seed": {
+      "path": "streamlines.rng_seed",
+      "effect": "Random seed for reproducible seed subsampling."
+    },
+    "tube_radius": {
+      "path": "streamlines.tube_radius",
+      "effect": "Rendered tube radius in physical mm; affects display geometry, not integration."
+    },
+    "pathline_color": {
+      "path": "pathlines.color",
+      "effect": "Uniform colour used when color_mode=uniform."
+    },
+    "plane_pathline_color": {
+      "path": null,
+      "effect": "Compatibility alias for the uniform pathline colour. Prefer pathline_color; affects GUI display only."
+    },
+    "pathline_color_mode": {
+      "path": "pathlines.color_mode",
+      "effect": "uniform, per_plane or per_group colour assignment; affects display only."
+    },
+    "pathline_temporal_cache_mb": {
+      "path": "pathlines.temporal_cache_mb",
+      "effect": "Memory limit in MiB for prepared temporal velocity grids; larger limits can accelerate repeated GUI phase changes."
+    },
+    "pressure_method": {
+      "path": "pressure_gradient.method",
+      "effect": "Relative-pressure reconstruction: least_squares integrates face-averaged PG; ppe balances finite-volume gradient fluxes. Their Cartesian discrete equations are equivalent."
+    },
+    "autoseg": {
+      "path": null,
+      "effect": "Run the selected automatic backend when a segmentation is needed; false requires an embedded or imported segmentation."
+    },
+    "autoseg_backend": {
+      "path": "segmentation.auto_backend",
+      "effect": "Automatic backend: nnUNet4D predicts phase-resolved temporal masks; nnUNet predicts a static mask copied over phases."
+    },
+    "autoseg_model": {
+      "path": "segmentation.auto_model",
+      "effect": "Model directory or auto profile. Auto resolves the backend-specific Dataset7020 temporal or Dataset7010 static model."
+    },
+    "autoseg_checkpoint": {
+      "path": "segmentation.auto_checkpoint",
+      "effect": "Checkpoint basename or auto. Auto chooses the profile's checkpoint; does not download a model."
+    },
+    "autoseg_folds": {
+      "path": "segmentation.auto_folds",
+      "effect": "single selects fold_all or the first available fold; all selects all numeric folds when available; a comma list selects explicit folds."
+    },
+    "autoseg_device": {
+      "path": "segmentation.auto_device",
+      "effect": "Inference device: auto selects CUDA when available, otherwise CPU."
+    },
+    "autoseg_label_map": {
+      "path": "segmentation.auto_label_map",
+      "effect": "Optional file/string label mapping used to interpret automatic model output."
+    },
+    "force_recompute_seg": {
+      "path": "segmentation.force_recompute_auto_cache",
+      "effect": "Ignore previous automatic-segmentation artifacts and produce a new prediction."
+    },
+    "write_segmentation_cache": {
+      "path": "segmentation.write_auto_cache",
+      "effect": "Permit segmentation-cache writes into supported source H5 files. Set false for read-only benchmarking."
+    },
+    "segmentation_only": {
+      "path": null,
+      "effect": "Load and generate/export segmentation, then stop before skeleton, planes and metrics."
+    },
+    "requested_metrics": {
+      "path": null,
+      "effect": "Opt-in family names: pwv, wss, tke, pg, vortex. Empty requests only basic plane metrics; skip flags take priority. TKE is skipped cleanly when unavailable."
+    },
+    "requested_videos": {
+      "path": null,
+      "effect": "Opt-in video names: plane, wss, tke, pg, streamlines. Empty produces no videos. Requested metric videos may require the corresponding numerical family."
+    },
+    "fps": {
+      "path": "video_exporting.fps",
+      "effect": "Output video frame rate in frames per second; sets playback speed independently of acquired RR."
+    },
+    "plane_rotation_frames": {
+      "path": "video_exporting.plane_rotation_frames",
+      "effect": "Number of camera-rotation frames in the plane video."
+    },
+    "make_plane_video": {
+      "path": "video_exporting.make_plane_video",
+      "effect": "Request a plane video without requiring a separate requested_videos entry."
+    },
+    "make_wss_video": {
+      "path": "video_exporting.make_wss_video",
+      "effect": "Request WSS computation/rendering and a WSS video."
+    },
+    "make_pressure_gradient_video": {
+      "path": "video_exporting.make_pressure_gradient_video",
+      "effect": "Request pressure computation and PG/relative-pressure videos."
+    },
+    "make_streamlines_video": {
+      "path": "video_exporting.make_streamlines_video",
+      "effect": "Request the streamline video."
+    },
+    "make_tke_video": {
+      "path": "video_exporting.make_tke_video",
+      "effect": "Request the TKE video when supported input TKE exists."
+    },
+    "camera_view": {
+      "path": "video_exporting.camera_view",
+      "effect": "Initial camera direction, such as right; controls exported viewing orientation."
+    },
+    "camera_distance_scale": {
+      "path": "video_exporting.camera_distance_scale",
+      "effect": "Multiplier of scene-based camera distance; larger values make the vessel appear smaller."
+    },
+    "rotate_dynamic_video": {
+      "path": "video_exporting.rotate_dynamic_video",
+      "effect": "Rotate the camera during dynamic metric videos; false retains a fixed view."
+    },
+    "dynamic_rotation_frames": {
+      "path": "video_exporting.dynamic_rotation_frames",
+      "effect": "Frames for one dynamic camera rotation cycle."
+    },
+    "dynamic_rotation_elevation_deg": {
+      "path": "video_exporting.dynamic_rotation_elevation_deg",
+      "effect": "Elevation in degrees for the dynamic camera orbit; null uses the renderer's standard setting."
+    },
+    "dynamic_time_repeat": {
+      "path": "video_exporting.dynamic_time_repeat",
+      "effect": "Number of cardiac playback repeats within the dynamic export."
+    },
+    "add_plane_idx": {
+      "path": "video_exporting.add_plane_idx",
+      "effect": "Annotate the plane index in plane-video labels."
+    },
+    "add_path_idx": {
+      "path": "video_exporting.add_path_idx",
+      "effect": "Annotate the owning path index in plane-video labels."
+    },
+    "plane_video_cfg": {
+      "path": "video_exporting.plane_video",
+      "effect": "Nested plane-video skeleton, label and per-group styles; see every field in video_exporting."
+    },
+    "window_size": {
+      "path": "video_exporting.window_size",
+      "effect": "Render canvas [width,height] in pixels; larger dimensions increase rendering and encoding cost."
+    },
+    "shared_colorbar_show": {
+      "path": "colorbar.show",
+      "effect": "Default shared GUI scalar-bar visibility; metric visibility still follows its active layer."
+    },
+    "shared_colorbar_bar_cfg": {
+      "path": "colorbar.bar_cfg",
+      "effect": "Colourbar geometry and fonts as a mapping. Nested fields are documented under colorbar in the configuration reference."
+    },
+    "wss_clim": {
+      "path": "wss.render.clim",
+      "effect": "Displayed scalar limits [lower,upper] in the metric's units; null selects the automatic range. Changes colours only, never numerical results."
+    },
+    "wss_show_scalar_bar": {
+      "path": "wss.render.show_scalar_bar",
+      "effect": "Show the metric scalar bar in the GUI/offline renderer."
+    },
+    "wss_bar_cfg": {
+      "path": "wss.render.bar_cfg",
+      "effect": "Colourbar geometry and fonts as a mapping. Nested fields are documented under wss in the configuration reference."
+    },
+    "tke_clim": {
+      "path": "tke.render.clim",
+      "effect": "Displayed scalar limits [lower,upper] in the metric's units; null selects the automatic range. Changes colours only, never numerical results."
+    },
+    "tke_show_scalar_bar": {
+      "path": "tke.render.show_scalar_bar",
+      "effect": "Show the metric scalar bar in the GUI/offline renderer."
+    },
+    "tke_bar_cfg": {
+      "path": "tke.render.bar_cfg",
+      "effect": "Colourbar geometry and fonts as a mapping. Nested fields are documented under tke in the configuration reference."
+    },
+    "pressure_gradient_clim": {
+      "path": "pressure_gradient.render.clim",
+      "effect": "Displayed scalar limits [lower,upper] in the metric's units; null selects the automatic range. Changes colours only, never numerical results."
+    },
+    "pressure_gradient_show_scalar_bar": {
+      "path": "pressure_gradient.render.show_scalar_bar",
+      "effect": "Show the metric scalar bar in the GUI/offline renderer."
+    },
+    "pressure_gradient_bar_cfg": {
+      "path": "pressure_gradient.render.bar_cfg",
+      "effect": "Colourbar geometry and fonts as a mapping. Nested fields are documented under pressure_gradient in the configuration reference."
+    },
+    "relative_pressure_clim": {
+      "path": "pressure_gradient.render.relative_pressure_clim",
+      "effect": "Displayed relative-pressure range [lower,upper] in Pa; null uses an automatic symmetric range."
+    },
+    "relative_pressure_show_scalar_bar": {
+      "path": "pressure_gradient.render.relative_pressure_show_scalar_bar",
+      "effect": "Show the relative-pressure scalar bar."
+    },
+    "relative_pressure_bar_cfg": {
+      "path": "pressure_gradient.render.relative_pressure_bar_cfg",
+      "effect": "Colourbar geometry and fonts as a mapping. Nested fields are documented under pressure_gradient in the configuration reference."
+    },
+    "streamline_clim": {
+      "path": "streamlines.render.clim",
+      "effect": "Displayed scalar limits [lower,upper] in the metric's units; null selects the automatic range. Changes colours only, never numerical results."
+    },
+    "streamline_show_scalar_bar": {
+      "path": "streamlines.render.show_scalar_bar",
+      "effect": "Show the metric scalar bar in the GUI/offline renderer."
+    },
+    "streamline_bar_cfg": {
+      "path": "streamlines.render.bar_cfg",
+      "effect": "Colourbar geometry and fonts as a mapping. Nested fields are documented under streamlines in the configuration reference."
+    },
+    "phase_unwrap_backend_params": {
+      "path": "phase_unwrapping.backend_params",
+      "effect": "Backend-specific nested objects, e.g. pudip and gust; supported adapter keys are listed below rather than passed blindly."
+    },
+    "dicom_backend": {
+      "path": "loader.dicom_backend",
+      "effect": "DICOM directory route: native loads recognized cases directly; dicom2h5 converts through the optional pinned converter and processes all resulting H5 groups. Explicit H5 files are unaffected."
+    },
+    "dicom_h5_dir": {
+      "path": "loader.dicom_h5_dir",
+      "effect": "Destination directory for preserved Dicom2H5 outputs. Empty uses output_dir/_dicom_h5. Existing files cause an error; reopen the saved H5 to reuse it."
+    }
+  }
+}
