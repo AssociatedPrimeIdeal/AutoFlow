@@ -29,9 +29,7 @@ else:
     from pyvistaqt import QtInteractor
 
 from ..algorithms import (
-    inspect_dicom_case,
     resolve_input_case,
-    scan_dicom_cases,
     load_segmentation_file,
     generate_threshold_segmentation,
     generate_nnunet_auto_segmentation,
@@ -51,7 +49,7 @@ from ..algorithms.segmentation import (
     resolve_nnunet_model_folder,
     resolve_nnunet_4d_model_folder,
 )
-from ..core.models import DicomParameterOverrides, ObjectKind, PlaneData, PwvParams, StepId, Workspace
+from ..core.models import ObjectKind, PlaneData, PwvParams, StepId, Workspace
 from ..core.pipeline import PipelineEngine
 from ..task_control import CancellationToken, TaskCancelled, check_cancelled, task_scope
 from .progress import TaskProgressDialog
@@ -61,7 +59,7 @@ from ..quality import build_quality_report, save_quality_report
 from ..algorithms import compute_plane_metrics, apply_internal_consistency_to_metrics, compute_plane_metrics_multithread, augment_plane_metrics_with_derived, save_plane_pixelwise_h5
 from ..algorithms.streamlines import _plane_seeds, create_pathline_temporal_source
 from .editors import PlaneEditor
-from .dicom_confirm import DicomImportDialog, DualVencSelectDialog, H5CaseSelectDialog
+from .input_dialogs import DualVencSelectDialog, H5CaseSelectDialog
 from .ortho_viewer import OrthoViewer
 from .segmentation import SegmentationDock, SOURCE_LABELS
 from .theme import apply_application_theme, configure_high_dpi, standard_icon
@@ -702,7 +700,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_quality_report = None
         self._last_plane_import_report = None
         self._active_input_case = None
-        self._active_dicom_parameter_overrides = {}
         self._input_signature = None
         self._build_ui()
         self._bind_scene()
@@ -2628,7 +2625,6 @@ class MainWindow(QtWidgets.QMainWindow):
         for label, slot in [
             ("Open H5", self._on_open_h5),
             ("Import DICOM Directory", self._on_import_dicom_directory),
-            ("Import DICOM via Dicom2H5...", self._on_import_dicom2h5),
             ("Clear Workspace", self._on_close_workspace),
             ("Exit", self.close),
         ]:
@@ -6847,7 +6843,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self.log(f"VIEW ERROR: {type(e).__name__}: {e}")
 
-    def _load_selected_input_case(self, case, dicom_parameter_overrides=None):
+    def _load_selected_input_case(self, case):
         if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
             return
         try:
@@ -6868,12 +6864,6 @@ class MainWindow(QtWidgets.QMainWindow):
             configured_out = str(self._config_bundle.get("batch", {}).get("output_dir", "") or "").strip()
             if configured_out:
                 pending.paths.output_dir = os.path.join(configured_out, resolved.output_name or Path(resolved.input_path).stem)
-            if resolved.input_kind == "dicom":
-                if not configured_out:
-                    pending.paths.output_dir = os.path.join(resolved.input_path, f"autoflow_{resolved.output_name or 'dicom_case'}")
-                pending.loader_params.dicom_parameter_overrides = DicomParameterOverrides.from_dict(dicom_parameter_overrides or {})
-            else:
-                pending.loader_params.dicom_parameter_overrides = DicomParameterOverrides()
 
             def load(progress, log):
                 self.pipeline.load_data(pending, log, input_source=resolved, progress_callback=progress)
@@ -6888,7 +6878,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._reset_segmentation_edit_history()
             self.workspace = pending
             self._active_input_case = resolved
-            self._active_dicom_parameter_overrides = dict(dicom_parameter_overrides or {})
             self._last_quality_report = None
             self._last_plane_import_report = None
             self.scene.workspace = pending
@@ -6914,7 +6903,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "kind": str(getattr(self._active_input_case, "input_kind", "")),
             "group": getattr(self._active_input_case, "source_group", None),
             "dual_venc_ratios": [ws.loader_params.background_phase_correction.dual_venc_ratio1, ws.loader_params.background_phase_correction.dual_venc_ratio2],
-            "dicom": dict(self._active_dicom_parameter_overrides or {}),
             "resolution": self.edit_input_resolution.text().strip(),
             "venc": self.edit_input_venc.text().strip(),
             "spatial_order": self.edit_input_spatial_order.text().strip(),
@@ -6967,10 +6955,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage("Input unchanged", 4000)
             return
         self.log("Input parameters changed; reloading input and invalidating downstream results.")
-        self._load_selected_input_case(
-            self._active_input_case,
-            dicom_parameter_overrides=self._active_dicom_parameter_overrides,
-        )
+        self._load_selected_input_case(self._active_input_case)
 
     def _on_open_h5(self):
         if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
@@ -7000,33 +6985,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
             return
         root = QtWidgets.QFileDialog.getExistingDirectory(self, "Import DICOM Directory", "")
-        if not root:
-            return
-        try:
-            cases = self._run_modal_task("Scan DICOM", "Scanning DICOM directory…",
-                lambda progress, log: scan_dicom_cases(root, progress_callback=progress))
-        except TaskCancelled:
-            self.log("DICOM scan cancelled.")
-            return
-        except Exception as e:
-            self.log(f"DICOM SCAN ERROR: {type(e).__name__}: {e}")
-            self.log(traceback.format_exc())
-            return
-        if not cases:
-            self.log(f"No supported DICOM 4D flow cases found in: {root}")
-            return
-        dialog = DicomImportDialog(cases, self._inspect_dicom_case_preview, self)
-        if dialog.exec() != QtWidgets.QDialog.Accepted:
-            return
-        selected = dialog.selected_case()
-        if selected is None:
-            return
-        self._load_selected_input_case(selected, dicom_parameter_overrides=dialog.parameter_overrides())
-
-    def _on_import_dicom2h5(self):
-        if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
-            return
-        root = QtWidgets.QFileDialog.getExistingDirectory(self, "Import DICOM via Dicom2H5", "")
         if not root:
             return
         target, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -7089,10 +7047,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if cases is not None:
             QtCore.QTimer.singleShot(0, lambda: self._apply_dicom_conversion_cases(cases))
         self._dicom_conversion_progress = None
-
-    def _inspect_dicom_case_preview(self, case):
-        return self._run_modal_task("Inspect DICOM", "Reading DICOM load parameters…",
-            lambda progress, log: inspect_dicom_case(case, progress_callback=progress))
 
     def _rendering_kwargs(self):
         rendering_cfg = bundle_to_autoflow_kwargs(self._config_bundle)

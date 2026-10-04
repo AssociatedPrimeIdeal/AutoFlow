@@ -6,17 +6,17 @@ This page collects the literature behind AutoFlow's calculations and identifies 
 
 | Feature | References | Relationship to AutoFlow | Main code |
 | --- | --- | --- | --- |
-| PG and relative pressure | [PG-1 to PG-5](#pressure-gradient-and-relative-pressure) | Navier–Stokes gradients, pressure Poisson and Stokes estimators; Cartesian adaptations | `autoflow/algorithms/metrics.py` |
-| WSS | [WSS-1 and WSS-2](#wall-shear-stress) | Tangential velocity derivatives and surface smoothing; not the original B-spline estimator | `autoflow/algorithms/metrics.py` |
+| PG and relative pressure | [PG-1 to PG-5](#pressure-gradient-and-relative-pressure) | Navier–Stokes gradients, pressure Poisson and Stokes estimators; Cartesian adaptations | `autoflow/algorithms/metrics/pressure.py` |
+| WSS | [WSS-1 and WSS-2](#wall-shear-stress) | Tangential velocity derivatives and surface smoothing; not the original B-spline estimator | `autoflow/algorithms/metrics/wss.py` |
 | Centerline and paths | [CL-1 and CL-2](#centerline-skeleton-and-paths) | Lee 3-D thinning and Savitzky–Golay smoothing; graph cleanup/grouping are AutoFlow logic | `autoflow/algorithms/skeleton.py`, `autoflow/algorithms/graph.py`, `autoflow/algorithms/paths.py` |
 | Noise mask and PC-MRA | [PC-1 and PC-2](#noise-masking-and-pc-mra) | Magnitude/temporal-SD screening and magnitude-weighted speed; thresholds are project settings | `autoflow/algorithms/noise_removal.py`, `autoflow/core/pipeline.py` |
 | Background phase correction | [BGC-1](#background-phase-correction) | Weighted regularized least squares with automatic rejection of temporally invariant outliers | `autoflow/algorithms/phase_correction.py` |
-| LAP4D phase unwrapping | [PU-1](#phase-unwrapping) | Four-dimensional single-step Laplacian method | `autoflow/algorithms/traditional/flowunwrap.py`, `autoflow/algorithms/phase_unwrapping.py` |
-| Model segmentation | [SEG-1](#segmentation) | nnU-Net framework; local models/4-D integration need separate validation | `autoflow/algorithms/segmentation.py` |
-| TKE | [TKE-1](#turbulent-kinetic-energy) | Intravoxel dispersion from magnitude attenuation, not cardiac-cycle speed SD | `autoflow/algorithms/data.py`, `autoflow/algorithms/metrics.py` |
+| LAP4D phase unwrapping | [PU-1](#phase-unwrapping) | Four-dimensional single-step Laplacian method | `autoflow/algorithms/phase_unwrapping/laplacian.py`, `autoflow/algorithms/phase_unwrapping/engine.py` |
+| Model segmentation | [SEG-1](#segmentation) | nnU-Net framework; local models/4-D integration need separate validation | `autoflow/algorithms/segmentation/nnunet_static.py` |
+| TKE | [TKE-1](#turbulent-kinetic-energy) | Intravoxel dispersion from magnitude attenuation, not cardiac-cycle speed SD | `autoflow/algorithms/data/h5_loader.py`, `autoflow/algorithms/metrics/tke.py` |
 | PWV | [PWV-1](#pulse-wave-velocity) | MRI transit-time methodology review, not an exact implementation specification | `autoflow/algorithms/pwv.py` |
-| Vortex kinematics | [V-1 and V-2](#vortex-kinematics) | Velocity-gradient vortex identifiers and swirling strength | `autoflow/algorithms/metrics.py` |
-| Acquisition, flow metrics and QC | [CMR-1 and CMR-2](#general-4d-flow-guidance) | Consensus guidance for acquisition, retrospective analysis and validation | `autoflow/algorithms/data.py`, `autoflow/algorithms/dicom.py`, `autoflow/quality.py` |
+| Vortex kinematics | [V-1 and V-2](#vortex-kinematics) | Velocity-gradient vortex identifiers and swirling strength | `autoflow/algorithms/metrics/vortex.py` |
+| Acquisition, flow metrics and QC | [CMR-1 and CMR-2](#general-4d-flow-guidance) | Consensus guidance for acquisition, retrospective analysis and validation | `autoflow/algorithms/data/h5_loader.py`, `autoflow/algorithms/inputs.py`, `autoflow/quality.py` |
 | Numerical and imaging libraries | [SW-1 and SW-2](#software-foundations) | Software acknowledgements, separate from physiological validation | SciPy and scikit-image |
 
 ## Pressure gradient and relative pressure

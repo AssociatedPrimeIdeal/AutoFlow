@@ -168,7 +168,7 @@ conversion, with equal arrays. Labeler's existing loader was restored.
 
 ## Code, regression checks, and evidence
 
-- `autoflow/algorithms/segmentation.py`: distinct-map encoding and standard sample links.
+- `autoflow/algorithms/segmentation/nnunet_static.py`: distinct-map encoding and standard sample links.
 - `autoflow/nnunet_runtime.py`: child-only transfer optimization and original-path fallbacks.
 - `autoflow/ui/labeler_exchange.py`: content digests, bounded export, independent image/mask reuse, backups.
 - `autoflow/ui/app.py`: responsive export progress and launch/import integration.

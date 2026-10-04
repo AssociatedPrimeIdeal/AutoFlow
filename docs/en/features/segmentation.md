@@ -172,11 +172,14 @@ Changing the active segmentation compares the processed masks and skeleton/group
 
 | Change you want | Edit here | Also check | Tests |
 | --- | --- | --- | --- |
-| add a new segmentation source | `autoflow/core/models.py`, `autoflow/ui/app.py` | `autoflow/ui/segmentation.py`, `autoflow/algorithms/segmentation.py` | `tests/test_smoke_phantoms.py` |
-| change threshold behavior | `autoflow/algorithms/segmentation.py`, `autoflow/ui/app.py` | `autoflow/core/models.py` | `tests/test_smoke_phantoms.py` |
-| change nnUNet auto segmentation | `autoflow/algorithms/segmentation.py`, `autoflow/nnunet_runtime.py` | `autoflow/processing.py`, `autoflow/ui/app.py` | manual verification plus smoke and phantom regression only |
+| add a new segmentation source | `autoflow/core/models.py`, `autoflow/ui/app.py` | `autoflow/ui/segmentation.py`, `autoflow/algorithms/segmentation/io.py` | `tests/test_smoke_phantoms.py` |
+| change threshold behavior | `autoflow/algorithms/segmentation/threshold.py`, `autoflow/ui/app.py` | `autoflow/core/models.py` | `tests/test_smoke_phantoms.py` |
+| change static nnUNet inference | `autoflow/algorithms/segmentation/nnunet_static.py`, `autoflow/nnunet_runtime.py` | `autoflow/processing.py`, `autoflow/ui/app.py` | manual verification plus smoke and phantom regression only |
+| change temporal/grouped nnUNet inference | `autoflow/algorithms/segmentation/nnunet_temporal.py`, `autoflow/algorithms/segmentation/nnunet_grouped.py` | `autoflow/algorithms/segmentation/channels.py` | smoke/phantom coverage and manual inference checks |
+| change models, channels or subprocess behavior | `autoflow/algorithms/segmentation/models.py`, `autoflow/algorithms/segmentation/channels.py`, `autoflow/algorithms/segmentation/runtime.py` | static and temporal inference modules | `tests/test_smoke_phantoms.py` |
+| change segmentation import/export | `autoflow/algorithms/segmentation/io.py`, `autoflow/algorithms/segmentation/_common.py` | `autoflow/ui/labeler_exchange.py` | `tests/test_smoke_phantoms.py` |
 | change segmentation dock behavior | `autoflow/ui/segmentation.py`, `autoflow/ui/app.py` | `autoflow/core/models.py` | `tests/test_smoke_phantoms.py` |
-| change external editor exchange | `autoflow/ui/labeler_exchange.py`, `autoflow/ui/app.py` | `autoflow/algorithms/segmentation.py`, `third_party/SpatioTemporalLabeler/src/spatiotemporal_labeler/io/nrrd_sequence.py` | NIfTI round-trip plus GUI manual verification |
+| change external editor exchange | `autoflow/ui/labeler_exchange.py`, `autoflow/ui/app.py` | `autoflow/algorithms/segmentation/io.py`, `third_party/SpatioTemporalLabeler/src/spatiotemporal_labeler/io/nrrd_sequence.py` | NIfTI round-trip plus GUI manual verification |
 
 ## Tests
 

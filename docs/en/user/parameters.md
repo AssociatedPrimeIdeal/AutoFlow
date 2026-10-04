@@ -29,33 +29,31 @@ Code owner: `autoflow/ui/app.py`.
 
 ## loader
 
-Code owner: `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py`.
+Code owner: `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/inputs.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py`.
 
 | Parameter | Type | Effective default | Where configured | Effect and units | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `background_phase_correction.enabled` | bool | `false` | `configs/loader.json` | Enable an explicit background-correction stage after loading, before segmentation. Compatible H5 correction caches may be reused unless force_recompute is true. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
-| `background_phase_correction.method` | string | `"wrls_arto"` | `configs/loader.json` | Correction backend: wrls_arto uses robust weighted regression with automatic rejection; msac uses polynomial sample consensus. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
-| `background_phase_correction.corr_fit_order` | int | `3` | `configs/loader.json` | Polynomial order for MSAC correction. Higher orders add spatial flexibility and fitting cost; not the WRLS fixed basis order. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
-| `background_phase_correction.threshold` | float | `0.2` | `configs/loader.json` | MSAC residual threshold as a fraction of VENC; controls static-tissue inlier acceptance. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
-| `background_phase_correction.wrls_lambda` | float | `5.0` | `configs/loader.json` | L1 penalty on WRLS polynomial coefficients; larger values impose stronger regularization. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
-| `background_phase_correction.wrls_magnitude_threshold` | float | `0.04` | `configs/loader.json` | Minimum reference-magnitude fraction for the static-tissue fitting mask; low-signal voxels are discarded. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
-| `background_phase_correction.wrls_mid_fov_fraction` | float | `0.5` | `configs/loader.json` | Fraction of the two in-plane axes used for the central fitting region; restricts initial static-tissue support. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
-| `background_phase_correction.wrls_mid_slice_fraction` | float | `0.65` | `configs/loader.json` | Fraction of the slice axis retained for the central fitting region. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
-| `background_phase_correction.wrls_arto_iterations` | int | `4` | `configs/loader.json` | Number of automatic rejection/refitting rounds after the initial WRLS estimate. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
-| `background_phase_correction.wrls_tau` | float | `3.0` | `configs/loader.json` | Residual acceptance width in multiples of the fitted central Gaussian standard deviation. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
-| `background_phase_correction.wrls_delta` | float | `2.0` | `configs/loader.json` | Initial separation of the outer ARTO Gaussian means from zero, in residual standard deviations. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
-| `background_phase_correction.wrls_central_probability` | float | `0.5` | `configs/loader.json` | Prior/minimum mixture probability for the static-tissue central Gaussian; lies between zero and one. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
-| `background_phase_correction.wrls_fista_iterations` | int | `5000` | `configs/loader.json` | Maximum iterations of the sparse WRLS coefficient solver; increases fitting work without changing polynomial degree. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
-| `background_phase_correction.wrls_gmm_iterations` | int | `1000` | `configs/loader.json` | Maximum EM iterations per ARTO Gaussian-mixture fit; early convergence may stop sooner. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
-| `background_phase_correction.dual_venc_ratio1` | float | `0.0` | `configs/loader.json` | Dual-VENC decision threshold used in the 2*LV alias-shift stage. Zero derives the threshold from high/low VENC. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
-| `background_phase_correction.dual_venc_ratio2` | float | `0.0` | `configs/loader.json` | Dual-VENC decision threshold used in the 4*LV alias-shift stage. Zero derives the threshold from high/low VENC. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
-| `background_phase_correction.force_recompute` | bool | `false` | `configs/loader.json` | Ignore reusable embedded correction and estimate a fresh field; needed for a cold algorithm benchmark. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
-| `background_phase_correction.write_cache` | bool | `true` | `configs/loader.json` | Allow newly computed correction to be stored in the source H5. Set false for read-only measurements. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
-| `dicom_parameter_overrides` | object | `{}` | `configs/loader.json` | Object of explicit DICOM metadata replacements; see the supported keys and units in the input contract. Does not rewrite DICOM files. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
-| `dicom_read_workers` | int | `1` | `configs/loader.json` | Number of concurrent DICOM file readers. One is conservative for network storage; more readers can increase I/O contention. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
-| `dicom_backend` | string | `"native"` | `configs/loader.json` | DICOM directory route: native loads recognized cases directly; dicom2h5 converts through the optional pinned converter and processes all resulting H5 groups. Explicit H5 files are unaffected. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
-| `dicom_h5_dir` | string | `""` | `configs/loader.json` | Destination directory for preserved Dicom2H5 outputs. Empty uses output_dir/_dicom_h5. Existing files cause an error; reopen the saved H5 to reuse it. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
-| `ignore_embedded_segmentation` | bool | `false` | `configs/loader.json` | Ignore source H5 segmentation while retaining image/velocity input; use to test a fresh segmentation path. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.enabled` | bool | `false` | `configs/loader.json` | Enable an explicit background-correction stage after loading, before segmentation. Compatible H5 correction caches may be reused unless force_recompute is true. | `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/inputs.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.method` | string | `"wrls_arto"` | `configs/loader.json` | Correction backend: wrls_arto uses robust weighted regression with automatic rejection; msac uses polynomial sample consensus. | `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/inputs.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.corr_fit_order` | int | `3` | `configs/loader.json` | Polynomial order for MSAC correction. Higher orders add spatial flexibility and fitting cost; not the WRLS fixed basis order. | `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/inputs.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.threshold` | float | `0.2` | `configs/loader.json` | MSAC residual threshold as a fraction of VENC; controls static-tissue inlier acceptance. | `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/inputs.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.wrls_lambda` | float | `5.0` | `configs/loader.json` | L1 penalty on WRLS polynomial coefficients; larger values impose stronger regularization. | `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/inputs.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.wrls_magnitude_threshold` | float | `0.04` | `configs/loader.json` | Minimum reference-magnitude fraction for the static-tissue fitting mask; low-signal voxels are discarded. | `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/inputs.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.wrls_mid_fov_fraction` | float | `0.5` | `configs/loader.json` | Fraction of the two in-plane axes used for the central fitting region; restricts initial static-tissue support. | `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/inputs.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.wrls_mid_slice_fraction` | float | `0.65` | `configs/loader.json` | Fraction of the slice axis retained for the central fitting region. | `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/inputs.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.wrls_arto_iterations` | int | `4` | `configs/loader.json` | Number of automatic rejection/refitting rounds after the initial WRLS estimate. | `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/inputs.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.wrls_tau` | float | `3.0` | `configs/loader.json` | Residual acceptance width in multiples of the fitted central Gaussian standard deviation. | `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/inputs.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.wrls_delta` | float | `2.0` | `configs/loader.json` | Initial separation of the outer ARTO Gaussian means from zero, in residual standard deviations. | `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/inputs.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.wrls_central_probability` | float | `0.5` | `configs/loader.json` | Prior/minimum mixture probability for the static-tissue central Gaussian; lies between zero and one. | `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/inputs.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.wrls_fista_iterations` | int | `5000` | `configs/loader.json` | Maximum iterations of the sparse WRLS coefficient solver; increases fitting work without changing polynomial degree. | `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/inputs.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.wrls_gmm_iterations` | int | `1000` | `configs/loader.json` | Maximum EM iterations per ARTO Gaussian-mixture fit; early convergence may stop sooner. | `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/inputs.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.dual_venc_ratio1` | float | `0.0` | `configs/loader.json` | Dual-VENC decision threshold used in the 2*LV alias-shift stage. Zero derives the threshold from high/low VENC. | `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/inputs.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.dual_venc_ratio2` | float | `0.0` | `configs/loader.json` | Dual-VENC decision threshold used in the 4*LV alias-shift stage. Zero derives the threshold from high/low VENC. | `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/inputs.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.force_recompute` | bool | `false` | `configs/loader.json` | Ignore reusable embedded correction and estimate a fresh field; needed for a cold algorithm benchmark. | `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/inputs.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.write_cache` | bool | `true` | `configs/loader.json` | Allow newly computed correction to be stored in the source H5. Set false for read-only measurements. | `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/inputs.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
+| `dicom_backend` | string | `"dicom2h5"` | `configs/loader.json` | Compatibility setting: DICOM directories always convert through Dicom2H5. Legacy API/config native values migrate to dicom2h5. | `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/inputs.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
+| `dicom_h5_dir` | string | `""` | `configs/loader.json` | Destination directory for preserved Dicom2H5 outputs. Empty uses output_dir/_dicom_h5. Existing files cause an error; reopen the saved H5 to reuse it. | `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/inputs.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
+| `ignore_embedded_segmentation` | bool | `false` | `configs/loader.json` | Ignore source H5 segmentation while retaining image/velocity input; use to test a fresh segmentation path. | `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/inputs.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
 
 ## noise_removal
 
@@ -70,19 +68,19 @@ Code owner: `autoflow/algorithms/noise_removal.py`, `autoflow/core/pipeline.py`,
 
 ## phase_unwrapping
 
-Code owner: `autoflow/algorithms/phase_unwrapping.py`.
+Code owner: `autoflow/algorithms/phase_unwrapping/engine.py`.
 
 | Parameter | Type | Effective default | Where configured | Effect and units | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `mask_source` | string | `"auto"` | `configs/phase_unwrapping.json` | Mask source: auto selects none for gc3D/lap4D/NPRS and pcmra_std for PUDIP/GUST. Traditional methods allow none/segmask; learned methods also allow pcmra_std/pcmra_mean. segmask requires an active segmentation. | `autoflow/algorithms/phase_unwrapping.py` |
-| `device` | string | `"auto"` | `configs/phase_unwrapping.json` | Compute device selector: auto, cpu, or cuda. Backend-specific CPU work can remain even with cuda selected. | `autoflow/algorithms/phase_unwrapping.py` |
-| `tfc` | bool | `true` | `configs/phase_unwrapping.json` | Temporal flow consistency option of supported traditional methods; couples recovery across cardiac phases. | `autoflow/algorithms/phase_unwrapping.py` |
-| `lap4d_ts` | float | `2.0` | `configs/phase_unwrapping.json` | Temporal-axis scaling in the lap4D Laplacian operator; controls the balance of temporal and spatial constraints. | `autoflow/algorithms/phase_unwrapping.py` |
-| `nprs_upsampling_factor` | int | `2` | `configs/phase_unwrapping.json` | Spatial Fourier upsampling factor used only by NPRS; larger factors increase memory and resampling cost. | `autoflow/algorithms/phase_unwrapping.py` |
-| `nprs_pi_unwrap` | bool | `true` | `configs/phase_unwrapping.json` | Enable the additional pi-unwrapping pass of NPRS. | `autoflow/algorithms/phase_unwrapping.py` |
-| `nprs_auto_crop` | bool | `true` | `configs/phase_unwrapping.json` | Return NPRS output cropped to the original array extent after FFT padding. | `autoflow/algorithms/phase_unwrapping.py` |
-| `backend_params` | object | `{}` | `configs/phase_unwrapping.json` | Backend-specific nested objects, e.g. pudip and gust; supported adapter keys are listed below rather than passed blindly. | `autoflow/algorithms/phase_unwrapping.py` |
-| `write_output` | bool | `true` | `configs/phase_unwrapping.json` | Write phase_unwrap.npz when phase recovery runs; has no effect when the method is disabled or DV input skips recovery. | `autoflow/algorithms/phase_unwrapping.py` |
+| `mask_source` | string | `"auto"` | `configs/phase_unwrapping.json` | Mask source: auto selects none for gc3D/lap4D/NPRS and pcmra_std for PUDIP/GUST. Traditional methods allow none/segmask; learned methods also allow pcmra_std/pcmra_mean. segmask requires an active segmentation. | `autoflow/algorithms/phase_unwrapping/backends.py` |
+| `device` | string | `"auto"` | `configs/phase_unwrapping.json` | Compute device selector: auto, cpu, or cuda. Backend-specific CPU work can remain even with cuda selected. | `autoflow/algorithms/phase_unwrapping/backends.py` |
+| `tfc` | bool | `true` | `configs/phase_unwrapping.json` | Temporal flow consistency option of supported traditional methods; couples recovery across cardiac phases. | `autoflow/algorithms/phase_unwrapping/engine.py` |
+| `lap4d_ts` | float | `2.0` | `configs/phase_unwrapping.json` | Temporal-axis scaling in the lap4D Laplacian operator; controls the balance of temporal and spatial constraints. | `autoflow/algorithms/phase_unwrapping/laplacian.py` |
+| `nprs_upsampling_factor` | int | `2` | `configs/phase_unwrapping.json` | Spatial Fourier upsampling factor used only by NPRS; larger factors increase memory and resampling cost. | `autoflow/algorithms/phase_unwrapping/nprs.py` |
+| `nprs_pi_unwrap` | bool | `true` | `configs/phase_unwrapping.json` | Enable the additional pi-unwrapping pass of NPRS. | `autoflow/algorithms/phase_unwrapping/nprs.py` |
+| `nprs_auto_crop` | bool | `true` | `configs/phase_unwrapping.json` | Return NPRS output cropped to the original array extent after FFT padding. | `autoflow/algorithms/phase_unwrapping/nprs.py` |
+| `backend_params` | object | `{}` | `configs/phase_unwrapping.json` | Backend-specific nested objects, e.g. pudip and gust; supported adapter keys are listed below rather than passed blindly. | `autoflow/algorithms/phase_unwrapping/_common.py` |
+| `write_output` | bool | `true` | `configs/phase_unwrapping.json` | Write phase_unwrap.npz when phase recovery runs; has no effect when the method is disabled or DV input skips recovery. | `autoflow/processing.py` |
 
 ## skeleton
 
@@ -204,23 +202,23 @@ No active fields are shipped. This object is retained for legacy compatibility; 
 
 ## fluid
 
-Code owner: `autoflow/algorithms/metrics.py`.
+Code owner: `autoflow/algorithms/metrics/wss.py; autoflow/algorithms/metrics/pressure.py; autoflow/algorithms/metrics/tke.py`.
 
 | Parameter | Type | Effective default | Where configured | Effect and units | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `rho` | float | `1060.0` | `configs/fluid.json` | Blood density in kg/m^3, shared by pressure and TKE unless their module overrides it. | `autoflow/algorithms/metrics.py` |
-| `viscosity` | float | `4.0` | `configs/fluid.json` | Dynamic viscosity in mPa*s, shared by WSS and pressure unless their module overrides it. | `autoflow/algorithms/metrics.py` |
+| `rho` | float | `1060.0` | `configs/fluid.json` | Blood density in kg/m^3, shared by pressure and TKE unless their module overrides it. | `autoflow/algorithms/metrics/wss.py; autoflow/algorithms/metrics/pressure.py; autoflow/algorithms/metrics/tke.py` |
+| `viscosity` | float | `4.0` | `configs/fluid.json` | Dynamic viscosity in mPa*s, shared by WSS and pressure unless their module overrides it. | `autoflow/algorithms/metrics/wss.py; autoflow/algorithms/metrics/pressure.py; autoflow/algorithms/metrics/tke.py` |
 
 ## wss
 
-Code owner: `autoflow/algorithms/metrics.py`.
+Code owner: `autoflow/algorithms/metrics/wss.py`.
 
 | Parameter | Type | Effective default | Where configured | Effect and units | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `smoothing_iteration` | int | `200` | `configs/wss.json` | Taubin surface-smoothing iterations before normal sampling; zero retains the extracted voxel surface. | `autoflow/algorithms/metrics.py` |
-| `inward_distance` | string | `"auto"` | `configs/wss.json` | Wall-normal sampling step h in mm; auto uses the minimum voxel spacing. Parabolic fitting also probes 2h. | `autoflow/algorithms/metrics.py` |
-| `parabolic_fitting` | bool | `true` | `configs/wss.json` | True computes the exact wall derivative of a three-point quadratic vector fit; false uses the first-segment linear slope. | `autoflow/algorithms/metrics.py` |
-| `no_slip_condition` | bool | `true` | `configs/wss.json` | Set the wall velocity vector to zero by default. False samples the measured wall vector and increases sensitivity to partial volume and surface placement. | `autoflow/algorithms/metrics.py` |
+| `smoothing_iteration` | int | `200` | `configs/wss.json` | Taubin surface-smoothing iterations before normal sampling; zero retains the extracted voxel surface. | `autoflow/algorithms/metrics/wss.py` |
+| `inward_distance` | string | `"auto"` | `configs/wss.json` | Wall-normal sampling step h in mm; auto uses the minimum voxel spacing. Parabolic fitting also probes 2h. | `autoflow/algorithms/metrics/wss.py` |
+| `parabolic_fitting` | bool | `true` | `configs/wss.json` | True computes the exact wall derivative of a three-point quadratic vector fit; false uses the first-segment linear slope. | `autoflow/algorithms/metrics/wss.py` |
+| `no_slip_condition` | bool | `true` | `configs/wss.json` | Set the wall velocity vector to zero by default. False samples the measured wall vector and increases sensitivity to partial volume and surface placement. | `autoflow/algorithms/metrics/wss.py` |
 | `render.clim` | list | `[0.0, 5.0]` | `configs/wss.json` | Displayed scalar limits [lower,upper] in the metric's units; null selects the automatic range. Changes colours only, never numerical results. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
 | `render.show_scalar_bar` | bool | `true` | `configs/wss.json` | Show the metric scalar bar in the GUI/offline renderer. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
 | `render.bar_cfg.position_x` | float | `0.75` | `configs/wss.json` | Horizontal scalar-bar origin as a viewport fraction between zero and one. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
@@ -232,7 +230,7 @@ Code owner: `autoflow/algorithms/metrics.py`.
 
 ## tke
 
-Code owner: `autoflow/algorithms/data.py; autoflow/algorithms/metrics.py`.
+Code owner: `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/metrics/tke.py`.
 
 | Parameter | Type | Effective default | Where configured | Effect and units | Code owner |
 | --- | --- | --- | --- | --- | --- |
@@ -247,16 +245,16 @@ Code owner: `autoflow/algorithms/data.py; autoflow/algorithms/metrics.py`.
 
 ## pressure_gradient
 
-Code owner: `autoflow/algorithms/metrics.py`.
+Code owner: `autoflow/algorithms/metrics/pressure.py`.
 
 | Parameter | Type | Effective default | Where configured | Effect and units | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `method` | string | `"ppe"` | `configs/pressure_gradient.json` | `ppe` is the merged Cartesian pressure solver; `ste` is the staggered-grid Stokes estimator. Legacy `least_squares` is accepted as an alias for `ppe`. | `autoflow/algorithms/metrics.py` |
-| `smoothing_sigma` | float | `0.0` | `configs/pressure_gradient.json` | Spatial Gaussian smoothing width in voxels. Zero disables smoothing; valid-mask normalization prevents boundary attenuation. | `autoflow/algorithms/metrics.py` |
-| `support_erosion_iters` | int | `1` | `configs/pressure_gradient.json` | Additional conservative 26-neighbour erosion margin. Complete measured spatial and temporal derivative stencils are mandatory even at zero. | `autoflow/algorithms/metrics.py` |
-| `layer_opacity` | float | `0.6` | `configs/pressure_gradient.json` | PG layer opacity between zero (transparent) and one (opaque), affecting display only. | `autoflow/algorithms/metrics.py` |
-| `relative_pressure_opacity` | float | `0.6` | `configs/pressure_gradient.json` | Relative-pressure layer opacity between zero and one. | `autoflow/algorithms/metrics.py` |
-| `use_convective_acceleration` | bool | `true` | `configs/pressure_gradient.json` | Include (v dot grad)v in Navier-Stokes PG. Disabling omits real convective effects and is an explicit approximation. | `autoflow/algorithms/metrics.py` |
+| `method` | string | `"ppe"` | `configs/pressure_gradient.json` | `ppe` is the merged Cartesian pressure solver; `ste` is the staggered-grid Stokes estimator. Legacy `least_squares` is accepted as an alias for `ppe`. | `autoflow/algorithms/metrics/pressure.py` |
+| `smoothing_sigma` | float | `0.0` | `configs/pressure_gradient.json` | Spatial Gaussian smoothing width in voxels. Zero disables smoothing; valid-mask normalization prevents boundary attenuation. | `autoflow/algorithms/metrics/pressure.py` |
+| `support_erosion_iters` | int | `1` | `configs/pressure_gradient.json` | Additional conservative 26-neighbour erosion margin. Complete measured spatial and temporal derivative stencils are mandatory even at zero. | `autoflow/algorithms/metrics/pressure.py` |
+| `layer_opacity` | float | `0.6` | `configs/pressure_gradient.json` | PG layer opacity between zero (transparent) and one (opaque), affecting display only. | `autoflow/algorithms/metrics/pressure.py` |
+| `relative_pressure_opacity` | float | `0.6` | `configs/pressure_gradient.json` | Relative-pressure layer opacity between zero and one. | `autoflow/algorithms/metrics/pressure.py` |
+| `use_convective_acceleration` | bool | `true` | `configs/pressure_gradient.json` | Include (v dot grad)v in Navier-Stokes PG. Disabling omits real convective effects and is an explicit approximation. | `autoflow/algorithms/metrics/pressure.py` |
 | `render.clim` | optional / null | `null` | `configs/pressure_gradient.json` | Displayed scalar limits [lower,upper] in the metric's units; null selects the automatic range. Changes colours only, never numerical results. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
 | `render.show_scalar_bar` | bool | `true` | `configs/pressure_gradient.json` | Show the metric scalar bar in the GUI/offline renderer. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
 | `render.bar_cfg.position_x` | float | `0.75` | `configs/pressure_gradient.json` | Horizontal scalar-bar origin as a viewport fraction between zero and one. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
@@ -276,12 +274,12 @@ Code owner: `autoflow/algorithms/metrics.py`.
 
 ## vortex
 
-Code owner: `autoflow/algorithms/metrics.py`.
+Code owner: `autoflow/algorithms/metrics/vortex.py`.
 
 | Parameter | Type | Effective default | Where configured | Effect and units | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `smoothing_sigma` | float | `0.0` | `configs/vortex.json` | Spatial Gaussian velocity smoothing width in voxels before vortex derivatives; zero disables smoothing. | `autoflow/algorithms/metrics.py` |
-| `support_erosion_iters` | int | `1` | `configs/vortex.json` | Lumen-mask erosion iterations defining valid vortex derivative support. Zero disables the optional erosion. | `autoflow/algorithms/metrics.py` |
+| `smoothing_sigma` | float | `0.0` | `configs/vortex.json` | Spatial Gaussian velocity smoothing width in voxels before vortex derivatives; zero disables smoothing. | `autoflow/algorithms/metrics/vortex.py` |
+| `support_erosion_iters` | int | `1` | `configs/vortex.json` | Lumen-mask erosion iterations defining valid vortex derivative support. Zero disables the optional erosion. | `autoflow/algorithms/metrics/vortex.py` |
 
 ## pwv
 
@@ -315,39 +313,39 @@ Code owner: `autoflow/algorithms/pwv.py`.
 
 ## segmentation
 
-Code owner: `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py`.
+Code owner: `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py`.
 
 | Parameter | Type | Effective default | Where configured | Effect and units | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `visible` | bool | `true` | `configs/segmentation.json` | Initial visibility of segmentation surfaces in the 3D scene. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `opacity` | float | `0.35` | `configs/segmentation.json` | Segmentation surface opacity between zero and one. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `active_label` | int | `1` | `configs/segmentation.json` | Integer label painted or modified by the editor. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `editing_enabled` | bool | `false` | `configs/segmentation.json` | Initial enable state of segmentation editing; enables correction controls. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `tool` | string | `"brush"` | `configs/segmentation.json` | Editor tool selector, e.g. brush; controls how mouse edits modify the active mask. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `brush_radius` | int | `3` | `configs/segmentation.json` | Brush radius in voxel/pixel units of the editing slice. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `edit_all_timepoints` | bool | `true` | `configs/segmentation.json` | Apply a mask edit across all cardiac phases instead of the current phase only. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `cleanup_4d_components` | bool | `false` | `configs/segmentation.json` | Enable connected-component cleanup of the 4D segmentation. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `cleanup_4d_mode` | string | `"absolute"` | `configs/segmentation.json` | Component cleanup policy; absolute uses a physical-volume threshold. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `cleanup_4d_min_volume_mm3` | float | `50.0` | `configs/segmentation.json` | Minimum physical component volume in mm^3 for configured 4D cleanup. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `mode` | string | `"input"` | `configs/segmentation.json` | Segmentation workflow mode: use input, import an external mask, threshold scalar data, or run the automatic backend. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `input_source` | string | `"original"` | `configs/segmentation.json` | Choose which already loaded segmentation source becomes active; original refers to embedded input segmentation. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `import_path` | string | `""` | `configs/segmentation.json` | External H5/NPY/NPZ/NIfTI segmentation path; empty leaves import unconfigured. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `threshold_scalar` | string | `"pcmra"` | `configs/segmentation.json` | Scalar field thresholded to create a mask, such as pcmra, mag or velocity magnitude. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `threshold_value.mode` | string | `"manual"` | `configs/segmentation.json` | manual uses explicit scalar-range percentages; supported automatic modes choose thresholds from the image. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `threshold_value.min_percent` | float | `10.0` | `configs/segmentation.json` | Lower cutoff as a percentage of the selected scalar range. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `threshold_value.max_percent` | float | `100.0` | `configs/segmentation.json` | Upper cutoff as a percentage of the selected scalar range. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `threshold_keep_largest_cc` | bool | `true` | `configs/segmentation.json` | Keep only the largest threshold-derived connected component when enabled. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `threshold_min_component_volume_mm3` | float | `0.0` | `configs/segmentation.json` | Remove threshold-derived components below this physical volume in mm^3. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `threshold_closing` | bool | `true` | `configs/segmentation.json` | Apply binary closing to the threshold-derived mask. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `threshold_opening` | bool | `false` | `configs/segmentation.json` | Apply binary opening to the threshold-derived mask. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `auto_backend` | string | `"nnUNet4D"` | `configs/segmentation.json` | Automatic backend: nnUNet4D predicts phase-resolved temporal masks; nnUNet predicts a static mask copied over phases. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `auto_model` | string | `"auto"` | `configs/segmentation.json` | Model directory or auto profile. Auto resolves the backend-specific Dataset7020 temporal or Dataset7010 static model. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `auto_checkpoint` | string | `"auto"` | `configs/segmentation.json` | Checkpoint basename or auto. Auto chooses the profile's checkpoint; does not download a model. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `auto_folds` | string | `"single"` | `configs/segmentation.json` | single selects fold_all or the first available fold; all selects all numeric folds when available; a comma list selects explicit folds. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `auto_device` | string | `"auto"` | `configs/segmentation.json` | Inference device: auto selects CUDA when available, otherwise CPU. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `auto_label_map` | string | `""` | `configs/segmentation.json` | Optional file/string label mapping used to interpret automatic model output. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `force_recompute_auto_cache` | bool | `false` | `configs/segmentation.json` | Ignore previous automatic-segmentation artifacts and produce a new prediction. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
-| `write_auto_cache` | bool | `true` | `configs/segmentation.json` | Permit segmentation-cache writes into supported source H5 files. Set false for read-only benchmarking. | `autoflow/algorithms/segmentation.py; autoflow/ui/segmentation.py` |
+| `visible` | bool | `true` | `configs/segmentation.json` | Initial visibility of segmentation surfaces in the 3D scene. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `opacity` | float | `0.35` | `configs/segmentation.json` | Segmentation surface opacity between zero and one. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `active_label` | int | `1` | `configs/segmentation.json` | Integer label painted or modified by the editor. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `editing_enabled` | bool | `false` | `configs/segmentation.json` | Initial enable state of segmentation editing; enables correction controls. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `tool` | string | `"brush"` | `configs/segmentation.json` | Editor tool selector, e.g. brush; controls how mouse edits modify the active mask. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `brush_radius` | int | `3` | `configs/segmentation.json` | Brush radius in voxel/pixel units of the editing slice. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `edit_all_timepoints` | bool | `true` | `configs/segmentation.json` | Apply a mask edit across all cardiac phases instead of the current phase only. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `cleanup_4d_components` | bool | `false` | `configs/segmentation.json` | Enable connected-component cleanup of the 4D segmentation. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `cleanup_4d_mode` | string | `"absolute"` | `configs/segmentation.json` | Component cleanup policy; absolute uses a physical-volume threshold. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `cleanup_4d_min_volume_mm3` | float | `50.0` | `configs/segmentation.json` | Minimum physical component volume in mm^3 for configured 4D cleanup. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `mode` | string | `"input"` | `configs/segmentation.json` | Segmentation workflow mode: use input, import an external mask, threshold scalar data, or run the automatic backend. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `input_source` | string | `"original"` | `configs/segmentation.json` | Choose which already loaded segmentation source becomes active; original refers to embedded input segmentation. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `import_path` | string | `""` | `configs/segmentation.json` | External H5/NPY/NPZ/NIfTI segmentation path; empty leaves import unconfigured. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `threshold_scalar` | string | `"pcmra"` | `configs/segmentation.json` | Scalar field thresholded to create a mask, such as pcmra, mag or velocity magnitude. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `threshold_value.mode` | string | `"manual"` | `configs/segmentation.json` | manual uses explicit scalar-range percentages; supported automatic modes choose thresholds from the image. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `threshold_value.min_percent` | float | `10.0` | `configs/segmentation.json` | Lower cutoff as a percentage of the selected scalar range. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `threshold_value.max_percent` | float | `100.0` | `configs/segmentation.json` | Upper cutoff as a percentage of the selected scalar range. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `threshold_keep_largest_cc` | bool | `true` | `configs/segmentation.json` | Keep only the largest threshold-derived connected component when enabled. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `threshold_min_component_volume_mm3` | float | `0.0` | `configs/segmentation.json` | Remove threshold-derived components below this physical volume in mm^3. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `threshold_closing` | bool | `true` | `configs/segmentation.json` | Apply binary closing to the threshold-derived mask. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `threshold_opening` | bool | `false` | `configs/segmentation.json` | Apply binary opening to the threshold-derived mask. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `auto_backend` | string | `"nnUNet4D"` | `configs/segmentation.json` | Automatic backend: nnUNet4D predicts phase-resolved temporal masks; nnUNet predicts a static mask copied over phases. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `auto_model` | string | `"auto"` | `configs/segmentation.json` | Model directory or auto profile. Auto resolves the backend-specific Dataset7020 temporal or Dataset7010 static model. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `auto_checkpoint` | string | `"auto"` | `configs/segmentation.json` | Checkpoint basename or auto. Auto chooses the profile's checkpoint; does not download a model. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `auto_folds` | string | `"single"` | `configs/segmentation.json` | single selects fold_all or the first available fold; all selects all numeric folds when available; a comma list selects explicit folds. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `auto_device` | string | `"auto"` | `configs/segmentation.json` | Inference device: auto selects CUDA when available, otherwise CPU. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `auto_label_map` | string | `""` | `configs/segmentation.json` | Optional file/string label mapping used to interpret automatic model output. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `force_recompute_auto_cache` | bool | `false` | `configs/segmentation.json` | Ignore previous automatic-segmentation artifacts and produce a new prediction. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
+| `write_auto_cache` | bool | `true` | `configs/segmentation.json` | Permit segmentation-cache writes into supported source H5 files. Set false for read-only benchmarking. | `autoflow/algorithms/segmentation/nnunet_static.py; autoflow/ui/segmentation.py` |
 
 ## colorbar
 

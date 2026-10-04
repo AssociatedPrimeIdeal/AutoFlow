@@ -116,15 +116,14 @@ press `Ctrl+C` to end the process.
 
 The workflow navigation filters actions and parameters to the active task. Everyday controls remain visible; advanced skeleton, WSS, and pressure parameters are hidden until `Advanced` is enabled, while vortex controls remain visible in Hemodynamics. In `Hemodynamics`, plane metrics, derived metrics, live streamlines, and pathlines form a 2x2 action grid; `Run All` and `Compute PWV` are full-width rows below it. The segmentation dock appears only in the Segmentation stage, and the Analysis dock appears in Hemodynamics and Review. The status beside the navigation reports `Ready`, `Needs review`, `Incomplete`, or `Not ready` from current workspace prerequisites.
 
-Input also provides `Reload Input with Current Parameters`. An unchanged input signature is skipped; changed geometry, VENC, dual-VENC ratios or DICOM overrides reload the source and invalidate downstream artifacts. Correction settings live in **Correction** and run through explicit actions. Background correction and unwrapping update working velocity while retaining existing downstream artifacts until manually rerun. Corr content becomes available only after correction is applied or reused.
+Input also provides `Reload Input with Current Parameters`. An unchanged input signature is skipped; changed geometry, VENC, dual-VENC ratios reload the source and invalidate downstream artifacts. Correction settings live in **Correction** and run through explicit actions. Background correction and unwrapping update working velocity while retaining existing downstream artifacts until manually rerun. Corr content becomes available only after correction is applied or reused.
 
 ## File Menu
 
 | Menu item | What it does | Main code |
 | --- | --- | --- |
-| `Open H5` | open an H5 or HDF5 case; prompts for a data-group path when one file contains multiple supported cases, asks for `LV`, `HV`, or `DV` for legacy dual-VENC data, then loads acquisition data and any embedded segmentation; correction runs explicitly in Correction | `autoflow/ui/app.py`, `autoflow/ui/dicom_confirm.py` |
-| `Import DICOM Directory` | scan a DICOM directory and choose a case using the native loader | `autoflow/ui/app.py`, `autoflow/ui/dicom_confirm.py` |
-| `Import DICOM via Dicom2H5...` | convert to a new reusable H5 in a background worker, validate it, select a group if needed, and load it | `autoflow/ui/app.py`, `autoflow/algorithms/dicom_conversion.py` |
+| `Open H5` | open an H5 or HDF5 case; prompts for a data-group path when one file contains multiple supported cases, asks for `LV`, `HV`, or `DV` for legacy dual-VENC data, then loads acquisition data and any embedded segmentation; correction runs explicitly in Correction | `autoflow/ui/app.py`, `autoflow/ui/input_dialogs.py` |
+| `Import DICOM Directory` | convert through Dicom2H5 to a new reusable H5 in a background worker, validate it, select a group if needed, and load it | `autoflow/ui/app.py`, `autoflow/algorithms/dicom_conversion.py`, `autoflow/ui/input_dialogs.py` |
 | `Clear Workspace` | clear loaded data and restore config defaults in the UI | `autoflow/ui/app.py` |
 | `Exit` | close the GUI | `autoflow/ui/app.py` |
 
@@ -149,7 +148,7 @@ Input also provides `Reload Input with Current Parameters`. An unchanged input s
 1. start the GUI
 2. load through `Open H5` or `Import DICOM Directory`; select `LV`, `HV` or `DV` for legacy dual-VENC H5
 3. inspect inputs in `Input & QC`; H5 loads embedded segmentation when available and leaves correction for the explicit Correction stage
-4. for DICOM, confirm or edit resolution, venc, spatial order, venc order, and RR
+4. for DICOM, choose a new H5 destination and review the converted acquisition calibration
 5. open `Correction`, configure background correction and noise masking, then click `Run All` for Background Correction → Noise Removal → Unwrap Phase → Generate PC-MRA (default `lap4D`, mask `none`)
 6. in the `Segmentation` workflow stage, configure nnUNet if needed and click `Run Automatic Segmentation` explicitly
 7. after segmentation, optionally return to `Correction > Phase Unwrapping`, choose a method and `segmask` for masked refinement, and click `Unwrap Phase`; existing downstream results stay available until manually rerun
@@ -199,10 +198,10 @@ datasets. Progress still advances once per completed plane.
 
 | Panel | Main purpose | Main code |
 | --- | --- | --- |
-| `Input Parameters` | input geometry and DICOM overrides; explicit reload | `autoflow/ui/app.py`, `autoflow/config.py` |
+| `Input Parameters` | input geometry and calibration; explicit reload | `autoflow/ui/app.py`, `autoflow/config.py` |
 | `Background Correction` | Correction action settings: `MSAC` or `WRLS + ARTO`, fit order and dual-VENC ratios | `autoflow/ui/app.py`, `autoflow/core/pipeline.py` |
 | `Noise Removal (PC-MRA Rendering Only)` | magnitude and temporal velocity SD display filter, plus reset | `autoflow/ui/app.py`, `autoflow/algorithms/noise_removal.py` |
-| `Segmentation Parameters` | choose 3D or 4D automatic segmentation and configure its model path, checkpoint, folds, device, and label map | `autoflow/ui/app.py`, `autoflow/core/models.py`, `autoflow/algorithms/segmentation.py` |
+| `Segmentation Parameters` | choose 3D or 4D automatic segmentation and configure its model path, checkpoint, folds, device, and label map | `autoflow/ui/app.py`, `autoflow/core/models.py`, `autoflow/algorithms/segmentation/nnunet_static.py` |
 | `Generate Skeleton Parameters` | cleanup and morphology controls, including `Special Handling`, `Minimum Edge Count`, and the `Separate Special Label Contacts` switch for `RBCT`/`CCA`/`LBCT` contacts | `autoflow/ui/app.py`, `autoflow/config.py`, `autoflow/algorithms/graph.py` |
 | `Generate Planes Parameters` | uniform/fixed-step layout, segmentation filter, and advanced trim controls | `autoflow/ui/app.py` |
 | `PWV Parameters` | edit groups, waveform selection, spacing, and plot styling | `autoflow/ui/app.py` |

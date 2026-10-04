@@ -19,9 +19,7 @@
     "force_recompute": false,
     "write_cache": true
   },
-  "dicom_parameter_overrides": {},
-  "dicom_read_workers": 1,
-  "dicom_backend": "native",
+  "dicom_backend": "dicom2h5",
   "dicom_h5_dir": "",
   "ignore_embedded_segmentation": false
 }

@@ -5,6 +5,14 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 
+def normalize_dicom_backend(value="dicom2h5"):
+    """Migrate the retired native setting to the sole Dicom2H5 route."""
+    token = str(value or "dicom2h5").strip().lower()
+    if token in {"native", "dicom2h5"}:
+        return "dicom2h5"
+    raise ValueError(f"Unknown DICOM backend: {value}; Dicom2H5 is the only supported route")
+
+
 @dataclass
 class LoaderCapabilities:
     has_segmentation: bool = False

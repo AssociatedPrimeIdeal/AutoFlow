@@ -1,3 +1,4 @@
+from .case_types import normalize_dicom_backend
 import copy
 import json
 from pathlib import Path
@@ -242,9 +243,7 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
             "force_recompute": False,
             "write_cache": True,
         },
-        "dicom_parameter_overrides": {},
-        "dicom_read_workers": 1,
-        "dicom_backend": "native",
+        "dicom_backend": "dicom2h5",
         "dicom_h5_dir": "",
         "ignore_embedded_segmentation": False,
     },
@@ -841,8 +840,7 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
         "phase_unwrap_nprs_pi_unwrap": bool(unwrap_cfg.get("nprs_pi_unwrap", True)),
         "phase_unwrap_nprs_auto_crop": bool(unwrap_cfg.get("nprs_auto_crop", True)),
         "phase_unwrap_backend_params": copy.deepcopy(unwrap_cfg.get("backend_params", {}) or {}),
-        "dicom_read_workers": int(loader_cfg.get("dicom_read_workers", 1)),
-        "dicom_backend": str(loader_cfg.get("dicom_backend", "native")),
+        "dicom_backend": normalize_dicom_backend(loader_cfg.get("dicom_backend", "dicom2h5")),
         "dicom_h5_dir": str(loader_cfg.get("dicom_h5_dir", "")),
         "ignore_embedded_segmentation": bool(loader_cfg.get("ignore_embedded_segmentation", False)),
         "plane_mode": str(plane_cfg.get("plane_mode", "fixed_step") or "fixed_step"),

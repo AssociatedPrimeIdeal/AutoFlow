@@ -38,7 +38,7 @@ This page explains where the major runtime responsibilities live so maintainers 
 
 ## Core Data Flow
 
-1. loader returns `LoadedCase`
+1. DICOM directories convert through Dicom2H5; the H5 loader returns `LoadedCase`
 2. workspace stores normalized source arrays and metadata
 3. optional Correction runs background correction → display noise mask → phase unwrap → PC-MRA generation before segmentation; segmentation availability then controls downstream eligibility
 4. skeleton feeds graph and paths
@@ -50,12 +50,32 @@ This page explains where the major runtime responsibilities live so maintainers 
 
 ### Temporal segmentation path
 
-`autoflow/algorithms/segmentation.py:generate_nnunet_4d_auto_segmentation()`
+`autoflow/algorithms/segmentation/nnunet_temporal.py:generate_nnunet_4d_auto_segmentation()`
 constructs one nnUNet sample per cardiac frame from the Dataset7020 temporal
 channels, invokes the checkpoint once, and restores an `XYZT` label volume.
 `auto_folds=single` selects one checkpoint; `all` passes every available fold
 to nnUNet's ensemble predictor. Topology preprocessing uses a 3D majority
 vote, while `Workspace.segmask_binary` remains temporal for phase-wise metrics.
+
+## Metric implementation boundaries
+
+`autoflow/algorithms/metrics/` separates numerical families and plane work by responsibility. `__init__.py` preserves existing `from autoflow.algorithms.metrics import ...` entry points, including the legacy helper imports used by the GUI and pressure phantom suite. Function signatures, numerical formulas, optional-family selection and output schemas are unchanged.
+
+`sampling.py` owns support geometry, ROI selection, representative-mask lookup and slice caches shared by `planes.py`, `plane_derived.py` and `wss.py`. `consistency.py` owns path, label and fork QC. WSS, TKE, pressure and vortex calculations live in their respective modules; `derived.py` combines only the requested families. `export.py` owns pixelwise H5 publication and metric-table loading. `_common.py` normalizes array shapes and `_parallel.py` transports cancellation/progress for isolated plane workers.
+
+Implementation modules import their dependencies directly, without importing the package entry point. This keeps the dependency graph acyclic and leaves geometry caches with one owner. When instrumenting a helper in tests, patch its implementation module; changing a re-export does not replace the helper used inside another module. See [Modules and code ownership](feature-to-code-map.md) for the file-level map.
+
+## Loader and segmentation boundaries
+
+`autoflow/algorithms/inputs.py` handles input dispatch. It sends DICOM directories to the pinned Dicom2H5 adapter and loads the resulting H5 cases; vendor decoding is owned by that dependency. `data/` separates H5 metadata/discovery, canonical array normalization, coordinate conversion, correction-cache IO and dual-VENC decoding. Existing `autoflow.algorithms.data` imports remain available.
+
+`segmentation/` separates label IO and thresholding from nnUNet models, channel preparation, runtime commands and static/temporal/grouped inference. Its package entry point preserves existing segmentation imports. Backend code uses direct implementation imports. Tests patch helpers at the call site in their implementation module rather than replacing package re-exports. Checkout-relative model/runtime paths retain their original roots after the move.
+
+## Phase-unwrapping boundaries
+
+`autoflow/algorithms/phase_unwrapping/__init__.py` preserves the original imports, signatures and result dictionary. `engine.py` validates the request, dispatches components/backends and builds diagnostics. `backends.py` owns method aliases, allowed mask sources, optional dependency checks and CPU/CUDA selection; `_common.py` owns canonical array and learned-weight normalization.
+
+`pudip.py` and `gust.py` adapt their upstream layouts and convert recovered velocity to phase. `laplacian.py`, `nprs.py` and `graphcut.py` own both CPU and Torch implementations of each traditional algorithm. Shared Fourier helpers live in `fourier.py`, PUMA in `_puma.py`, total-field correction in `_common.py`, and the legacy local-gradient method in `brute.py`. `cpu.py` owns `unwrap_data` dispatch and its low-level return contract. All callers use the unified owners; the former standalone traditional package is removed. Each implementation imports its dependencies directly, so the package facade is not part of the internal dependency graph. Patch an implementation helper where it is called when instrumenting manual checks.
 
 ## Design Constraints To Keep
 - `LoadedCase` normalization is the contract between loaders and the rest of the system
@@ -72,7 +92,7 @@ vote, while `Workspace.segmask_binary` remains temporal for phase-wise metrics.
 
 Plane metrics cache thresholded support geometry per unique mask phase and slice specifications per plane and representative phase. WSS caches the extracted and smoothed base surface per unique mask phase, then copies that geometry before attaching phase-specific arrays. Geometry caches must never share mutable phase-specific scalar data.
 
-Long-running compute-oriented GUI pipeline steps are dispatched by `_PipelineTaskWorker` in `autoflow/ui/app.py`. The worker computes each step in a detached copy of mutable workspace containers, sharing read-only numerical inputs. It publishes only completed successful steps. An application-modal progress dialog prevents competing user actions until the thread stops; scene cache invalidation and VTK actor refresh happen on the GUI thread after completion. Interactive editors and live streamlines use their existing scene paths; pathlines have a separate cancellable worker. H5/DICOM loading, DICOM scan/preview, segmentation preparation and Labeler exchange use the shared background function runner. Case loading retains the current workspace until the replacement load succeeds.
+Long-running compute-oriented GUI pipeline steps are dispatched by `_PipelineTaskWorker` in `autoflow/ui/app.py`. The worker computes each step in a detached copy of mutable workspace containers, sharing read-only numerical inputs. It publishes only completed successful steps. An application-modal progress dialog prevents competing user actions until the thread stops; scene cache invalidation and VTK actor refresh happen on the GUI thread after completion. Interactive editors and live streamlines use their existing scene paths; pathlines have a separate cancellable worker. H5 loading, Dicom2H5 conversion, segmentation preparation and Labeler exchange use the shared background function runner. Case loading retains the current workspace until the replacement load succeeds.
 
 `autoflow/task_control.py` owns thread-local cancellation/progress scopes and task-owned subprocess termination. `autoflow/ui/progress.py` owns application modality, input filtering, animated activity, elapsed/update age, and the close-to-cancel lifecycle. A progress window is dismissed only after worker termination. × requests cancellation; Escape does not dismiss the task lock. Native calculations and file writes stop at safe boundaries.
 

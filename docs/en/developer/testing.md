@@ -58,3 +58,13 @@ Smoke/phantom checks also cover absent PC-MRA before explicit generation, PC-MRA
 ## Task and geometry smoke coverage
 
 The retained smoke file covers frame-specific plane ROI sampling, static slice reuse, serial/process derived equivalence, segmentation topology retention/invalidation, modal input locking and cancellation without partial workspace publication. Qt checks use `QT_QPA_PLATFORM=offscreen` and skip only when the optional PySide6 runtime is absent. Real-data speed comparisons and rendering-process checks are recorded in [Performance](performance.md); no private validation data is copied into tests.
+
+## Algorithm module refactors
+
+The retained smoke suite checks default Dicom2H5 directory dispatch, legacy native-setting migration, preserved ambiguous multi-group conversions and absence of TKE for magnitude/velocity input. H5 and segmentation package re-exports preserve imports; helper instrumentation patches the implementation call site. Existing geometry/progress phantoms require one parent-thread callback per completed plane even when worker markers arrive together.
+
+### Phase-unwrapping refactors
+
+Keep the existing package imports and compare phase, velocity, wrap counts, masks and statistics against a small synthetic baseline. CPU traditional solvers and Torch operations on CPU can validate structural moves without a CUDA run; lightweight PUDIP/GUST stand-ins validate the adapter contracts without full training. These checks do not establish real learned-backend quality or CUDA performance. Full backend/device runs are manual checks, and no separate targeted pytest file is required.
+
+The traditional CPU implementation is merged into the same phase-unwrapping owners as its Torch paths. Import low-level methods from `phase_unwrapping.cpu` and helpers from their algorithm modules; no standalone traditional package or compatibility forwards remain. Compare `lap3D`, `lap4D`, NPRS, graph-cut and local-gradient modes through `unwrap_data`, and verify Fourier pad/crop/shift helpers after removing duplicate definitions. CPU algorithm functions should retain their original bodies and low-level signatures.

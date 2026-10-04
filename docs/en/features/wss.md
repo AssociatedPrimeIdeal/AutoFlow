@@ -52,7 +52,7 @@ Segmentation, smoothing and sample distance affect estimates. A sample reaching 
 
 ## Where to change code
 
-`autoflow/algorithms/metrics.py` (`calculate_gradient`, `cal_wss_from_surf`, `compute_wss_metrics`); caching and plane wiring: `autoflow/core/pipeline.py`; views: `autoflow/ui/viewer.py`, `autoflow/ui/ortho_viewer.py`.
+`autoflow/algorithms/metrics/wss.py` (`calculate_gradient`, `cal_wss_from_surf`, `compute_wss_metrics`); caching and plane wiring: `autoflow/core/pipeline.py`; views: `autoflow/ui/viewer.py`, `autoflow/ui/ortho_viewer.py`.
 
 ## Tests
 

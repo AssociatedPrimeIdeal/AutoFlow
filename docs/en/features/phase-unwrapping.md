@@ -40,7 +40,7 @@ The loader must provide canonical `phase_wrapped` (`X,Y,Z,T,3`). Normalized H5 a
 
 | Parameter / flag | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `mask_source` / `--phase-unwrap-mask` / API `phase_unwrap_mask` | string | `auto` | JSON, GUI, CLI/API | `auto` resolves by method as described above; `none` uses the whole volume | `autoflow/algorithms/phase_unwrapping.py`, `autoflow/core/pipeline.py` |
+| `mask_source` / `--phase-unwrap-mask` / API `phase_unwrap_mask` | string | `auto` | JSON, GUI, CLI/API | `auto` resolves by method as described above; `none` uses the whole volume | `autoflow/algorithms/phase_unwrapping/backends.py`, `autoflow/core/pipeline.py` |
 
 
 See [phase unwrapping parameters](../user/parameters.md#phase_unwrapping), [CLI flags](../user/cli-parameters.md), and [API fields](../user/api-parameters.md) for complete type/default/unit/effect/owner tables. Dictionary controls are expanded in [Structured parameters](../user/parameter-schemas.md).
@@ -63,11 +63,34 @@ When the `pu` extra is not installed, PUDIP-Flow and GUST-Flow are hidden from t
 
 ## Where to change code
 
-Backend adapter: `autoflow/algorithms/phase_unwrapping.py`; upstream sources: `third_party/PUDIP-Flow` and `third_party/GUST-Flow`; pipeline/state: `autoflow/core/pipeline.py` and `autoflow/core/models.py`; GUI: `autoflow/ui/app.py` and `autoflow/ui/ortho_viewer.py`.
+Existing imports from `autoflow.algorithms.phase_unwrapping` remain valid. The package entry point re-exports the original functions; numerical work lives in the modules below.
+
+| Change you want | Edit here | Also check | Tests |
+| --- | --- | --- | --- |
+| method aliases, allowed masks, dependency checks or device selection | `autoflow/algorithms/phase_unwrapping/backends.py` | `autoflow/cli.py`, `autoflow/ui/app.py` | `tests/test_smoke_phantoms.py` |
+| phase/VENC shape validation or learned mask weights | `autoflow/algorithms/phase_unwrapping/_common.py` | `autoflow/core/pipeline.py` | smoke/phantom suite and a synthetic array check |
+| dispatch, component order or wrap diagnostics | `autoflow/algorithms/phase_unwrapping/engine.py` | `autoflow/core/pipeline.py`, `autoflow/core/models.py` | smoke/phantom suite |
+| PUDIP-Flow adapter | `autoflow/algorithms/phase_unwrapping/pudip.py` | `third_party/PUDIP-Flow` | synthetic adapter check; manual real-backend verification |
+| GUST-Flow adapter or CUDA error messages | `autoflow/algorithms/phase_unwrapping/gust.py` | `third_party/GUST-Flow` | synthetic adapter check; manual CUDA verification |
+| CPU/Torch Laplacian, NPRS resampling or masked graph recovery | `autoflow/algorithms/phase_unwrapping/laplacian.py`, `autoflow/algorithms/phase_unwrapping/nprs.py`, `autoflow/algorithms/phase_unwrapping/graphcut.py` | `autoflow/algorithms/phase_unwrapping/_puma.py`, `autoflow/algorithms/phase_unwrapping/fourier.py` | synthetic phase comparison plus smoke/phantom suite |
+| shared total-field correction | `autoflow/algorithms/phase_unwrapping/_common.py` | `autoflow/algorithms/phase_unwrapping/cpu.py`, `autoflow/algorithms/phase_unwrapping/engine.py` | temporal synthetic phase comparison |
+| CPU dispatch or local-gradient recovery | `autoflow/algorithms/phase_unwrapping/cpu.py`, `autoflow/algorithms/phase_unwrapping/brute.py` | `autoflow/algorithms/phase_unwrapping/engine.py` | synthetic legacy-mode comparison |
+| pipeline state, exports or GUI workflow | `autoflow/core/pipeline.py`, `autoflow/core/models.py`, `autoflow/ui/app.py`, `autoflow/ui/ortho_viewer.py` | `autoflow/processing.py` | `tests/test_smoke_phantoms.py` and manual GUI review |
+
+CPU and Torch implementations now share the same algorithm modules under `autoflow/algorithms/phase_unwrapping/`. `cpu.py` owns `unwrap_data` dispatch. All implementation and imports use this unified package. Numerical formulas are unchanged. `fourier.py` contains one copy of each shared Fourier helper, replacing the identical duplicate definitions in the former `fourierOperators.py`. Implementation modules import their owners directly and do not import the package facade.
+
+For low-level CPU calls, use `from autoflow.algorithms.phase_unwrapping.cpu import unwrap_data`. Low-level modes (`lap3D`, `brute`, `gc4D`) remain available through `unwrap_data`; the GUI/CLI `method` choices remain those listed above. The old standalone traditional package has been removed without forwarding modules.
 
 ## Tests
 
-`pytest tests/test_smoke_phantoms.py tests/test_pressure_gradient_phantom.py -q`
+Activate `autoflow311`, then run the retained suite:
+
+```bash
+conda activate autoflow311
+python -m pytest tests/test_smoke_phantoms.py tests/test_pressure_gradient_phantom.py -q
+```
+
+For structural refactors, manually compare wrapped/unwrapped phase, velocity, signed wrap counts, masks and statistics on a small synthetic phase volume. Check learned adapters with lightweight stand-ins; full PUDIP/GUST fitting and actual CUDA execution require separate manual validation. Patch helpers at their implementation call site rather than on package re-exports. Keep automated tests within the two retained smoke/phantom files.
 
 ## Common problems
 

@@ -25,6 +25,8 @@ CLI-only install:
 pip install .
 ```
 
+For DICOM directories, initialize `third_party/4DFlow_Dicom2H5` and install `.[dicom]` before importing; conversion saves a reusable H5. H5-only analysis needs no converter.
+
 Both normal and editable installs include the bundled nnUNet final checkpoint and its required metadata. The `gui` extra installs both the GUI and nnUNet inference dependencies; there is no separate automatic-segmentation extra.
 
 To enable the optional SpatioTemporal Labeler `v0.4.7` exchange workflow, initialize the pinned source submodule and install its extra:
@@ -83,7 +85,7 @@ autoflow-gui
 
 Typical GUI flow:
 
-1. `File > Open H5` or `File > Import DICOM Directory`
+1. `File > Open H5` or `File > Import DICOM Directory` (converts to a new H5 first)
 2. inspect the case in the 3D view and ortho viewer
 3. if needed, choose or generate segmentation
 4. click `Run All`

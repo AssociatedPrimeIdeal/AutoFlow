@@ -73,7 +73,7 @@ Low-level Python users can call `augment_plane_metrics_with_derived(...)` with:
 
 | Parameter | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `use_multithread` | bool | `False` | function keyword; pipeline uses its plane-computation setting | Automatically use up to four isolated processes at 1920 plane-phases or more | `autoflow/algorithms/metrics.py` |
+| `use_multithread` | bool | `False` | function keyword; pipeline uses its plane-computation setting | Automatically use up to four isolated processes at 1920 plane-phases or more | `autoflow/algorithms/metrics/plane_derived.py` |
 | `max_workers` | int or None | `None` | function keyword | Override derived-sampling process count; one selects serial | same |
 | `progress_callback` | callable or None | `None` | function keyword | Receive completed-plane dictionaries on the calling thread | same |
 
@@ -122,6 +122,8 @@ Low-level Python users can call `augment_plane_metrics_with_derived(...)` with:
 
 Process parallelism now accounts for temporal workload: below 128 planes, 1920 or more plane-phase evaluations use up to four processes; smaller workloads remain serial. At least 128 planes retain up to eight processes. Shared input memmaps avoid copying full arrays into each worker. The controlled 96-plane/20-phase comparison preserved metric and QC results; see [Performance](../developer/performance.md).
 
+Plane progress callbacks report every completed plane on the calling thread, including when several worker markers are collected in one poll.
+
 Plane pixelwise H5 output is written privately and replaces the previous file only after a complete write. Cancelling or failing that export retains the previous complete file; its schema is unchanged.
 
 ## Limitations
@@ -138,11 +140,17 @@ Plane pixelwise H5 output is written privately and replaces the previous file on
 
 | Change you want | Edit here | Also check | Tests |
 | --- | --- | --- | --- |
-| plane metric computation | `autoflow/algorithms/metrics.py` | `autoflow/core/pipeline.py` | `tests/test_smoke_phantoms.py`, `tests/test_pressure_gradient_phantom.py` |
+| plane flow, area, velocity and process dispatch | `autoflow/algorithms/metrics/planes.py` | `autoflow/core/pipeline.py` | `tests/test_smoke_phantoms.py`, `tests/test_pressure_gradient_phantom.py` |
+| support geometry, ROI selection and sampling caches | `autoflow/algorithms/metrics/sampling.py` | `autoflow/ui/ortho_viewer.py` | `tests/test_smoke_phantoms.py` |
+| path, label and fork internal consistency | `autoflow/algorithms/metrics/consistency.py` | `autoflow/quality.py` | `tests/test_smoke_phantoms.py` |
+| derived per-plane summaries and sample payloads | `autoflow/algorithms/metrics/plane_derived.py` | `autoflow/algorithms/metrics/derived.py` | `tests/test_smoke_phantoms.py`, `tests/test_pressure_gradient_phantom.py` |
+| pixelwise H5 publication and metric-table loading | `autoflow/algorithms/metrics/export.py` | `autoflow/core/pipeline.py` | `tests/test_smoke_phantoms.py` |
 | plane metric save format | `autoflow/core/pipeline.py`, `autoflow/plane_io.py` | `autoflow/reporting.py` | `tests/test_pressure_gradient_phantom.py` |
 | GUI plane metric refresh and PWV dock | `autoflow/ui/app.py`, `autoflow/ui/ortho_viewer.py` | `autoflow/core/pipeline.py`, `autoflow/algorithms/pwv.py` | GUI manual verification |
 
 ## Tests
+
+The existing `autoflow.algorithms.metrics` import path remains supported. Numerical implementations live in the modules above; helper instrumentation should patch the owning module, such as `metrics.sampling` or `metrics.wss`.
 
 - `/home/renyuyang/miniconda3/envs/autoflow311/bin/python -m pytest tests/test_smoke_phantoms.py -q`
 - `/home/renyuyang/miniconda3/envs/autoflow311/bin/python -m pytest tests/test_pressure_gradient_phantom.py -q`

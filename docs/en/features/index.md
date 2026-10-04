@@ -18,7 +18,7 @@ flowchart LR
 
 | Stage | Feature and purpose | Entry points |
 | --- | --- | --- |
-| DICOM conversion | [DICOM loading and conversion](dicom-loading.md): direct or preserved H5 input route | GUI / CLI / Python; converter optional |
+| DICOM conversion | [DICOM loading and conversion](dicom-loading.md): Dicom2H5 conversion followed by H5 loading | GUI / CLI / Python; converter optional |
 | Input | [Inputs](../user/inputs.md): formats, coordinate mapping, cm/s, mm and RR | GUI / CLI / Python |
 | Correction | [Background phase correction](background-phase-correction.md): static-tissue offsets | GUI / CLI / Python |
 | Correction | [Noise removal](noise-removal.md): PC-MRA display-region screening | GUI / CLI / Python |

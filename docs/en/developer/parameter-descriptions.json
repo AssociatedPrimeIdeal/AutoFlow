@@ -32,10 +32,8 @@
       "background_phase_correction.dual_venc_ratio2": "Dual-VENC decision threshold used in the 4*LV alias-shift stage. Zero derives the threshold from high/low VENC.",
       "background_phase_correction.force_recompute": "Ignore reusable embedded correction and estimate a fresh field; needed for a cold algorithm benchmark.",
       "background_phase_correction.write_cache": "Allow newly computed correction to be stored in the source H5. Set false for read-only measurements.",
-      "dicom_parameter_overrides": "Object of explicit DICOM metadata replacements; see the supported keys and units in the input contract. Does not rewrite DICOM files.",
-      "dicom_read_workers": "Number of concurrent DICOM file readers. One is conservative for network storage; more readers can increase I/O contention.",
       "ignore_embedded_segmentation": "Ignore source H5 segmentation while retaining image/velocity input; use to test a fresh segmentation path.",
-      "dicom_backend": "DICOM directory route: native loads recognized cases directly; dicom2h5 converts through the optional pinned converter and processes all resulting H5 groups. Explicit H5 files are unaffected.",
+      "dicom_backend": "Compatibility setting: DICOM directories always convert through Dicom2H5 before H5 loading. Legacy native values migrate to dicom2h5; explicit H5 files are unaffected.",
       "dicom_h5_dir": "Destination directory for preserved Dicom2H5 outputs. Empty uses output_dir/_dicom_h5. Existing files cause an error; reopen the saved H5 to reuse it."
     },
     "phase_unwrapping": {
@@ -252,7 +250,7 @@
   "api": {
     "inputs": {
       "path": null,
-      "effect": "H5/HDF5 or DICOM files/directories to discover. H5 directory discovery is top-level; nested H5 case groups become separate cases."
+      "effect": "H5/HDF5 files, H5 batch directories, or DICOM acquisition directories to discover. H5 directory discovery is top-level; nested H5 case groups become separate cases."
     },
     "config_dir": {
       "path": null,
@@ -369,10 +367,6 @@
     "background_phase_write_cache": {
       "path": "loader.background_phase_correction.write_cache",
       "effect": "Allow newly computed correction to be stored in the source H5. Set false for read-only measurements."
-    },
-    "dicom_read_workers": {
-      "path": "loader.dicom_read_workers",
-      "effect": "Number of concurrent DICOM file readers. One is conservative for network storage; more readers can increase I/O contention."
     },
     "ignore_embedded_segmentation": {
       "path": "loader.ignore_embedded_segmentation",
@@ -764,7 +758,7 @@
     },
     "dicom_backend": {
       "path": "loader.dicom_backend",
-      "effect": "DICOM directory route: native loads recognized cases directly; dicom2h5 converts through the optional pinned converter and processes all resulting H5 groups. Explicit H5 files are unaffected."
+      "effect": "Compatibility setting: DICOM directories always convert through Dicom2H5 before H5 loading. Legacy native values migrate to dicom2h5; explicit H5 files are unaffected."
     },
     "dicom_h5_dir": {
       "path": "loader.dicom_h5_dir",

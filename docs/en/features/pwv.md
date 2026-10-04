@@ -89,7 +89,7 @@ See [pwv parameters](../user/parameters.md#pwv), [CLI flags](../user/cli-paramet
 | --- | --- | --- | --- |
 | PWV algorithm | `autoflow/algorithms/pwv.py` | `autoflow/core/pipeline.py` | manual verification plus retained smoke/phantom suite |
 | PWV scene registration | `autoflow/core/pipeline.py` | `autoflow/ui/viewer.py` | GUI manual verification |
-| Analysis dock, PWV panel, plane curves, and internal-consistency views | `autoflow/ui/app.py` | `autoflow/algorithms/pwv.py`, `autoflow/algorithms/metrics.py` | GUI manual verification |
+| Analysis dock, PWV panel, plane curves, and internal-consistency views | `autoflow/ui/app.py` | `autoflow/algorithms/pwv.py`, `autoflow/algorithms/metrics/planes.py`, `autoflow/algorithms/metrics/consistency.py` | GUI manual verification |
 
 ## Tests
 - `/home/renyuyang/miniconda3/envs/autoflow311/bin/python -m pytest tests/test_smoke_phantoms.py tests/test_pressure_gradient_phantom.py -q`

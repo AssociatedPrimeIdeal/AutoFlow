@@ -419,11 +419,7 @@ class PipelineEngine:
                 getattr(ws.loader_params, "ignore_embedded_segmentation", False)
             ),
         }
-        dicom_overrides = ws.loader_params.dicom_parameter_overrides.to_loader_kwargs()
-        if dicom_overrides:
-            load_kwargs["parameter_overrides"] = dicom_overrides
-        load_kwargs["dicom_read_workers"] = int(getattr(ws.loader_params, "dicom_read_workers", 1) or 1)
-        load_kwargs["dicom_backend"] = getattr(ws.loader_params, "dicom_backend", "native")
+        load_kwargs["dicom_backend"] = getattr(ws.loader_params, "dicom_backend", "dicom2h5")
         load_kwargs["dicom_h5_dir"] = getattr(ws.loader_params, "dicom_h5_dir", "")
         source_metadata = getattr(load_target, "metadata", {}) if not isinstance(load_target, (str, bytes, os.PathLike)) else {}
         if isinstance(source_metadata, dict) and source_metadata.get("dual_venc_mode"):
@@ -436,6 +432,15 @@ class PipelineEngine:
             if "unexpected keyword argument" not in str(exc):
                 raise
             data = load_input_data(load_target)
+        # Reruns and saved workspaces must reread the preserved H5, rather than
+        # trying to convert the original directory into an existing destination.
+        converted_h5 = data.metadata.get("converted_h5")
+        if converted_h5:
+            load_target = InputCase(
+                str(converted_h5), "h5", source_group=data.source_group,
+                metadata=dict(data.metadata),
+            )
+            ws.paths.flow_path = ws.paths.segmask_path = str(converted_h5)
         ws._loaded_input_source = copy.deepcopy(load_target)
         ws._loaded_input_kwargs = dict(load_kwargs)
         ws.pcmra_render_mask = None
@@ -820,14 +825,12 @@ class PipelineEngine:
         cfg.enabled = True
         kwargs = dict(getattr(ws, "_loaded_input_kwargs", {}) or {})
         kwargs.pop("progress_callback", None)
+        kwargs.pop("parameter_overrides", None)
+        kwargs.pop("dicom_read_workers", None)
         if progress_callback is not None:
             kwargs["progress_callback"] = progress_callback
         kwargs.update(correction_config=cfg, ignore_embedded_segmentation=True, force_recompute_seg=False)
         if not getattr(ws, "_loaded_input_kwargs", None):
-            overrides = ws.loader_params.dicom_parameter_overrides.to_loader_kwargs()
-            if overrides:
-                kwargs["parameter_overrides"] = overrides
-            kwargs["dicom_read_workers"] = ws.loader_params.dicom_read_workers
             kwargs["dicom_backend"] = ws.loader_params.dicom_backend
             kwargs["dicom_h5_dir"] = ws.loader_params.dicom_h5_dir
             dual_info = ws.input_state.metadata.get("dual_venc", {})

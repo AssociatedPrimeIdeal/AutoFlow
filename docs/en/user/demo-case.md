@@ -243,19 +243,16 @@ The captured GUI export produced planes_rotate.mp4, wss_video.mp4, pressure_grad
 
 ## 14. DICOM is another input route
 
-The same workflow accepts a DICOM directory directly or through the optional [4DFlow_Dicom2H5 converter](../features/dicom-loading.md). The converter is pinned as the third_party/4DFlow_Dicom2H5 submodule.
+The same workflow accepts DICOM directories through the [4DFlow_Dicom2H5 converter](../features/dicom-loading.md). The converter is pinned as the third_party/4DFlow_Dicom2H5 submodule.
 
     git submodule update --init third_party/4DFlow_Dicom2H5
     pip install -e ".[dicom]"
-
-    autoflow-run /path/to/dicom --output-dir "$OUT/dicom-native" \
-      --dicom-backend native --bgc --autoseg --no-cache-write
 
     autoflow-run /path/to/dicom --output-dir "$OUT/dicom-converted" \
       --dicom-backend dicom2h5 --dicom-h5-dir "$OUT/converted-h5" \
       --bgc --autoseg --with wss,pg --no-cache-write
 
-In the GUI use **File > Import DICOM Directory** for native loading, or **File > Import DICOM via Dicom2H5...** to create a new H5 and then load it. Conversion never overwrites an existing destination. Converted magnitude plus velocity inputs support skeletons, graphs, planes, metrics, WSS, pressure and streamlines; TKE remains optional.
+In the GUI use **File > Import DICOM Directory** to create a new H5 through Dicom2H5 and then load it. Conversion never overwrites an existing destination. Converted magnitude plus velocity inputs support skeletons, graphs, planes, metrics, WSS, pressure and streamlines; TKE remains optional.
 
 ## Output checklist
 

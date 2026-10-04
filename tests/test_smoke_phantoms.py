@@ -9,7 +9,7 @@ import pytest
 
 from autoflow import AutoFlowConfig, build_workspace, run_batch, run_case
 from autoflow.algorithms.data import discover_h5_input_cases, inspect_h5_input_case, load_h5_data
-from autoflow.algorithms.dicom import collect_input_cases
+from autoflow.algorithms.inputs import collect_input_cases
 from autoflow.algorithms.segmentation import default_nnunet_model_folder
 from autoflow.algorithms.pwv import compute_cross_correlation_delay_ms, detect_waveform_foot_time_ms
 from autoflow.algorithms.preprocess import filter_connected_components, separate_longitudinal_label_contacts
@@ -656,7 +656,7 @@ def test_wss_linear_mode_and_invalid_wall_normal_samples():
 
 
 def test_static_masks_reuse_plane_and_wss_geometry(monkeypatch):
-    import autoflow.algorithms.metrics as metrics_module
+    from autoflow.algorithms.metrics import sampling, wss
 
     mask = np.zeros((8, 8, 8, 3), dtype=bool)
     mask[1:7, 1:7, 1:7, :] = True
@@ -668,26 +668,26 @@ def test_static_masks_reuse_plane_and_wss_geometry(monkeypatch):
     ]
 
     support_calls = 0
-    original_support = metrics_module._build_plane_support_mesh
+    original_support = sampling._build_plane_support_mesh
 
     def counting_support(*args, **kwargs):
         nonlocal support_calls
         support_calls += 1
         return original_support(*args, **kwargs)
 
-    monkeypatch.setattr(metrics_module, "_build_plane_support_mesh", counting_support)
+    monkeypatch.setattr(sampling, "_build_plane_support_mesh", counting_support)
     compute_plane_metrics(flow, mask, (1.0, 1.0, 1.0), (0.0, 0.0, 0.0), planes)
     assert support_calls == 1
 
     surface_calls = 0
-    original_extract_surface = metrics_module._extract_surface
+    original_extract_surface = wss._extract_surface
 
     def counting_surface(*args, **kwargs):
         nonlocal surface_calls
         surface_calls += 1
         return original_extract_surface(*args, **kwargs)
 
-    monkeypatch.setattr(metrics_module, "_extract_surface", counting_surface)
+    monkeypatch.setattr(wss, "_extract_surface", counting_surface)
     result = compute_wss_metrics(
         mask, flow, (1.0, 1.0, 1.0), smoothing_iteration=0,
     )
@@ -1079,7 +1079,7 @@ def test_load_h5_data_runs_dual_venc_corrections_concurrently(tmp_path, monkeypa
             "skipped_reason": "test",
         }
 
-    monkeypatch.setattr("autoflow.algorithms.data.apply_background_phase_correction_to_complex", fake_apply)
+    monkeypatch.setattr("autoflow.algorithms.data.dual_venc.apply_background_phase_correction_to_complex", fake_apply)
     callback_threads = []
     caller_thread = threading.get_ident()
     loaded = load_h5_data(str(path), correction_config={"enabled": True},
@@ -1877,8 +1877,8 @@ def test_nnunet_autoseg_progress_callback_reports_stage_updates(monkeypatch, tmp
         pred.write_bytes(b"fake")
         return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
-    monkeypatch.setattr('autoflow.algorithms.segmentation._run_subprocess', fake_run_subprocess)
-    monkeypatch.setattr('autoflow.algorithms.segmentation._read_nifti_segmentation', lambda path: np.ones((2, 2, 2), dtype=np.int16))
+    monkeypatch.setattr('autoflow.algorithms.segmentation.nnunet_static._run_subprocess', fake_run_subprocess)
+    monkeypatch.setattr('autoflow.algorithms.segmentation.nnunet_static._read_nifti_segmentation', lambda path: np.ones((2, 2, 2), dtype=np.int16))
 
     events = []
     mag = np.ones((2, 2, 2, 3), dtype=np.float32)
@@ -1918,7 +1918,7 @@ def test_nnunet4d_auto_profile_uses_best_checkpoint_and_keeps_frames(monkeypatch
     if not hard_links:
         def unavailable_link(*args, **kwargs):
             raise OSError("hard links unavailable")
-        monkeypatch.setattr("autoflow.algorithms.segmentation.os.link", unavailable_link)
+        monkeypatch.setattr("autoflow.algorithms.segmentation.io.os.link", unavailable_link)
     model_dir = tmp_path / "temporal_model"
     fold_dir = model_dir / "fold_all"
     fold_dir.mkdir(parents=True)
@@ -1953,7 +1953,7 @@ def test_nnunet4d_auto_profile_uses_best_checkpoint_and_keeps_frames(monkeypatch
         frame = int(Path(path).name.split("_t", 1)[1].split(".", 1)[0])
         return np.full((2, 2, 2), frame + 1, dtype=np.int16)
 
-    monkeypatch.setattr("autoflow.algorithms.segmentation._read_nifti_segmentation", fake_read)
+    monkeypatch.setattr("autoflow.algorithms.segmentation.nnunet_temporal._read_nifti_segmentation", fake_read)
     seg, provenance = generate_nnunet_auto_segmentation(
         mag=np.broadcast_to(np.arange(1, 4, dtype=np.float32), (2, 2, 2, 3)),
         flow=np.zeros((2, 2, 2, 3, 3), dtype=np.float32),
@@ -2103,7 +2103,7 @@ def test_nnunet_autoseg_prefers_gpu_resampling_and_falls_back_to_cpu(monkeypatch
         return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
     monkeypatch.setattr(
-        "autoflow.algorithms.segmentation._read_nifti_segmentation",
+        "autoflow.algorithms.segmentation.nnunet_static._read_nifti_segmentation",
         lambda _path: np.ones((2, 2, 2), dtype=np.int16),
     )
     events = []
@@ -3039,7 +3039,7 @@ def test_bundled_nnunet_relative_path_resolves_outside_repo_cwd(monkeypatch, tmp
 
 
 def test_frozen_nnunet_predict_command_reuses_main_executable(monkeypatch):
-    import autoflow.algorithms.segmentation as segmentation_module
+    from autoflow.algorithms.segmentation import runtime as segmentation_module
 
     monkeypatch.setattr(segmentation_module.sys, "frozen", True, raising=False)
     monkeypatch.setattr(segmentation_module.sys, "executable", "AutoFlow-GUI.exe")
@@ -3050,7 +3050,7 @@ def test_frozen_nnunet_predict_command_reuses_main_executable(monkeypatch):
 
 
 def test_nnunet_predict_command_stays_in_current_environment(monkeypatch):
-    import autoflow.algorithms.segmentation as segmentation_module
+    from autoflow.algorithms.segmentation import runtime as segmentation_module
 
     monkeypatch.setattr(segmentation_module.sys, "frozen", False, raising=False)
     monkeypatch.setattr(segmentation_module.sys, "executable", "/current/env/bin/python")
@@ -3231,9 +3231,10 @@ def test_scene_display_axis_orientation_mirrors_points_without_mutating_world_da
     assert np.allclose(controller.display_to_world_points(displayed), world)
 
 
-def test_dicom2h5_groups_route_through_h5_loader(tmp_path, monkeypatch):
+@pytest.mark.parametrize("dicom_backend", [None, "dicom2h5", "native"])
+def test_dicom2h5_groups_route_through_h5_loader(tmp_path, monkeypatch, dicom_backend):
     from autoflow.algorithms import dicom_conversion as conversion
-    from autoflow.algorithms.dicom import load_input_data
+    from autoflow.algorithms.inputs import load_input_data
     root = tmp_path / "dicom"
     root.mkdir()
     original = root / "source.dcm"
@@ -3254,12 +3255,13 @@ def test_dicom2h5_groups_route_through_h5_loader(tmp_path, monkeypatch):
                 group["VENCOrder"] = np.asarray(["LR", "AP", "FH"], dtype=h5py.string_dtype())
     backend = SimpleNamespace(convert_dicom_to_h5=convert, validate_native_h5=lambda _: {"valid": True, "groups": ["sequence_a", "sequence_b"]})
     monkeypatch.setattr(conversion, "_converter_module", lambda: backend)
-    cases = collect_input_cases([str(root), str(root)], dicom_backend="dicom2h5", dicom_h5_dir=str(tmp_path / "converted"))
+    backend_kwargs = {} if dicom_backend is None else {"dicom_backend": dicom_backend}
+    cases = collect_input_cases([str(root), str(root)], dicom_h5_dir=str(tmp_path / "converted"), **backend_kwargs)
     assert len(cases) == 2
     assert {case.source_group for case in cases} == {"sequence_a", "sequence_b"}
     assert cases[0].input_kind == "h5"
     assert ".dicom2h5-" not in cases[0].output_name
-    loaded = load_input_data(cases[0], dicom_backend="dicom2h5")
+    loaded = load_input_data(cases[0])
     assert loaded.flow.shape == (4, 5, 6, 2, 3)
     np.testing.assert_allclose(loaded.flow, 12.0)
     assert loaded.metadata["dicom_backend"] == "dicom2h5"
@@ -3268,6 +3270,9 @@ def test_dicom2h5_groups_route_through_h5_loader(tmp_path, monkeypatch):
     assert result["segmentation_only"] and result["source_group"] == "sequence_a"
     assert original.read_bytes() == b"read-only-source"
     assert not list((tmp_path / "converted").glob(".dicom2h5-*"))
+    with pytest.raises(ValueError, match="multiple H5 cases"):
+        load_input_data(root, dicom_h5_dir=str(tmp_path / "ambiguous"))
+    assert len(list((tmp_path / "ambiguous").glob("*.h5"))) == 1
 
 
 def test_dicom2h5_failed_conversion_never_publishes_or_replaces(tmp_path, monkeypatch):
@@ -3305,6 +3310,9 @@ def test_dicom2h5_failed_conversion_never_publishes_or_replaces(tmp_path, monkey
 def test_dicom2h5_loader_config_and_cli_selection():
     from autoflow.cli import build_parser
     from autoflow.core.models import LoaderParams
+    assert AutoFlowConfig().dicom_backend == "dicom2h5"
+    assert LoaderParams.from_dict({"dicom_backend": "native", "dicom_read_workers": 8}).to_dict()["dicom_backend"] == "dicom2h5"
+    assert "dicom_read_workers" not in LoaderParams().to_dict()
     config = AutoFlowConfig(dicom_backend="dicom2h5", dicom_h5_dir="converted")
     workspace = build_workspace(config)
     restored = LoaderParams.from_dict(workspace.loader_params.to_dict())
@@ -3868,25 +3876,25 @@ def test_content_menu_only_exposes_available_results_and_keeps_selection(monkeyp
 
 
 def test_derived_plane_cube_reuses_geometry_and_applies_frame_roi(monkeypatch):
-    from autoflow.algorithms import metrics as module
+    from autoflow.algorithms.metrics import sampling, summarize_plane_derived_metrics
     shape = (12, 12, 12)
     mask = np.ones(shape + (2,), dtype=bool)
     pressure = np.repeat(np.indices(shape)[1][..., None], 2, axis=3).astype(np.float32)
     plane = PlaneData(center=np.array([5.5, 5.5, 5.5]), normal=np.array([1., 0., 0.]))
-    original = module._build_plane_slice_spec
+    original = sampling._build_plane_slice_spec
     frames = []
     def counted(*args, **kwargs):
         frames.append(kwargs.get("frame_index"))
         return original(*args, **kwargs)
-    monkeypatch.setattr(module, "_build_plane_slice_spec", counted)
-    _, payload = module.summarize_plane_derived_metrics(plane, mask, (1, 1, 1), (0, 0, 0),
-                                                       relative_pressure_array=pressure)
+    monkeypatch.setattr(sampling, "_build_plane_slice_spec", counted)
+    _, payload = summarize_plane_derived_metrics(plane, mask, (1, 1, 1), (0, 0, 0),
+                                                relative_pressure_array=pressure)
     assert frames == [0]
     assert len(payload["timepoints"][1]["relative_pressure_Pa"]) == 144
     plane.roi_edit_operations = {"1": [{"mode": "replace", "polygon": [[0, 0], [3, 0], [3, 3], [0, 3]]}]}
     frames.clear()
-    _, payload = module.summarize_plane_derived_metrics(plane, mask, (1, 1, 1), (0, 0, 0),
-                                                       relative_pressure_array=pressure)
+    _, payload = summarize_plane_derived_metrics(plane, mask, (1, 1, 1), (0, 0, 0),
+                                                relative_pressure_array=pressure)
     assert frames == [0, 1]
     values = payload["timepoints"][1]["relative_pressure_Pa"]
     assert len(values) == 16

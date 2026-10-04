@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
-from ..case_types import BackgroundPhaseCorrectionConfig, PhaseUnwrappingConfig, NoiseRemovalConfig, InputState, LoadedCase, LoaderCapabilities
+from ..case_types import BackgroundPhaseCorrectionConfig, PhaseUnwrappingConfig, NoiseRemovalConfig, InputState, LoadedCase, LoaderCapabilities, normalize_dicom_backend
 
 
 PATHLINE_CATEGORICAL_COLORS = (
@@ -829,82 +829,11 @@ class PwvParams:
 
 
 @dataclass
-class DicomParameterOverrides:
-    resolution: Optional[List[float]] = None
-    venc: Optional[List[float]] = None
-    spatial_order: Optional[List[str]] = None
-    venc_order: Optional[List[str]] = None
-    rr: Optional[float] = None
-
-    @staticmethod
-    def _coerce_float_triplet(value):
-        if value is None:
-            return None
-        arr = np.asarray(value, dtype=float).reshape(-1)
-        if arr.size == 1:
-            arr = np.repeat(arr, 3)
-        if arr.size < 3:
-            return None
-        return [float(x) for x in arr[:3]]
-
-    @staticmethod
-    def _coerce_label_triplet(value):
-        if value is None:
-            return None
-        labels = [str(x).strip().upper() for x in list(value) if str(x).strip()]
-        if len(labels) < 3:
-            return None
-        return labels[:3]
-
-    def to_dict(self):
-        return {
-            "resolution": None if self.resolution is None else [float(x) for x in self.resolution[:3]],
-            "venc": None if self.venc is None else [float(x) for x in self.venc[:3]],
-            "spatial_order": None if self.spatial_order is None else [str(x).upper() for x in self.spatial_order[:3]],
-            "venc_order": None if self.venc_order is None else [str(x).upper() for x in self.venc_order[:3]],
-            "rr": None if self.rr is None else float(self.rr),
-        }
-
-    def to_loader_kwargs(self):
-        payload = {}
-        if self.resolution is not None:
-            payload["resolution"] = [float(x) for x in self.resolution[:3]]
-        if self.venc is not None:
-            payload["venc"] = [float(x) for x in self.venc[:3]]
-        if self.spatial_order is not None:
-            payload["spatial_order"] = [str(x).upper() for x in self.spatial_order[:3]]
-        if self.venc_order is not None:
-            payload["venc_order"] = [str(x).upper() for x in self.venc_order[:3]]
-        if self.rr is not None:
-            payload["rr"] = float(self.rr)
-        return payload
-
-    def has_values(self):
-        return bool(self.to_loader_kwargs())
-
-    @staticmethod
-    def from_dict(d):
-        payload = d or {}
-        rr = payload.get("rr")
-        return DicomParameterOverrides(
-            resolution=DicomParameterOverrides._coerce_float_triplet(payload.get("resolution")),
-            venc=DicomParameterOverrides._coerce_float_triplet(payload.get("venc")),
-            spatial_order=DicomParameterOverrides._coerce_label_triplet(payload.get("spatial_order")),
-            venc_order=DicomParameterOverrides._coerce_label_triplet(payload.get("venc_order")),
-            rr=None if rr in (None, "") else float(rr),
-        )
-
-
-@dataclass
 class LoaderParams:
     background_phase_correction: BackgroundPhaseCorrectionConfig = field(
         default_factory=lambda: BackgroundPhaseCorrectionConfig(enabled=False)
     )
-    dicom_parameter_overrides: "DicomParameterOverrides" = field(
-        default_factory=lambda: DicomParameterOverrides()
-    )
-    dicom_read_workers: int = 1
-    dicom_backend: str = "native"
+    dicom_backend: str = "dicom2h5"
     dicom_h5_dir: str = ""
     # Explicitly bypass segmentation embedded in an input file.  This is
     # useful for cold-start benchmarks and for forcing the model/threshold
@@ -914,9 +843,7 @@ class LoaderParams:
     def to_dict(self):
         return {
             "background_phase_correction": self.background_phase_correction.to_dict(),
-            "dicom_parameter_overrides": self.dicom_parameter_overrides.to_dict(),
-            "dicom_read_workers": int(self.dicom_read_workers),
-            "dicom_backend": str(self.dicom_backend),
+            "dicom_backend": normalize_dicom_backend(self.dicom_backend),
             "dicom_h5_dir": str(self.dicom_h5_dir),
             "ignore_embedded_segmentation": bool(self.ignore_embedded_segmentation),
         }
@@ -928,11 +855,7 @@ class LoaderParams:
             background_phase_correction=BackgroundPhaseCorrectionConfig.from_dict(
                 payload.get("background_phase_correction", {"enabled": False})
             ),
-            dicom_parameter_overrides=DicomParameterOverrides.from_dict(
-                payload.get("dicom_parameter_overrides", {})
-            ),
-            dicom_read_workers=int(payload.get("dicom_read_workers", 1) or 1),
-            dicom_backend=str(payload.get("dicom_backend", "native")),
+            dicom_backend=normalize_dicom_backend(payload.get("dicom_backend", "dicom2h5")),
             dicom_h5_dir=str(payload.get("dicom_h5_dir", "")),
             ignore_embedded_segmentation=bool(payload.get("ignore_embedded_segmentation", False)),
         )

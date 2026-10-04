@@ -54,7 +54,7 @@ Each disconnected support component has its own gauge; pressure levels across di
 
 ## Where to change code
 
-`autoflow/algorithms/metrics.py` (`compute_pressure_gradient_metrics`, `reconstruct_relative_pressure_map`, assembly and solver helpers); signatures/profiles: `autoflow/core/pipeline.py`; export: `autoflow/processing.py`; views: `autoflow/ui/ortho_viewer.py`, `autoflow/ui/viewer.py`.
+`autoflow/algorithms/metrics/pressure.py` (`compute_pressure_gradient_metrics`, `reconstruct_relative_pressure_map`, assembly and solver helpers); signatures/profiles: `autoflow/core/pipeline.py`; export: `autoflow/processing.py`; views: `autoflow/ui/ortho_viewer.py`, `autoflow/ui/viewer.py`.
 
 ## Tests
 

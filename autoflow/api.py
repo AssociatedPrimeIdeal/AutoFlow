@@ -1,3 +1,4 @@
+from .case_types import normalize_dicom_backend
 import copy
 from dataclasses import dataclass, field
 import json
@@ -58,8 +59,7 @@ class AutoFlowConfig:
     dual_venc_ratio2: float = 0.0
     force_recompute_corr: bool = False
     background_phase_write_cache: bool = True
-    dicom_read_workers: int = 1
-    dicom_backend: str = "native"
+    dicom_backend: str = "dicom2h5"
     dicom_h5_dir: str = ""
     ignore_embedded_segmentation: bool = False
     phase_unwrap_enabled: bool = False
@@ -213,8 +213,7 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
     ws.loader_params.background_phase_correction.dual_venc_ratio2 = float(cfg.dual_venc_ratio2)
     ws.loader_params.background_phase_correction.force_recompute = bool(cfg.force_recompute_corr)
     ws.loader_params.background_phase_correction.write_cache = bool(cfg.background_phase_write_cache)
-    ws.loader_params.dicom_read_workers = int(cfg.dicom_read_workers)
-    ws.loader_params.dicom_backend = str(cfg.dicom_backend)
+    ws.loader_params.dicom_backend = normalize_dicom_backend(cfg.dicom_backend)
     ws.loader_params.dicom_h5_dir = str(cfg.dicom_h5_dir or os.path.join(cfg.output_dir, "_dicom_h5"))
     ws.loader_params.ignore_embedded_segmentation = bool(cfg.ignore_embedded_segmentation)
     ws.phase_unwrap_params.enabled = bool(cfg.phase_unwrap_enabled)
@@ -460,7 +459,6 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 dual_venc_ratio2=config.dual_venc_ratio2,
                 force_recompute_corr=config.force_recompute_corr,
                 background_phase_write_cache=config.background_phase_write_cache,
-                dicom_read_workers=config.dicom_read_workers,
                 dicom_backend=config.dicom_backend,
                 dicom_h5_dir=config.dicom_h5_dir,
                 ignore_embedded_segmentation=config.ignore_embedded_segmentation,

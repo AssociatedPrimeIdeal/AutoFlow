@@ -79,7 +79,7 @@ For the shipped WRLS fit orders, CUDA constructs the volume-scale normal equatio
 ## Where to change code
 
 - Algorithm implementations and automatic CUDA fallback: `autoflow/algorithms/phase_correction.py`
-- H5 cache validation, dual-venc concurrency, and cache writing: `autoflow/algorithms/data.py`
+- H5 cache validation, dual-venc concurrency, and cache writing: `autoflow/algorithms/data/h5_loader.py`, `autoflow/algorithms/data/correction_cache.py`, `autoflow/algorithms/data/dual_venc.py`
 - Public configuration types: `autoflow/case_types.py`, `autoflow/api.py`, and `autoflow/config.py`
 - CLI flags: `autoflow/cli.py`
 - Explicit pipeline action and original-source reloading: `autoflow/core/pipeline.py`

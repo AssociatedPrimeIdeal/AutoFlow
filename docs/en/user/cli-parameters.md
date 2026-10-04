@@ -5,7 +5,7 @@ All arguments accepted by `autoflow-run`. Omitted overrides inherit the module b
 | Flag / argument | Type / allowed values | Omitted parser value | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
 | `-h` / `--help` | switch | `"==SUPPRESS=="` | CLI | show this help message and exit | `autoflow/cli.py; autoflow/api.py` |
-| `inputs` | string | inherited / omitted | CLI | H5/HDF5 files, DICOM files, or directories to process. | `autoflow/cli.py; autoflow/api.py` |
+| `inputs` | string | inherited / omitted | CLI | H5/HDF5 files, H5 batch directories, or DICOM acquisition directories. | `autoflow/cli.py; autoflow/api.py` |
 | `--config-dir` | string | inherited / omitted | CLI | Directory containing per-module JSON configs used to build CLI defaults. When omitted, AutoFlow uses repo-level configs/ if present. | `autoflow/cli.py; autoflow/api.py` |
 | `--output-dir` | string | inherited / omitted | CLI; `batch.output_dir` | Root output directory. Overrides configs/batch.json. | `autoflow/cli.py; autoflow/api.py` |
 | `--import-planes` / `--reuse-planes` | string | inherited / omitted | CLI; `batch.reuse_planes` | Import a plane coordinate JSON file, or a directory containing per-case plane_positions.json files. | `autoflow/cli.py; autoflow/api.py` |
@@ -35,9 +35,8 @@ All arguments accepted by `autoflow-run`. Omitted overrides inherit the module b
 | `--dual-venc-ratio2` | float | inherited / omitted | CLI; `loader.background_phase_correction.dual_venc_ratio2` | Dual-venc alias threshold ratio2 used when loading legacy Nv=7 complex H5 inputs. | `autoflow/cli.py; autoflow/api.py` |
 | `--force-recompute-corr` | switch | `false` | CLI; `loader.background_phase_correction.force_recompute` | Ignore reusable H5 background phase correction caches and recompute them before optionally overwriting the cache. | `autoflow/cli.py; autoflow/api.py` |
 | `--no-cache-write` | switch | inherited / omitted | CLI; `loader.background_phase_correction.write_cache` | Do not write newly computed correction or automatic-segmentation caches back to the input H5 (useful for read-only benchmarks). | `autoflow/cli.py; autoflow/api.py` |
-| `--dicom-backend` | string; `["native", "dicom2h5"]` | inherited / omitted | CLI; `loader.dicom_backend` | DICOM loader: direct native loading or conversion through the optional Dicom2H5 submodule. H5 files load normally. | `autoflow/cli.py; autoflow/api.py` |
+| `--dicom-backend` | string; `["dicom2h5"]` | inherited / omitted | CLI; `loader.dicom_backend` | Compatibility setting: DICOM directories always convert through Dicom2H5. Legacy API/config native values migrate to dicom2h5. | `autoflow/cli.py; autoflow/api.py` |
 | `--dicom-h5-dir` | string | inherited / omitted | CLI; `loader.dicom_h5_dir` | Directory for new Dicom2H5 outputs; defaults to OUTPUT_DIR/_dicom_h5. Existing H5 files are never replaced. | `autoflow/cli.py; autoflow/api.py` |
-| `--dicom-read-workers` | int | inherited / omitted | CLI; `loader.dicom_read_workers` | Worker count for direct DICOM loading; use 0 to pick an automatic thread count. | `autoflow/cli.py; autoflow/api.py` |
 | `--plane-mode` | string; `["uniform", "fixed_step", "count", "distance", "anchored_offset"]` | inherited / omitted | CLI; `planes.plane_mode` | Plane placement mode. | `autoflow/cli.py; autoflow/api.py` |
 | `--plane-count` | int | inherited / omitted | CLI; `planes.plane_count` | Plane count; -1 places every position that fits. Symmetric even counts omit the center plane. | `autoflow/cli.py; autoflow/api.py` |
 | `--plane-anchor` | string; `["start", "center", "end", "junction"]` | inherited / omitted | CLI; `planes.anchor` | Anchor for fixed_step placement. | `autoflow/cli.py; autoflow/api.py` |

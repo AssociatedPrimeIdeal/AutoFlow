@@ -365,7 +365,7 @@ def process_single(
     generate_pcmra=False,
 ):
     loader = getattr(workspace, "loader_params", None)
-    case = resolve_input_case(input_source, getattr(loader, "dicom_backend", "native"), getattr(loader, "dicom_h5_dir", ""))
+    case = resolve_input_case(input_source, getattr(loader, "dicom_backend", "dicom2h5"), getattr(loader, "dicom_h5_dir", ""))
     input_label = case.display_name or case.input_path
 
     metric_flags = _requested_metric_flags(
@@ -1021,7 +1021,7 @@ def collect_h5_files(inputs):
     return sorted(dict.fromkeys(files))
 
 
-def collect_input_items(inputs, dicom_backend="native", dicom_h5_dir=""):
+def collect_input_items(inputs, dicom_backend="dicom2h5", dicom_h5_dir=""):
     return collect_input_cases(inputs, dicom_backend, dicom_h5_dir)
 
 

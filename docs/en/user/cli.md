@@ -34,7 +34,7 @@ autoflow-run /path/to/dicom_root --dicom-backend dicom2h5 \
   --autoseg --bgc --with wss,pg --no-cache-write
 ```
 
-Each recognized acquisition becomes an H5 case group. Existing conversion destinations are never overwritten; pass the saved H5 to reuse it. The default direct route is `--dicom-backend native`.
+Each recognized acquisition becomes an H5 case group. Existing conversion destinations are never overwritten; pass the saved H5 to reuse it. DICOM conversion is the default and only route. Directories containing top-level H5 files are treated as H5 batches.
 
 ### Import and export plane coordinates
 
@@ -201,13 +201,13 @@ available as `skeleton.min_edge_points` in `configs/skeleton.json`.
 | `--with` | csv | empty | command line | opt in to `pwv`, `wss`, `tke`, `pg`, and/or `vortex` | `autoflow/cli.py`, `autoflow/processing.py` |
 | `--skip-derived` | bool | `False` | `configs/batch.json` | remove WSS, TKE, and relative-pressure work from the requested set | `autoflow/processing.py` |
 | `--skip-plane-metrics` | bool | `False` | `configs/batch.json` | skip plane metric export | `autoflow/processing.py` |
-| `--single-thread` | bool | parallel on | `configs/batch.json` | disable adaptive base/derived plane parallelism; large jobs use isolated processes despite the compatibility flag name | `autoflow/core/pipeline.py`, `autoflow/algorithms/metrics.py` |
+| `--single-thread` | bool | parallel on | `configs/batch.json` | disable adaptive base/derived plane parallelism; large jobs use isolated processes despite the compatibility flag name | `autoflow/core/pipeline.py`, `autoflow/algorithms/metrics/planes.py`, `autoflow/algorithms/metrics/plane_derived.py` |
 
 ### Loading and background phase correction
 
 | CLI flag | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `--bgc` | bool | `False` | `configs/loader.json` | run background correction after loading; H5 inputs reuse or write a compatible `corr` cache | `autoflow/algorithms/phase_correction.py`, `autoflow/algorithms/data.py` |
+| `--bgc` | bool | `False` | `configs/loader.json` | run background correction after loading; H5 inputs reuse or write a compatible `corr` cache | `autoflow/algorithms/phase_correction.py`, `autoflow/algorithms/data/h5_loader.py` |
 | `--bgc-method` | choice | `wrls_arto` | `configs/loader.json` | choose `msac` or `wrls_arto` | `autoflow/algorithms/phase_correction.py` |
 | `--bgc-fit-order` | int | `3` | `configs/loader.json` | polynomial fit order for correction | `autoflow/algorithms/phase_correction.py` |
 | `--bgc-threshold` | float | `0.2` | `configs/loader.json` | MSAC venc-space threshold for the stationary-tissue mask | `autoflow/algorithms/phase_correction.py` |
@@ -221,9 +221,8 @@ available as `skeleton.min_edge_points` in `configs/skeleton.json`.
 | `--bgc-wrls-central-probability` | float | `0.5` | `configs/loader.json` | minimum central-Gaussian prior | `autoflow/algorithms/phase_correction.py` |
 | `--bgc-wrls-fista-iterations` | int | `5000` | `configs/loader.json` | maximum FISTA iterations per WRLS fit | `autoflow/algorithms/phase_correction.py` |
 | `--bgc-wrls-gmm-iterations` | int | `1000` | `configs/loader.json` | maximum GMM EM iterations per ARTO pass | `autoflow/algorithms/phase_correction.py` |
-| `--dual-venc-ratio1` | float | `0.0` | `configs/loader.json` | first dual-venc alias window ratio for legacy `Nv=7` H5 | `autoflow/algorithms/data.py` |
-| `--dual-venc-ratio2` | float | `0.0` | `configs/loader.json` | second dual-venc alias window ratio for legacy `Nv=7` H5 | `autoflow/algorithms/data.py` |
-| `--dicom-read-workers` | int | `1` | `configs/loader.json` | DICOM read worker count; `0` means auto selection inside loader | `autoflow/algorithms/dicom.py` |
+| `--dual-venc-ratio1` | float | `0.0` | `configs/loader.json` | first dual-venc alias window ratio for legacy `Nv=7` H5 | `autoflow/algorithms/data/h5_loader.py` |
+| `--dual-venc-ratio2` | float | `0.0` | `configs/loader.json` | second dual-venc alias window ratio for legacy `Nv=7` H5 | `autoflow/algorithms/data/h5_loader.py` |
 
 WRLS+ARTO automatically uses CUDA for its ARTO GMM stage when the installed PyTorch build reports a usable CUDA device. There is no background-correction device flag; unavailable or failed CUDA execution falls back to CPU.
 
@@ -282,22 +281,22 @@ WSS, TKE, and pressure-analysis compute defaults are now split by metric:
 | --- | --- | --- | --- | --- | --- |
 | `--seed-ratio` | float | `0.1` | `configs/streamlines.json` | streamline seed density | `autoflow/algorithms/streamlines.py` |
 | `--tube-radius` | float | `0.05` | `configs/streamlines.json` | streamline tube radius in mm | `autoflow/rendering/videos.py` |
-| `--pressure-method` | string | `ppe` | `configs/pressure_gradient.json` | choose `ppe` (merged Cartesian solver) or `ste` (staggered-grid Stokes estimator); `least_squares` remains a compatibility alias for `ppe` | `autoflow/algorithms/metrics.py` |
+| `--pressure-method` | string | `ppe` | `configs/pressure_gradient.json` | choose `ppe` (merged Cartesian solver) or `ste` (staggered-grid Stokes estimator); `least_squares` remains a compatibility alias for `ppe` | `autoflow/algorithms/metrics/pressure.py` |
 
 ### Auto segmentation
 
 | CLI flag | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
 | `--autoseg` | bool | `False` | command line | run auto segmentation only when the loaded case has no segmentation | `autoflow/processing.py` |
-| `--autoseg-backend` | string | `nnUNet4D` in `configs/segmentation.json` | `AutoFlowConfig` | select `nnUNet4D` temporal or `nnUNet` static automatic segmentation | `autoflow/algorithms/segmentation.py` |
-| `--autoseg-model` | path or `auto` | `auto` | `AutoFlowConfig` | select the backend-specific Dataset7010/Dataset7020 model, or override it with a model folder (4D also accepts an orchestration script) | `autoflow/algorithms/segmentation.py` |
-| `--autoseg-checkpoint` | string or `auto` | `auto` | `AutoFlowConfig` | select Dataset7010 final or Dataset7020 best automatically, or choose an explicit checkpoint name | `autoflow/algorithms/segmentation.py` |
-| `--autoseg-folds` | string | `single` | `AutoFlowConfig` | choose `single`, `all`/`ensemble`, or explicit fold IDs such as `0,1,2,3,4` | `autoflow/algorithms/segmentation.py` |
-| `--autoseg-device` | string | `auto` | `AutoFlowConfig` | choose `auto`, `cpu`, or `cuda` | `autoflow/algorithms/segmentation.py` |
-| `--autoseg-label-map` | JSON string | empty | `AutoFlowConfig` | remap predicted labels after inference | `autoflow/algorithms/segmentation.py` |
-| `--force-recompute-seg` | bool | `False` | command line | ignore an AutoFlow-generated H5 segmentation cache and rerun automatic segmentation | `autoflow/algorithms/data.py`, `autoflow/processing.py` |
-| `--ignore-embedded-segmentation` | bool | `False` | command line | ignore every embedded segmentation source for a cold start without changing the input H5 | `autoflow/algorithms/data.py`, `autoflow/core/pipeline.py` |
-| `--no-cache-write` | bool | `False` | command line | keep newly computed correction and automatic-segmentation caches out of the source H5; pair with `--ignore-embedded-segmentation` for read-only timing | `autoflow/algorithms/data.py`, `autoflow/processing.py`, `autoflow/cli.py` |
+| `--autoseg-backend` | string | `nnUNet4D` in `configs/segmentation.json` | `AutoFlowConfig` | select `nnUNet4D` temporal or `nnUNet` static automatic segmentation | `autoflow/algorithms/segmentation/nnunet_static.py` |
+| `--autoseg-model` | path or `auto` | `auto` | `AutoFlowConfig` | select the backend-specific Dataset7010/Dataset7020 model, or override it with a model folder (4D also accepts an orchestration script) | `autoflow/algorithms/segmentation/nnunet_static.py` |
+| `--autoseg-checkpoint` | string or `auto` | `auto` | `AutoFlowConfig` | select Dataset7010 final or Dataset7020 best automatically, or choose an explicit checkpoint name | `autoflow/algorithms/segmentation/nnunet_static.py` |
+| `--autoseg-folds` | string | `single` | `AutoFlowConfig` | choose `single`, `all`/`ensemble`, or explicit fold IDs such as `0,1,2,3,4` | `autoflow/algorithms/segmentation/nnunet_static.py` |
+| `--autoseg-device` | string | `auto` | `AutoFlowConfig` | choose `auto`, `cpu`, or `cuda` | `autoflow/algorithms/segmentation/nnunet_static.py` |
+| `--autoseg-label-map` | JSON string | empty | `AutoFlowConfig` | remap predicted labels after inference | `autoflow/algorithms/segmentation/nnunet_static.py` |
+| `--force-recompute-seg` | bool | `False` | command line | ignore an AutoFlow-generated H5 segmentation cache and rerun automatic segmentation | `autoflow/algorithms/data/h5_loader.py`, `autoflow/processing.py` |
+| `--ignore-embedded-segmentation` | bool | `False` | command line | ignore every embedded segmentation source for a cold start without changing the input H5 | `autoflow/algorithms/data/h5_loader.py`, `autoflow/core/pipeline.py` |
+| `--no-cache-write` | bool | `False` | command line | keep newly computed correction and automatic-segmentation caches out of the source H5; pair with `--ignore-embedded-segmentation` for read-only timing | `autoflow/algorithms/data/h5_loader.py`, `autoflow/processing.py`, `autoflow/cli.py` |
 | `--segmentation-only` | bool | `False` | command line | stop after loading or generating segmentation; skip skeleton, planes, metrics, and videos | `autoflow/processing.py` |
 
 Note:

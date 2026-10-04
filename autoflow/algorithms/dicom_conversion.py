@@ -57,7 +57,7 @@ def convert_dicom_input(dicom_directory, output_h5, progress_callback=None):
                 for key in ("RR", "Resolution", "VENC", "Origin"):
                     value = np.asarray(group[key], dtype=float)
                     if not np.all(np.isfinite(value)) or (key != "Origin" and np.any(value <= 0)):
-                        raise ValueError(f"Dicom2H5 group {name or '<root>'} has invalid {key}. Verify DICOM calibration or use native import with metadata overrides.")
+                        raise ValueError(f"Dicom2H5 group {name or '<root>'} has invalid {key}. Verify DICOM calibration before converting again.")
         cases = discover_h5_input_cases(temporary)
         if not cases:
             raise ValueError("Dicom2H5 produced no AutoFlow-compatible mag + flow groups.")

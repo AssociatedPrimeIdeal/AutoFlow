@@ -50,7 +50,7 @@ Unavailable TKE is skipped cleanly by pipeline, GUI and videos. DICOM or normali
 
 ## Where to change code
 
-`autoflow/algorithms/data.py` and `autoflow/algorithms/metrics.py`; optional execution/caching: `autoflow/core/pipeline.py`; export: `autoflow/processing.py`, `autoflow/rendering/videos.py`.
+`autoflow/algorithms/data/normalization.py`, `autoflow/algorithms/data/h5_loader.py` and `autoflow/algorithms/metrics/tke.py`; optional execution/caching: `autoflow/core/pipeline.py`; export: `autoflow/processing.py`, `autoflow/rendering/videos.py`.
 
 ## Tests
 

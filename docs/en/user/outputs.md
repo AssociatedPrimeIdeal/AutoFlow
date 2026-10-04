@@ -64,7 +64,7 @@
 
 ## Preserved DICOM conversion
 
-The optional Dicom2H5 route saves a new H5 before analysis, under `dicom_h5_dir` (default `output_dir/_dicom_h5`). It contains normalized `mag + flow` acquisition groups and geometry/patient/scanner/acquisition metadata. Existing destinations are never overwritten. Subsequent analysis uses ordinary H5 case output directories. See [DICOM loading and conversion](../features/dicom-loading.md).
+DICOM directory input through Dicom2H5 saves a new H5 before analysis, under `dicom_h5_dir` (default `output_dir/_dicom_h5`). It contains normalized `mag + flow` acquisition groups and geometry/patient/scanner/acquisition metadata. Existing destinations are never overwritten. Subsequent analysis uses ordinary H5 case output directories. See [DICOM loading and conversion](../features/dicom-loading.md).
 
 ## Correction records
 

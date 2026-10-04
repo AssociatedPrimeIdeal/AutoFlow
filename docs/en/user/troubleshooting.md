@@ -47,8 +47,8 @@
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
-| wrong axis or velocity direction | DICOM parameter override is wrong | inspect and correct resolution, venc, spatial order, venc order, and RR in the DICOM confirmation dialog |
-| very slow load | low worker count | try `--dicom-read-workers` for CLI or tune loader defaults |
+| wrong axis or velocity direction | conversion calibration or source metadata is wrong | inspect the converted H5 and review upstream DICOM decoding before analysis |
+| very slow DICOM conversion | storage or conversion worker contention | tune `DICOM2H5_MAX_WORKERS`, then reuse the saved H5 for later analysis |
 
 ## Video Export Warnings
 
@@ -69,8 +69,8 @@
 
 ## Where To Inspect Code
 
-- loader issues: `autoflow/algorithms/data.py`, `autoflow/algorithms/dicom.py`
-- segmentation issues: `autoflow/algorithms/segmentation.py`, `autoflow/ui/app.py`
+- loader issues: `autoflow/algorithms/data/h5_loader.py`, `autoflow/algorithms/inputs.py`
+- segmentation issues: `autoflow/algorithms/segmentation/nnunet_static.py`, `autoflow/ui/app.py`
 - pipeline behavior: `autoflow/core/pipeline.py`, `autoflow/processing.py`
 - rendering issues: `autoflow/rendering/videos.py`
 

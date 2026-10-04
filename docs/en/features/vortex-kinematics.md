@@ -85,7 +85,7 @@ See [vortex parameters](../user/parameters.md#vortex), [CLI flags](../user/cli-p
 
 | Change you want | Edit here | Also check | Tests |
 | --- | --- | --- | --- |
-| velocity-gradient calculation and units | `autoflow/algorithms/metrics.py` | `autoflow/algorithms/data.py` | `tests/test_smoke_phantoms.py` |
+| velocity-gradient calculation and units | `autoflow/algorithms/metrics/vortex.py` | `autoflow/algorithms/data/h5_loader.py` | `tests/test_smoke_phantoms.py` |
 | cache, workspace arrays, and NPZ wiring | `autoflow/core/models.py`, `autoflow/core/pipeline.py`, `autoflow/processing.py` | `autoflow/api.py`, `autoflow/cli.py` | `tests/test_pressure_gradient_phantom.py` |
 | GUI parameters and maps | `autoflow/ui/app.py`, `autoflow/ui/ortho_viewer.py` | `configs/vortex.json` | manual GUI verification |
 

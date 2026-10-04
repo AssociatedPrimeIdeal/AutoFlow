@@ -35,14 +35,14 @@
 5. run the retained smoke and phantom regression suite when needed
 
 ## Add Or Change Loader Behavior
-1. edit `autoflow/algorithms/data.py` or `autoflow/algorithms/dicom.py`
+1. edit `autoflow/algorithms/data/h5_loader.py` for H5 normalization or `autoflow/algorithms/inputs.py` for dispatch; vendor DICOM decoding belongs to the pinned Dicom2H5 dependency
 2. keep the `LoadedCase` contract consistent in `autoflow/case_types.py`
 3. update `autoflow/core/pipeline.py` only if downstream workspace mapping changes
 4. update the English input docs
 5. run the retained smoke and phantom regression suite when needed
 
 ## Add Or Change Segmentation Behavior
-1. edit source logic in `autoflow/algorithms/segmentation.py`
+1. edit source logic in `autoflow/algorithms/segmentation/nnunet_static.py`
 2. edit workspace state in `autoflow/core/models.py` if needed
 3. edit GUI wiring in `autoflow/ui/app.py` and `autoflow/ui/segmentation.py`
 4. edit CLI wiring in `autoflow/cli.py` and `autoflow/api.py` if batch behavior changes

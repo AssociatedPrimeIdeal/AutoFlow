@@ -23,7 +23,7 @@ with h5py.File("case.h5", "r") as handle:
 
 Legacy complex data must be channels-last `XYZT4` (single VENC) or `XYZT7` (dual VENC). Real combined `img` is `XYZT4`; normalized `mag` is `XYZT` and `flow` is `XYZT3`. Channels-first layouts are rejected, not silently transposed.
 
-[Loader parameters](parameters.md#loader) and [DICOM override schema](parameter-schemas.md#dicom-metadata-overrides) explain every supported setting.
+[Loader parameters](parameters.md#loader) and [DICOM conversion](../features/dicom-loading.md) explain input settings.
 
 ## Supported Inputs
 
@@ -33,8 +33,7 @@ Legacy complex data must be channels-last `XYZT4` (single VENC) or `XYZT7` (dual
 | normalized H5 with `mag` and `flow` | yes | CLI, GUI, Python API | preferred normalized path |
 | normalized H5 with real-valued `img[..., 0:4]` | yes | CLI, GUI, Python API | requires `XYZT4` and is interpreted as `mag + flow_xyz` |
 | DICOM-to-H5 conversion | optional backend | CLI, GUI, Python API | [Pinned converter](../features/dicom-loading.md); preserves normalized H5 groups for reuse |
-| direct DICOM directory | yes | CLI, GUI, Python API | scanned into importable cases |
-| single DICOM file | yes for case collection | CLI | resolved through case collection logic |
+| single DICOM file | no | — | select the containing acquisition directory |
 
 ## Legacy Complex H5 Variants
 
@@ -145,10 +144,9 @@ AutoFlow normalizes loaders to `LoadedCase`.
 
 ## DICOM Notes
 
-- direct DICOM loading is handled in `autoflow/algorithms/dicom.py`
-- Siemens signed phase velocity channels are rescaled to physical velocity during direct load
-- textual through-plane direction tags such as `IN` or `TH` are interpreted as slice-select velocity components during case detection
-- DICOM-derived mag and flow inputs do not reconstruct fake TKE
+- DICOM directories are decoded by the pinned Dicom2H5 converter, then loaded as normalized H5 through `autoflow/algorithms/inputs.py`.
+- Vendor scaling, direction tags and acquisition assembly belong to the converter; AutoFlow validates and normalizes its H5 output.
+- DICOM-derived magnitude and flow do not reconstruct fake TKE.
 
 ## Segmentation Expectations By Input
 
@@ -156,7 +154,7 @@ AutoFlow normalizes loaders to `LoadedCase`.
 | --- | --- | --- | --- |
 | legacy complex H5 | yes when present | yes | yes |
 | normalized H5 | yes when present | yes | yes |
-| direct DICOM | usually no | yes | yes |
+| DICOM converted to H5 | usually no | yes | yes |
 
 ## Grouped Multi-Label Segmentation Behavior
 
@@ -170,8 +168,10 @@ AutoFlow normalizes loaders to `LoadedCase`.
 
 ## Code References
 
-- H5 loading: `autoflow/algorithms/data.py`
-- DICOM scan and load: `autoflow/algorithms/dicom.py`
+- H5 loading: `autoflow/algorithms/data/h5_loader.py`; cases/metadata: `data/discovery.py`, `data/h5_metadata.py`
+- Array and coordinate normalization: `autoflow/algorithms/data/normalization.py`, `autoflow/algorithms/data/orientation.py`
+- Correction caches and dual-VENC: `autoflow/algorithms/data/correction_cache.py`, `autoflow/algorithms/data/dual_venc.py`
+- Input dispatch and conversion: `autoflow/algorithms/inputs.py`
 - pipeline load step: `autoflow/core/pipeline.py`
 - types: `autoflow/case_types.py`
 

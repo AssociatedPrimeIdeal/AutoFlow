@@ -161,4 +161,4 @@ This is about 56–65% less time for **base plane metrics**, not the entire pipe
 
 ## Code and validation
 
-Measure through the public API and the metric functions above. Algorithm owners: `autoflow/algorithms/segmentation.py`, `phase_correction.py`, `metrics.py`; orchestration: `autoflow/core/pipeline.py`, `autoflow/processing.py`. Numerical optimizations must preserve smoke/phantom truth and use controlled real-case comparisons. See [Testing](testing.md).
+Measure through the public API and the metric functions above. Algorithm owners: `autoflow/algorithms/segmentation/`, `autoflow/algorithms/data/`, `phase_correction.py`, `metrics/`; orchestration: `autoflow/core/pipeline.py`, `autoflow/processing.py`. Numerical optimizations must preserve smoke/phantom truth and use controlled real-case comparisons. See [Testing](testing.md).

@@ -12,7 +12,7 @@ cd AutoFlow
 pip install -e ".[gui,test]"
 ```
 
-For CLI-only use, install `pip install .`. Optional preserved DICOM conversion uses `git submodule update --init third_party/4DFlow_Dicom2H5` and `pip install -e ".[dicom]"`; direct DICOM loading remains available without that extra. For learned phase unwrapping, initialize submodules and install `.[pu]`. The optional SpatioTemporal Labeler bridge uses `.[labeler]`; `.[all]` installs all optional dependency groups. Model and runtime details are in [Quickstart](docs/en/user/quickstart.md).
+For CLI-only use, install `pip install .`. DICOM directory input uses `git submodule update --init third_party/4DFlow_Dicom2H5` and `pip install -e ".[dicom]"`. H5-only loading does not require that extra. For learned phase unwrapping, initialize submodules and install `.[pu]`. The optional SpatioTemporal Labeler bridge uses `.[labeler]`; `.[all]` installs all optional dependency groups. Model and runtime details are in [Quickstart](docs/en/user/quickstart.md).
 
 ## Quickstart
 
@@ -50,7 +50,7 @@ Detailed documentation is English-only and organized by function.
 | Start and run | [Quickstart](docs/en/user/quickstart.md), [Worked example](docs/en/user/demo-case.md), [GUI](docs/en/user/gui.md), [CLI](docs/en/user/cli.md), [Python API](docs/en/user/python-api.md) |
 | Data correction | [Background correction](docs/en/features/background-phase-correction.md), [Noise removal](docs/en/features/noise-removal.md), [Phase unwrapping](docs/en/features/phase-unwrapping.md) |
 | Functional workflow | [Feature directory](docs/en/features/index.md) |
-| DICOM input | [Direct loading and preserved conversion](docs/en/features/dicom-loading.md) |
+| DICOM input | [Dicom2H5 conversion and H5 loading](docs/en/features/dicom-loading.md) |
 | Input and output contracts | [Inputs](docs/en/user/inputs.md), [Outputs](docs/en/user/outputs.md), [Troubleshooting](docs/en/user/troubleshooting.md) |
 | Every parameter | [20 configuration modules](docs/en/user/parameters.md), [Structured schemas](docs/en/user/parameter-schemas.md), [CLI flags](docs/en/user/cli-parameters.md), [API fields](docs/en/user/api-parameters.md) |
 | Scientific basis | [References by calculation, with implementation differences](docs/en/references/index.md) |

@@ -28,13 +28,10 @@ from .phase_correction import (
     coerce_background_phase_correction_config,
 )
 
-from .dicom import (
+from .inputs import (
     collect_input_cases,
-    inspect_dicom_case,
-    load_dicom_case,
     load_input_data,
     resolve_input_case,
-    scan_dicom_cases,
 )
 
 from .preprocess import (
@@ -180,11 +177,8 @@ __all__ = [
     "background_phase_report_for_metadata",
     "coerce_background_phase_correction_config",
     "load_input_data",
-    "load_dicom_case",
     "resolve_input_case",
-    "scan_dicom_cases",
     "collect_input_cases",
-    "inspect_dicom_case",
     "normalize_loaded_case",
     "filter_segmask_labels",
     "binarize_segmask",

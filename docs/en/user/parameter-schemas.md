@@ -71,25 +71,13 @@ Keys under `labels.label_groups` are arbitrary group names. Their defaults are:
 | `preprocess.opening_iters` | int | inherited | same | Remove small foreground projections with opening | same |
 | `preprocess.closing_iters` | int | inherited | same | Close small gaps with closing | same |
 
-## DICOM metadata overrides
-
-All fields are optional and otherwise use detected DICOM metadata. Values are interpreted before canonical reorientation; they do not rewrite DICOM files.
-
-| Parameter | Type | Default | Where configured | Effect / units | Code owner |
-| --- | --- | --- | --- | --- | --- |
-| `spatial_order` | three direction strings | detected | `loader.dicom_parameter_overrides` | Physical directions of the three source spatial axes, e.g. LR/AP/FH with their reversals | `autoflow/algorithms/dicom.py` |
-| `venc_order` | three direction strings | detected | same | Physical directions/order of source velocity components | same |
-| `resolution` | three floats | detected | same | Source voxel spacing in mm | same |
-| `venc` | three floats | detected | same | Source component VENC in cm/s | same |
-| `rr` | float | detected | same | Cardiac cycle duration in ms | same |
-
 ## Learned phase-unwrapping adapters
 
 Put keys inside `phase_unwrapping.backend_params.pudip` or `.gust`. AutoFlow passes the following supported constructor controls; unsupported keys are not forwarded blindly. Input VENC/device come from the case and selected top-level method/device.
 
 | Parameter | Type | Adapter default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `pudip.level` | int | 4 | phase_unwrapping.backend_params | DIP network depth | `autoflow/algorithms/phase_unwrapping.py` |
+| `pudip.level` | int | 4 | phase_unwrapping.backend_params | DIP network depth | `autoflow/algorithms/phase_unwrapping/pudip.py` |
 | `pudip.features` | int | 128 | same | Feature channels in the network | same |
 | `pudip.input_depth` | int | 128 | same | Input noise channel count | same |
 | `pudip.lr` | float | 0.001 | same | Optimizer learning rate | same |
@@ -135,7 +123,7 @@ These accepted controls may be absent from shipped JSON.
 
 | Parameter | Type | Default | Where configured | Effect / units | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `wss.viscosity` | float | fluid.viscosity = 4.0 | configs/wss.json | Override shared WSS viscosity in mPa s | `autoflow/config.py; autoflow/algorithms/metrics.py` |
+| `wss.viscosity` | float | fluid.viscosity = 4.0 | configs/wss.json | Override shared WSS viscosity in mPa s | `autoflow/config.py; autoflow/algorithms/metrics/wss.py` |
 | `tke.rho` | float | fluid.rho = 1060.0 | configs/tke.json | Override shared density in kg/m3 | same |
 | `pressure_gradient.rho` | float | fluid.rho = 1060.0 | configs/pressure_gradient.json | Override pressure density in kg/m3 | same |
 | `pressure_gradient.viscosity` | float | fluid.viscosity = 4.0 | configs/pressure_gradient.json | Override pressure viscosity in mPa s | same |
