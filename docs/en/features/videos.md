@@ -9,7 +9,7 @@
 | GUI | Supported | selective export through `Export > Export Videos...` |
 
 ## What It Does
-Offline video rendering exports rotating or time-resolved MP4 files for planes, WSS, TKE, pressure gradient, relative pressure, and streamlines. In grouped vessel workflows, plane videos color each rendered centerline path with the configured group path color from `configs/labels.json`. Plane rotation videos annotate `planeidx=<index>` by default so the rendered label matches the saved plane index, and `configs/video_exporting.json -> plane_video.label` controls the label prefix, font size, text color, and label background styling. Dynamic exports cache per-timepoint streamlines, tube geometry, and sampled TKE or pressure meshes. Streamline phases are prepared in parallel, identical pressure-support phases share one smoothed surface, and VTK actors stay attached while their mapper input and camera are updated for each frame.
+Offline video rendering exports rotating or time-resolved MP4 files for planes, WSS, TKE, pressure gradient, relative pressure, and streamlines. In grouped vessel workflows, plane videos color each rendered centerline path with the configured group path color from `configs/labels.json`. Plane rotation videos annotate `planeidx=<index>` by default so the rendered label matches the saved plane index, and `configs/video_exporting.json -> plane_video.label` controls the label prefix, font size, text color, and label background styling. Frames are encoded as they are rendered; exports do not retain the full RGB frame sequence. Complete MP4s replace the destination atomically, retaining an existing complete video on encoding failure or cancellation. Dynamic exports still cache per-timepoint streamlines, tube geometry, and sampled TKE or pressure meshes. Streamline phases are prepared in parallel, identical pressure-support phases share one smoothed surface, and VTK actors stay attached while their mapper input and camera are updated for each frame.
 
 ## When To Use It
 - use it for reports, demos, or review packages
@@ -40,7 +40,7 @@ summary = run_case("case.h5", config=config)
 ```
 
 ### GUI
-Use `Export > Export Videos...`, choose an output directory, then select any combination of `plane`, `wss`, `tke`, `pg`, and `streamlines`. The GUI computes missing derived data for WSS, TKE, and pressure-analysis exports before rendering. Plane videos read per-group skeleton color plus plane size, color, and opacity from `configs/video_exporting.json -> plane_video.groups`. Plane-video index label prefix, font size, text color, and label background styling come from `configs/video_exporting.json -> plane_video.label`. Live GUI plane objects read `configs/planes.json -> render`.
+Use `Export > Export Videos...`, choose an output directory, then select any combination of `plane`, `wss`, `tke`, `pg`, and `streamlines`. The GUI computes missing derived data in a background task, then runs VTK/FFmpeg in an isolated rendering process. Progress shows completed videos and rendered frames while the activity dots continue independently. × stops that task process and its encoder; the workspace unlocks after exit. Completed videos are published from a temporary directory only after successful rendering. Plane videos read per-group skeleton color plus plane size, color, and opacity from `configs/video_exporting.json -> plane_video.groups`. Plane-video index label prefix, font size, text color, and label background styling come from `configs/video_exporting.json -> plane_video.label`. Live GUI plane objects read `configs/planes.json -> render`.
 
 ## Inputs
 
@@ -71,7 +71,9 @@ See [video exporting parameters](../user/parameters.md#video_exporting), [colorb
 - offline export writes MP4 only through ImageIO FFmpeg; no GIF fallback is generated when MP4 encoding fails
 - TKE video stays unavailable when TKE is unavailable
 - pathlines are not currently exported as a separate batch video feature
-- dynamic video caches remain alive for the duration of one export, using additional memory and up to eight streamline preparation workers to reduce repeated geometry and sampling work
+- dynamic geometry/field caches remain alive for the duration of one export, using additional memory and up to eight streamline preparation workers to reduce repeated geometry and sampling work
+
+GUI process isolation and task cleanup are owned by `autoflow/rendering/jobs.py`, `autoflow/task_control.py`, and `autoflow/ui/progress.py`. Shared streaming encoding and renderer generators remain in `autoflow/rendering/videos.py`.
 
 ## Where To Change Code
 

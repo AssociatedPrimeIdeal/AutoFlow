@@ -10,6 +10,7 @@ import h5py
 import numpy as np
 
 from .data import discover_h5_input_cases
+from ..task_control import check_cancelled
 
 
 def _converter_module():
@@ -61,6 +62,7 @@ def convert_dicom_input(dicom_directory, output_h5, progress_callback=None):
         if not cases:
             raise ValueError("Dicom2H5 produced no AutoFlow-compatible mag + flow groups.")
         # Atomic publication without replacing another run's output.
+        check_cancelled()
         os.link(temporary, target)
         cases = discover_h5_input_cases(target)
         for case in cases:

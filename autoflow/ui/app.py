@@ -2,7 +2,6 @@ import hashlib
 import json
 import copy
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import importlib.util
 import os
@@ -11,9 +10,8 @@ import signal
 import sys
 import time
 import traceback
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
-from queue import SimpleQueue
 
 os.environ["QT_API"] = "pyside6"
 
@@ -48,13 +46,15 @@ from ..algorithms import (
 )
 from ..algorithms.data import discover_h5_input_cases, inspect_h5_input_case
 from ..algorithms.dicom_conversion import convert_dicom_input
-from ..algorithms.phase_unwrapping import backend_available
+from ..algorithms.phase_unwrapping import backend_available, mask_sources_for_method, resolve_mask_source
 from ..algorithms.segmentation import (
     resolve_nnunet_model_folder,
     resolve_nnunet_4d_model_folder,
 )
 from ..core.models import DicomParameterOverrides, ObjectKind, PlaneData, PwvParams, StepId, Workspace
 from ..core.pipeline import PipelineEngine
+from ..task_control import CancellationToken, TaskCancelled, check_cancelled, task_scope
+from .progress import TaskProgressDialog
 from ..config import apply_config_bundle_to_workspace, bundle_to_autoflow_kwargs, load_config_bundle
 from ..plane_io import load_plane_position_payload, project_planes_to_workspace, save_plane_positions
 from ..quality import build_quality_report, save_quality_report
@@ -183,8 +183,8 @@ _RUNTIME_RENDER_METRICS = [
 
 _WORKFLOW_STAGES = [
     ("Input & QC", "input"),
+    ("Correction", "correction"),
     ("Segmentation", "segmentation"),
-    ("Phase Unwrapping", "phase_unwrap"),
     ("Centerline & Planes", "centerline"),
     ("Hemodynamics", "hemodynamics"),
     ("Review & Export", "review"),
@@ -193,7 +193,7 @@ _WORKFLOW_STAGES = [
 _WORKFLOW_STEPS = {
     "input": set(),
     "segmentation": set(),
-    "phase_unwrap": {StepId.UNWRAP_PHASE},
+    "correction": {StepId.BACKGROUND_CORRECTION, StepId.REMOVE_NOISE, StepId.UNWRAP_PHASE, StepId.GENERATE_PCMRA},
     "centerline": {
         StepId.GENERATE_SKELETON,
         StepId.EDIT_SKELETON,
@@ -221,7 +221,7 @@ _WORKFLOW_RUN_ALL_STEPS = {
         StepId.COMPUTE_PLANE_METRICS,
         StepId.COMPUTE_DERIVED_METRICS,
     ),
-    "phase_unwrap": (StepId.UNWRAP_PHASE,),
+    "correction": (StepId.BACKGROUND_CORRECTION, StepId.REMOVE_NOISE, StepId.UNWRAP_PHASE, StepId.GENERATE_PCMRA),
 }
 
 
@@ -247,7 +247,47 @@ class _VideoExportOptions:
     export_streamlines: bool
 
 
-class _AutoSegmentationWorker(QtCore.QObject):
+def _cancellable_worker(method):
+    @wraps(method)
+    def run(self):
+        try:
+            with task_scope(self.cancel_token):
+                return method(self)
+        except TaskCancelled:
+            self.failed.emit("Cancelled")
+    return run
+
+
+class _TaskWorker(QtCore.QObject):
+    def __init__(self):
+        super().__init__()
+        self.cancel_token = CancellationToken()
+
+
+class _FunctionTaskWorker(_TaskWorker):
+    finished = QtCore.Signal(object)
+    failed = QtCore.Signal(str)
+    progress = QtCore.Signal(object)
+    log_message = QtCore.Signal(str)
+
+    def __init__(self, function):
+        super().__init__()
+        self.function = function
+
+    @_cancellable_worker
+    def run(self):
+        try:
+            with task_scope(self.cancel_token, self.progress.emit):
+                result = self.function(self.progress.emit, self.log_message.emit)
+                check_cancelled()
+            self.finished.emit(result)
+        except TaskCancelled:
+            raise
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
+class _AutoSegmentationWorker(_TaskWorker):
     progress = QtCore.Signal(dict)
     finished = QtCore.Signal(object)
     failed = QtCore.Signal(str)
@@ -270,12 +310,14 @@ class _AutoSegmentationWorker(QtCore.QObject):
         self._source_group = str(source_group).strip("/") if source_group else None
 
     def _emit_progress(self, payload):
+        check_cancelled()
         data = dict(payload or {})
         if int(data.get("total") or 0) == 5:
             data["total"] = 7
         self.progress.emit(data)
 
     @QtCore.Slot()
+    @_cancellable_worker
     def run(self):
         t_start = time.perf_counter()
         try:
@@ -301,6 +343,7 @@ class _AutoSegmentationWorker(QtCore.QObject):
                 # subprocess instead of terminating the application.
                 grouped_preprocessing=False,
             )
+            check_cancelled()
             seg = np.asarray(seg, dtype=np.int16)
             foreground_labels = [int(value) for value in np.unique(seg) if int(value) > 0]
             if not foreground_labels:
@@ -349,12 +392,15 @@ class _AutoSegmentationWorker(QtCore.QObject):
                 "total": 7,
                 "elapsed_sec": float(elapsed),
             })
+            check_cancelled()
             self.finished.emit(_AutoSegmentationResult(seg=seg, provenance=provenance, cache_path=cache_path, elapsed_sec=float(elapsed)))
+        except TaskCancelled:
+            raise
         except Exception:
             self.failed.emit(traceback.format_exc())
 
 
-class _DicomConversionWorker(QtCore.QObject):
+class _DicomConversionWorker(_TaskWorker):
     finished = QtCore.Signal(object)
     failed = QtCore.Signal(str)
 
@@ -364,14 +410,19 @@ class _DicomConversionWorker(QtCore.QObject):
         self.output_h5 = output_h5
 
     @QtCore.Slot()
+    @_cancellable_worker
     def run(self):
         try:
-            self.finished.emit(convert_dicom_input(self.root, self.output_h5))
+            result = convert_dicom_input(self.root, self.output_h5)
+            check_cancelled()
+            self.finished.emit(result)
+        except TaskCancelled:
+            raise
         except Exception:
             self.failed.emit(traceback.format_exc())
 
 
-class _PipelineTaskWorker(QtCore.QObject):
+class _PipelineTaskWorker(_TaskWorker):
     progress = QtCore.Signal(dict)
     finished = QtCore.Signal(object)
     failed = QtCore.Signal(str)
@@ -381,13 +432,16 @@ class _PipelineTaskWorker(QtCore.QObject):
         self._engine = engine
         self._workspace = workspace
         self._steps = list(steps)
+        self.completed_steps = []
 
     @QtCore.Slot()
+    @_cancellable_worker
     def run(self):
         started = time.perf_counter()
         results = []
         try:
             for index, step in enumerate(self._steps, start=1):
+                check_cancelled()
                 self.progress.emit({
                     "stage": "start",
                     "current": index - 1,
@@ -397,15 +451,27 @@ class _PipelineTaskWorker(QtCore.QObject):
                 })
                 step_started = time.perf_counter()
                 def _step_progress(payload, *, _step=step):
+                    check_cancelled()
                     data = dict(payload or {})
                     data.setdefault("step", _step)
+                    data.setdefault("detail_current", data.get("current", 0))
+                    data.setdefault("detail_total", data.get("total", 0))
+                    data["current"] = index - 1
+                    data["total"] = len(self._steps)
                     self.progress.emit(data)
-                result = self._engine.run_step(
-                    self._workspace, step, lambda _message: None,
-                    progress_callback=_step_progress,
-                )
+                candidate = self._workspace.copy_for_task()
+                with task_scope(self.cancel_token, _step_progress):
+                    result = self._engine.run_step(
+                        candidate, step, lambda _message: None,
+                        progress_callback=_step_progress,
+                    )
+                check_cancelled()
                 elapsed = time.perf_counter() - step_started
+                if not result.success:
+                    raise RuntimeError(f"{step.label}: {result.message}")
+                self._workspace.__dict__.update(vars(candidate))
                 results.append((step, result, float(elapsed)))
+                self.completed_steps.append(step)
                 self.progress.emit({
                     "stage": "done",
                     "current": index,
@@ -419,11 +485,13 @@ class _PipelineTaskWorker(QtCore.QObject):
                 "results": results,
                 "elapsed_sec": float(time.perf_counter() - started),
             })
+        except TaskCancelled:
+            raise
         except Exception:
             self.failed.emit(traceback.format_exc())
 
 
-class _PathlineTaskWorker(QtCore.QObject):
+class _PathlineTaskWorker(_TaskWorker):
     progress = QtCore.Signal(dict)
     finished = QtCore.Signal(object)
     failed = QtCore.Signal(str)
@@ -443,6 +511,7 @@ class _PathlineTaskWorker(QtCore.QObject):
         self._params = dict(params or {})
 
     @QtCore.Slot()
+    @_cancellable_worker
     def run(self):
         started = time.perf_counter()
         try:
@@ -470,6 +539,7 @@ class _PathlineTaskWorker(QtCore.QObject):
                 max(1, int(self._params["pathline_max_steps"])),
             )
             for current, plane_index in enumerate(self._plane_indices, start=1):
+                check_cancelled()
                 seeds = _plane_seeds(
                     mask_t,
                     self._planes[plane_index],
@@ -486,6 +556,7 @@ class _PathlineTaskWorker(QtCore.QObject):
                 seed_results[int(plane_index)] = seeds
                 plane_offset = (current - 1) * frame_steps
                 def _step_progress(step, step_total, *, _plane=int(plane_index), _offset=plane_offset, _current=current):
+                    check_cancelled()
                     self.progress.emit({
                         "current": min(_offset + int(step), _current * frame_steps),
                         "total": total * frame_steps,
@@ -520,6 +591,7 @@ class _PathlineTaskWorker(QtCore.QObject):
                     "message": f"Generated pathlines for plane {int(plane_index)} ({current}/{total})",
                     "elapsed_sec": float(time.perf_counter() - started),
                 })
+            check_cancelled()
             self.finished.emit({
                 "plane_indices": self._plane_indices,
                 "meshes": results,
@@ -527,6 +599,8 @@ class _PathlineTaskWorker(QtCore.QObject):
                 "temporal_cache_all_phases": bool(temporal_source.cache_all_phases),
                 "elapsed_sec": float(time.perf_counter() - started),
             })
+        except TaskCancelled:
+            raise
         except Exception:
             self.failed.emit(traceback.format_exc())
 
@@ -759,8 +833,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._workflow_param_widgets[stage_key].append((widget, bool(advanced)))
 
         _capture_params("input", self._build_preprocess_params)
+        _capture_params("correction", self._build_background_correction_params)
+        _capture_params("correction", self._build_noise_removal_params)
+        _capture_params("correction", self._build_phase_unwrap_params)
         _capture_params("segmentation", self._build_segmentation_params)
-        _capture_params("phase_unwrap", self._build_phase_unwrap_params)
         _capture_params("centerline", self._build_skeleton_params, advanced=True)
         _capture_params("centerline", self._build_plane_params)
         _capture_params("hemodynamics", self._build_pwv_params)
@@ -878,7 +954,7 @@ class MainWindow(QtWidgets.QMainWindow):
         gl = QtWidgets.QGridLayout(grp)
         self.step_buttons = {}
         all_steps = [
-            StepId.UNWRAP_PHASE,
+            StepId.BACKGROUND_CORRECTION, StepId.REMOVE_NOISE, StepId.UNWRAP_PHASE, StepId.GENERATE_PCMRA,
             StepId.GENERATE_SKELETON, StepId.EDIT_SKELETON,
             StepId.GENERATE_GRAPH, StepId.EDIT_GRAPH,
             StepId.GENERATE_PLANES, StepId.COMPUTE_PLANE_METRICS,
@@ -886,6 +962,7 @@ class MainWindow(QtWidgets.QMainWindow):
             StepId.GENERATE_STREAMLINES, StepId.PLANE_STREAMLINES,
         ]
         step_tooltips = {
+            StepId.GENERATE_PCMRA: "Compute PC-MRA from current working velocity and create its 3D rendering layer.",
             StepId.UNWRAP_PHASE: "Run the selected optional phase-unwrapping method. Dual-VENC inputs are skipped.",
             StepId.EDIT_SKELETON: "Correct skeleton points interactively. Saving clears graph, paths, planes, and downstream metrics.",
             StepId.EDIT_GRAPH: "Move graph nodes, toggle edges, or delete graph elements. Saving clears paths, planes, and downstream metrics.",
@@ -951,10 +1028,29 @@ class MainWindow(QtWidgets.QMainWindow):
         parent.addWidget(edit_grp, 0)
 
     def _build_preprocess_params(self):
-        grp = QtWidgets.QGroupBox("Input / Background Correction")
+        grp = QtWidgets.QGroupBox("Input Parameters")
         fl = QtWidgets.QFormLayout(grp)
+        self.edit_input_resolution = QtWidgets.QLineEdit("1.0, 1.0, 1.0")
+        self.edit_input_venc = QtWidgets.QLineEdit("150.0, 150.0, 150.0")
+        self.edit_input_spatial_order = QtWidgets.QLineEdit("LR, AP, FH")
+        self.edit_input_venc_order = QtWidgets.QLineEdit("LR, AP, FH")
+        fl.addRow("Current Resolution XYZ", self.edit_input_resolution)
+        fl.addRow("Current VENC XYZ", self.edit_input_venc)
+        fl.addRow("Current Spatial Order", self.edit_input_spatial_order)
+        fl.addRow("Current VENC Order", self.edit_input_venc_order)
+        self.btn_reload_input = QtWidgets.QPushButton("Reload Input with Current Parameters")
+        self.btn_reload_input.setIcon(standard_icon(self, "SP_BrowserReload"))
+        self.btn_reload_input.clicked.connect(self._reload_input_case)
+        fl.addRow("", self.btn_reload_input)
+        self.params_layout.addWidget(grp)
+
+    def _build_background_correction_params(self):
+        grp = QtWidgets.QGroupBox("Background Correction")
+        fl = QtWidgets.QFormLayout(grp)
+        # Kept internally for older UI/workspace parameter bindings. Explicit
+        # correction actions always enable correction; loading never applies it.
         self.chk_bpc_enabled = QtWidgets.QCheckBox()
-        self.chk_bpc_enabled.setChecked(False)
+        self.chk_bpc_enabled.setChecked(True)
         self.combo_bpc_method = QtWidgets.QComboBox()
         for label, method in _BACKGROUND_PHASE_METHOD_ITEMS:
             self.combo_bpc_method.addItem(label, method)
@@ -968,35 +1064,63 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_bpc_threshold.setSingleStep(0.01)
         self.spin_bpc_threshold.setValue(0.2)
         self.spin_dual_venc_ratio1 = QtWidgets.QDoubleSpinBox()
-        self.spin_dual_venc_ratio1.setDecimals(4)
-        self.spin_dual_venc_ratio1.setRange(-10.0, 10.0)
-        self.spin_dual_venc_ratio1.setSingleStep(0.01)
-        self.spin_dual_venc_ratio1.setValue(0.0)
         self.spin_dual_venc_ratio2 = QtWidgets.QDoubleSpinBox()
-        self.spin_dual_venc_ratio2.setDecimals(4)
-        self.spin_dual_venc_ratio2.setRange(-10.0, 10.0)
-        self.spin_dual_venc_ratio2.setSingleStep(0.01)
-        self.spin_dual_venc_ratio2.setValue(0.0)
-        self.edit_input_resolution = QtWidgets.QLineEdit("1.0, 1.0, 1.0")
-        self.edit_input_venc = QtWidgets.QLineEdit("150.0, 150.0, 150.0")
-        self.edit_input_spatial_order = QtWidgets.QLineEdit("LR, AP, FH")
-        self.edit_input_venc_order = QtWidgets.QLineEdit("LR, AP, FH")
-        fl.addRow("Enable Correction", self.chk_bpc_enabled)
+        for widget in (self.spin_dual_venc_ratio1, self.spin_dual_venc_ratio2):
+            widget.setDecimals(4)
+            widget.setRange(-10.0, 10.0)
+            widget.setSingleStep(0.01)
         fl.addRow("Correction Method", self.combo_bpc_method)
         fl.addRow("Corr Fit Order", self.spin_bpc_fit_order)
         fl.addRow("MSAC Threshold", self.spin_bpc_threshold)
         fl.addRow("Dual-VENC Ratio1", self.spin_dual_venc_ratio1)
         fl.addRow("Dual-VENC Ratio2", self.spin_dual_venc_ratio2)
-        fl.addRow("Current Resolution XYZ", self.edit_input_resolution)
-        fl.addRow("Current VENC XYZ", self.edit_input_venc)
-        fl.addRow("Current Spatial Order", self.edit_input_spatial_order)
-        fl.addRow("Current VENC Order", self.edit_input_venc_order)
-        self.btn_reload_input = QtWidgets.QPushButton("Reload Input with Current Parameters")
-        self.btn_reload_input.setIcon(standard_icon(self, "SP_BrowserReload"))
-        self.btn_reload_input.clicked.connect(self._reload_input_case)
-        fl.addRow("", self.btn_reload_input)
+        hint = QtWidgets.QLabel("Updates working velocity used by segmentation. Existing downstream results are retained; rerun them manually.")
+        hint.setWordWrap(True)
+        fl.addRow(hint)
         self._on_bpc_method_changed()
         self.params_layout.addWidget(grp)
+
+    def _build_noise_removal_params(self):
+        grp = QtWidgets.QGroupBox("Noise Removal (PC-MRA Rendering Only)")
+        fl = QtWidgets.QFormLayout(grp)
+        self.combo_noise_method = QtWidgets.QComboBox()
+        self.combo_noise_method.addItem("Magnitude + temporal speed SD", "magnitude_temporal")
+        self.combo_noise_method.addItem("Magnitude only", "magnitude")
+        self.spin_noise_magnitude = QtWidgets.QDoubleSpinBox()
+        self.spin_noise_magnitude.setRange(0.0, 1.0)
+        self.spin_noise_magnitude.setDecimals(3)
+        self.spin_noise_magnitude.setSingleStep(0.01)
+        self.spin_noise_magnitude.setValue(0.05)
+        self.spin_noise_magnitude.setSpecialValueText("Positive signal only")
+        self.spin_noise_magnitude.setToolTip("Fraction of maximum temporal-mean magnitude; default 0.05 (5%). Lower values retain more voxels. Zero keeps positive finite signal.")
+        self.spin_noise_std_max = QtWidgets.QDoubleSpinBox()
+        self.spin_noise_std_max.setRange(0.0, 1.0)
+        self.spin_noise_std_max.setDecimals(3)
+        self.spin_noise_std_max.setSingleStep(0.01)
+        self.spin_noise_std_max.setValue(0.80)
+        self.spin_noise_std_max.setSpecialValueText("Disabled")
+        self.spin_noise_std_max.setToolTip("Upper temporal speed SD fraction of maximum SD; default 0.80 (80%). Higher values retain more voxels; zero disables screening. Rerun after editing.")
+        fl.addRow("Method", self.combo_noise_method)
+        fl.addRow("Magnitude fraction of maximum", self.spin_noise_magnitude)
+        fl.addRow("Temporal SD fraction of maximum", self.spin_noise_std_max)
+        reset = QtWidgets.QPushButton("Reset PC-MRA Noise Mask")
+        reset.clicked.connect(self._reset_noise_removal)
+        fl.addRow(reset)
+        self.params_layout.addWidget(grp)
+
+    def _reset_noise_removal(self):
+        if self._pipeline_running_guard("resetting noise removal"):
+            return
+        self.workspace.pcmra_render_mask = None
+        self.workspace.noise_removal_result = {}
+        self.workspace.remove_object_by_data_key("noise_region")
+        self.workspace.pipeline.completed.pop(StepId.REMOVE_NOISE.value, None)
+        self.scene.invalidate_cache("pcmra_volume")
+        self.scene.invalidate_cache("noise_region")
+        self.scene.sync_from_workspace(rebuild_prefixes=("pcmra_volume", "noise_region"))
+        self.ortho_viewer.refresh()
+        self._refresh_browser()
+        self._refresh_workflow_status()
 
     def _build_segmentation_params(self):
         grp = QtWidgets.QGroupBox("Segmentation Parameters")
@@ -1184,7 +1308,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.params_layout.addWidget(grp)
 
     def _build_phase_unwrap_params(self):
-        grp = QtWidgets.QGroupBox("Phase Unwrapping (Optional)")
+        grp = QtWidgets.QGroupBox("Phase Unwrapping")
         fl = QtWidgets.QFormLayout(grp)
         self.combo_phase_unwrap_method = QtWidgets.QComboBox()
         for label, method in [
@@ -1199,8 +1323,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.combo_phase_unwrap_method.addItem(label, method)
         self.combo_phase_unwrap_method.currentIndexChanged.connect(self._on_phase_unwrap_method_changed)
         self.combo_phase_unwrap_mask = QtWidgets.QComboBox()
-        self.combo_phase_unwrap_mask.addItem("segmask", "segmask")
-        self.combo_phase_unwrap_mask.addItem("PCMRAStd", "pcmra_std")
+        self._phase_unwrap_masks = {}
+        self._phase_unwrap_mask_method = None
+        self.combo_phase_unwrap_mask.currentIndexChanged.connect(self._on_phase_unwrap_mask_changed)
         self.combo_phase_unwrap_device = QtWidgets.QComboBox()
         for label, value in [("Auto (GPU if available)", "auto"), ("CPU", "cpu"), ("CUDA", "cuda")]:
             self.combo_phase_unwrap_device.addItem(label, value)
@@ -1235,7 +1360,7 @@ class MainWindow(QtWidgets.QMainWindow):
         fl.addRow("Mask / initialization", self.combo_phase_unwrap_mask)
         fl.addRow("Device", self.combo_phase_unwrap_device)
         fl.addRow("Method parameters", self.phase_unwrap_method_stack)
-        self.btn_revert_phase_unwrap = QtWidgets.QPushButton("Revert to Loaded Flow")
+        self.btn_revert_phase_unwrap = QtWidgets.QPushButton("Revert to Pre-Unwrapping Flow")
         self.btn_revert_phase_unwrap.clicked.connect(self._revert_phase_unwrap)
         fl.addRow("", self.btn_revert_phase_unwrap)
         self.params_layout.addWidget(grp)
@@ -1504,7 +1629,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.edit_dm_pg_opacity = QtWidgets.QLineEdit("0.6")
         self.edit_dm_rp_opacity = QtWidgets.QLineEdit("0.6")
         self.combo_dm_pressure_method = QtWidgets.QComboBox()
-        self.combo_dm_pressure_method.addItems(["least_squares", "ppe"])
+        self.combo_dm_pressure_method.addItems(["ppe", "ste"])
         self.chk_dm_multithread = QtWidgets.QCheckBox()
         self.chk_dm_multithread.setChecked(False)
         fl_tke.addRow(u"Density \u03c1 (kg/m\u00b3)", self.edit_dm_rho)
@@ -1748,24 +1873,11 @@ class MainWindow(QtWidgets.QMainWindow):
             if not ws.data_loaded:
                 return "Not ready"
             return "Ready" if ws.segmask_raw is not None else "Needs review"
-        if stage_key == "phase_unwrap":
+        if stage_key == "correction":
             if not ws.data_loaded:
                 return "Not ready"
-            dual_info = (ws.input_state.metadata or {}).get("dual_venc", {})
-            if not isinstance(dual_info, dict):
-                dual_info = {}
-            dual_mode = str(dual_info.get("selected_mode", dual_info.get("mode", "dv")) or "dv").lower()
-            if (
-                dual_mode == "dv"
-                and (
-                    str(ws.input_state.source_format).lower() == "legacy_h5_dual_venc"
-                    or bool(dual_info.get("enabled", False))
-                )
-            ):
-                return "Skipped (dual-VENC)"
-            if not ws.input_state.capabilities.has_wrapped_phase:
-                return "Unavailable"
-            return "Ready" if ws.pipeline.is_done(StepId.UNWRAP_PHASE) else "Optional"
+            steps = _WORKFLOW_RUN_ALL_STEPS["correction"]
+            return "Ready" if all(ws.pipeline.is_done(step) for step in steps) else "Optional"
         if stage_key == "centerline":
             if len(ws.planes) > 0:
                 return "Ready"
@@ -1826,7 +1938,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if widget is not None:
                 widget.setVisible(False)
         ordered_steps = [
-            StepId.UNWRAP_PHASE,
+            StepId.BACKGROUND_CORRECTION, StepId.REMOVE_NOISE, StepId.UNWRAP_PHASE, StepId.GENERATE_PCMRA,
             StepId.GENERATE_SKELETON, StepId.EDIT_SKELETON,
             StepId.GENERATE_GRAPH, StepId.EDIT_GRAPH, StepId.GENERATE_PLANES,
             StepId.COMPUTE_PLANE_METRICS, StepId.COMPUTE_PWV,
@@ -1851,7 +1963,7 @@ class MainWindow(QtWidgets.QMainWindow):
             for idx, step in enumerate(active_steps):
                 step_layout.addWidget(self.step_buttons[step], idx // 2, idx % 2)
             action_row = (len(active_steps) + 1) // 2
-            if stage_key in {"centerline", "hemodynamics"}:
+            if stage_key in {"correction", "centerline", "hemodynamics"}:
                 step_layout.addWidget(self.btn_run_all, action_row, 0, 1, 2)
         if stage_key == "centerline":
             plane_row = active_steps.index(StepId.GENERATE_PLANES) // 2
@@ -1860,8 +1972,8 @@ class MainWindow(QtWidgets.QMainWindow):
             button.setVisible(step in visible_steps)
         if hasattr(self, "btn_import_planes_centerline"):
             self.btn_import_planes_centerline.setVisible(stage_key == "centerline")
-        self.btn_run_all.setVisible(stage_key in {"centerline", "hemodynamics"})
-        if stage_key in {"centerline", "hemodynamics"}:
+        self.btn_run_all.setVisible(stage_key in {"correction", "centerline", "hemodynamics"})
+        if stage_key in {"correction", "centerline", "hemodynamics"}:
             self.btn_run_all.setText("Run All")
         self.steps_group.setVisible(bool(visible_steps) or self.btn_run_all.isVisible())
         stage_label = _WORKFLOW_STAGES[int(index)][0].replace("&", "&&")
@@ -3074,6 +3186,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 grouped.visible = bool(ws.segmentation.visible)
 
     def _refresh_segmentation_ui(self):
+        self._refresh_phase_unwrap_masks()
         panel = self.segmentation_panel
         ws = self.workspace
         seg = ws.segmentation
@@ -3211,10 +3324,24 @@ class MainWindow(QtWidgets.QMainWindow):
     def _commit_segmentation_source_change(self, source, log_message=None):
         self._last_quality_report = None
         ws = self.workspace
-        if not ws.activate_segmentation_source(source):
+        if ws.get_segmentation_source(source) is None:
             self.log(f"Segmentation source unavailable: {source}")
             return False
-        ws.reset_segmentation_results()
+        candidate = ws.copy_for_task()
+        def prepare(progress, log):
+            candidate.activate_segmentation_source(source)
+            progress({"stage": "segmentation_update", "message": "Checking segmentation topology…"})
+            return self.pipeline.refresh_segmentation_dependents(candidate)
+        try:
+            reuse = self._run_modal_task("Update Segmentation", "Preparing segmentation…", prepare)
+        except TaskCancelled:
+            self.log("Segmentation update cancelled; the active workspace is retained.")
+            return False
+        ws.__dict__.update(vars(candidate))
+        if reuse == "geometry":
+            self.log("Processed 3D topology unchanged; centerlines and planes retained. Rerun metrics and trajectories.")
+        elif reuse == "unchanged":
+            self.log("Processed segmentation unchanged; existing geometry and metrics retained.")
         self._selected_plane_index = -1
         self.scene.highlight_plane(None)
         self.scene.highlight_path(None)
@@ -3355,6 +3482,7 @@ class MainWindow(QtWidgets.QMainWindow):
             source_spatial_order=tuple(str(x).upper() for x in (ws.input_state.metadata.get("spatial_order_raw") or [])),
             source_group=ws.input_state.source_group,
         )
+        self._bind_task_progress(self._autoseg_progress_dialog, self._autoseg_worker)
         self._autoseg_worker.moveToThread(self._autoseg_thread)
         self._autoseg_thread.started.connect(self._autoseg_worker.run)
         self._autoseg_worker.progress.connect(self._on_autoseg_progress)
@@ -3362,6 +3490,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._autoseg_worker.failed.connect(self._on_autoseg_failed)
         self._autoseg_worker.finished.connect(self._autoseg_thread.quit)
         self._autoseg_worker.failed.connect(self._autoseg_thread.quit)
+        self._autoseg_thread.finished.connect(self._autoseg_worker.deleteLater)
         self._autoseg_thread.finished.connect(self._cleanup_autoseg_task)
         self.log(
             f"Auto segmentation started: backend={seg_state.auto_backend} model={resolved_model} "
@@ -3384,19 +3513,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         stage = str(payload.get("stage", "") or "")
         message = str(payload.get("message", "") or stage or "Auto segmentation")
-        elapsed_sec = payload.get("elapsed_sec")
-        if elapsed_sec is not None:
-            message = f"{message}\nElapsed: {float(elapsed_sec):.2f}s"
         dialog = self._autoseg_progress_dialog
         if dialog is not None and dialog.isVisible():
-            total = payload.get("total")
-            current = payload.get("current")
-            if total is not None and int(total) > 0:
-                dialog.setRange(0, int(total))
-                dialog.setValue(min(int(current or 0), int(total)))
-            else:
-                dialog.setRange(0, 0)
-            dialog.setLabelText(message)
+            dialog.update_progress(payload)
         should_log = stage in {
             "autoseg_model_ready",
             "autoseg_run_inference",
@@ -3416,6 +3535,15 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.processEvents()
 
     def _on_autoseg_finished(self, result):
+        if self._autoseg_progress_dialog is not None and self._autoseg_progress_dialog.cancel_token.cancelled:
+            self._on_autoseg_failed("Cancelled")
+            return
+        self._autoseg_result = result
+
+    def _apply_autoseg_result(self, result):
+        if self._autoseg_progress_dialog is not None and self._autoseg_progress_dialog.cancel_token.cancelled:
+            self._on_autoseg_failed("Cancelled")
+            return
         ws = self.workspace
         seg_state = ws.segmentation
         ws.set_segmentation_source("auto", result.seg, provenance=result.provenance)
@@ -3437,10 +3565,11 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         if seg_nifti:
             self.log(f"Auto segmentation NIfTI saved: {seg_nifti}")
-        self._close_progress_dialog(self._autoseg_progress_dialog)
-        self._autoseg_progress_dialog = None
 
     def _on_autoseg_failed(self, error_text):
+        if str(error_text) == "Cancelled":
+            self.log("Automatic segmentation cancelled; no result was applied.")
+            return
         text = str(error_text or "").strip()
         if not text:
             text = "Unknown auto segmentation failure."
@@ -3448,8 +3577,27 @@ class MainWindow(QtWidgets.QMainWindow):
         summary = lines[-1] if lines else "Unknown auto segmentation failure."
         self.log(f"Auto segmentation failed: {summary}")
         self.log(text)
+        self._autoseg_error = (summary, text)
+
+    def _cleanup_autoseg_task(self):
+        cancelled = self._autoseg_progress_dialog is not None and self._autoseg_progress_dialog.cancel_token.cancelled
+        result = getattr(self, "_autoseg_result", None)
+        self._autoseg_result = None
         self._close_progress_dialog(self._autoseg_progress_dialog)
         self._autoseg_progress_dialog = None
+        if self._autoseg_thread is not None:
+            self._autoseg_thread.deleteLater()
+        self._autoseg_worker = None
+        self._autoseg_thread = None
+        self._autoseg_started_at = None
+        error = getattr(self, "_autoseg_error", None)
+        self._autoseg_error = None
+        if error is not None:
+            self._show_autoseg_error(*error)
+        elif result is not None and not cancelled:
+            self._apply_autoseg_result(result)
+
+    def _show_autoseg_error(self, summary, text):
         message_box = QtWidgets.QMessageBox(self)
         message_box.setIcon(QtWidgets.QMessageBox.Critical)
         message_box.setWindowTitle("Automatic Segmentation Failed")
@@ -3458,15 +3606,6 @@ class MainWindow(QtWidgets.QMainWindow):
         message_box.setDetailedText(text)
         message_box.setWindowModality(QtCore.Qt.WindowModal)
         message_box.exec()
-
-    def _cleanup_autoseg_task(self):
-        if self._autoseg_worker is not None:
-            self._autoseg_worker.deleteLater()
-        if self._autoseg_thread is not None:
-            self._autoseg_thread.deleteLater()
-        self._autoseg_worker = None
-        self._autoseg_thread = None
-        self._autoseg_started_at = None
 
     def _format_threshold_summary(self, threshold_info):
         mode = str(threshold_info.get("mode", "manual_absolute"))
@@ -3589,69 +3728,44 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Install with pip install .[gui,labeler]."
             )
             return
-        progress = QtWidgets.QProgressDialog(
-            "Preparing SpatioTemporal Labeler...", "", 0, 6, self
-        )
-        progress.setWindowTitle("Export Labeler Features")
-        progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
-        progress.setCancelButton(None)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(False)
-        progress.setAutoReset(False)
-        progress.setValue(0)
-        progress.show()
-        QtWidgets.QApplication.processEvents()
         self._labeler_export_running = True
         try:
             segmentation = np.asarray(segmentation, dtype=np.int16)
-            mag = np.asarray(ws.mag_raw, dtype=np.float32)
-            flow = np.asarray(ws.flow_raw, dtype=np.float32)
+            mag, flow = np.asarray(ws.mag_raw, dtype=np.float32), np.asarray(ws.flow_raw, dtype=np.float32)
             if segmentation.ndim != 4:
                 raise ValueError(f"active segmentation must be XYZT, got shape={segmentation.shape}")
             if mag.ndim == 3:
                 mag = np.repeat(mag[..., None], segmentation.shape[3], axis=3)
-            if mag.shape != segmentation.shape:
-                raise ValueError(
-                    "magnitude and segmentation must have matching XYZT shapes, "
-                    f"got {mag.shape} and {segmentation.shape}"
-                )
-            if flow.ndim != 5 or flow.shape[:4] != segmentation.shape or flow.shape[-1] != 3:
-                raise ValueError(
-                    "flow and segmentation must have matching XYZT dimensions, "
-                    f"got flow={flow.shape}, segmentation={segmentation.shape}"
-                )
+            if mag.shape != segmentation.shape or flow.shape[:4] != segmentation.shape or flow.shape[-1] != 3:
+                raise ValueError("magnitude, flow and segmentation must have matching XYZT dimensions")
             metadata = self._labeler_exchange_metadata(segmentation)
             exchange_dir = self._labeler_exchange_directory(metadata)
-            os.makedirs(exchange_dir, exist_ok=True)
-            completed = SimpleQueue()
-            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="autoflow-labeler-export") as pool:
-                future = pool.submit(
-                    export_labeler_exchange, exchange_dir, metadata, mag, flow, segmentation,
-                    ws.resolution, ws.origin, completed.put,
-                )
+            def export(progress, log):
                 count = 0
-                while not future.done():
-                    while not completed.empty():
-                        name = completed.get()
-                        count += 1
-                        progress.setValue(count)
-                        progress.setLabelText(f"Exported {name} ({count}/6)...")
-                    QtWidgets.QApplication.processEvents()
-                    time.sleep(0.01)
-                exported = future.result()
-            feature_paths = exported["feature_paths"]
-            label_path = exported["label_path"]
+                progress({"stage": "labeler_digest", "message": "Checking image and segmentation files…"})
+                def written(name):
+                    nonlocal count
+                    count += 1
+                    progress({"stage": "labeler_export", "current": count, "total": 6,
+                              "message": f"Exported {name} ({count}/6)"})
+                result = export_labeler_exchange(exchange_dir, metadata, mag, flow, segmentation,
+                                                 ws.resolution, ws.origin, written)
+                progress({"stage": "labeler_export", "current": 6, "total": 6,
+                          "message": "Labeler features ready"})
+                return result
+            exported = self._run_modal_task("Export Labeler Features", "Preparing SpatioTemporal Labeler…", export)
+            feature_paths, label_path = exported["feature_paths"], exported["label_path"]
             reuse_exchange = exported["reused_features"] and exported["reused_labels"]
             if exported["previous_label_path"]:
                 self.log(f"Preserved previous Labeler mask: {exported['previous_label_path']}")
-            progress.setValue(6)
+        except TaskCancelled:
+            self.log("Labeler export cancelled; the editor was not launched.")
+            return
         except Exception as exc:
-            self._close_progress_dialog(progress)
             self.log(f"Could not launch SpatioTemporal Labeler: {type(exc).__name__}: {exc}")
             return
         finally:
             self._labeler_export_running = False
-        self._close_progress_dialog(progress)
 
         process = QtCore.QProcess(self)
         process.setWorkingDirectory(exchange_dir)
@@ -3707,6 +3821,7 @@ class MainWindow(QtWidgets.QMainWindow):
         process.readyReadStandardOutput.connect(self._on_external_segmentation_editor_stdout)
         process.readyReadStandardError.connect(self._on_external_segmentation_editor_stderr)
         self._labeler_process = process
+        self._labeler_origin_workspace = self.workspace
         self._labeler_segmentation_path = label_path
         self._labeler_segmentation_mtime_ns = os.stat(label_path).st_mtime_ns
         if removed_render_variables:
@@ -3762,6 +3877,8 @@ class MainWindow(QtWidgets.QMainWindow):
         process = self._labeler_process
         label_path = self._labeler_segmentation_path
         initial_mtime_ns = self._labeler_segmentation_mtime_ns
+        origin_workspace = getattr(self, "_labeler_origin_workspace", self.workspace)
+        self._labeler_origin_workspace = None
         self._on_external_segmentation_editor_stdout()
         self._on_external_segmentation_editor_stderr()
         self._labeler_process = None
@@ -3791,6 +3908,16 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if not changed:
             self.log("Labeler segmentation was not saved; the active AutoFlow segmentation is unchanged.")
+            return
+        self._offer_labeler_import(label_path, origin_workspace)
+
+    def _offer_labeler_import(self, label_path, origin_workspace):
+        if self.workspace is not origin_workspace:
+            self.log(f"Labeler result saved for the previous case: {label_path}")
+            return
+        app = QtWidgets.QApplication.instance()
+        if app.activeModalWidget() is not None:
+            QtCore.QTimer.singleShot(250, lambda: self._offer_labeler_import(label_path, origin_workspace))
             return
         choice = QtWidgets.QMessageBox.question(
             self,
@@ -4132,6 +4259,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return "Segmentation"
         if data_key == "pcmra_volume":
             return "PC-MRA"
+        if data_key == "noise_region":
+            return "Noise"
         if data_key == "pwv_planes":
             return "PWV"
         if data_key.startswith("skeleton_") or obj.kind == ObjectKind.SKELETON:
@@ -4173,6 +4302,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _browser_type_sort_key(self, type_name):
         order = [
             "PC-MRA",
+            "Noise",
             "Segmentation",
             "Skeleton",
             "Graph",
@@ -5196,63 +5326,59 @@ class MainWindow(QtWidgets.QMainWindow):
         self.console.append(str(text))
 
     def _create_progress_dialog(self, title, label_text):
-        dlg = QtWidgets.QProgressDialog(label_text, "", 0, 0, self)
-        dlg.setWindowTitle(str(title))
-        dlg.setWindowModality(QtCore.Qt.WindowModal)
-        dlg.setCancelButton(None)
-        dlg.setMinimumDuration(0)
-        dlg.setAutoClose(False)
-        dlg.setAutoReset(False)
-        dlg.setValue(0)
+        self._on_pause()
+        self._timeline_scrub_timer.stop()
+        self._pending_timeline_value = None
+        self._seg_surface_rebuild_timer.stop()
+        dlg = TaskProgressDialog(title, label_text, self)
         dlg.show()
         QtWidgets.QApplication.processEvents()
         return dlg
+
+    def _bind_task_progress(self, dialog, worker):
+        worker.cancel_token = dialog.cancel_token
+
+    def _run_modal_task(self, title, message, function):
+        """Wait in a Qt event loop while numerical/file work runs off the UI thread."""
+        dialog = self._create_progress_dialog(title, message)
+        worker = _FunctionTaskWorker(function)
+        self._bind_task_progress(dialog, worker)
+        thread = QtCore.QThread(self)
+        worker.moveToThread(thread)
+        loop = QtCore.QEventLoop(self)
+        outcome = {}
+        worker.progress.connect(dialog.update_progress)
+        worker.log_message.connect(self.log)
+        worker.finished.connect(lambda result: outcome.update(result=result))
+        worker.failed.connect(lambda error: outcome.update(error=error))
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(loop.quit)
+        thread.started.connect(worker.run)
+        thread.start()
+        loop.exec()
+        thread.wait()
+        thread.deleteLater()
+        self._close_progress_dialog(dialog)
+        dialog.cancel_token.check()
+        if "error" in outcome:
+            raise RuntimeError(outcome["error"])
+        return outcome.get("result")
 
     def _close_progress_dialog(self, dialog):
         if dialog is None:
             return
         try:
-            dialog.close()
+            if hasattr(dialog, "finish"):
+                dialog.finish()
+            else:
+                dialog.close()
             dialog.deleteLater()
         except Exception:
             pass
 
-    def _make_progress_handler(self, dialog, log_prefix):
-        state = {"last_key": None}
-
-        def _handler(payload):
-            if not isinstance(payload, dict):
-                message = str(payload or "").strip()
-                if message and dialog.isVisible():
-                    dialog.setLabelText(message)
-                if message:
-                    self.log(f"[{log_prefix}] {message}")
-                QtWidgets.QApplication.processEvents()
-                return
-            stage = str(payload.get("stage", "") or "")
-            current = payload.get("current")
-            total = payload.get("total")
-            message = str(payload.get("message", "") or stage or log_prefix)
-            if dialog.isVisible():
-                if total is not None and int(total) > 0:
-                    dialog.setRange(0, int(total))
-                    dialog.setValue(min(int(current or 0), int(total)))
-                else:
-                    dialog.setRange(0, 0)
-                dialog.setLabelText(message)
-            should_log = False
-            if stage in {"dicom_scan_done", "background_phase_done", "background_phase_start"}:
-                should_log = True
-            elif stage in {"dicom_scan_file", "dicom_load_file"} and total:
-                step = max(1, int(total) // 10)
-                should_log = int(current or 0) in {1, int(total)} or int(current or 0) % step == 0
-            key = (stage, int(current or 0), int(total or 0), message)
-            if should_log and key != state["last_key"]:
-                self.log(f"[{log_prefix}] {message}")
-                state["last_key"] = key
-            QtWidgets.QApplication.processEvents()
-
-        return _handler
 
     def _float_from_text(self, text, default=0.0):
         try:
@@ -5318,12 +5444,42 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_bpc_threshold.setEnabled(is_msac)
 
     def _on_phase_unwrap_method_changed(self, *_args):
-        """Show only the controls belonging to the selected unwrap method."""
         if not hasattr(self, "phase_unwrap_method_stack"):
             return
-        method = str(self.combo_phase_unwrap_method.currentData() or "gc3D")
-        page = {"lap4D": 0, "gc3D": 1, "nprs": 2, "pudip": 3, "gust": 4}.get(method, 0)
+        method = str(self.combo_phase_unwrap_method.currentData() or "lap4D")
+        page = {"lap4D": 1, "gc3D": 0, "nprs": 2, "pudip": 3, "gust": 4}.get(method, 0)
         self.phase_unwrap_method_stack.setCurrentIndex(page)
+        self._refresh_phase_unwrap_masks()
+
+    def _on_phase_unwrap_mask_changed(self, *_args):
+        method = str(self.combo_phase_unwrap_method.currentData() or "lap4D")
+        choice = self.combo_phase_unwrap_mask.currentData()
+        if choice is not None:
+            self._phase_unwrap_masks[method] = str(choice)
+
+    def _refresh_phase_unwrap_masks(self):
+        if not hasattr(self, "_phase_unwrap_masks"):
+            return
+        method = str(self.combo_phase_unwrap_method.currentData() or "lap4D")
+        sources = mask_sources_for_method(method)
+        selected = self._phase_unwrap_masks.get(method, sources[0])
+        if selected not in sources or (selected == "segmask" and self.workspace.segmask_raw is None):
+            selected = sources[0]
+        combo = self.combo_phase_unwrap_mask
+        combo.blockSignals(True)
+        combo.clear()
+        labels = {"none": "None (whole volume)", "segmask": "segmask",
+                  "pcmra_std": "PCMRAStd", "pcmra_mean": "PCMRAMean"}
+        for source in sources:
+            combo.addItem(labels[source], source)
+        item = combo.model().item(combo.findData("segmask"))
+        item.setEnabled(self.workspace.segmask_raw is not None)
+        item.setToolTip("Uses the active segmentation" if self.workspace.segmask_raw is not None
+                        else "Generate or import a segmentation first")
+        combo.setCurrentIndex(combo.findData(selected))
+        combo.blockSignals(False)
+        self._phase_unwrap_mask_method = method
+        self._phase_unwrap_masks[method] = selected
 
     def _sync_params_to_ws(self):
         ws = self.workspace
@@ -5332,13 +5488,16 @@ class MainWindow(QtWidgets.QMainWindow):
             # runs only when the user presses "Unwrap Phase" (or explicitly
             # requests it from the CLI/configuration).
             ws.phase_unwrap_params.enabled = True
-            ws.phase_unwrap_params.method = str(self.combo_phase_unwrap_method.currentData() or "gc3D")
-            ws.phase_unwrap_params.mask_source = str(self.combo_phase_unwrap_mask.currentData() or "segmask")
+            ws.phase_unwrap_params.method = str(self.combo_phase_unwrap_method.currentData() or "lap4D")
+            ws.phase_unwrap_params.mask_source = str(self.combo_phase_unwrap_mask.currentData() or "none")
             ws.phase_unwrap_params.device = str(self.combo_phase_unwrap_device.currentData() or "auto")
             ws.phase_unwrap_params.lap4d_ts = self._float_from_text(self.edit_phase_unwrap_ts.text(), 2.0)
             ws.phase_unwrap_params.nprs_upsampling_factor = max(1, self._int_from_text(self.edit_phase_unwrap_nprs_up.text(), 2))
             ws.phase_unwrap_params.nprs_pi_unwrap = bool(self.chk_phase_unwrap_nprs_pi.isChecked())
             ws.phase_unwrap_params.nprs_auto_crop = bool(self.chk_phase_unwrap_nprs_crop.isChecked())
+        ws.noise_removal_params.method = str(self.combo_noise_method.currentData() or "magnitude_temporal")
+        ws.noise_removal_params.magnitude_fraction = float(self.spin_noise_magnitude.value())
+        ws.noise_removal_params.velocity_std_max = float(self.spin_noise_std_max.value())
         ws.loader_params.background_phase_correction.enabled = self.chk_bpc_enabled.isChecked()
         ws.loader_params.background_phase_correction.method = str(
             self.combo_bpc_method.currentData() or "wrls_arto"
@@ -5442,9 +5601,9 @@ class MainWindow(QtWidgets.QMainWindow):
         ws.derived_params.parabolic_fitting = self.chk_dm_parabolic.isChecked()
         ws.derived_params.no_slip_condition = self.chk_dm_noslip.isChecked()
         ws.derived_params.rho = max(self._float_from_text(self.edit_dm_rho.text(), 1060.0), 1.0)
-        pressure_method = str(self.combo_dm_pressure_method.currentText().strip() or "least_squares").lower()
-        if pressure_method not in {"least_squares", "ppe"}:
-            pressure_method = "least_squares"
+        pressure_method = str(self.combo_dm_pressure_method.currentText().strip() or "ppe").lower()
+        if pressure_method not in {"ppe", "ste"}:
+            pressure_method = "ppe"
         ws.derived_params.pressure_method = pressure_method
         ws.derived_params.pressure_gradient_smoothing_sigma = max(self._float_from_text(self.edit_dm_pg_smoothing_sigma.text(), 0.0), 0.0)
         ws.derived_params.pressure_gradient_support_erosion_iters = max(self._int_from_text(self.edit_dm_pg_support_erosion.text(), 1), 0)
@@ -5501,11 +5660,13 @@ class MainWindow(QtWidgets.QMainWindow):
             # Select the first real backend when opening those workspaces;
             # unwrapping remains an explicit step in the GUI.
             self.combo_phase_unwrap_method.setCurrentIndex(max(0, idx))
-            mask_source = str(ws.phase_unwrap_params.mask_source or "segmask")
-            if mask_source in {"segmentation", "active_segmentation", "seg", "mask"}:
-                mask_source = "segmask"
-            idx = self.combo_phase_unwrap_mask.findData(mask_source)
-            self.combo_phase_unwrap_mask.setCurrentIndex(max(0, idx))
+            method = str(self.combo_phase_unwrap_method.currentData() or "lap4D")
+            try:
+                source = resolve_mask_source(method, ws.phase_unwrap_params.mask_source)
+            except ValueError:
+                source = resolve_mask_source(method)
+            self._phase_unwrap_masks[method] = source
+            self._refresh_phase_unwrap_masks()
             idx = self.combo_phase_unwrap_device.findData(str(ws.phase_unwrap_params.device))
             self.combo_phase_unwrap_device.setCurrentIndex(max(0, idx))
             self.edit_phase_unwrap_ts.setText(str(ws.phase_unwrap_params.lap4d_ts))
@@ -5513,6 +5674,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.chk_phase_unwrap_nprs_pi.setChecked(bool(ws.phase_unwrap_params.nprs_pi_unwrap))
             self.chk_phase_unwrap_nprs_crop.setChecked(bool(ws.phase_unwrap_params.nprs_auto_crop))
             self._on_phase_unwrap_method_changed()
+        self.combo_noise_method.setCurrentIndex(max(0, self.combo_noise_method.findData(ws.noise_removal_params.method)))
+        self.spin_noise_magnitude.setValue(ws.noise_removal_params.magnitude_fraction)
+        self.spin_noise_std_max.setValue(ws.noise_removal_params.velocity_std_max)
         self.chk_bpc_enabled.setChecked(ws.loader_params.background_phase_correction.enabled)
         self._set_background_phase_method(ws.loader_params.background_phase_correction.method)
         self.spin_bpc_fit_order.setValue(int(ws.loader_params.background_phase_correction.corr_fit_order))
@@ -5954,9 +6118,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _selected_render_object(self):
         for obj in self._browser_selected_objects():
+            if obj.data_key == "noise_region" or obj.data_key.startswith("segmask_"):
+                continue
             if obj.scalars or obj.data_key == "pcmra_volume":
                 return obj
-        return None
+        return self.scene._visible_volume_object()
 
     def _render_object_range(self, obj):
         if obj.data_key == "pcmra_volume":
@@ -6399,6 +6565,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "pathline_temporal_cache_mb": getattr(params, "pathline_temporal_cache_mb", 512.0),
             },
         )
+        self._bind_task_progress(self._pathline_progress_dialog, self._pathline_worker)
         self._pathline_worker.moveToThread(self._pathline_thread)
         self._pathline_thread.started.connect(self._pathline_worker.run)
         self._pathline_worker.progress.connect(self._on_pathline_progress)
@@ -6410,6 +6577,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pathline_worker.failed.connect(self._on_pathline_failed)
         self._pathline_worker.finished.connect(self._pathline_thread.quit)
         self._pathline_worker.failed.connect(self._pathline_thread.quit)
+        self._pathline_thread.finished.connect(self._pathline_worker.deleteLater)
         self._pathline_thread.finished.connect(self._cleanup_pathline_task)
         self.statusBar().showMessage("Generating pathlines...")
         self._pathline_thread.start()
@@ -6419,11 +6587,12 @@ class MainWindow(QtWidgets.QMainWindow):
         data = dict(payload or {})
         dialog = self._pathline_progress_dialog
         if dialog is not None and dialog.isVisible():
-            dialog.setRange(0, max(1, int(data.get("total", 1))))
-            dialog.setValue(max(0, int(data.get("current", 0))))
-            dialog.setLabelText(str(data.get("message", "Generating pathlines...")))
+            dialog.update_progress(data)
 
     def _on_pathline_finished(self, payload):
+        if self._pathline_progress_dialog is not None and self._pathline_progress_dialog.cancel_token.cancelled:
+            self._on_pathline_failed("Cancelled")
+            return
         selected_plane_idx = self._pathline_selected_plane_idx
         self._pathline_selected_plane_idx = None
         data = dict(payload or {})
@@ -6457,14 +6626,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_pathline_failed(self, error_text):
         self._pathline_selected_plane_idx = None
-        self.log(f"PATHLINE ERROR:\n{str(error_text).strip()}")
-        self.statusBar().showMessage("Pathlines failed", 10000)
-        self._close_progress_dialog(self._pathline_progress_dialog)
-        self._pathline_progress_dialog = None
+        if str(error_text) == "Cancelled":
+            self.log("Pathlines cancelled; no new trajectories were applied.")
+            self.statusBar().showMessage("Pathlines cancelled", 8000)
+        else:
+            self.log(f"PATHLINE ERROR:\n{str(error_text).strip()}")
+            self.statusBar().showMessage("Pathlines failed", 10000)
 
     def _cleanup_pathline_task(self):
-        if self._pathline_worker is not None:
-            self._pathline_worker.deleteLater()
+        self._close_progress_dialog(self._pathline_progress_dialog)
+        self._pathline_progress_dialog = None
         if self._pathline_thread is not None:
             self._pathline_thread.deleteLater()
         self._pathline_worker = None
@@ -6679,71 +6850,60 @@ class MainWindow(QtWidgets.QMainWindow):
     def _load_selected_input_case(self, case, dicom_parameter_overrides=None):
         if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
             return
-        progress_dialog = None
-        load_succeeded = False
         try:
             resolved = resolve_input_case(case)
-            self._active_input_case = resolved
-            self._active_dicom_parameter_overrides = dict(dicom_parameter_overrides or {})
+            self._sync_params_to_ws()
+            previous = self.workspace
+            pending = Workspace()
+            apply_config_bundle_to_workspace(pending, self._config_bundle)
+            # Read UI parameters on the GUI thread, while retaining the loaded
+            # case until the background load actually succeeds.
+            self.workspace = pending
+            try:
+                self._sync_params_to_ws()
+            finally:
+                self.workspace = previous
+            pending.paths.segmask_path = resolved.input_path
+            pending.paths.flow_path = resolved.input_path
+            configured_out = str(self._config_bundle.get("batch", {}).get("output_dir", "") or "").strip()
+            if configured_out:
+                pending.paths.output_dir = os.path.join(configured_out, resolved.output_name or Path(resolved.input_path).stem)
+            if resolved.input_kind == "dicom":
+                if not configured_out:
+                    pending.paths.output_dir = os.path.join(resolved.input_path, f"autoflow_{resolved.output_name or 'dicom_case'}")
+                pending.loader_params.dicom_parameter_overrides = DicomParameterOverrides.from_dict(dicom_parameter_overrides or {})
+            else:
+                pending.loader_params.dicom_parameter_overrides = DicomParameterOverrides()
+
+            def load(progress, log):
+                self.pipeline.load_data(pending, log, input_source=resolved, progress_callback=progress)
+                return pending
+
+            self._run_modal_task("Load Input", f"Loading {resolved.display_name or resolved.input_path}…", load)
             if self._edit_mode is not None:
                 self._exit_interactive_edit(False)
             self._clear_plane_drag_widgets()
             self._seg_surface_rebuild_timer.stop()
             self._seg_edit_active = False
             self._reset_segmentation_edit_history()
-            self._sync_params_to_ws()
-            self.workspace.reset_all()
+            self.workspace = pending
+            self._active_input_case = resolved
+            self._active_dicom_parameter_overrides = dict(dicom_parameter_overrides or {})
             self._last_quality_report = None
             self._last_plane_import_report = None
-            apply_config_bundle_to_workspace(self.workspace, self._config_bundle)
-            self._sync_params_to_ws()
-            self.workspace.paths.segmask_path = resolved.input_path
-            self.workspace.paths.flow_path = resolved.input_path
-            configured_out = str(self._config_bundle.get("batch", {}).get("output_dir", "") or "").strip()
-            if configured_out:
-                self.workspace.paths.output_dir = os.path.join(configured_out, resolved.output_name or Path(resolved.input_path).stem)
-            if resolved.input_kind == "dicom":
-                out_name = resolved.output_name or "dicom_case"
-                if not configured_out:
-                    self.workspace.paths.output_dir = os.path.join(resolved.input_path, f"autoflow_{out_name}")
-                self.workspace.loader_params.dicom_parameter_overrides = DicomParameterOverrides.from_dict(
-                    dicom_parameter_overrides or {}
-                )
-                progress_dialog = self._create_progress_dialog("Load DICOM", "Loading DICOM case...")
-                progress_handler = self._make_progress_handler(progress_dialog, "DICOM Load")
-            else:
-                self.workspace.loader_params.dicom_parameter_overrides = DicomParameterOverrides()
-                if self.workspace.loader_params.background_phase_correction.enabled:
-                    progress_dialog = self._create_progress_dialog(
-                        "Background Phase Correction",
-                        "Loading H5 and preparing background phase correction...",
-                    )
-                    progress_handler = self._make_progress_handler(progress_dialog, "H5 Load")
-                else:
-                    progress_handler = None
-            self.pipeline.load_data(
-                self.workspace,
-                self.log,
-                input_source=resolved,
-                progress_callback=progress_handler,
-            )
-            self.scene.workspace = self.workspace
+            self.scene.workspace = pending
+            self.ortho_viewer.workspace = pending
+            self.ortho_viewer.update_slider_ranges()
             self.scene.reset_display_reference()
             self.scene.reset_scene()
             self._refresh_all()
-            self.ortho_viewer.update_slider_ranges()
-            label = resolved.display_name or resolved.input_path
-            mode = "enabled" if self.workspace.loader_params.background_phase_correction.enabled else "disabled"
-            self.log(f"Loaded input: {label} (BGC {mode})")
-            load_succeeded = True
+            self.log(f"Loaded input: {resolved.display_name or resolved.input_path}. Run Correction explicitly to update working velocity.")
+            self._input_signature = self._current_input_signature()
+        except TaskCancelled:
+            self.log("Input loading cancelled; the previous workspace is retained.")
         except Exception as e:
             self.log(f"LOAD ERROR: {type(e).__name__}: {e}")
             self.log(traceback.format_exc())
-        finally:
-            if progress_dialog is not None:
-                self._close_progress_dialog(progress_dialog)
-        if load_succeeded:
-            self._input_signature = self._current_input_signature()
 
     def _current_input_signature(self):
         """Stable signature for deciding whether an input reload is necessary."""
@@ -6753,7 +6913,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "path": str(getattr(self._active_input_case, "input_path", "") or ws.paths.flow_path),
             "kind": str(getattr(self._active_input_case, "input_kind", "")),
             "group": getattr(self._active_input_case, "source_group", None),
-            "correction": ws.loader_params.background_phase_correction.to_dict(),
+            "dual_venc_ratios": [ws.loader_params.background_phase_correction.dual_venc_ratio1, ws.loader_params.background_phase_correction.dual_venc_ratio2],
             "dicom": dict(self._active_dicom_parameter_overrides or {}),
             "resolution": self.edit_input_resolution.text().strip(),
             "venc": self.edit_input_venc.text().strip(),
@@ -6812,68 +6972,6 @@ class MainWindow(QtWidgets.QMainWindow):
             dicom_parameter_overrides=self._active_dicom_parameter_overrides,
         )
 
-    def _prompt_background_phase_choice(self, case):
-        resolved = resolve_input_case(case)
-        label = resolved.display_name or resolved.input_path
-        if resolved.input_kind == "h5":
-            features = dict(resolved.metadata or {})
-            if "has_background_correction_cache" not in features:
-                inspected = inspect_h5_input_case(resolved)
-                existing_dual = features.get("dual_venc")
-                features.update(inspected)
-                if isinstance(existing_dual, dict) and isinstance(features.get("dual_venc"), dict):
-                    merged_dual = dict(features["dual_venc"])
-                    merged_dual.update(existing_dual)
-                    features["dual_venc"] = merged_dual
-                resolved.metadata.update(features)
-            if self.workspace.loader_params.background_phase_correction.force_recompute:
-                self.chk_bpc_enabled.setChecked(True)
-                self.log(f"Recomputing background correction with {self.combo_bpc_method.currentText()}: {label}")
-                return resolved
-            if bool(features.get("has_background_correction_cache", False)):
-                self.chk_bpc_enabled.setChecked(True)
-                method = str(features.get("background_correction_method", "wrls_arto") or "wrls_arto")
-                self._set_background_phase_method(method)
-                method_label = self.combo_bpc_method.currentText()
-                self.log(f"Using embedded {method_label} background correction cache: {label}")
-                return resolved
-        kind_label = "DICOM case" if resolved.input_kind == "dicom" else "H5 input"
-        buttons = (
-            QtWidgets.QMessageBox.Yes
-            | QtWidgets.QMessageBox.No
-            | QtWidgets.QMessageBox.Cancel
-        )
-        choice = QtWidgets.QMessageBox.question(
-            self,
-            "Background Phase Correction",
-            f"{kind_label}: {label}\n\nEnable background phase correction for this load?",
-            buttons,
-            QtWidgets.QMessageBox.No,
-        )
-        if choice == QtWidgets.QMessageBox.Cancel:
-            self.log(f"Load cancelled: {label}")
-            return None
-        enabled = choice == QtWidgets.QMessageBox.Yes
-        self.chk_bpc_enabled.setChecked(enabled)
-        if enabled:
-            method_labels = [item[0] for item in _BACKGROUND_PHASE_METHOD_ITEMS]
-            selected, accepted = QtWidgets.QInputDialog.getItem(
-                self,
-                "Background Phase Correction Method",
-                "Correction method:",
-                method_labels,
-                0,
-                False,
-            )
-            if not accepted:
-                self.chk_bpc_enabled.setChecked(False)
-                self.log(f"Load cancelled: {label}")
-                return None
-            method_by_label = dict(_BACKGROUND_PHASE_METHOD_ITEMS)
-            self._set_background_phase_method(method_by_label.get(str(selected), "wrls_arto"))
-            self.log(f"Background correction method: {self.combo_bpc_method.currentText()}")
-        return resolved
-
     def _on_open_h5(self):
         if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
             return
@@ -6896,9 +6994,6 @@ class MainWindow(QtWidgets.QMainWindow):
         resolved = self._prompt_dual_venc_choice(resolved)
         if resolved is None:
             return
-        resolved = self._prompt_background_phase_choice(resolved)
-        if resolved is None:
-            return
         self._load_selected_input_case(resolved)
 
     def _on_import_dicom_directory(self):
@@ -6907,15 +7002,16 @@ class MainWindow(QtWidgets.QMainWindow):
         root = QtWidgets.QFileDialog.getExistingDirectory(self, "Import DICOM Directory", "")
         if not root:
             return
-        progress_dialog = self._create_progress_dialog("Scan DICOM", "Scanning DICOM directory...")
         try:
-            cases = scan_dicom_cases(root, progress_callback=self._make_progress_handler(progress_dialog, "DICOM Scan"))
+            cases = self._run_modal_task("Scan DICOM", "Scanning DICOM directory…",
+                lambda progress, log: scan_dicom_cases(root, progress_callback=progress))
+        except TaskCancelled:
+            self.log("DICOM scan cancelled.")
+            return
         except Exception as e:
-            self._close_progress_dialog(progress_dialog)
             self.log(f"DICOM SCAN ERROR: {type(e).__name__}: {e}")
             self.log(traceback.format_exc())
             return
-        progress_dialog.close()
         if not cases:
             self.log(f"No supported DICOM 4D flow cases found in: {root}")
             return
@@ -6925,10 +7021,7 @@ class MainWindow(QtWidgets.QMainWindow):
         selected = dialog.selected_case()
         if selected is None:
             return
-        resolved = self._prompt_background_phase_choice(selected)
-        if resolved is None:
-            return
-        self._load_selected_input_case(resolved, dicom_parameter_overrides=dialog.parameter_overrides())
+        self._load_selected_input_case(selected, dicom_parameter_overrides=dialog.parameter_overrides())
 
     def _on_import_dicom2h5(self):
         if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
@@ -6954,6 +7047,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._dicom_conversion_progress.setRange(0, 0)
         self._dicom_conversion_thread = QtCore.QThread(self)
         self._dicom_conversion_worker = _DicomConversionWorker(root, target)
+        self._bind_task_progress(self._dicom_conversion_progress, self._dicom_conversion_worker)
         self._dicom_conversion_worker.moveToThread(self._dicom_conversion_thread)
         self._dicom_conversion_thread.started.connect(self._dicom_conversion_worker.run)
         self._dicom_conversion_worker.finished.connect(self._on_dicom_conversion_finished)
@@ -6966,7 +7060,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._dicom_conversion_thread.start()
 
     def _on_dicom_conversion_finished(self, cases):
-        self._close_progress_dialog(self._dicom_conversion_progress)
+        if not self._dicom_conversion_progress.cancel_token.cancelled:
+            self._dicom_completed_cases = cases
+
+    def _apply_dicom_conversion_cases(self, cases):
         self.log(f"Dicom2H5 saved {len(cases)} case(s): {cases[0].input_path}")
         selected = cases[0]
         if len(cases) > 1:
@@ -6976,29 +7073,26 @@ class MainWindow(QtWidgets.QMainWindow):
             selected = dialog.selected_case()
             if selected is None:
                 return
-        selected = self._prompt_background_phase_choice(selected)
         if selected is not None:
             self._load_selected_input_case(selected)
 
     def _on_dicom_conversion_failed(self, details):
-        self._close_progress_dialog(self._dicom_conversion_progress)
-        self.log(f"DICOM CONVERSION ERROR: {details}")
+        self.log("DICOM conversion cancelled." if str(details) == "Cancelled" else f"DICOM CONVERSION ERROR: {details}")
 
     def _cleanup_dicom_conversion(self):
+        self._close_progress_dialog(self._dicom_conversion_progress)
         self._dicom_conversion_thread.deleteLater()
         self._dicom_conversion_worker = None
         self._dicom_conversion_thread = None
+        cases = getattr(self, "_dicom_completed_cases", None)
+        self._dicom_completed_cases = None
+        if cases is not None:
+            QtCore.QTimer.singleShot(0, lambda: self._apply_dicom_conversion_cases(cases))
         self._dicom_conversion_progress = None
 
     def _inspect_dicom_case_preview(self, case):
-        progress_dialog = self._create_progress_dialog("Inspect DICOM", "Reading DICOM load parameters...")
-        try:
-            return inspect_dicom_case(
-                case,
-                progress_callback=self._make_progress_handler(progress_dialog, "DICOM Preview"),
-            )
-        finally:
-            progress_dialog.close()
+        return self._run_modal_task("Inspect DICOM", "Reading DICOM load parameters…",
+            lambda progress, log: inspect_dicom_case(case, progress_callback=progress))
 
     def _rendering_kwargs(self):
         rendering_cfg = bundle_to_autoflow_kwargs(self._config_bundle)
@@ -7145,7 +7239,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _on_export_videos(self):
-        if self._autoseg_running_guard("exporting videos"):
+        if self._pipeline_running_guard("exporting videos") or self._autoseg_running_guard("exporting videos"):
             return
         if not self.workspace.data_loaded:
             self.log("No data loaded. Use File > Open H5 or Import DICOM Directory.")
@@ -7154,202 +7248,41 @@ class MainWindow(QtWidgets.QMainWindow):
         if options is None:
             return
         self._sync_params_to_ws()
-        os.makedirs(options.out_dir, exist_ok=True)
-        self.workspace.paths.output_dir = options.out_dir
-        progress = self._create_progress_dialog("Export Videos", "Preparing video export...")
-        requested_flags = {
-            "plane": bool(options.export_plane),
-            "wss": bool(options.export_wss),
-            "tke": bool(options.export_tke),
-            "pg": bool(options.export_pg),
-            "streamlines": bool(options.export_streamlines),
-        }
-        rendered = {}
-        video_outputs = {}
-        video_times = {}
-        export_started_at = time.perf_counter()
-        try:
-            if self.workspace.segmask_binary is None and self.workspace.segmask_raw is not None:
-                self.pipeline.preprocess(self.workspace)
-
-            need_wss = bool(options.export_wss)
-            need_tke = bool(options.export_tke)
-            need_pg = bool(options.export_pg)
-            if need_wss or need_tke or need_pg:
-                progress.setLabelText("Computing derived data for video export...")
-                QtWidgets.QApplication.processEvents()
-                if self.workspace.segmask_raw is None:
+        requested = {"plane": bool(options.export_plane), "wss": bool(options.export_wss),
+                     "tke": bool(options.export_tke), "pg": bool(options.export_pg),
+                     "streamlines": bool(options.export_streamlines)}
+        render_config = self._rendering_kwargs()
+        workspace = self.workspace.copy_for_task()
+        started = time.perf_counter()
+        def export(progress, log):
+            from ..rendering.jobs import export_videos_in_process
+            if workspace.segmask_binary is None and workspace.segmask_raw is not None:
+                self.pipeline.preprocess(workspace)
+            check_cancelled()
+            if requested["wss"] or requested["tke"] or requested["pg"]:
+                progress({"stage": "video_prepare", "message": "Computing derived data for video export…"})
+                if workspace.segmask_raw is None:
                     raise ValueError("derived videos require segmentation")
-                self.pipeline._ensure_derived_metrics(
-                    self.workspace,
-                    save_pixelwise=False,
-                    refresh_scene_objects=False,
-                    compute_wss=need_wss,
-                    compute_tke=need_tke,
-                    compute_pressure_gradient=need_pg,
-                )
-
-            render_cfg = self._rendering_kwargs()
-
-            def _run(name, fn, enabled, available=True):
-                if not enabled:
-                    return
-                if not available:
-                    video_outputs[name] = ""
-                    self.log(f"[Video Export] skipped {name}: upstream data unavailable")
-                    return
-                progress.setLabelText(f"Rendering {name} video...")
-                QtWidgets.QApplication.processEvents()
-                t0 = time.perf_counter()
-                out = fn()
-                elapsed = time.perf_counter() - t0
-                video_times[name] = float(elapsed)
-                video_outputs[name] = str(out or "")
-                if out:
-                    rendered[name] = out
-                    self.log(f"[Video Export] {name} saved: {out} | time={elapsed:.2f}s")
-                else:
-                    self.log(f"[Video Export] {name} produced no output | time={elapsed:.2f}s")
-
-            _run(
-                "plane",
-                lambda: render_plane_rotation_video(
-                    self.workspace,
-                    options.out_dir,
-                    fps=render_cfg["fps"],
-                    n_frames=render_cfg["plane_rotation_frames"],
-                    smoothing_iteration=self.workspace.derived_params.smoothing_iteration,
-                    distance_scale=render_cfg["camera_distance_scale"],
-                    add_plane_idx=render_cfg["add_plane_idx"],
-                    add_path_idx=render_cfg["add_path_idx"],
-                    plane_video_cfg=render_cfg["plane_video_cfg"],
-                    window_size=render_cfg["window_size"],
-                ),
-                options.export_plane,
-                available=len(self.workspace.planes) > 0,
-            )
-            _run(
-                "wss",
-                lambda: render_wss_video(
-                    self.workspace,
-                    options.out_dir,
-                    fps=render_cfg["fps"],
-                    smoothing_iteration=self.workspace.derived_params.smoothing_iteration,
-                    view=render_cfg["camera_view"],
-                    distance_scale=render_cfg["camera_distance_scale"],
-                    wss_clim=render_cfg["wss_clim"],
-                    show_scalar_bar=render_cfg["wss_show_scalar_bar"],
-                    wss_bar_cfg=render_cfg["wss_bar_cfg"],
-                    rotate=render_cfg["rotate_dynamic_video"],
-                    rotation_frames=render_cfg["dynamic_rotation_frames"],
-                    elevation_deg=render_cfg["dynamic_rotation_elevation_deg"],
-                    time_repeat=render_cfg["dynamic_time_repeat"],
-                    window_size=render_cfg["window_size"],
-                ),
-                options.export_wss,
-                available=self.workspace.derived.wss_surfaces is not None and len(self.workspace.derived.wss_surfaces) > 0,
-            )
-            _run(
-                "tke",
-                lambda: render_tke_video(
-                    self.workspace,
-                    options.out_dir,
-                    fps=render_cfg["fps"],
-                    smoothing_iteration=self.workspace.derived_params.smoothing_iteration,
-                    view=render_cfg["camera_view"],
-                    distance_scale=render_cfg["camera_distance_scale"],
-                    tke_clim=render_cfg["tke_clim"],
-                    show_scalar_bar=render_cfg["tke_show_scalar_bar"],
-                    tke_bar_cfg=render_cfg["tke_bar_cfg"],
-                    rotate=render_cfg["rotate_dynamic_video"],
-                    rotation_frames=render_cfg["dynamic_rotation_frames"],
-                    elevation_deg=render_cfg["dynamic_rotation_elevation_deg"],
-                    time_repeat=render_cfg["dynamic_time_repeat"],
-                    window_size=render_cfg["window_size"],
-                ),
-                options.export_tke,
-                available=self.workspace.derived.tke_array is not None or self.workspace.derived.tke_volume is not None,
-            )
-            _run(
-                "pressure_gradient",
-                lambda: render_pressure_gradient_video(
-                    self.workspace,
-                    options.out_dir,
-                    fps=render_cfg["fps"],
-                    smoothing_iteration=self.workspace.derived_params.smoothing_iteration,
-                    view=render_cfg["camera_view"],
-                    distance_scale=render_cfg["camera_distance_scale"],
-                    pressure_gradient_clim=render_cfg["pressure_gradient_clim"],
-                    show_scalar_bar=render_cfg["pressure_gradient_show_scalar_bar"],
-                    pressure_gradient_bar_cfg=render_cfg["pressure_gradient_bar_cfg"],
-                    rotate=render_cfg["rotate_dynamic_video"],
-                    rotation_frames=render_cfg["dynamic_rotation_frames"],
-                    elevation_deg=render_cfg["dynamic_rotation_elevation_deg"],
-                    time_repeat=render_cfg["dynamic_time_repeat"],
-                    window_size=render_cfg["window_size"],
-                ),
-                options.export_pg,
-                available=self.workspace.derived.pressure_gradient_magnitude is not None,
-            )
-            _run(
-                "relative_pressure",
-                lambda: render_relative_pressure_video(
-                    self.workspace,
-                    options.out_dir,
-                    fps=render_cfg["fps"],
-                    smoothing_iteration=self.workspace.derived_params.smoothing_iteration,
-                    view=render_cfg["camera_view"],
-                    distance_scale=render_cfg["camera_distance_scale"],
-                    relative_pressure_clim=render_cfg["relative_pressure_clim"],
-                    show_scalar_bar=render_cfg["relative_pressure_show_scalar_bar"],
-                    relative_pressure_bar_cfg=render_cfg["relative_pressure_bar_cfg"],
-                    rotate=render_cfg["rotate_dynamic_video"],
-                    rotation_frames=render_cfg["dynamic_rotation_frames"],
-                    elevation_deg=render_cfg["dynamic_rotation_elevation_deg"],
-                    time_repeat=render_cfg["dynamic_time_repeat"],
-                    window_size=render_cfg["window_size"],
-                ),
-                options.export_pg,
-                available=self.workspace.derived.relative_pressure_array is not None,
-            )
-            _run(
-                "streamlines",
-                lambda: render_streamlines_video(
-                    self.workspace,
-                    options.out_dir,
-                    fps=render_cfg["fps"],
-                    smoothing_iteration=self.workspace.derived_params.smoothing_iteration,
-                    view=render_cfg["camera_view"],
-                    distance_scale=render_cfg["camera_distance_scale"],
-                    streamline_clim=render_cfg["streamline_clim"],
-                    show_scalar_bar=render_cfg["streamline_show_scalar_bar"],
-                    streamline_bar_cfg=render_cfg["streamline_bar_cfg"],
-                    rotate=render_cfg["rotate_dynamic_video"],
-                    rotation_frames=render_cfg["dynamic_rotation_frames"],
-                    elevation_deg=render_cfg["dynamic_rotation_elevation_deg"],
-                    time_repeat=render_cfg["dynamic_time_repeat"],
-                    window_size=render_cfg["window_size"],
-                ),
-                options.export_streamlines,
-                available=self.workspace.flow_raw is not None and self.workspace.segmask_binary is not None and self.workspace.segmask_3d is not None,
-            )
-            if rendered:
-                self.log(f"[Video Export] completed: {', '.join(sorted(rendered))}")
-            else:
-                self.log("[Video Export] completed with no saved videos")
-            summary_path = self._update_video_export_summary(
-                options.out_dir,
-                requested_flags,
-                video_outputs,
-                video_times,
-                time.perf_counter() - export_started_at,
-            )
+                self.pipeline._ensure_derived_metrics(workspace, save_pixelwise=False,
+                    refresh_scene_objects=False, compute_wss=requested["wss"],
+                    compute_tke=requested["tke"], compute_pressure_gradient=requested["pg"])
+            check_cancelled()
+            return export_videos_in_process(workspace, options.out_dir, render_config, requested, progress)
+        try:
+            result = self._run_modal_task("Export Videos", "Preparing video export…", export)
+            workspace.paths.output_dir = options.out_dir
+            self.workspace.__dict__.update(vars(workspace))
+            for name, output in result["outputs"].items():
+                self.log(f"[Video Export] {name}: {output or 'skipped: upstream data unavailable'}"
+                         f" | time={result['times'].get(name, 0):.2f}s")
+            summary_path = self._update_video_export_summary(options.out_dir, requested,
+                result["outputs"], result["times"], time.perf_counter() - started)
             self.log(f"[Video Export] summary updated: {summary_path}")
+        except TaskCancelled:
+            self.log("Video export cancelled.")
         except Exception as e:
             self.log(f"VIDEO EXPORT ERROR: {type(e).__name__}: {e}")
             self.log(traceback.format_exc())
-        finally:
-            self._close_progress_dialog(progress)
 
     def _on_close_workspace(self):
         if self._autoseg_thread is not None:
@@ -7392,6 +7325,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         self._on_pause()
         self._pipeline_task_label = str(task_label)
+        self._pipeline_task_steps = list(steps)
         self._pipeline_progress_dialog = self._create_progress_dialog(
             self._pipeline_task_label,
             f"Preparing {self._pipeline_task_label}...",
@@ -7400,6 +7334,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pipeline_progress_dialog.setValue(0)
         self._pipeline_thread = QtCore.QThread(self)
         self._pipeline_worker = _PipelineTaskWorker(self.pipeline, self.workspace, steps)
+        self._bind_task_progress(self._pipeline_progress_dialog, self._pipeline_worker)
         self._pipeline_worker.moveToThread(self._pipeline_thread)
         self._pipeline_thread.started.connect(self._pipeline_worker.run)
         self._pipeline_worker.progress.connect(self._on_pipeline_progress)
@@ -7407,6 +7342,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pipeline_worker.failed.connect(self._on_pipeline_failed)
         self._pipeline_worker.finished.connect(self._pipeline_thread.quit)
         self._pipeline_worker.failed.connect(self._pipeline_thread.quit)
+        self._pipeline_thread.finished.connect(self._pipeline_worker.deleteLater)
         self._pipeline_thread.finished.connect(self._cleanup_pipeline_task)
         self.statusBar().showMessage(f"Running {self._pipeline_task_label}...")
         self._pipeline_thread.start()
@@ -7416,9 +7352,7 @@ class MainWindow(QtWidgets.QMainWindow):
         data = dict(payload or {})
         dialog = self._pipeline_progress_dialog
         if dialog is not None and dialog.isVisible():
-            dialog.setRange(0, max(int(data.get("total", 1)), 1))
-            dialog.setValue(max(int(data.get("current", 0)), 0))
-            dialog.setLabelText(str(data.get("message", self._pipeline_task_label)))
+            dialog.update_progress(data)
         step = data.get("step")
         if data.get("stage") == "start" and step is not None:
             self.log(f"[{self._pipeline_task_label}] Running {step.label}...")
@@ -7433,6 +7367,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._pipeline_progress_dialog.setLabelText("Refreshing views...")
         steps = set(steps or [])
         prefix_map = {
+            StepId.BACKGROUND_CORRECTION: ("phase_wrap_mask", "phase_wrap_count"),
+            StepId.REMOVE_NOISE: ("noise_region", "pcmra_volume"),
+            StepId.GENERATE_PCMRA: ("pcmra_volume",),
             StepId.UNWRAP_PHASE: ("phase_wrap_mask", "phase_wrap_count"),
             StepId.GENERATE_SKELETON: ("segmask_group_", "skeleton_"),
             StepId.GENERATE_GRAPH: ("segmask_group_", "skeleton_", "graph_", "forks_", "path_"),
@@ -7474,9 +7411,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_analysis_panel()
         self._refresh_selection_info()
         self._refresh_segmentation_ui()
+        self._refresh_workflow_status()
+        if StepId.REMOVE_NOISE in steps and self.workspace.pcmra_render_mask is not None:
+            self.ortho_viewer.btn_noise_overlay.setChecked(True)
+        self._refresh_render_range_control()
         self.ortho_viewer.refresh()
 
     def _on_pipeline_finished(self, payload):
+        if self._pipeline_progress_dialog is not None and self._pipeline_progress_dialog.cancel_token.cancelled:
+            self._on_pipeline_failed("Cancelled")
+            return
         self._last_quality_report = None
         data = dict(payload or {})
         try:
@@ -7487,20 +7431,26 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f"{self._pipeline_task_label} completed in {elapsed:.2f}s", 8000)
         except Exception:
             self.log(f"VIEW REFRESH ERROR: {traceback.format_exc()}")
-        finally:
-            self._close_progress_dialog(self._pipeline_progress_dialog)
-            self._pipeline_progress_dialog = None
 
     def _on_pipeline_failed(self, error_text):
         self._run_all_pathlines_after_pipeline = False
+        if str(error_text) == "Cancelled":
+            steps = list(getattr(self._pipeline_worker, "completed_steps", []))
+            if steps:
+                self._finish_pipeline_scene_refresh(steps)
+            self.log(f"{self._pipeline_task_label} cancelled; completed steps were retained.")
+            self.statusBar().showMessage("Task cancelled", 8000)
+            return
+        correction_steps = {StepId.BACKGROUND_CORRECTION, StepId.REMOVE_NOISE, StepId.UNWRAP_PHASE, StepId.GENERATE_PCMRA}
+        partial_steps = correction_steps.intersection(getattr(self, "_pipeline_task_steps", []))
+        if partial_steps:
+            self._finish_pipeline_scene_refresh(partial_steps)
         self.log(f"PIPELINE ERROR:\n{str(error_text).strip()}")
         self.statusBar().showMessage(f"{self._pipeline_task_label} failed", 10000)
-        self._close_progress_dialog(self._pipeline_progress_dialog)
-        self._pipeline_progress_dialog = None
 
     def _cleanup_pipeline_task(self):
-        if self._pipeline_worker is not None:
-            self._pipeline_worker.deleteLater()
+        self._close_progress_dialog(self._pipeline_progress_dialog)
+        self._pipeline_progress_dialog = None
         if self._pipeline_thread is not None:
             self._pipeline_thread.deleteLater()
         self._pipeline_worker = None
@@ -7578,9 +7528,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         result = self.pipeline.revert_phase_unwrap(self.workspace)
         self.log(result.message)
-        self.scene.invalidate_cache()
-        self.scene.sync_from_workspace()
-        self._refresh_all()
+        self._finish_pipeline_scene_refresh([StepId.UNWRAP_PHASE])
 
     def _run_all_pipeline(self):
         if self._autoseg_running_guard("running the full pipeline"):
@@ -7600,7 +7548,7 @@ class MainWindow(QtWidgets.QMainWindow):
         stage_key = self._workflow_stage_key()
         all_steps = _workflow_run_all_steps(stage_key)
         if not all_steps:
-            self.log("Run All is only available in Centerline & Planes or Hemodynamics.")
+            self.log("Run All is available in Correction, Centerline & Planes or Hemodynamics.")
             return
         stage_label = next(
             label for label, key in _WORKFLOW_STAGES if key == stage_key

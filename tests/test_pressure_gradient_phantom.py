@@ -6,7 +6,7 @@ import h5py
 import numpy as np
 import pytest
 
-from autoflow import AutoFlowConfig, run_batch
+from autoflow import AutoFlowConfig, build_workspace, run_batch
 from autoflow.algorithms.metrics import (
     _periodic_central_difference,
     compute_centerline_pressure_profiles,
@@ -20,7 +20,16 @@ REL_TOL = 0.05
 PLANE_SPACING_MM = 15.0
 
 
-@pytest.mark.parametrize("method", ["least_squares", "ppe"])
+@pytest.mark.parametrize(
+    ("requested", "canonical"),
+    [("least_squares", "ppe"), ("ppe", "ppe"), ("ste", "ste"), ("stokes", "ste")],
+)
+def test_pressure_method_aliases_are_canonical(requested, canonical):
+    workspace = build_workspace(AutoFlowConfig(pressure_method=requested))
+    assert workspace.derived_params.pressure_method == canonical
+
+
+@pytest.mark.parametrize("method", ["least_squares", "ppe", "ste"])
 @pytest.mark.parametrize("spacing", [(0.5, 0.5, 0.5), (1.0, 1.0, 1.0), (0.5, 1.5, 2.0)])
 def test_pressure_reconstruction_matches_constant_gradient_in_pa(method, spacing):
     shape = (5, 6, 7, 3)
@@ -36,7 +45,7 @@ def test_pressure_reconstruction_matches_constant_gradient_in_pa(method, spacing
     np.testing.assert_allclose(actual["relative_pressure_array"], expected, rtol=2e-4, atol=2e-5)
 
 
-@pytest.mark.parametrize("method", ["least_squares", "ppe"])
+@pytest.mark.parametrize("method", ["least_squares", "ppe", "ste"])
 def test_pressure_reconstruction_integrates_quadratic_pressure_on_irregular_support(method):
     spacing = np.array([0.8, 1.2, 1.7])
     xyz = np.indices((6, 6, 6)).transpose(1, 2, 3, 0) * spacing / 1000.0
@@ -50,7 +59,7 @@ def test_pressure_reconstruction_integrates_quadratic_pressure_on_irregular_supp
                                truth[support[..., 0]], rtol=3e-4, atol=3e-5)
 
 
-@pytest.mark.parametrize("method", ["least_squares", "ppe"])
+@pytest.mark.parametrize("method", ["least_squares", "ppe", "ste"])
 def test_pressure_reconstruction_anchors_each_disconnected_component(method):
     support = np.zeros((11, 4, 4, 1), dtype=bool)
     support[0:3, :, :, :] = True
@@ -222,7 +231,7 @@ def test_phantom_p_plane_metrics_include_mean_velocity_error_and_valid_distance_
     assert all(str(item.get("label_name", "")).strip() for item in planes_json)
     assert len(plane_positions) == len(metrics)
     assert len(metrics) >= 1
-    assert summary["pressure_method"] == "least_squares"
+    assert summary["pressure_method"] == "ppe"
     assert summary["pressure_gradient_temporal_scheme"] == "periodic_central_difference"
     assert "pwv_h5_file" in summary
     assert "pwv_json_file" in summary

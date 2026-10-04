@@ -16,6 +16,7 @@ Find a feature owner here, then use its feature page for algorithms, inputs, out
 | `autoflow/reporting.py` | Summary and metric reporting/serialization. |
 | `autoflow/plane_io.py` | Plane coordinate formats, import mapping, compatibility and export records. |
 | `autoflow/io_utils.py` | Reusable input/output serialization helpers. |
+| `autoflow/task_control.py` | Cooperative task cancellation, thread-local progress and task-owned subprocess cleanup. |
 | `autoflow/utils.py` | Shared numerical/coordinate utility functions. |
 | `autoflow/core/models.py` | Workspace state, parameters, segmentation versions, planes, scene objects and saved-state contracts. |
 | `autoflow/core/pipeline.py` | Step orchestration, geometry/metrics dispatch, dependencies, derived signatures and scene registration. |
@@ -23,6 +24,7 @@ Find a feature owner here, then use its feature page for algorithms, inputs, out
 | `autoflow/algorithms/dicom_conversion.py` | Optional pinned Dicom2H5 conversion, calibrated H5 validation, safe publication and source provenance. |
 | `autoflow/algorithms/dicom.py` | DICOM scan, case detection/preview, component/geometry decoding and normalized loading. |
 | `autoflow/algorithms/phase_correction.py` | MSAC and WRLS+ARTO background phase correction, robust fitting and CUDA fallback. |
+| `autoflow/algorithms/noise_removal.py` | Magnitude/temporal-velocity PC-MRA display mask; no quantitative data changes. |
 | `autoflow/algorithms/phase_unwrapping.py` | Backend adapters, masks/devices, traditional/learned unwrapping and wrap diagnostics. |
 | `autoflow/algorithms/preprocess.py` | Label cleanup, morphology, Gaussian masks and connected-component filtering. |
 | `autoflow/algorithms/segmentation.py` | Threshold, static/4D nnUNet input preparation, inference, cleanup and reusable outputs. |
@@ -38,6 +40,7 @@ Find a feature owner here, then use its feature page for algorithms, inputs, out
 | `autoflow/algorithms/surfaces.py` | VTK grids, velocity/field conversion, segmentation surfaces and connected support meshes. |
 | `autoflow/algorithms/traditional/flowunwrap.py` | Bundled traditional phase-recovery algorithms and graph/FFT helpers. |
 | `autoflow/algorithms/traditional/fourierOperators.py` | Fourier differentiation, inversion and resampling operators for phase recovery. |
+| `autoflow/ui/progress.py` | Application-modal animated progress, input lock and close-to-cancel lifecycle. |
 | `autoflow/ui/app.py` | Main Qt window, menus/docks, actions, worker coordination and user workflow. |
 | `autoflow/ui/viewer.py` | 3D dataset/actor management, scalar ranges, PC-MRA, geometry/trajectory caches and rendering. |
 | `autoflow/ui/ortho_viewer.py` | Orthogonal image/derived-map slices, overlays, content selection and phase display. |
@@ -50,6 +53,7 @@ Find a feature owner here, then use its feature page for algorithms, inputs, out
 | `autoflow/ui/launcher.py` | GUI startup, environment checks and application entry point. |
 | `autoflow/ui/remote_plotter.py` | Remote/off-screen VTK setup and rendering fallbacks. |
 | `autoflow/ui/theme.py` | Qt appearance and colour/theme helpers. |
+| `autoflow/rendering/jobs.py` | Isolated GUI VTK/FFmpeg task, progress transport and completed-video publication. |
 | `autoflow/rendering/videos.py` | Offline geometry/metric/streamline videos, cameras, labels, colourbars and encoding. |
 
 Package `__init__.py` files in `autoflow/`, `algorithms/`, `algorithms/traditional/`, `core/`, `ui/`, and `rendering/` define their package/export boundaries rather than separate algorithm controls.
@@ -61,6 +65,7 @@ Package `__init__.py` files in `autoflow/`, `algorithms/`, `algorithms/tradition
 | Batch execution | [`batch.json`](../user/parameters.md#batch) | `autoflow/config.py` mapping and the owner listed in its parameter table |
 | 3D display | [`ui.json`](../user/parameters.md#ui) | `autoflow/config.py` mapping and the owner listed in its parameter table |
 | Inputs/correction | [`loader.json`](../user/parameters.md#loader) | `autoflow/config.py` mapping and the owner listed in its parameter table |
+| PC-MRA noise mask | [`noise_removal.json`](../user/parameters.md#noise_removal) | `autoflow/algorithms/noise_removal.py`, `autoflow/ui/viewer.py` |
 | Unwrapping | [`phase_unwrapping.json`](../user/parameters.md#phase_unwrapping) | `autoflow/config.py` mapping and the owner listed in its parameter table |
 | Skeleton preprocessing | [`skeleton.json`](../user/parameters.md#skeleton) | `autoflow/config.py` mapping and the owner listed in its parameter table |
 | Labels/groups | [`labels.json`](../user/parameters.md#labels) | `autoflow/config.py` mapping and the owner listed in its parameter table |

@@ -10,6 +10,7 @@
 
 ## What It Does
 Graph and path generation converts the skeleton into nodes, edges, branches, forks, and path objects used by planes and downstream metrics.
+The thinning/smoothing sources and AutoFlow-specific graph logic are distinguished in [Scientific references: centerline](../references/index.md#centerline-skeleton-and-paths).
 When segmentation is grouped, graph generation runs per group, then combines path endpoints, fork nodes, fork roles, and path indices into one workspace-wide numbering while preserving each path `group_name`.
 
 GUI edits now invalidate dependent artifacts explicitly: skeleton edits clear

@@ -33,7 +33,7 @@ Code owner: `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow
 
 | Parameter | Type | Effective default | Where configured | Effect and units | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `background_phase_correction.enabled` | bool | `false` | `configs/loader.json` | Enable correction of static-tissue velocity offsets during loading. A compatible embedded correction may be reused unless force_recompute is true. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
+| `background_phase_correction.enabled` | bool | `false` | `configs/loader.json` | Enable an explicit background-correction stage after loading, before segmentation. Compatible H5 correction caches may be reused unless force_recompute is true. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
 | `background_phase_correction.method` | string | `"wrls_arto"` | `configs/loader.json` | Correction backend: wrls_arto uses robust weighted regression with automatic rejection; msac uses polynomial sample consensus. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
 | `background_phase_correction.corr_fit_order` | int | `3` | `configs/loader.json` | Polynomial order for MSAC correction. Higher orders add spatial flexibility and fitting cost; not the WRLS fixed basis order. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
 | `background_phase_correction.threshold` | float | `0.2` | `configs/loader.json` | MSAC residual threshold as a fraction of VENC; controls static-tissue inlier acceptance. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
@@ -57,13 +57,24 @@ Code owner: `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow
 | `dicom_h5_dir` | string | `""` | `configs/loader.json` | Destination directory for preserved Dicom2H5 outputs. Empty uses output_dir/_dicom_h5. Existing files cause an error; reopen the saved H5 to reuse it. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
 | `ignore_embedded_segmentation` | bool | `false` | `configs/loader.json` | Ignore source H5 segmentation while retaining image/velocity input; use to test a fresh segmentation path. | `autoflow/algorithms/data.py; autoflow/algorithms/dicom.py; autoflow/algorithms/dicom_conversion.py; autoflow/algorithms/phase_correction.py` |
 
+## noise_removal
+
+Code owner: `autoflow/algorithms/noise_removal.py`, `autoflow/core/pipeline.py`, `autoflow/ui/viewer.py`.
+
+| Parameter | Type | Effective default | Where configured | Effect and units | Code owner |
+| --- | --- | --- | --- | --- | --- |
+| `enabled` | bool | `false` | `configs/noise_removal.json` | Run PC-MRA display-region masking; does not change magnitude, velocity or segmentation inputs. | `autoflow/algorithms/noise_removal.py`, `autoflow/processing.py` |
+| `method` | string | `"magnitude_temporal"` | `configs/noise_removal.json` | Choose magnitude_temporal screening or magnitude-only screening. | `autoflow/algorithms/noise_removal.py`, `autoflow/processing.py` |
+| `magnitude_fraction` | float | `0.05` | `configs/noise_removal.json` | Fraction of maximum temporal-mean magnitude; AutoFlow default 0.05. Lower values retain more voxels; zero keeps all positive finite magnitude. | `autoflow/algorithms/noise_removal.py`, `autoflow/processing.py` |
+| `velocity_std_max` | float | `0.8` | `configs/noise_removal.json` | Upper temporal speed SD as a fraction of maximum SD over finite velocity voxels; AutoFlow default 0.80. Higher values retain more voxels; zero disables temporal screening. Not VENC-normalized. | `autoflow/algorithms/noise_removal.py`, `autoflow/processing.py` |
+
 ## phase_unwrapping
 
 Code owner: `autoflow/algorithms/phase_unwrapping.py`.
 
 | Parameter | Type | Effective default | Where configured | Effect and units | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `mask_source` | string | `"segmask"` | `configs/phase_unwrapping.json` | Learned-backend support/confidence: segmask uses segmentation; pcmra_std uses temporal PC-MRA standard deviation for weighting and Gaussian-centre confidence. | `autoflow/algorithms/phase_unwrapping.py` |
+| `mask_source` | string | `"auto"` | `configs/phase_unwrapping.json` | Mask source: auto selects none for gc3D/lap4D/NPRS and pcmra_std for PUDIP/GUST. Traditional methods allow none/segmask; learned methods also allow pcmra_std/pcmra_mean. segmask requires an active segmentation. | `autoflow/algorithms/phase_unwrapping.py` |
 | `device` | string | `"auto"` | `configs/phase_unwrapping.json` | Compute device selector: auto, cpu, or cuda. Backend-specific CPU work can remain even with cuda selected. | `autoflow/algorithms/phase_unwrapping.py` |
 | `tfc` | bool | `true` | `configs/phase_unwrapping.json` | Temporal flow consistency option of supported traditional methods; couples recovery across cardiac phases. | `autoflow/algorithms/phase_unwrapping.py` |
 | `lap4d_ts` | float | `2.0` | `configs/phase_unwrapping.json` | Temporal-axis scaling in the lap4D Laplacian operator; controls the balance of temporal and spatial constraints. | `autoflow/algorithms/phase_unwrapping.py` |
@@ -240,7 +251,7 @@ Code owner: `autoflow/algorithms/metrics.py`.
 
 | Parameter | Type | Effective default | Where configured | Effect and units | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `method` | string | `"least_squares"` | `configs/pressure_gradient.json` | Relative-pressure reconstruction: least_squares integrates face-averaged PG; ppe balances finite-volume gradient fluxes. Their Cartesian discrete equations are equivalent. | `autoflow/algorithms/metrics.py` |
+| `method` | string | `"ppe"` | `configs/pressure_gradient.json` | `ppe` is the merged Cartesian pressure solver; `ste` is the staggered-grid Stokes estimator. Legacy `least_squares` is accepted as an alias for `ppe`. | `autoflow/algorithms/metrics.py` |
 | `smoothing_sigma` | float | `0.0` | `configs/pressure_gradient.json` | Spatial Gaussian smoothing width in voxels. Zero disables smoothing; valid-mask normalization prevents boundary attenuation. | `autoflow/algorithms/metrics.py` |
 | `support_erosion_iters` | int | `1` | `configs/pressure_gradient.json` | Additional conservative 26-neighbour erosion margin. Complete measured spatial and temporal derivative stencils are mandatory even at zero. | `autoflow/algorithms/metrics.py` |
 | `layer_opacity` | float | `0.6` | `configs/pressure_gradient.json` | PG layer opacity between zero (transparent) and one (opaque), affecting display only. | `autoflow/algorithms/metrics.py` |

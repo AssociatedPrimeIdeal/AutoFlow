@@ -11,6 +11,8 @@
 ## What it does
 PWV computes pulse-wave velocity from one or more configured label groups.
 
+The MRI transit-time methodology review is listed in [Scientific references: PWV](../references/index.md#pulse-wave-velocity); AutoFlow's timing and path-selection rules are project implementations.
+
 For each PWV group, AutoFlow:
 
 1. merges the configured labels into one mask

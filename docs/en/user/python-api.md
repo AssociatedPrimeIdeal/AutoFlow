@@ -22,7 +22,16 @@ config = AutoFlowConfig(output_dir="./results/demo")
 summary = run_case("./data/demo_data.h5", config=config)
 ```
 
-Phase unwrapping is opt-in:
+The whole Correction group is opt-in:
+
+```python
+config = AutoFlowConfig(correction_all=True, autoseg=True)
+summary = run_case("case.h5", config=config)
+```
+
+It runs background correction, PC-MRA noise masking, unwrapping and PC-MRA generation before segmentation; default unwrap is `lap4D` with no mask. Separate fields are `background_phase_correction`, `noise_removal`, `phase_unwrap_method` and `generate_pcmra`. Noise masking does not modify magnitude/velocity or segmentation features. See [Noise removal](../features/noise-removal.md) for its thresholds and reusable output.
+
+Phase unwrapping alone is opt-in:
 
 ```python
 config = AutoFlowConfig(
@@ -129,3 +138,9 @@ Main code:
 ## Optional DICOM conversion
 
 Set `AutoFlowConfig.dicom_backend="dicom2h5"` and `dicom_h5_dir` for preserved conversion during batch collection. `run_batch()` processes all converted H5 groups; `run_case()` requires one group or an explicit H5 `InputCase`. Use `convert_dicom_input()` for conversion without analysis. Installation, signatures, output contracts and failure behavior are documented in [DICOM loading and conversion](../features/dicom-loading.md).
+
+`phase_unwrap_mask="auto"` resolves to `none` for gc3D/lap4D/NPRS and `pcmra_std` for PUDIP/GUST. All methods accept an available `segmask`; learned methods additionally accept `pcmra_mean`. A masked rerun updates working velocity while retaining existing downstream artifacts. Use `PipelineEngine.run_step` on a workspace for interactive reruns; rerun downstream actions explicitly. Noise controls are `noise_removal_method`, `noise_magnitude_fraction` (default `0.05`, fraction of maximum temporal-mean magnitude) and `noise_velocity_std_max` (default `0.80`, upper temporal-speed SD fraction of maximum SD, not VENC). These AutoFlow defaults can be overridden manually; lower magnitude or higher SD fractions retain more voxels. See [Noise removal](../features/noise-removal.md) for equations, reports and compatibility notes, and [Scientific references](../references/index.md) for the literature basis.
+
+## Low-level plane sampling
+
+`autoflow.algorithms.augment_plane_metrics_with_derived()` accepts optional `use_multithread=False`, `max_workers=None` and `progress_callback=None` keywords. Automatic process sampling starts at 1920 plane-phases, uses up to four workers, and preserves per-frame contour edits and output order. See [Metrics](../features/metrics.md) for the parameter table. The standard pipeline selects this through its existing parallel-computation setting.

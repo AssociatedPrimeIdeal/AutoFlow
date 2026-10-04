@@ -9,6 +9,7 @@ import h5py
 import numpy as np
 
 from ..case_types import BackgroundPhaseCorrectionConfig, InputCase, LoadedCase, LoaderCapabilities
+from ..task_control import check_cancelled, current_cancellation_token, task_scope
 from .phase_correction import (
     apply_background_phase_correction_to_complex,
     apply_background_phase_correction_to_mag_flow,
@@ -1165,8 +1166,14 @@ def _load_legacy_dual_venc_h5(
     callback = progress_events.put if progress_callback is not None else None
 
     def drain_progress():
+        check_cancelled()
         while not progress_events.empty():
             progress_callback(progress_events.get())
+
+    token = current_cancellation_token()
+    def correct_encoding(complex_data, **kwargs):
+        with task_scope(token):
+            return apply_background_phase_correction_to_complex(complex_data, **kwargs)
 
     lv_kwargs = {
         "config": cfg,
@@ -1183,12 +1190,12 @@ def _load_legacy_dual_venc_h5(
     if bool(cfg.enabled):
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="autoflow-bgc") as executor:
             lv_future = executor.submit(
-                apply_background_phase_correction_to_complex,
+                correct_encoding,
                 lv_complex,
                 **lv_kwargs,
             )
             hv_future = executor.submit(
-                apply_background_phase_correction_to_complex,
+                correct_encoding,
                 hv_complex,
                 **hv_kwargs,
             )

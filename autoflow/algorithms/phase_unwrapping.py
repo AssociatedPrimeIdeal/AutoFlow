@@ -37,6 +37,24 @@ def _canonical_method(method: str) -> str:
     return aliases.get(token.lower(), token)
 
 
+def mask_sources_for_method(method: str) -> tuple[str, ...]:
+    if _canonical_method(method) in {"pudip", "gust"}:
+        return ("pcmra_std", "pcmra_mean", "none", "segmask")
+    return ("none", "segmask")
+
+
+def resolve_mask_source(method: str, source: str = "auto") -> str:
+    token = str(source or "auto").strip().lower()
+    token = {"segmentation": "segmask", "active_segmentation": "segmask", "seg": "segmask",
+             "mask": "segmask", "pcmrastd": "pcmra_std", "pcmramean": "pcmra_mean"}.get(token, token)
+    allowed = mask_sources_for_method(method)
+    if token == "auto":
+        return allowed[0]
+    if token not in allowed:
+        raise ValueError(f"{method} supports mask sources {', '.join(allowed)}; got {source!r}")
+    return token
+
+
 def backend_available(method: str) -> bool:
     """Return whether an optional learned backend is installed and importable."""
     token = _canonical_method(method)

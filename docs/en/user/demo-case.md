@@ -11,6 +11,8 @@ On Windows the same file is available as:
 
 The screenshots in this page are unedited captures from autoflow-gui running on a private server display. Every operation is also shown as a CLI command. The exact counts below are from the run captured on 2026-10-02; counts can change after mask edits or configuration changes.
 
+The screenshots show the earlier workflow captured on 2026-10-02. Current navigation is **Input & QC → Correction → Segmentation**; background correction now runs explicitly in Correction, and optional unwrapping is in that same stage. Historical screenshots/counts are retained as review examples.
+
 ## Before you start
 
     conda activate autoflow311
@@ -65,7 +67,7 @@ mag and flow are normalized internally from img_complex. DICOM-derived normalize
 
 ![Background correction in progress](../../assets/images/dv-gui/03-background-correction.png)
 
-**GUI.** After choosing DV, AutoFlow applies the low and high correction paths. Then select **Input & QC** and inspect the normalized fields. The captured run used WRLS + ARTO with a forced recomputation, and the source H5 remained unchanged.
+**GUI.** After choosing DV, inspect normalized fields in **Input & QC** (PC-MRA is not computed yet), then open **Correction** and click **Background Correction**. Click **Generate PC-MRA** to create its render layer. Use Run All to add noise masking and the optional unwrap stage; DV unwrap is skipped. The captured historical run used WRLS + ARTO with forced recomputation and preserved the source H5.
 
 ![Loaded input and normalized data](../../assets/images/dv-gui/04-loaded-input.png)
 
@@ -100,7 +102,7 @@ The run produced a 4D mask with shape (158,44,144,20), 16 labels and 7 connected
 
 ![Phase unwrapping result](../../assets/images/dv-gui/07-phase-unwrapping.png)
 
-**GUI.** Choose **Phase Unwrapping > Unwrap Phase** when the input is single-VENC or when a supported method is appropriate. For this dual-VENC case the action is intentionally skipped because the dual-VENC reconstruction already resolves the selected source.
+**GUI.** Choose **Correction > Phase Unwrapping > Unwrap Phase** when the input is single-VENC or when a supported method is appropriate. For this dual-VENC case the action is intentionally skipped because the dual-VENC reconstruction already resolves the selected source.
 
 **CLI.** The matching explicit command is:
 

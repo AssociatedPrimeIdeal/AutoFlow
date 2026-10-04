@@ -26,8 +26,8 @@ GUI metric layers share the live `colorbar.json` layout. Metric `render.bar_cfg`
 1. Add or change the built-in and shipped JSON default.
 2. Update the workspace model and config mapping, plus a dataclass field / CLI flag only if it is public there.
 3. Update `docs/en/developer/parameter-descriptions.json` with meaning, units and ownership.
-4. Regenerate all parameter tables with `python tools/build_parameter_reference.py`.
+4. Update the affected rows in the configuration, structured-parameter, CLI and API references. Keep type, default, configuration location, effect and code owner synchronized with the source.
 5. Update the affected feature's behaviour and limitation text.
-6. Run `python tools/build_parameter_reference.py --check` and `mkdocs build --strict`.
+6. Compare the edited references with the live merged bundle, dataclass fields and argparse declarations, then run `mkdocs build --strict`.
 
-The generator reads the live merged bundle, dataclass fields and argparse actions. It fails for unexplained keys or stale generated files rather than silently omitting a new control.
+Parameter references are maintained alongside code changes. Review every new or changed control against its declaration and effective shipped default; documentation-site builds check links and rendering, not numerical parameter completeness.

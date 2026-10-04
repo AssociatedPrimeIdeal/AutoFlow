@@ -117,7 +117,7 @@ class PhaseUnwrappingConfig:
     # loaded.  Selecting ``method`` is now the sole user-facing opt-in.
     enabled: bool = False
     method: str = "none"
-    mask_source: str = "segmask"
+    mask_source: str = "auto"
     device: str = "auto"
     tfc: bool = True
     lap4d_ts: float = 2.0
@@ -153,11 +153,12 @@ class PhaseUnwrappingConfig:
         method = aliases.get(method.lower(), method)
         if method not in {"none", "gc3D", "lap4D", "nprs", "pudip", "gust"}:
             method = "none"
-        mask_source = str(payload.get("mask_source", "segmask") or "segmask").strip().lower()
+        mask_source = str(payload.get("mask_source", "auto") or "auto").strip().lower()
         if mask_source in {"active_segmentation", "segmentation", "seg", "mask"}:
             mask_source = "segmask"
-        if mask_source not in {"segmask", "pcmra_std"}:
-            mask_source = "segmask"
+        mask_source = {"pcmrastd": "pcmra_std", "pcmramean": "pcmra_mean"}.get(mask_source, mask_source)
+        if mask_source not in {"auto", "none", "segmask", "pcmra_std", "pcmra_mean"}:
+            raise ValueError(f"unsupported phase-unwrapping mask source: {mask_source}")
         return PhaseUnwrappingConfig(
             enabled=bool(payload.get("enabled", False)),
             method=method,
@@ -171,6 +172,34 @@ class PhaseUnwrappingConfig:
             backend_params=copy.deepcopy(payload.get("backend_params", {}) or {}),
             write_output=bool(payload.get("write_output", True)),
         )
+
+
+@dataclass
+class NoiseRemovalConfig:
+    """Magnitude/temporal-velocity screening, restricted to PC-MRA rendering."""
+    enabled: bool = False
+    method: str = "magnitude_temporal"
+    magnitude_fraction: float = 0.05
+    velocity_std_max: float = 0.80
+
+    def __post_init__(self):
+        if self.method not in {"magnitude_temporal", "magnitude"}:
+            raise ValueError("noise removal method must be magnitude_temporal or magnitude")
+        for name in ("magnitude_fraction", "velocity_std_max"):
+            value = float(getattr(self, name))
+            if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be between 0 and 1")
+            setattr(self, name, value)
+
+    def to_dict(self):
+        return {"enabled": bool(self.enabled), "method": self.method,
+                "magnitude_fraction": self.magnitude_fraction, "velocity_std_max": self.velocity_std_max}
+
+    @staticmethod
+    def from_dict(d):
+        payload = dict(d or {})
+        return NoiseRemovalConfig(**{name: payload[name] for name in
+            ("enabled", "method", "magnitude_fraction", "velocity_std_max") if name in payload})
 
 
 @dataclass

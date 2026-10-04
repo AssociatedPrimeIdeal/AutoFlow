@@ -96,6 +96,7 @@ nav:
       - Data preparation:
           - DICOM loading and conversion: en/features/dicom-loading.md
           - Background phase correction: en/features/background-phase-correction.md
+          - Noise removal: en/features/noise-removal.md
           - Phase unwrapping: en/features/phase-unwrapping.md
           - Segmentation and review: en/features/segmentation.md
       - Vessel geometry:
@@ -115,6 +116,8 @@ nav:
           - PC-MRA: en/features/pcmra-volume-rendering.md
           - Quality control: en/features/quality-control.md
           - Videos: en/features/videos.md
+  - References:
+      - Scientific references: en/references/index.md
   - Parameters:
       - Configuration by module: en/user/parameters.md
       - Structured dictionaries: en/user/parameter-schemas.md

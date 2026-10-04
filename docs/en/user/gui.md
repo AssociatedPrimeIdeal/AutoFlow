@@ -54,7 +54,7 @@ and saved numerical results are identical.
 The main window contains:
 
 - menu bar
-- workflow navigation for `Input & QC`, `Segmentation`, `Phase Unwrapping`, `Centerline & Planes`, `Hemodynamics`, and `Review & Export`
+- workflow navigation for `Input & QC`, `Correction`, `Segmentation`, `Centerline & Planes`, `Hemodynamics`, and `Review & Export`
 - left browser
 - central 3D view
 - steps area
@@ -71,7 +71,7 @@ The loaded arrays are already normalized to `LR/AP/FH`. The 3D orientation axes,
 
 The left browser is group-aware and path-aware. When the loaded segmentation produces multiple vessel groups, the browser shows one top-level section per group. Path geometry, generated planes, and their pathlines are organized as `Paths -> Path -> Plane -> Pathline`; each path row shows its plane count. Manual or unmatched planes appear under `Unbound Planes`. Group, path, and plane checkboxes control all descendants, while selecting a path or plane updates the corresponding 3D highlight and analysis panel. Use Ctrl/Shift selection with a plane context menu to launch pathlines for that subset; the main `Pathlines` action runs all planes.
 
-When magnitude and flow are loaded, `Global → PC-MRA (4D)` is available as a
+After **Correction > Generate PC-MRA**, `Global → PC-MRA (4D)` is available as a
 grayscale VTK volume backdrop. It is phase-resolved (`magnitude_t × speed_t`)
 and updates with the timeline/playback, with a low-intensity transfer function
 to suppress background noise. The volume uses GPU rendering when supported,
@@ -116,13 +116,13 @@ press `Ctrl+C` to end the process.
 
 The workflow navigation filters actions and parameters to the active task. Everyday controls remain visible; advanced skeleton, WSS, and pressure parameters are hidden until `Advanced` is enabled, while vortex controls remain visible in Hemodynamics. In `Hemodynamics`, plane metrics, derived metrics, live streamlines, and pathlines form a 2x2 action grid; `Run All` and `Compute PWV` are full-width rows below it. The segmentation dock appears only in the Segmentation stage, and the Analysis dock appears in Hemodynamics and Review. The status beside the navigation reports `Ready`, `Needs review`, `Incomplete`, or `Not ready` from current workspace prerequisites.
 
-Input also provides `Reload Input with Current Parameters`. An unchanged input signature is skipped; changed correction, geometry, VENC, or DICOM override settings reload the source and invalidate downstream artifacts. The default correction method is WRLS + ARTO. Corr content is enabled only after correction is applied or reused; dual-venc cases show separate normalized `Corr Low LR/AP/FH` and `Corr High LR/AP/FH` fields.
+Input also provides `Reload Input with Current Parameters`. An unchanged input signature is skipped; changed geometry, VENC, dual-VENC ratios or DICOM overrides reload the source and invalidate downstream artifacts. Correction settings live in **Correction** and run through explicit actions. Background correction and unwrapping update working velocity while retaining existing downstream artifacts until manually rerun. Corr content becomes available only after correction is applied or reused.
 
 ## File Menu
 
 | Menu item | What it does | Main code |
 | --- | --- | --- |
-| `Open H5` | open an H5 or HDF5 case; prompts for a data-group path when one file contains multiple supported cases, asks for `LV`, `HV`, or `DV` for legacy dual-VENC data, then reuses a compatible correction cache when available | `autoflow/ui/app.py`, `autoflow/ui/dicom_confirm.py` |
+| `Open H5` | open an H5 or HDF5 case; prompts for a data-group path when one file contains multiple supported cases, asks for `LV`, `HV`, or `DV` for legacy dual-VENC data, then loads acquisition data and any embedded segmentation; correction runs explicitly in Correction | `autoflow/ui/app.py`, `autoflow/ui/dicom_confirm.py` |
 | `Import DICOM Directory` | scan a DICOM directory and choose a case using the native loader | `autoflow/ui/app.py`, `autoflow/ui/dicom_confirm.py` |
 | `Import DICOM via Dicom2H5...` | convert to a new reusable H5 in a background worker, validate it, select a group if needed, and load it | `autoflow/ui/app.py`, `autoflow/algorithms/dicom_conversion.py` |
 | `Clear Workspace` | clear loaded data and restore config defaults in the UI | `autoflow/ui/app.py` |
@@ -147,12 +147,12 @@ Input also provides `Reload Input with Current Parameters`. An unchanged input s
 ## Standard Workflow
 
 1. start the GUI
-2. load a case through `Open H5` or `Import DICOM Directory`; when `Open H5` detects a legacy dual-VENC case, choose `LV`, `HV`, or `DV` in the source-selection dialog before the correction prompt
-3. for H5, the GUI uses an existing correction cache and embedded segmentation directly; when correction is missing, it first asks whether correction is needed and then shows a method dropdown with `MSAC` and `WRLS + ARTO`
+2. load through `Open H5` or `Import DICOM Directory`; select `LV`, `HV` or `DV` for legacy dual-VENC H5
+3. inspect inputs in `Input & QC`; H5 loads embedded segmentation when available and leaves correction for the explicit Correction stage
 4. for DICOM, confirm or edit resolution, venc, spatial order, venc order, and RR
-5. check loader parameters in `Input / Background Correction`, including dual-venc ratios for legacy `Nv=7` H5 when needed
+5. open `Correction`, configure background correction and noise masking, then click `Run All` for Background Correction → Noise Removal → Unwrap Phase → Generate PC-MRA (default `lap4D`, mask `none`)
 6. in the `Segmentation` workflow stage, configure nnUNet if needed and click `Run Automatic Segmentation` explicitly
-7. optionally open `Phase Unwrapping`, which defaults to `lap4D`, choose `gc3D`, `lap4D`, `nprs`, `pudip`, or `gust`, select `segmask` or `PCMRAStd` for learned-backend weighting/initialization, and click `Unwrap Phase`; method-specific parameters appear for the selected method and `DV` dual-VENC inputs are skipped automatically
+7. after segmentation, optionally return to `Correction > Phase Unwrapping`, choose a method and `segmask` for masked refinement, and click `Unwrap Phase`; existing downstream results stay available until manually rerun
 8. if phase unwrapping ran, inspect `Estimated Wrap Locations`, `Phase Wrap Count`, and the `Unwrapped − Wrapped` views to see where wraps were detected
 9. if the segmentation is a label mask, AutoFlow will reduce 4D labels to 3D by time majority vote, remove small connected components per label, merge labels by configured groups, filter grouped components with the configured skeleton cleanup rule, and then run grouped skeleton, graph, and plane generation
 10. move through the workflow stages and run the actions shown for the current stage; `Run All` is limited to the active stage
@@ -191,14 +191,17 @@ datasets. Progress still advances once per completed plane.
 
 `Run All` scope:
 
-1. `Centerline & Planes`: `Generate Skeleton` -> `Generate Graph` -> `Generate Planes`
-2. `Hemodynamics`: `Calculate && Save Metrics` -> `WSS / TKE / Pressure / Vortex` -> `Generate Streamlines` -> `Pathlines` for every plane. The metric stages run in a background worker; streamlines are then added to the live scene and pathline integration runs in its own worker.
+1. `Correction`: `Background Correction` → `Noise Removal` → `Unwrap Phase` → `Generate PC-MRA`. Default `lap4D` uses no mask. Noise masking changes the 3D PC-MRA region and can optionally be reviewed as a red ortho overlay; the other two stages update working velocity. Existing downstream results are kept until manually rerun.
+2. `Centerline & Planes`: `Generate Skeleton` -> `Generate Graph` -> `Generate Planes`
+3. `Hemodynamics`: `Calculate && Save Metrics` -> `WSS / TKE / Pressure / Vortex` -> `Generate Streamlines` -> `Pathlines` for every plane. The metric stages run in a background worker; streamlines are then added to the live scene and pathline integration runs in its own worker.
 
 ## Parameter Panels
 
 | Panel | Main purpose | Main code |
 | --- | --- | --- |
-| `Input / Background Correction` | loader and DICOM settings, including the active `MSAC` or `WRLS + ARTO` correction method | `autoflow/ui/app.py`, `autoflow/config.py` |
+| `Input Parameters` | input geometry and DICOM overrides; explicit reload | `autoflow/ui/app.py`, `autoflow/config.py` |
+| `Background Correction` | Correction action settings: `MSAC` or `WRLS + ARTO`, fit order and dual-VENC ratios | `autoflow/ui/app.py`, `autoflow/core/pipeline.py` |
+| `Noise Removal (PC-MRA Rendering Only)` | magnitude and temporal velocity SD display filter, plus reset | `autoflow/ui/app.py`, `autoflow/algorithms/noise_removal.py` |
 | `Segmentation Parameters` | choose 3D or 4D automatic segmentation and configure its model path, checkpoint, folds, device, and label map | `autoflow/ui/app.py`, `autoflow/core/models.py`, `autoflow/algorithms/segmentation.py` |
 | `Generate Skeleton Parameters` | cleanup and morphology controls, including `Special Handling`, `Minimum Edge Count`, and the `Separate Special Label Contacts` switch for `RBCT`/`CCA`/`LBCT` contacts | `autoflow/ui/app.py`, `autoflow/config.py`, `autoflow/algorithms/graph.py` |
 | `Generate Planes Parameters` | uniform/fixed-step layout, segmentation filter, and advanced trim controls | `autoflow/ui/app.py` |
@@ -228,15 +231,15 @@ Important behavior:
 
 - `Run All` does not auto-start segmentation
 - segmentation must already exist when segmentation-dependent steps run
-- opening H5 checks the selected case group before loading: a reusable `corr` cache selects the cached correction method; embedded `segmask`, `segmentation`, or `seg` becomes the initial active source
-- when correction is absent, the GUI asks whether it should run; answering `Yes` opens a second dropdown for `MSAC` or `WRLS + ARTO`, while cancelling either dialog cancels the load
+- opening H5 loads the selected acquisition group and any embedded `segmask`, `segmentation` or `seg`; correction remains an explicit action
+- background correction settings are in Correction; there are no correction configuration prompts during input loading
 - input loading never starts or asks to start automatic segmentation
 - the top menu bar has no separate `Segmentation` menu; generation settings and commands are in the `Segmentation` workflow parameter panel, while source review and editing remain in the right-side `Segmentation` dock
 - use the `Segmentation Parameters` panel to choose `3D` or `4D`, choose a detected local model preset or browse to a custom model folder, and set checkpoint, folds, device, and label map; click `Run Automatic Segmentation`. The right-side dock keeps active-source review, import, save, visibility, and label-editing controls
 - an input case's embedded segmentation is activated during loading; click `Run Automatic Segmentation` only when you want to replace it with a new model result
 - `Open in SpatioTemporal Labeler` is available when the optional `labeler` extra is installed; it exports `mag`, three flow components, `pcmra`, and the active segmentation as NIfTI files through a separate editor process
 - the shipped automatic-segmentation settings default to the local Dataset7020 `nnUNet4D` profile (with the orchestration script as fallback); enter a static model folder and select `nnUNet` when a 3D model is required
-- GUI auto segmentation uses the same window-modal progress dialog as other long-running GUI tasks; nnUNet inference runs in an isolated child process so native CUDA/nnUNet failures are reported in the dialog instead of terminating the Qt GUI. Closing the dialog hides progress permanently for that run and does not cancel the worker, while completion still applies the result and failure opens an explicit error dialog
+- GUI auto segmentation uses the same application-modal progress dialog as other long-running GUI tasks; nnUNet inference runs in an isolated child process so native CUDA/nnUNet failures are reported in the dialog instead of terminating the Qt GUI. × requests cancellation and stops the inference child process; the dialog remains visible until the task stops, cancelled results are not applied, and failures open an error dialog after the progress lock is released
 - automatic segmentation saves a sidecar H5 file after a successful run
 - automatic segmentation also saves the predicted segmentation NIfTI plus the feature-channel NIfTI inputs used for that run
 - the Labeler export dialog advances as the six background exports finish; unchanged images are reused, and changing the active segmentation refreshes only the label file. Files remain uncompressed `.nii`
@@ -362,8 +365,22 @@ an open contour endpoint to the original boundary; `Auto` retains the adaptive
 voxel-spacing threshold. Display settings do not change the metric ROI, its
 area, or any sampled output.
 
-The `Overlay` slider changes the segmentation color overlay opacity immediately
-without changing the scalar image window/level.
+The `Segmentation` slider changes the segmentation color overlay opacity immediately
+without changing the scalar image window/level. The `Noise mask` checkbox starts
+off; Noise Removal, alone or in Correction Run All, enables it for review. Its
+separate opacity slider draws only voxels rejected by
+the PC-MRA display mask in red on the three orthogonal slices. It does not modify
+the scalar image or segmentation data. The red layer is above segmentation so
+opaque segmentation cannot hide it; retained voxels are transparent. It also
+works in selected-plane U/V/N views. Positive slider opacity enables the overlay;
+zero disables it, and unchecking the checkbox shows 0%. Run `Correction -> Noise Removal` first if
+the controls are disabled. Red includes excluded low-signal background, not only
+verified velocity noise. The independent 3-D `Noise Region` is hidden by default
+and shows a binary red maximum-intensity volume, with transparent retained voxels.
+Its opacity does not accumulate with depth into a solid red block. With no
+continuous scalar layer selected, the 3-D Window/Level and Auto controls target
+visible PC-MRA rather than staying disabled when segmentation or Noise Region
+is selected.
 
 When a plane is selected, `Edit contour` is available below the main content
 bar. It edits only the selected plane and current cardiac frame. A closed
@@ -413,3 +430,37 @@ Current popup behavior:
 - the transform controls only affect the rendered preview and do not modify source data on disk
 
 The GUI uses `batch.output_dir` from the selected config directory as its output root, with a case-named subdirectory for analysis and generated segmentation sidecars. Video export has its own destination picker. Set `loader.background_phase_correction.write_cache=false` and `segmentation.write_auto_cache=false` to preserve source H5 files.
+
+## Correction mask choices
+
+`lap4D`, `gc3D` and `nprs` offer `none` (default) and `segmask`. PUDIP/GUST offer `PCMRAStd` (default), `PCMRAMean`, `none` and `segmask`. The `segmask` option is disabled until a segmentation is active. Choices are remembered per method. See [Noise removal](../features/noise-removal.md) and [Phase unwrapping](../features/phase-unwrapping.md) for scope and limitations.
+
+## Generated displays and Content choices
+
+Input loading computes no PC-MRA and creates no PC-MRA Browser layer. Correction has four buttons in a 2×2 grid: **Background Correction**, **Noise Removal**, **Unwrap Phase**, **Generate PC-MRA**, followed by **Run All**. The fourth action materializes `magnitude × speed` from current working flow and adds its time-resolved render layer. Run All always generates it last. After a later velocity correction, rerun Generate PC-MRA to update that stored display.
+
+Noise Removal adds **Global → Noise → Noise Region** to the left Browser. The
+3-D surface is hidden by default and marks voxels excluded by the display mask;
+use the Browser checkbox and opacity control to review it. In the ortho viewer,
+enable **Noise mask** to draw only those excluded voxels in red, with its own
+opacity control. Reset PC-MRA Noise Mask removes both the filter and review layer.
+
+Noise Removal parameters default to **Magnitude fraction of maximum** `0.050` (5%)
+and **Temporal SD fraction of maximum** `0.800` (80%). The panel has no explanatory
+paragraph below the controls. Magnitude uses the maximum temporal-mean signal; temporal SD uses
+the maximum SD of speed, not component SD divided by VENC. Both are editable.
+If too much flow disappears, lower the magnitude fraction or raise the SD fraction,
+then rerun **Noise Removal** or **Run All** and inspect the red slice overlay.
+Magnitude zero keeps positive finite signal only; SD zero disables temporal screening.
+Older saved parameters are retained, so enter `0.05` and `0.80` explicitly for an
+older workspace if you want the new defaults. See [Noise removal](../features/noise-removal.md)
+for actual threshold reports and limitations, and [Scientific references](../references/index.md)
+for the papers and their original empirical ranges.
+
+The right **Content** menu contains only available data/results. Before PC-MRA generation it offers acquired magnitude/flow and speed; PC-MRA appears after the fourth action. WSS, TKE, PG, relative pressure, vortex fields, correction fields and unwrap diagnostics appear only when the corresponding arrays/results exist. Through-plane flow appears only while a valid plane is selected. New entries preserve the selected field; when that field disappears, the viewer falls back to magnitude (or the first available acquired field).
+
+## Task progress and cancellation
+
+Task progress locks all other GUI operations until completion. Use × to request cancellation; Escape cannot dismiss the lock. Animated dots, elapsed time, time since the last changed progress payload, and stage/phase/plane/frame counts show activity. The lock stays visible until the worker or task-owned process exits. Completed pipeline steps remain; an incomplete step does not publish workspace results. Failed/cancelled background loads retain the previous case.
+
+![Task progress](images/task-progress.png)

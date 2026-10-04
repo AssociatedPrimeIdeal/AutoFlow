@@ -14,7 +14,7 @@
       "background_color": "Background colour of the 3D scene, as a VTK colour name or hexadecimal RGB. Changes display only."
     },
     "loader": {
-      "background_phase_correction.enabled": "Enable correction of static-tissue velocity offsets during loading. A compatible embedded correction may be reused unless force_recompute is true.",
+      "background_phase_correction.enabled": "Enable an explicit background-correction stage after loading, before segmentation. Compatible H5 correction caches may be reused unless force_recompute is true.",
       "background_phase_correction.method": "Correction backend: wrls_arto uses robust weighted regression with automatic rejection; msac uses polynomial sample consensus.",
       "background_phase_correction.corr_fit_order": "Polynomial order for MSAC correction. Higher orders add spatial flexibility and fitting cost; not the WRLS fixed basis order.",
       "background_phase_correction.threshold": "MSAC residual threshold as a fraction of VENC; controls static-tissue inlier acceptance.",
@@ -39,7 +39,7 @@
       "dicom_h5_dir": "Destination directory for preserved Dicom2H5 outputs. Empty uses output_dir/_dicom_h5. Existing files cause an error; reopen the saved H5 to reuse it."
     },
     "phase_unwrapping": {
-      "mask_source": "Learned-backend support/confidence: segmask uses segmentation; pcmra_std uses temporal PC-MRA standard deviation for weighting and Gaussian-centre confidence.",
+      "mask_source": "Mask source: auto selects none for gc3D/lap4D/NPRS and pcmra_std for PUDIP/GUST. Traditional methods allow none/segmask; learned methods also allow pcmra_std/pcmra_mean. segmask requires an active segmentation.",
       "device": "Compute device selector: auto, cpu, or cuda. Backend-specific CPU work can remain even with cuda selected.",
       "tfc": "Temporal flow consistency option of supported traditional methods; couples recovery across cardiac phases.",
       "lap4d_ts": "Temporal-axis scaling in the lap4D Laplacian operator; controls the balance of temporal and spatial constraints.",
@@ -128,7 +128,7 @@
     "pressure_gradient": {
       "rho": "Optional pressure density override in kg/m^3; absent uses fluid.rho.",
       "viscosity": "Optional pressure viscosity override in mPa*s; absent uses fluid.viscosity.",
-      "method": "Relative-pressure reconstruction: least_squares integrates face-averaged PG; ppe balances finite-volume gradient fluxes. Their Cartesian discrete equations are equivalent.",
+      "method": "Relative-pressure reconstruction: ppe is the merged Cartesian solver; ste is the staggered-grid Stokes estimator; legacy least_squares is accepted as an alias for ppe.",
       "smoothing_sigma": "Spatial Gaussian smoothing width in voxels. Zero disables smoothing; valid-mask normalization prevents boundary attenuation.",
       "support_erosion_iters": "Additional conservative 26-neighbour erosion margin. Complete measured spatial and temporal derivative stencils are mandatory even at zero.",
       "layer_opacity": "PG layer opacity between zero (transparent) and one (opaque), affecting display only.",
@@ -227,6 +227,12 @@
       "plane_video.default.plane_color": "Plane-video default colour; group settings can override it.",
       "plane_video.default.plane_opacity": "Default plane-video opacity between zero and one.",
       "plane_video.groups": "Per-group plane-video overrides; each group may supply skeleton_color, plane_size, plane_color and plane_opacity."
+    },
+    "noise_removal": {
+      "enabled": "Run PC-MRA display-region masking; does not change magnitude, velocity or segmentation inputs.",
+      "method": "Choose magnitude_temporal screening or magnitude-only screening.",
+      "magnitude_fraction": "Fraction of maximum temporal-mean magnitude; AutoFlow default 0.05. Lower values retain more voxels; zero keeps all positive finite magnitude.",
+      "velocity_std_max": "Upper temporal speed SD as a fraction of maximum SD over finite velocity voxels; AutoFlow default 0.80. Higher values retain more voxels; zero disables temporal screening. Not VENC-normalized."
     }
   },
   "render": {
@@ -294,7 +300,7 @@
     },
     "background_phase_correction": {
       "path": "loader.background_phase_correction.enabled",
-      "effect": "Enable correction of static-tissue velocity offsets during loading. A compatible embedded correction may be reused unless force_recompute is true."
+      "effect": "Enable an explicit background-correction stage after loading, before segmentation. Compatible H5 correction caches may be reused unless force_recompute is true."
     },
     "background_phase_method": {
       "path": "loader.background_phase_correction.method",
@@ -382,7 +388,7 @@
     },
     "phase_unwrap_mask": {
       "path": "phase_unwrapping.mask_source",
-      "effect": "Learned-backend support/confidence: segmask uses segmentation; pcmra_std uses temporal PC-MRA standard deviation for weighting and Gaussian-centre confidence."
+      "effect": "Mask source: auto selects none for gc3D/lap4D/NPRS and pcmra_std for PUDIP/GUST. Traditional methods allow none/segmask; learned methods also allow pcmra_std/pcmra_mean. segmask requires an active segmentation."
     },
     "phase_unwrap_device": {
       "path": "phase_unwrapping.device",
@@ -566,7 +572,7 @@
     },
     "pressure_method": {
       "path": "pressure_gradient.method",
-      "effect": "Relative-pressure reconstruction: least_squares integrates face-averaged PG; ppe balances finite-volume gradient fluxes. Their Cartesian discrete equations are equivalent."
+      "effect": "Relative-pressure reconstruction: ppe is the merged Cartesian solver; ste is the staggered-grid Stokes estimator; legacy least_squares is accepted as an alias for ppe."
     },
     "autoseg": {
       "path": null,
@@ -763,6 +769,28 @@
     "dicom_h5_dir": {
       "path": "loader.dicom_h5_dir",
       "effect": "Destination directory for preserved Dicom2H5 outputs. Empty uses output_dir/_dicom_h5. Existing files cause an error; reopen the saved H5 to reuse it."
+    },
+    "noise_removal": {
+      "path": "noise_removal.enabled",
+      "effect": "Run PC-MRA display-region masking; does not change magnitude, velocity or segmentation inputs."
+    },
+    "noise_removal_method": {
+      "path": "noise_removal.method",
+      "effect": "Choose magnitude_temporal screening or magnitude-only screening."
+    },
+    "noise_magnitude_fraction": {
+      "path": "noise_removal.magnitude_fraction",
+      "effect": "Fraction of maximum temporal-mean magnitude; AutoFlow default 0.05. Lower values retain more voxels; zero keeps all positive finite magnitude."
+    },
+    "noise_velocity_std_max": {
+      "path": "noise_removal.velocity_std_max",
+      "effect": "Upper temporal speed SD as a fraction of maximum SD over finite velocity voxels; AutoFlow default 0.80. Higher values retain more voxels; zero disables temporal screening. Not VENC-normalized."
+    },
+    "correction_all": {
+      "effect": "Run background correction, noise masking, phase unwrapping and PC-MRA generation before segmentation; default unwrap is lap4D with no mask."
+    },
+    "generate_pcmra": {
+      "effect": "Generate PC-MRA after requested correction steps; loading leaves it uncomputed."
     }
   }
 }

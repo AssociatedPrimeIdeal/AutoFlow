@@ -1,11 +1,13 @@
 # Phase Unwrapping
 
 ## Status
-Supported as an optional GUI, CLI, and Python workflow step for the bundled backends; PUDIP-Flow and GUST-Flow are Experimental. Disabled by default; `DV` dual-VENC inputs are skipped while `LV` and `HV` selections can be unwrapped.
+Supported as an optional GUI, CLI, and Python workflow step for the bundled backends; PUDIP-Flow and GUST-Flow are Experimental. Explicit action in GUI; CLI/API remain opt-in, while `--correction` / `correction_all=True` default to `lap4D` with no mask; `DV` dual-VENC inputs are skipped while `LV` and `HV` selections can be unwrapped.
 
 ## What it does
 
 Runs a selected phase-unwrapping backend on wrapped phase (radians), converts the result to velocity, and records signed wrap count `k` plus affected voxels. The bundled `gc3D`, `lap4D`, and `nprs` methods remain available; optional `pudip` and `gust` methods use the `third_party/PUDIP-Flow` and `third_party/GUST-Flow` git submodules.
+
+The LAP4D article and upstream implementation are listed in [Scientific references: phase unwrapping](../references/index.md#phase-unwrapping). That citation does not cover every available backend.
 
 ## When to use it
 
@@ -13,7 +15,7 @@ Use for single-VENC data containing phase wraps or for a dual-VENC case loaded a
 
 ## Quick use
 
-GUI: open **Phase Unwrapping**; the method selector defaults to `lap4D`. Choose a method/mask/device and click **Unwrap Phase**. Choosing a method is the opt-in action; the step is never run until that button is pressed. PUDIP-Flow and GUST-Flow training settings are read from `phase_unwrapping.json` under `backend_params`. The Browser exposes **Estimated Wrap Locations** and **Phase Wrap Count**.
+GUI: open **Correction > Phase Unwrapping**; the method defaults to `lap4D` and the mask to `none`. Click **Unwrap Phase** to run only this stage, or **Run All** to run Background Correction → Noise Removal → Unwrap Phase → Generate PC-MRA. PUDIP/GUST training settings come from `phase_unwrapping.json` under `backend_params`. Review **Estimated Wrap Locations** and **Phase Wrap Count** in the Browser.
 
 CLI:
 
@@ -32,9 +34,14 @@ Python: set `AutoFlowConfig(phase_unwrap_method="lap4D")` and call `run_case`. O
 
 ## Inputs
 
-The loader must provide canonical `phase_wrapped` (`X,Y,Z,T,3`). For normalized H5 and DICOM velocity inputs, AutoFlow reconstructs the wrapped phase modulo `2π` from velocity and VENC before this step. The GUI and CLI mask choices are `segmask` and `pcmra_std`. `segmask` is used as the learned-backend weight map and Gaussian-center confidence; `pcmra_std` uses temporal PC-MRA standard deviation for the PUDIP weight map and GUST Gaussian-center initialization. PUDIP-Flow and GUST-Flow receive the converted `[component,time,x,y,z]` layout expected by their upstream packages.
+The loader must provide canonical `phase_wrapped` (`X,Y,Z,T,3`). Normalized H5 and DICOM velocity inputs reconstruct wrapped phase modulo `2π` from velocity and VENC. Mask choices depend on the method: `gc3D`, `lap4D` and `nprs` allow `none` (default) or `segmask`; `pudip` and `gust` allow `pcmra_std` (default), `pcmra_mean`, `none` or `segmask`. GUI disables `segmask` until an active segmentation exists; direct calls reject an unavailable mask. PCMRA choices are computed from magnitude and wrapped phase independently of segmentation and the noise display mask. Learned backends receive `[component,time,x,y,z]` layout.
 
 ## Parameters
+
+| Parameter / flag | Type | Default | Where configured | Effect | Code owner |
+| --- | --- | --- | --- | --- | --- |
+| `mask_source` / `--phase-unwrap-mask` / API `phase_unwrap_mask` | string | `auto` | JSON, GUI, CLI/API | `auto` resolves by method as described above; `none` uses the whole volume | `autoflow/algorithms/phase_unwrapping.py`, `autoflow/core/pipeline.py` |
+
 
 See [phase unwrapping parameters](../user/parameters.md#phase_unwrapping), [CLI flags](../user/cli-parameters.md), and [API fields](../user/api-parameters.md) for complete type/default/unit/effect/owner tables. Dictionary controls are expanded in [Structured parameters](../user/parameter-schemas.md).
 
@@ -42,7 +49,11 @@ When omitted, the learned backends use the upstream notebook settings: PUDIP-Flo
 
 ## Outputs
 
-`summary.json` records method, device, elapsed time, and wrap statistics. `phase_unwrap.npz` contains wrapped/unwrapped phase, flow, `wrap_count`, `wrap_mask`, and `mask_used`.
+`summary.json` records method, selected mask source, device, elapsed time, diagnostic scope and wrap statistics. `phase_unwrap.npz` contains wrapped/unwrapped phase, flow, `wrap_count`, `wrap_mask`, and `mask_used`.
+
+Correction updates `Workspace.flow_raw`, the working velocity used by later segmentation and analysis. Every unwrap run starts from stored wrapped phase, preventing repeated unwrapping of already recovered phase. A masked rerun preserves current velocity outside the mask; exported recovered phase matches that combined velocity, while wrap counts/statistics describe the latest mask (`diagnostic_scope=latest_masked_run`). `flow_input` retains the pre-unwrapping baseline (after background correction if run), used by **Revert to Pre-Unwrapping Flow**.
+
+Existing segmentation, skeleton, graph, paths, planes, metrics and trajectories are retained after unwrap or revert. They do not automatically recompute: rerun the desired downstream actions yourself. After segmentation, return to Correction and select `segmask` to run a masked refinement.
 
 ## Limitations
 
@@ -61,3 +72,7 @@ Backend adapter: `autoflow/algorithms/phase_unwrapping.py`; upstream sources: `t
 ## Common problems
 
 “wrapped phase unavailable” means an input has neither stored phase nor a reconstructable velocity/VENC pair. Normalized H5 and DICOM velocity inputs now reconstruct a wrapped phase automatically. `DV` dual-VENC input intentionally skips this step; an `LV` or `HV` selection from the GUI keeps its selected single-VENC wrapped phase available.
+
+For CLI/API, standalone unwrapping with `segmask` is delayed until requested automatic segmentation has produced a mask when none was loaded. `--correction` requires its mask to exist before the group runs; use its default `none` or a learned PCMRA source for correction before segmentation.
+
+PC-MRA is a stored display computed by the fourth Correction action. Returning to run only Unwrap Phase updates velocity but keeps the existing PC-MRA data until Generate PC-MRA is explicitly rerun. Run All finishes with that generation step.

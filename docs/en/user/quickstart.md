@@ -150,3 +150,15 @@ autoflow-run ./data/demo_data.h5 \
 - [Troubleshooting](troubleshooting.md)
 
 [Functional workflow](../features/index.md) explains each module. [Configuration parameters](parameters.md) explains all defaults.
+
+## Optional Correction group
+
+In the GUI, load in Input & QC, then use **Correction > Run All** for Background Correction → Noise Removal → Unwrap Phase → Generate PC-MRA. Default unwrap is LAP4D/none. Input loading itself creates no PC-MRA. Continue to Segmentation afterward.
+
+```bash
+autoflow-run case.h5 --correction --autoseg --no-cache-write
+# PC-MRA generation alone, for a case with segmentation:
+autoflow-run case.h5 --generate-pcmra
+```
+
+The left Noise Region layer reviews excluded voxels and is hidden by default; its binary maximum-intensity rendering does not accumulate opacity with depth. Noise Removal, alone or in Correction Run All, automatically enables the ortho viewer's **Noise mask** overlay for review. Its checkbox and opacity slider show only excluded voxels in red; zero opacity disables it. Right-side Content lists acquired fields and computed results only.

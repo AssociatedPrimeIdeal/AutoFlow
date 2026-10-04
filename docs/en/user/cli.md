@@ -124,13 +124,13 @@ autoflow-run ./data/demo_data.h5 \
 
 ### Opt in to optional computations
 
-Phase unwrapping is opt-in and disabled by default. For single-VENC wrapped phase:
+The whole Correction group is opt-in: `autoflow-run case.h5 --correction --autoseg` loads, runs Background Correction → Noise Removal → Unwrap Phase → Generate PC-MRA, then runs segmentation if needed. Default unwrap is `lap4D` with mask `none`. Individual controls remain `--bgc`, `--noise-removal`, `--phase-unwrap-method` and `--generate-pcmra`; their omitted defaults skip the corresponding stage. Noise options are documented in [Noise removal](../features/noise-removal.md). For single-VENC wrapped phase:
 
 ```bash
 autoflow-run ./data/demo_data.h5 --phase-unwrap-method lap4D --phase-unwrap-device auto
 ```
 
-Choose `gc3D`, `lap4D`, `nprs`, `pudip`, or `gust`; use `--phase-unwrap-mask segmask` or `--phase-unwrap-mask pcmra_std` for the learned-backend weight/initialization source. The `pudip` and `gust` choices use the corresponding git submodules and require their optional dependencies. Dual-VENC inputs report a skip.
+Choose `gc3D`, `lap4D`, `nprs`, `pudip` or `gust`. `--phase-unwrap-mask auto` selects `none` for traditional methods and `pcmra_std` for learned methods. Traditional masks allow `none` or `segmask`; learned masks also allow `pcmra_std` and `pcmra_mean`. An unavailable `segmask` is rejected. Standalone masked unwrap may run after `--autoseg`; the full `--correction` group needs its mask before segmentation. PUDIP/GUST require optional dependencies. `DV` inputs skip phase unwrapping; `LV`/`HV` can run it.
 
 ```bash
 autoflow-run ./data/demo_data.h5 \
@@ -167,7 +167,6 @@ Behavior details:
 - if segmentation is missing, segmentation-dependent steps are skipped
 - if `--autoseg` is enabled and the case has no segmentation, auto segmentation runs before skeleton and graph steps; H5 inputs then reuse the cached `segmask` on later runs
 - CLI auto segmentation prints backend/model/device details, stage progress, and per-case timing for inference plus source H5 cache write when the input is H5
-- `tools/benchmark_pipeline.py` defaults to the registered DV H5 validation case, cold-start correction/segmentation semantics, and no source-H5 writes; use `--autoseg-folds all` to benchmark a future 5-fold ensemble
 - directory inputs scan only top-level H5/HDF5 files, so nested output folders such as `autoflow_out/` are skipped during H5 batch discovery
 - default CLI runs only through plane metrics
 - `--with pwv,wss,tke,pg,vortex` enables one or more optional computations
@@ -202,13 +201,13 @@ available as `skeleton.min_edge_points` in `configs/skeleton.json`.
 | `--with` | csv | empty | command line | opt in to `pwv`, `wss`, `tke`, `pg`, and/or `vortex` | `autoflow/cli.py`, `autoflow/processing.py` |
 | `--skip-derived` | bool | `False` | `configs/batch.json` | remove WSS, TKE, and relative-pressure work from the requested set | `autoflow/processing.py` |
 | `--skip-plane-metrics` | bool | `False` | `configs/batch.json` | skip plane metric export | `autoflow/processing.py` |
-| `--single-thread` | bool | parallel on | `configs/batch.json` | disable adaptive plane parallelism; large jobs use isolated processes despite the compatibility flag name | `autoflow/core/pipeline.py`, `autoflow/algorithms/metrics.py` |
+| `--single-thread` | bool | parallel on | `configs/batch.json` | disable adaptive base/derived plane parallelism; large jobs use isolated processes despite the compatibility flag name | `autoflow/core/pipeline.py`, `autoflow/algorithms/metrics.py` |
 
 ### Loading and background phase correction
 
 | CLI flag | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `--bgc` | bool | `False` | `configs/loader.json` | enable background phase correction; H5 inputs reuse or write a compatible `corr` cache | `autoflow/algorithms/phase_correction.py`, `autoflow/algorithms/data.py` |
+| `--bgc` | bool | `False` | `configs/loader.json` | run background correction after loading; H5 inputs reuse or write a compatible `corr` cache | `autoflow/algorithms/phase_correction.py`, `autoflow/algorithms/data.py` |
 | `--bgc-method` | choice | `wrls_arto` | `configs/loader.json` | choose `msac` or `wrls_arto` | `autoflow/algorithms/phase_correction.py` |
 | `--bgc-fit-order` | int | `3` | `configs/loader.json` | polynomial fit order for correction | `autoflow/algorithms/phase_correction.py` |
 | `--bgc-threshold` | float | `0.2` | `configs/loader.json` | MSAC venc-space threshold for the stationary-tissue mask | `autoflow/algorithms/phase_correction.py` |
@@ -283,7 +282,7 @@ WSS, TKE, and pressure-analysis compute defaults are now split by metric:
 | --- | --- | --- | --- | --- | --- |
 | `--seed-ratio` | float | `0.1` | `configs/streamlines.json` | streamline seed density | `autoflow/algorithms/streamlines.py` |
 | `--tube-radius` | float | `0.05` | `configs/streamlines.json` | streamline tube radius in mm | `autoflow/rendering/videos.py` |
-| `--pressure-method` | string | `least_squares` | `configs/pressure_gradient.json` | choose `least_squares` or `ppe` relative-pressure reconstruction; both use SciPy sparse solvers | `autoflow/algorithms/metrics.py` |
+| `--pressure-method` | string | `ppe` | `configs/pressure_gradient.json` | choose `ppe` (merged Cartesian solver) or `ste` (staggered-grid Stokes estimator); `least_squares` remains a compatibility alias for `ppe` | `autoflow/algorithms/metrics.py` |
 
 ### Auto segmentation
 

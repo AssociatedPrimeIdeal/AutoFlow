@@ -1,0 +1,326 @@
+{
+  "date": "2026-10-04",
+  "scope": "Local real-case validation; numerical cold starts ignore embedded correction/segmentation and disable source writes.",
+  "cold_runs": [
+    {
+      "mode": "baseline-gui",
+      "wall_time_sec": 234.47905419499148,
+      "stage_times_sec": {
+        "load": 19.116634334030095,
+        "background_correction": 47.40130084002158,
+        "autoseg": 117.31864067603601,
+        "skeleton": 1.7322646249667741,
+        "graph": 0.1896777399815619,
+        "planes": 2.00715877400944,
+        "plane_metrics": 43.78286520403344,
+        "derived_export": 0.36648520798189566
+      },
+      "source_unchanged": true,
+      "model": {
+        "source": "/nas-data/ryy_rawdata/aorta_seg/nnres_noCC/Dataset7020_Aorta_4DTemporalFT/nnUNetTrainerPartBalancedTversky__nnUNetPlansIso1mm__3d_fullres",
+        "model": "/tmp/autoflow-opt-20261004-vsxifvm5/model/nnUNetTrainerPartBalancedTversky__nnUNetPlansIso1mm__3d_fullres",
+        "checkpoint": "checkpoint_best.pth",
+        "folds": [
+          "all"
+        ],
+        "sha256": {
+          "all": "a3b253f440bb9b1935c6457faf9eb6790a82af098e9ccc8fbce6645ad459987c"
+        }
+      },
+      "gpu_before": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 92 %, 10462 MiB",
+      "n_planes": 113,
+      "n_paths": 39
+    },
+    {
+      "mode": "optimized-gui",
+      "wall_time_sec": 228.35768630797975,
+      "stage_times_sec": {
+        "load": 18.602628135005943,
+        "background_correction": 54.00026306899963,
+        "autoseg": 118.3182956270175,
+        "skeleton": 1.3368939720094204,
+        "graph": 0.12422223499743268,
+        "planes": 1.5562509509618394,
+        "plane_metrics": 31.271774897992145,
+        "derived_export": 0.4773919470026158
+      },
+      "source_unchanged": true,
+      "model": {
+        "source": "/nas-data/ryy_rawdata/aorta_seg/nnres_noCC/Dataset7020_Aorta_4DTemporalFT/nnUNetTrainerPartBalancedTversky__nnUNetPlansIso1mm__3d_fullres",
+        "model": "/tmp/autoflow-opt-20261004-vsxifvm5/model/nnUNetTrainerPartBalancedTversky__nnUNetPlansIso1mm__3d_fullres",
+        "checkpoint": "checkpoint_best.pth",
+        "folds": [
+          "all"
+        ],
+        "sha256": {
+          "all": "a3b253f440bb9b1935c6457faf9eb6790a82af098e9ccc8fbce6645ad459987c"
+        }
+      },
+      "gpu_before": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 100 %, 21245 MiB",
+      "n_planes": 113,
+      "n_paths": 39
+    },
+    {
+      "mode": "baseline-seeded",
+      "wall_time_sec": 281.1775278840214,
+      "stage_times_sec": {
+        "load": 21.12679502199171,
+        "background_correction": 75.44875595002668,
+        "autoseg": 137.92996238498017,
+        "skeleton": 1.2562091309810057,
+        "graph": 0.108871147967875,
+        "planes": 1.4656619189772755,
+        "plane_metrics": 42.791789467970375,
+        "derived_export": 0.3896894929930568
+      },
+      "source_unchanged": true,
+      "model": {
+        "source": "/nas-data/ryy_rawdata/aorta_seg/nnres_noCC/Dataset7020_Aorta_4DTemporalFT/nnUNetTrainerPartBalancedTversky__nnUNetPlansIso1mm__3d_fullres",
+        "model": "/tmp/autoflow-opt-20261004-vsxifvm5/model/nnUNetTrainerPartBalancedTversky__nnUNetPlansIso1mm__3d_fullres",
+        "checkpoint": "checkpoint_best.pth",
+        "folds": [
+          "all"
+        ],
+        "sha256": {
+          "all": "a3b253f440bb9b1935c6457faf9eb6790a82af098e9ccc8fbce6645ad459987c"
+        }
+      },
+      "gpu_before": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 100 %, 44678 MiB",
+      "n_planes": 113,
+      "n_paths": 39
+    },
+    {
+      "mode": "optimized-seeded",
+      "wall_time_sec": 188.52956714096945,
+      "stage_times_sec": {
+        "load": 17.000677136005834,
+        "background_correction": 36.29282783099916,
+        "autoseg": 101.192270982021,
+        "skeleton": 1.2316375689697452,
+        "graph": 0.09984922298463061,
+        "planes": 1.5717932360130362,
+        "plane_metrics": 28.295088807994034,
+        "derived_export": 0.35661539202556014
+      },
+      "source_unchanged": true,
+      "model": {
+        "source": "/nas-data/ryy_rawdata/aorta_seg/nnres_noCC/Dataset7020_Aorta_4DTemporalFT/nnUNetTrainerPartBalancedTversky__nnUNetPlansIso1mm__3d_fullres",
+        "model": "/tmp/autoflow-opt-20261004-vsxifvm5/model/nnUNetTrainerPartBalancedTversky__nnUNetPlansIso1mm__3d_fullres",
+        "checkpoint": "checkpoint_best.pth",
+        "folds": [
+          "all"
+        ],
+        "sha256": {
+          "all": "a3b253f440bb9b1935c6457faf9eb6790a82af098e9ccc8fbce6645ad459987c"
+        }
+      },
+      "gpu_before": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 37 %, 43810 MiB",
+      "n_planes": 113,
+      "n_paths": 39
+    }
+  ],
+  "frozen_plane_replay": {
+    "input": "baseline-gui-frozen",
+    "planes": 113,
+    "phases": 20,
+    "baseline": [
+      {
+        "base": 11.286022721033078,
+        "derived": 18.58759683702374,
+        "total": 29.873619558056816
+      },
+      {
+        "base": 10.752257120038848,
+        "derived": 18.19658150995383,
+        "total": 28.94883862999268
+      }
+    ],
+    "optimized": [
+      {
+        "base": 8.817310067999642,
+        "derived": 5.616253794985823,
+        "total": 14.433563862985466
+      },
+      {
+        "base": 7.502498233981896,
+        "derived": 5.918741299014073,
+        "total": 13.421239532995969
+      }
+    ],
+    "comparison_rtol": 1e-06,
+    "comparison_atol": 1e-07,
+    "all_metrics_qc_pixelwise_equivalent": true,
+    "timing_scope": "Base metrics plus derived sampling; excludes loading, correction, segmentation, volume WSS/pressure calculation and output writing."
+  },
+  "wrls_fit_replay": {
+    "runs": [
+      {
+        "mode": "baseline",
+        "seconds": 1.2285022230353206,
+        "repeat": 0
+      },
+      {
+        "mode": "optimized",
+        "seconds": 0.06664239399833605,
+        "repeat": 0
+      },
+      {
+        "mode": "baseline",
+        "seconds": 0.6730261709890328,
+        "repeat": 1
+      },
+      {
+        "mode": "optimized",
+        "seconds": 0.04810818698024377,
+        "repeat": 1
+      },
+      {
+        "mode": "baseline",
+        "seconds": 0.5746990479528904,
+        "repeat": 2
+      },
+      {
+        "mode": "optimized",
+        "seconds": 0.05375545896822587,
+        "repeat": 2
+      }
+    ],
+    "max_abs_difference": 6.938893903907228e-17,
+    "input_shape": [
+      158,
+      44,
+      144
+    ],
+    "iterations": 5000,
+    "order": 2
+  },
+  "seeded_cold_array_comparison": {
+    "pressure_gradient_array": {
+      "same_shape": true,
+      "exact": true,
+      "max_abs_difference": 0.0,
+      "allclose": true
+    },
+    "branch_labels": {
+      "same_shape": true,
+      "exact": true,
+      "max_abs_difference": 0.0,
+      "allclose": true
+    },
+    "segmask_raw": {
+      "same_shape": true,
+      "exact": true,
+      "max_abs_difference": 0.0,
+      "allclose": true
+    },
+    "segmask_binary": {
+      "same_shape": true,
+      "exact": true,
+      "max_abs_difference": 0.0,
+      "allclose": true
+    },
+    "segmask_labels": {
+      "same_shape": true,
+      "exact": true,
+      "max_abs_difference": 0.0,
+      "allclose": true
+    },
+    "mag_raw": {
+      "same_shape": true,
+      "exact": true,
+      "max_abs_difference": 0.0,
+      "allclose": true
+    },
+    "segmask_labels_3d": {
+      "same_shape": true,
+      "exact": true,
+      "max_abs_difference": 0.0,
+      "allclose": true
+    },
+    "flow_raw": {
+      "same_shape": true,
+      "exact": true,
+      "max_abs_difference": 0.0,
+      "allclose": true
+    },
+    "segmask_3d": {
+      "same_shape": true,
+      "exact": true,
+      "max_abs_difference": 0.0,
+      "allclose": true
+    },
+    "relative_pressure_array": {
+      "same_shape": true,
+      "exact": true,
+      "max_abs_difference": 0.0,
+      "allclose": true
+    }
+  },
+  "unseeded_pressure_variation": {
+    "same_shape": true,
+    "exact": false,
+    "max_abs_difference": 0.0017692744731903076,
+    "allclose": false
+  },
+  "pressure_unchanged_code_seed_replay": {
+    "same_seed_exact": true,
+    "different_seed_max_abs_pa": 0.0001220703125,
+    "p95_abs_pressure_pa": 582.7175903320312,
+    "seconds": [
+      1.4198472210555337,
+      1.3765851429780014,
+      1.3268817729549482
+    ]
+  },
+  "gui": {
+    "cancelled_h5_previous_workspace_retained": true,
+    "cancelled_h5_seconds": 2.1404485940001905,
+    "cancelled_h5_ui_ticks": 1,
+    "real_h5_load_seconds": 22.651731627003755,
+    "loaded_flow_shape": [
+      158,
+      44,
+      144,
+      20,
+      3
+    ],
+    "real_h5_ui_ticks": 254,
+    "video_seconds": 2.8376269380096346,
+    "video_ui_ticks": 29,
+    "video_frames": 6,
+    "process_cancel_seconds": 0.40327432396588847,
+    "unrelated_process_preserved": true,
+    "source_unchanged": true,
+    "screenshot": "/nas-data/ryy_rawdata/gitrepo/autoflow_git/docs/en/user/images/task-progress.png"
+  },
+  "gui_pipeline": {
+    "smaller_case_rebind": true,
+    "native_pcmra_qthread_cleanup": true,
+    "real_plane_count": 113,
+    "real_plane_ui_ticks": 112,
+    "actual_detail_progress_screenshot": 2
+  },
+  "limits": [
+    "Shared GPU load differed between cold runs; cold differences are observations, not a stable end-to-end percentage gain.",
+    "WRLS replay is one order-2 fit of velocity-derived input, not the entire WRLS+ARTO correction.",
+    "GUI checks use Qt offscreen and the existing software scene adapter; the isolated video child uses actual VTK/FFmpeg."
+  ],
+  "gui_labeler_modal": {
+    "labeler_prompt_deferred_while_modal": true,
+    "labeler_previous_case_import_avoided": true
+  },
+  "verification": {
+    "environment": "autoflow311",
+    "pytest_command": "pytest tests/test_smoke_phantoms.py tests/test_pressure_gradient_phantom.py -q",
+    "pytest_passed": 158,
+    "pytest_seconds": 44.6,
+    "mkdocs_strict_build_passed": true,
+    "mkdocs_build_seconds": 2.87,
+    "python_ast_file_count": 57,
+    "git_diff_check_passed": true,
+    "feature_page_section_coverage_passed": true,
+    "new_module_owner_map_passed": true,
+    "removed_script_references_check_passed": true,
+    "manual_md_absent": true
+  }
+}

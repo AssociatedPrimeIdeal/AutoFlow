@@ -9,6 +9,8 @@
 | Python API | Supported | through `run_case()` and `run_batch()` |
 
 ## What It Does
+
+General acquisition, retrospective plane-flow analysis and validation guidance are listed in [Scientific references: 4D flow](../references/index.md#general-4d-flow-guidance). The consensus statements are context, not validation of AutoFlow's numerical outputs.
 Plane metrics compute time-resolved cross-sectional measurements for each plane and save them into `plane_metrics.json`. The same per-plane payload is also mirrored into `planes.json` and `planes.h5`, so one plane index has one consistent set of geometry and summaries across outputs. The GUI plane-metric step computes basic flow, area, and velocity without implicitly starting WSS, TKE, or pressure work. If derived arrays already exist, it reuses them. Batch runs compute only the derived fields explicitly requested through `--with` or `requested_metrics`.
 
 For each unique segmentation phase, plane metrics build one thresholded VTK support mesh and reuse it across all planes. Each plane still has its own slice and connectivity selection, while repeated cardiac phases reuse the resulting slice specification. Large parallel jobs use independent loky worker processes with memory-mapped arrays because concurrently slicing a shared VTK dataset from Python threads is unsafe. Plane centers remain local physical coordinates and are shifted by `origin` only for VTK slicing.
@@ -65,6 +67,17 @@ Use the standard `run_case()` or `run_batch()` flow. Plane metrics run unless `s
 
 See [batch parameters](../user/parameters.md#batch), [planes parameters](../user/parameters.md#planes), [CLI flags](../user/cli-parameters.md), and [API fields](../user/api-parameters.md) for complete type/default/unit/effect/owner tables. Dictionary controls are expanded in [Structured parameters](../user/parameter-schemas.md).
 
+Derived plane sampling reuses a slice only for the same support phase and ROI state. Each timepoint uses its own contour edits, including when the volume mask is unchanged. Label-specific support meshes also share geometry across phases when that label's filtered mask is identical.
+
+Low-level Python users can call `augment_plane_metrics_with_derived(...)` with:
+
+| Parameter | Type | Default | Where configured | Effect | Code owner |
+| --- | --- | --- | --- | --- | --- |
+| `use_multithread` | bool | `False` | function keyword; pipeline uses its plane-computation setting | Automatically use up to four isolated processes at 1920 plane-phases or more | `autoflow/algorithms/metrics.py` |
+| `max_workers` | int or None | `None` | function keyword | Override derived-sampling process count; one selects serial | same |
+| `progress_callback` | callable or None | `None` | function keyword | Receive completed-plane dictionaries on the calling thread | same |
+
+
 ## Outputs
 
 | Output file or object | Created when | Meaning |
@@ -108,6 +121,8 @@ See [batch parameters](../user/parameters.md#batch), [planes parameters](../user
 - `forward` and `reverse` use the resolved local forward direction; `signed` keeps that sign convention in one curve
 
 Process parallelism now accounts for temporal workload: below 128 planes, 1920 or more plane-phase evaluations use up to four processes; smaller workloads remain serial. At least 128 planes retain up to eight processes. Shared input memmaps avoid copying full arrays into each worker. The controlled 96-plane/20-phase comparison preserved metric and QC results; see [Performance](../developer/performance.md).
+
+Plane pixelwise H5 output is written privately and replaces the previous file only after a complete write. Cancelling or failing that export retains the previous complete file; its schema is unchanged.
 
 ## Limitations
 - segmentation is required

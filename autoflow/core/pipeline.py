@@ -4,7 +4,7 @@ import os
 import hashlib
 import numpy as np
 
-from .models import StepId, ObjectKind, GraphData
+from .models import StepId, ObjectKind, GraphData, DerivedResults
 from ..algorithms import (
     load_input_data,
     filter_segmask_labels, binarize_segmask, merge_segmask_to_3d,
@@ -24,7 +24,10 @@ from ..algorithms import (
     segmentation_timestamp,
     detect_willis_ring,
 )
-from ..algorithms.phase_unwrapping import unwrap_phase
+from ..algorithms.phase_unwrapping import unwrap_phase, resolve_mask_source
+from ..algorithms.noise_removal import pcmra_render_mask
+from ..case_types import InputCase
+from ..task_control import TaskCancelled, check_cancelled, report_progress
 from ..plane_io import build_plane_records, save_planes_h5, save_planes_json, save_pwv_h5
 
 
@@ -410,7 +413,7 @@ class PipelineEngine:
             raise ValueError("data path is empty")
         load_target = path if input_source is None else input_source
         load_kwargs = {
-            "correction_config": ws.loader_params.background_phase_correction,
+            "correction_config": dict(ws.loader_params.background_phase_correction.to_dict(), enabled=False),
             "force_recompute_seg": bool(getattr(ws.segmentation, "force_recompute_auto_cache", False)),
             "ignore_embedded_segmentation": bool(
                 getattr(ws.loader_params, "ignore_embedded_segmentation", False)
@@ -433,6 +436,14 @@ class PipelineEngine:
             if "unexpected keyword argument" not in str(exc):
                 raise
             data = load_input_data(load_target)
+        ws._loaded_input_source = copy.deepcopy(load_target)
+        ws._loaded_input_kwargs = dict(load_kwargs)
+        ws.pcmra_render_mask = None
+        ws.pcmra_array = None
+        ws.noise_removal_result = {}
+        for step in (StepId.BACKGROUND_CORRECTION, StepId.REMOVE_NOISE, StepId.UNWRAP_PHASE, StepId.GENERATE_PCMRA):
+            ws.pipeline.completed.pop(step.value, None)
+            ws.pipeline.skipped.pop(step.value, None)
         flow = np.asarray(data.flow, dtype=np.float32)
         mag = np.asarray(data.mag, dtype=np.float32)
         seg = None if data.segmentation is None else np.asarray(data.segmentation, dtype=np.int16)
@@ -567,23 +578,10 @@ class PipelineEngine:
             "segmask_raw_surface", "segmask_pre_surface", "wss_surface_live", "tke_volume",
             "pressure_gradient_volume", "relative_pressure_volume", "vorticity_magnitude_volume",
             "q_criterion_volume", "swirling_strength_volume", "phase_wrap_mask", "phase_wrap_count",
-            "pcmra_volume",
+            "pcmra_volume", "noise_region",
         ]:
             ws.remove_object_by_data_key(data_key)
         ws.remove_object_by_data_key("pwv_planes")
-        if ws.mag_raw is not None and ws.flow_raw is not None:
-            ws.add_object(
-                name="PC-MRA (4D)",
-                kind=ObjectKind.AUX,
-                data_key="pcmra_volume",
-                group_name="Global",
-                visible=True,
-                opacity=0.85,
-                scalars="PC-MRA",
-                cmap="gray",
-                dynamic=True,
-                show_scalar_bar=False,
-            )
         if ws.segmask_raw is not None:
             ws.add_object(name="segmask_raw", kind=ObjectKind.SEGMENTATION,
                           data_key="segmask_raw_surface", visible=True, opacity=0.3,
@@ -663,7 +661,9 @@ class PipelineEngine:
         binary_shape = voted_labels_3d.shape + (time_count,)
         global_binary = np.zeros(binary_shape, dtype=bool)
         global_mask_3d = np.zeros(voted_labels_3d.shape, dtype=bool)
-        for spec in specs:
+        for spec_index, spec in enumerate(specs):
+            report_progress({"stage": "segmentation_preprocess", "current": spec_index, "total": len(specs),
+                             "message": f"Preparing segmentation group {spec_index + 1}/{len(specs)}"})
             group_name = str(spec["name"])
             labels = [int(x) for x in spec["labels"]]
             group_mask_3d = np.isin(voted_labels_3d, labels)
@@ -737,11 +737,59 @@ class PipelineEngine:
                 opacity=0.15,
                 color=ws.skeleton_params.scene_color_for_group(group_name, "scene"),
             )
+        check_cancelled()
         ws._preprocess_signature = signature
         return True
 
+    def refresh_segmentation_dependents(self, ws):
+        """Keep geometry only when its processed topology and configuration match."""
+        previous_signature = ws._preprocess_signature
+        previous_labels, previous_binary = ws.segmask_labels, ws.segmask_binary
+        previous_labels_3d, previous_mask = ws.segmask_labels_3d, ws.segmask_3d
+        previous_order, previous_groups = list(ws.group_order), dict(ws.multilabel_groups)
+        if previous_signature is None or previous_labels_3d is None:
+            ws.reset_segmentation_results()
+            return "reset"
+        self.preprocess(ws)
+        check_cancelled()
+        topology_same = (
+            previous_signature[1:] == ws._preprocess_signature[1:]
+            and previous_order == ws.group_order
+            and np.array_equal(previous_labels_3d, ws.segmask_labels_3d)
+            and np.array_equal(previous_mask, ws.segmask_3d)
+            and all(
+                previous_groups[name].get("labels") == ws.multilabel_groups[name].get("labels")
+                and np.array_equal(previous_groups[name].get("clean_mask_3d"), ws.multilabel_groups[name].get("clean_mask_3d"))
+                and np.array_equal(previous_groups[name].get("segmask_3d"), ws.multilabel_groups[name].get("segmask_3d"))
+                for name in previous_order
+            )
+        )
+        if not topology_same:
+            ws.reset_segmentation_results()
+            return "reset"
+        if np.array_equal(previous_labels, ws.segmask_labels) and np.array_equal(previous_binary, ws.segmask_binary):
+            return "unchanged"
+        # Temporal changes affect numerical support and trajectories even when
+        # the voted 3-D centerline topology is stable. Recompute all metrics.
+        ws.clear_streamlines()
+        ws.clear_pathlines()
+        ws.derived = DerivedResults()
+        for plane in ws.planes:
+            plane.metrics = {}
+        for step in (StepId.COMPUTE_PLANE_METRICS, StepId.COMPUTE_DERIVED_METRICS,
+                     StepId.COMPUTE_PWV, StepId.GENERATE_STREAMLINES, StepId.PLANE_STREAMLINES):
+            ws.pipeline.completed.pop(step.value, None)
+            ws.pipeline.skipped.pop(step.value, None)
+        for key, obj in list(ws.scene_objects.items()):
+            if obj.kind == ObjectKind.METRIC or obj.data_key in {"pwv_planes", "derived_streamlines_live"}:
+                ws.scene_objects.pop(key)
+        return "geometry"
+
     def run_step(self, ws, step, log, progress_callback=None):
         dispatch = {
+            StepId.BACKGROUND_CORRECTION: lambda workspace: self._step_background_correction(workspace, progress_callback=progress_callback),
+            StepId.REMOVE_NOISE: self._step_remove_noise,
+            StepId.GENERATE_PCMRA: self._step_generate_pcmra,
             StepId.UNWRAP_PHASE: self._step_unwrap_phase,
             StepId.GENERATE_SKELETON: self._step_generate_skeleton,
             StepId.EDIT_SKELETON: self._step_edit_skeleton,
@@ -756,6 +804,120 @@ class PipelineEngine:
             StepId.COMPUTE_DERIVED_METRICS: self._step_compute_derived_metrics,
         }
         return dispatch[step](ws)
+
+    def _step_background_correction(self, ws, progress_callback=None):
+        """Correct source encoding, retaining all manually generated downstream artifacts."""
+        if not ws.data_loaded or ws.flow_raw is None:
+            return StepResult(StepId.BACKGROUND_CORRECTION, False, False, "Load data before background correction")
+        source = getattr(ws, "_loaded_input_source", None)
+        if source is None:
+            path = ws.paths.flow_path or ws.paths.segmask_path
+            if not path:
+                return StepResult(StepId.BACKGROUND_CORRECTION, False, False, "Source input is unavailable")
+            source = InputCase(path, "dicom" if "dicom" in ws.input_state.source_format else "h5",
+                               source_group=ws.input_state.source_group, metadata=dict(ws.input_state.metadata))
+        cfg = copy.deepcopy(ws.loader_params.background_phase_correction)
+        cfg.enabled = True
+        kwargs = dict(getattr(ws, "_loaded_input_kwargs", {}) or {})
+        kwargs.pop("progress_callback", None)
+        if progress_callback is not None:
+            kwargs["progress_callback"] = progress_callback
+        kwargs.update(correction_config=cfg, ignore_embedded_segmentation=True, force_recompute_seg=False)
+        if not getattr(ws, "_loaded_input_kwargs", None):
+            overrides = ws.loader_params.dicom_parameter_overrides.to_loader_kwargs()
+            if overrides:
+                kwargs["parameter_overrides"] = overrides
+            kwargs["dicom_read_workers"] = ws.loader_params.dicom_read_workers
+            kwargs["dicom_backend"] = ws.loader_params.dicom_backend
+            kwargs["dicom_h5_dir"] = ws.loader_params.dicom_h5_dir
+            dual_info = ws.input_state.metadata.get("dual_venc", {})
+            if isinstance(dual_info, dict) and dual_info.get("selected_mode"):
+                kwargs["dual_venc_mode"] = dual_info["selected_mode"]
+        try:
+            data = load_input_data(source, **kwargs)
+            flow = np.asarray(data.flow, dtype=np.float32)
+            if flow.shape != ws.flow_raw.shape:
+                raise ValueError("corrected source dimensions differ from the loaded input")
+            for field in ("resolution", "origin", "venc"):
+                if not np.allclose(np.asarray(getattr(data, field)), np.asarray(getattr(ws, field))):
+                    raise ValueError(f"source {field} differs from the loaded input; reload before correction")
+        except TaskCancelled:
+            raise
+        except Exception as exc:
+            return StepResult(StepId.BACKGROUND_CORRECTION, False, False, f"Background correction failed: {exc}")
+        report = dict(data.metadata.get("background_phase_correction", {}) or {})
+        parts = [report.get("dual_venc_low", {}), report.get("dual_venc_high", {})] if "dual_venc_low" in report else [report]
+        if not all(part.get("applied", False) for part in parts):
+            reason = "; ".join(str(part.get("skipped_reason", "not applied")) for part in parts)
+            return StepResult(StepId.BACKGROUND_CORRECTION, False, False, f"Background correction not applied: {reason}")
+        check_cancelled()
+        ws.flow_raw = flow
+        ws.flow_input = flow.copy()
+        phase = getattr(data, "phase_wrapped", None)
+        if phase is None:
+            venc = np.asarray(ws.venc, dtype=np.float32).reshape(1, 1, 1, 1, 3)
+            phase = np.angle(np.exp(1j * flow * np.pi / np.maximum(venc, 1e-6)))
+        ws.phase_wrapped = np.asarray(phase, dtype=np.float32)
+        ws.phase_wrapped_high = None if data.phase_wrapped_high is None else np.asarray(data.phase_wrapped_high, dtype=np.float32)
+        ws.correction_raw = None if data.correction is None else np.asarray(data.correction, dtype=np.float32)
+        ws.correction_high_raw = None if data.correction_high is None else np.asarray(data.correction_high, dtype=np.float32)
+        for key in ("background_phase_correction", "dual_venc"):
+            if key in data.metadata:
+                ws.input_state.metadata[key] = copy.deepcopy(data.metadata[key])
+        ws.loader_params.background_phase_correction.enabled = True
+        ws.phase_unwrap_result = {}
+        ws.remove_object_by_data_key("phase_wrap_mask")
+        ws.remove_object_by_data_key("phase_wrap_count")
+        ws.pipeline.completed.pop(StepId.UNWRAP_PHASE.value, None)
+        ws.pipeline.skipped.pop(StepId.UNWRAP_PHASE.value, None)
+        ws.pipeline.mark_done(StepId.BACKGROUND_CORRECTION)
+        return StepResult(StepId.BACKGROUND_CORRECTION, True, False,
+                          "Background correction applied to working flow; existing downstream results retained. Rerun them manually.")
+
+    def _step_remove_noise(self, ws):
+        if not ws.data_loaded or ws.mag_raw is None or ws.flow_raw is None:
+            return StepResult(StepId.REMOVE_NOISE, False, False, "Load magnitude and velocity before noise removal")
+        cfg = ws.noise_removal_params
+        try:
+            mask, report = pcmra_render_mask(ws.mag_raw, ws.flow_raw, ws.venc, method=cfg.method,
+                                              magnitude_fraction=cfg.magnitude_fraction, velocity_std_max=cfg.velocity_std_max)
+        except Exception as exc:
+            return StepResult(StepId.REMOVE_NOISE, False, False, f"Noise removal failed: {exc}")
+        ws.pcmra_render_mask = mask
+        ws.noise_removal_result = report
+        ws.remove_object_by_data_key("noise_region")
+        ws.add_object(name="Noise Region", kind=ObjectKind.AUX, data_key="noise_region",
+                      group_name="Global", visible=False, opacity=0.15, color="#ff0000", dynamic=False)
+        ws.pipeline.mark_done(StepId.REMOVE_NOISE)
+        return StepResult(StepId.REMOVE_NOISE, True, False,
+                          f"PC-MRA rendering region retained {report['retained_fraction']:.1%}; magnitude and flow unchanged")
+
+    def _step_generate_pcmra(self, ws):
+        """Materialize PC-MRA only when requested, after all correction actions."""
+        if not ws.data_loaded or ws.mag_raw is None or ws.flow_raw is None:
+            return StepResult(StepId.GENERATE_PCMRA, False, False, "Load magnitude and velocity before generating PC-MRA")
+        magnitude = np.asarray(ws.mag_raw)
+        flow = np.asarray(ws.flow_raw)
+        if magnitude.ndim == 3:
+            magnitude = magnitude[..., None]
+        if (flow.ndim != 5 or flow.shape[-1] != 3 or magnitude.ndim != 4
+                or magnitude.shape[:3] != flow.shape[:3] or magnitude.shape[3] not in (1, flow.shape[3])):
+            return StepResult(StepId.GENERATE_PCMRA, False, False, "Magnitude/velocity dimensions do not match for PC-MRA")
+        pcmra = np.empty(flow.shape[:4], dtype=np.float32)
+        for tidx in range(flow.shape[3]):
+            report_progress({"stage": "pcmra", "current": tidx, "total": flow.shape[3],
+                             "message": f"Generating PC-MRA phase {tidx + 1}/{flow.shape[3]}"})
+            mag_t = np.asarray(magnitude[..., min(tidx, magnitude.shape[3] - 1)], dtype=np.float32)
+            speed = np.linalg.norm(np.asarray(flow[..., tidx, :], dtype=np.float32), axis=-1)
+            pcmra[..., tidx] = np.nan_to_num(mag_t * speed, nan=0.0, posinf=0.0, neginf=0.0)
+        check_cancelled()
+        ws.pcmra_array = pcmra
+        ws.remove_object_by_data_key("pcmra_volume")
+        ws.add_object(name="PC-MRA (4D)", kind=ObjectKind.AUX, data_key="pcmra_volume", group_name="Global",
+                      visible=True, opacity=0.85, scalars="PC-MRA", cmap="gray", dynamic=True, show_scalar_bar=False)
+        ws.pipeline.mark_done(StepId.GENERATE_PCMRA)
+        return StepResult(StepId.GENERATE_PCMRA, True, False,
+                          "Generated PC-MRA from current working velocity; noise mask applies to 3D rendering only")
 
     def _step_unwrap_phase(self, ws):
         """Optional traditional or learned phase unwrapping with diagnostics."""
@@ -785,46 +947,44 @@ class PipelineEngine:
             ws.phase_unwrap_result = {"skipped": True, "reason": "wrapped_phase_unavailable"}
             ws.pipeline.mark_done(StepId.UNWRAP_PHASE, skipped=True)
             return StepResult(StepId.UNWRAP_PHASE, True, True, "Phase unwrapping skipped: wrapped phase unavailable")
-        mask_source = str(getattr(cfg, "mask_source", "segmask") or "segmask").lower()
-        segmask = None if ws.segmask_raw is None else np.asarray(ws.segmask_raw) > 0
-        phase_shape = np.asarray(ws.phase_wrapped).shape[:4]
-        if segmask is not None and tuple(segmask.shape) != tuple(phase_shape):
-            raise ValueError(f"segmentation mask shape {segmask.shape} does not match wrapped phase {phase_shape}")
-        if mask_source in {"segmentation", "segmask", "seg", "mask"}:
-            if segmask is None:
-                ws.phase_unwrap_result = {"skipped": True, "reason": "segmentation_unavailable"}
-                ws.pipeline.mark_done(StepId.UNWRAP_PHASE, skipped=True)
-                return StepResult(StepId.UNWRAP_PHASE, True, True, "Phase unwrapping skipped: segmentation mask unavailable")
-            mask = segmask
-            backend_weightmask = segmask.astype(np.float32)
-            backend_center_confidence = np.any(segmask, axis=3).astype(np.float32)
-        elif mask_source == "pcmra_std":
-            # Learned backends use the temporal PC-MRA standard deviation as
-            # their confidence map.  PUDIP receives the corresponding
-            # std(PC-MRA) * PC-MRA weight volume; GUST uses std(PC-MRA) to
-            # initialize Gaussian centers and the same volume as its loss
-            # weight.  The segmentation remains the evaluation/output mask
-            # when one is available.
-            phase = np.asarray(ws.phase_wrapped, dtype=np.float32)
+        try:
+            mask_source = resolve_mask_source(method, getattr(cfg, "mask_source", "auto"))
+        except ValueError as exc:
+            return StepResult(StepId.UNWRAP_PHASE, False, False, str(exc))
+        phase = np.asarray(ws.phase_wrapped, dtype=np.float32)
+        phase_shape = phase.shape[:4]
+        # A segmentation is used only when selected, never implicitly by a PCMRA source.
+        if mask_source == "segmask":
+            if ws.segmask_raw is None:
+                return StepResult(StepId.UNWRAP_PHASE, False, False, "segmask requires an available segmentation")
+            mask = np.asarray(ws.segmask_raw) > 0
+            if mask.ndim == 3:
+                mask = np.broadcast_to(mask[..., None], phase_shape)
+            if tuple(mask.shape) != tuple(phase_shape):
+                return StepResult(StepId.UNWRAP_PHASE, False, False, "segmask dimensions do not match wrapped phase")
+            backend_weightmask = mask.astype(np.float32)
+            backend_center_confidence = np.any(mask, axis=3).astype(np.float32)
+        elif mask_source == "none":
+            mask = np.ones(phase_shape, dtype=bool)
+            backend_weightmask = np.ones(phase_shape, dtype=np.float32)
+            backend_center_confidence = np.ones(phase_shape[:3], dtype=np.float32)
+        else:
             magnitude = np.asarray(ws.mag_raw, dtype=np.float32)
+            if magnitude.ndim == 3:
+                magnitude = magnitude[..., None]
             pcmra = magnitude * np.linalg.norm(phase, axis=-1)
             pcmra = np.nan_to_num(pcmra, nan=0.0, posinf=0.0, neginf=0.0)
-            pcmra_scale = float(np.max(pcmra))
-            if pcmra_scale > 0:
-                pcmra = pcmra / pcmra_scale
-            pcmra_std = np.std(pcmra, axis=3).astype(np.float32)
-            std_scale = float(np.max(pcmra_std))
-            if std_scale > 0:
-                pcmra_std /= std_scale
-            backend_weightmask = np.asarray(pcmra * pcmra_std[..., None], dtype=np.float32)
-            backend_center_confidence = pcmra_std
-            mask = segmask if segmask is not None else np.broadcast_to(
-                pcmra_std[..., None] > 0, phase_shape
-            ).copy()
-        else:
-            raise ValueError(
-                f"unsupported phase-unwrapping mask source {mask_source!r}; choose segmask or pcmra_std"
-            )
+            scale = float(np.max(pcmra))
+            if scale > 0:
+                pcmra /= scale
+            confidence = (np.std(pcmra, axis=3) if mask_source == "pcmra_std"
+                          else np.mean(pcmra, axis=3)).astype(np.float32)
+            scale = float(np.max(confidence))
+            if scale > 0:
+                confidence /= scale
+            backend_center_confidence = confidence
+            backend_weightmask = np.asarray(pcmra * confidence[..., None], dtype=np.float32)
+            mask = np.broadcast_to(confidence[..., None] > 0, phase_shape).copy()
         if not np.any(mask):
             ws.phase_unwrap_result = {"skipped": True, "reason": "empty_mask"}
             ws.pipeline.mark_done(StepId.UNWRAP_PHASE, skipped=True)
@@ -864,21 +1024,13 @@ class PipelineEngine:
             return StepResult(StepId.UNWRAP_PHASE, False, False, f"Phase unwrapping failed: {exc}")
         if ws.flow_input is None:
             ws.flow_input = np.array(ws.flow_raw, copy=True) if ws.flow_raw is not None else None
-        ws.flow_raw = np.asarray(result["flow_unwrapped"], dtype=np.float32)
+        result["flow_unwrapped"] = np.where(mask[..., None], result["flow_unwrapped"], ws.flow_raw).astype(np.float32)
+        venc = np.asarray(ws.venc, dtype=np.float32).reshape(1, 1, 1, 1, 3)
+        result["phase_unwrapped"] = result["flow_unwrapped"] * np.pi / venc
+        result["diagnostic_scope"] = "latest_masked_run"
+        ws.flow_raw = result["flow_unwrapped"]
         ws.phase_unwrap_result = result
-        # Invalidate all flow-dependent downstream products.
-        ws.skeleton_points = None; ws.skeleton_mask = None; ws.graph = GraphData()
-        ws.branch_labels = None; ws.centerline_paths = []; ws.centerline_node_paths = []
-        ws.centerline_paths_smooth = []; ws.path_info = []; ws.forks = []; ws.planes = []
-        ws.clear_streamlines(); ws.clear_pathlines(); ws.derived = type(ws.derived)()
-        for downstream in (
-            StepId.GENERATE_SKELETON, StepId.EDIT_SKELETON, StepId.GENERATE_GRAPH,
-            StepId.EDIT_GRAPH, StepId.GENERATE_PLANES, StepId.EDIT_PLANES,
-            StepId.COMPUTE_PWV, StepId.GENERATE_STREAMLINES, StepId.PLANE_STREAMLINES,
-            StepId.COMPUTE_PLANE_METRICS, StepId.COMPUTE_DERIVED_METRICS,
-        ):
-            ws.pipeline.completed.pop(downstream.value, None)
-            ws.pipeline.skipped.pop(downstream.value, None)
+        # Existing segmentation, geometry, metrics and trajectories remain until manually rerun.
         ws.remove_object_by_data_key("phase_wrap_mask")
         ws.remove_object_by_data_key("phase_wrap_count")
         ws.add_object(name="Estimated Wrap Locations", kind=ObjectKind.AUX, data_key="phase_wrap_mask", visible=False,
@@ -889,7 +1041,7 @@ class PipelineEngine:
         stats = result.get("statistics", {})
         msg = (f"Phase unwrapping: method={result.get('method')} device={result.get('device')} "
                f"wrapped_voxels={stats.get('wrapped_voxels_any', 0)} max|k|={stats.get('max_abs_k', 0)} "
-               f"elapsed={result.get('elapsed_sec', 0.0):.2f}s")
+               f"elapsed={result.get('elapsed_sec', 0.0):.2f}s; rerun downstream results manually")
         return StepResult(StepId.UNWRAP_PHASE, True, False, msg)
 
     def revert_phase_unwrap(self, ws):
@@ -897,21 +1049,9 @@ class PipelineEngine:
         if ws.flow_input is None or "flow_unwrapped" not in (ws.phase_unwrap_result or {}):
             return StepResult(StepId.UNWRAP_PHASE, True, True, "Revert skipped: no active phase-unwrapping result")
         ws.flow_raw = np.asarray(ws.flow_input, dtype=np.float32).copy()
-        ws.skeleton_points = None; ws.skeleton_mask = None; ws.graph = GraphData()
-        ws.branch_labels = None; ws.centerline_paths = []; ws.centerline_node_paths = []
-        ws.centerline_paths_smooth = []; ws.path_info = []; ws.forks = []; ws.planes = []
-        ws.clear_streamlines(); ws.clear_pathlines(); ws.derived = type(ws.derived)()
-        for downstream in (
-            StepId.GENERATE_SKELETON, StepId.EDIT_SKELETON, StepId.GENERATE_GRAPH,
-            StepId.EDIT_GRAPH, StepId.GENERATE_PLANES, StepId.EDIT_PLANES,
-            StepId.COMPUTE_PWV, StepId.GENERATE_STREAMLINES, StepId.PLANE_STREAMLINES,
-            StepId.COMPUTE_PLANE_METRICS, StepId.COMPUTE_DERIVED_METRICS,
-        ):
-            ws.pipeline.completed.pop(downstream.value, None)
-            ws.pipeline.skipped.pop(downstream.value, None)
         ws.pipeline.completed.pop(StepId.UNWRAP_PHASE.value, None)
         ws.pipeline.skipped.pop(StepId.UNWRAP_PHASE.value, None)
-        return StepResult(StepId.UNWRAP_PHASE, True, False, "Restored loaded flow; wrap diagnostics retained")
+        return StepResult(StepId.UNWRAP_PHASE, True, False, "Restored pre-unwrapping flow; diagnostics and downstream results retained")
 
     def _step_generate_skeleton(self, ws):
         if ws.segmask_raw is None:
@@ -930,7 +1070,9 @@ class PipelineEngine:
         ws.remove_object_by_data_key("skeleton_mask_surface")
         ws.remove_object_by_data_key("segmask_3d_surface")
         ws.remove_objects_by_prefix("skeleton_")
-        for group_name in ws.group_order:
+        for group_index, group_name in enumerate(ws.group_order):
+            report_progress({"stage": "skeleton_group", "current": group_index, "total": len(ws.group_order),
+                             "message": f"Processing {group_name} ({group_index + 1}/{len(ws.group_order)})"})
             group_state = ws.multilabel_groups.get(group_name, {})
             group_params = ws.skeleton_params.params_for_group(group_name)
             special_handling = str(getattr(group_params, "special_handling", "three_pass_merge") or "three_pass_merge").strip().lower().replace("-", "_")
@@ -965,6 +1107,7 @@ class PipelineEngine:
             )
         ws.skeleton_points = np.vstack(points_all) if points_all else np.empty((0, 3), dtype=float)
         ws.skeleton_mask = np.asarray(skeleton_mask, dtype=bool)
+        check_cancelled()
         ws.pipeline.mark_done(StepId.GENERATE_SKELETON)
         return StepResult(StepId.GENERATE_SKELETON, True, False, f"Skeleton: {len(ws.skeleton_points)} points groups={len(ws.group_order)}")
 
@@ -999,7 +1142,9 @@ class PipelineEngine:
         ws.remove_objects_by_prefix("path_")
         ws.remove_objects_by_prefix("smooth_path_")
         ws.remove_objects_by_prefix("path_arrow_")
-        for group_name in ws.group_order:
+        for group_index, group_name in enumerate(ws.group_order):
+            report_progress({"stage": "graph_group", "current": group_index, "total": len(ws.group_order),
+                             "message": f"Processing {group_name} ({group_index + 1}/{len(ws.group_order)})"})
             group_state = ws.multilabel_groups.get(group_name, {})
             group_params = ws.skeleton_params.params_for_group(group_name)
             local_points = np.asarray(group_state.get("skeleton_points"), dtype=float).reshape(-1, 3) if group_state.get("skeleton_points") is not None else np.empty((0, 3), dtype=float)
@@ -1102,6 +1247,7 @@ class PipelineEngine:
         ws.selected_path_index = -1
         self._update_willis_ring_overlay(ws)
 
+        check_cancelled()
         ws.pipeline.mark_done(StepId.GENERATE_GRAPH)
         willis_status = str(getattr(ws, "willis_ring_status", {}).get("status", "indeterminate"))
         return StepResult(StepId.GENERATE_GRAPH, True, False,
@@ -1416,6 +1562,7 @@ class PipelineEngine:
                     ws.derived.relative_pressure_array if derived_validity["pressure"] else None
                 ),
                 wss_surfaces=ws.derived.wss_surfaces if derived_validity["wss"] else None,
+                use_multithread=use_multithread, progress_callback=progress_callback,
             )
         else:
             metrics = [dict(metric) for metric in metrics]
@@ -1499,7 +1646,9 @@ class PipelineEngine:
         branch_support_cache = {}
         ws.clear_pathlines()
         ws.pathline_colors = {}
-        for group_name in ws.group_order:
+        for group_index, group_name in enumerate(ws.group_order):
+            report_progress({"stage": "planes_group", "current": group_index, "total": len(ws.group_order),
+                             "message": f"Processing {group_name} ({group_index + 1}/{len(ws.group_order)})"})
             group_state = ws.multilabel_groups.get(group_name, {})
             local_paths = list(group_state.get("centerline_paths", []))
             fork_points = [
@@ -1643,6 +1792,7 @@ class PipelineEngine:
         ws.derived.plane_qc = plane_layout_qc
 
         planes_path = self._save_planes_json(ws)
+        check_cancelled()
         ws.pipeline.mark_done(StepId.GENERATE_PLANES)
         dropped_planes = sum(
             1 for item in plane_layout_qc.get("planes", [])

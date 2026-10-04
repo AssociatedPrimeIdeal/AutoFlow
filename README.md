@@ -37,7 +37,9 @@ summary = run_case("case.h5", config=config)
 
 The [worked DV H5 example](docs/en/user/demo-case.md) starts with the actual H5 keys and follows the GUI from loading through segmentation, geometry, hemodynamics, QC and video export. Each step includes the equivalent CLI command and expected output. [DICOM loading and conversion](docs/en/features/dicom-loading.md) covers both input routes.
 
-The pipeline loads and optionally corrects data, prepares segmentation, runs selected unwrapping, builds skeleton/paths/planes, prepares requested derived fields, samples plane metrics, optionally calculates PWV, and exports results/videos. Normal correction and automatic segmentation can write reusable H5 caches; [Inputs](docs/en/user/inputs.md) explains controls and formats.
+The GUI starts with **Input & QC → Correction → Segmentation**. Correction provides Background Correction, Noise Removal, Unwrap Phase and Generate PC-MRA, plus Run All in that order (default `lap4D`, no mask). Background correction and unwrapping update working velocity; noise masking filters only the PC-MRA display. GUI Noise Removal enables a red orthogonal-slice mask for review; its separate 3D layer stays hidden by default and uses non-accumulating opacity. Existing downstream results remain until manually rerun. CLI/Python opt into the full group with `--correction` / `correction_all=True`. Geometry, requested metrics, PWV and exports follow segmentation. Normal correction and automatic segmentation can write reusable H5 caches; [Inputs](docs/en/user/inputs.md) explains controls and formats.
+
+GUI task progress locks other actions until completion. Use × to request cancellation; animated activity dots, elapsed time and stage/frame counts remain visible until the task stops.
 
 ## Documentation
 
@@ -46,10 +48,12 @@ Detailed documentation is English-only and organized by function.
 | Topic | Pages |
 | --- | --- |
 | Start and run | [Quickstart](docs/en/user/quickstart.md), [Worked example](docs/en/user/demo-case.md), [GUI](docs/en/user/gui.md), [CLI](docs/en/user/cli.md), [Python API](docs/en/user/python-api.md) |
+| Data correction | [Background correction](docs/en/features/background-phase-correction.md), [Noise removal](docs/en/features/noise-removal.md), [Phase unwrapping](docs/en/features/phase-unwrapping.md) |
 | Functional workflow | [Feature directory](docs/en/features/index.md) |
 | DICOM input | [Direct loading and preserved conversion](docs/en/features/dicom-loading.md) |
 | Input and output contracts | [Inputs](docs/en/user/inputs.md), [Outputs](docs/en/user/outputs.md), [Troubleshooting](docs/en/user/troubleshooting.md) |
-| Every parameter | [19 configuration modules](docs/en/user/parameters.md), [Structured schemas](docs/en/user/parameter-schemas.md), [CLI flags](docs/en/user/cli-parameters.md), [API fields](docs/en/user/api-parameters.md) |
+| Every parameter | [20 configuration modules](docs/en/user/parameters.md), [Structured schemas](docs/en/user/parameter-schemas.md), [CLI flags](docs/en/user/cli-parameters.md), [API fields](docs/en/user/api-parameters.md) |
+| Scientific basis | [References by calculation, with implementation differences](docs/en/references/index.md) |
 | Implementation | [Architecture](docs/en/developer/architecture.md), [Modules and owners](docs/en/developer/feature-to-code-map.md), [Configuration](docs/en/developer/config-system.md), [Change recipes](docs/en/developer/change-recipes.md) |
 | Validation and speed | [Testing](docs/en/developer/testing.md), [Current performance](docs/en/developer/performance.md), [Segmentation measurements](docs/en/developer/segmentation-performance.md) |
 
@@ -57,7 +61,6 @@ Build and validate the documentation locally:
 
 ```bash
 conda activate autoflow311
-python tools/build_parameter_reference.py --check
 mkdocs build --strict
 ```
 
@@ -67,7 +70,7 @@ The retained automated suite is smoke and phantom coverage:
 PYVISTA_OFF_SCREEN=true python -m pytest tests/test_smoke_phantoms.py tests/test_pressure_gradient_phantom.py -q
 ```
 
-For a read-only cold pipeline benchmark, run `python tools/benchmark_pipeline.py --report /tmp/autoflow-benchmark.json`. It recomputes correction and nnUNet4D segmentation without reusing or writing source caches, requests WSS/PG, and excludes videos.
+For cold-run measurement and controlled comparisons, see [Current performance](docs/en/developer/performance.md).
 
 ## License
 

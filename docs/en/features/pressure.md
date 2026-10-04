@@ -8,9 +8,11 @@ Supported in GUI, CLI and Python.
 
 Estimates `grad(p) = -rho*(dv/dt + (v dot grad)v) + mu*laplacian(v)` from velocity, then reconstructs relative pressure and samples centreline pressure/drop profiles. Input velocity (cm/s), spacing (mm), RR (ms) and viscosity (mPa s) are converted to SI; outputs are Pa/m and Pa.
 
+See [Scientific references: PG and relative pressure](../references/index.md#pressure-gradient-and-relative-pressure) for the Navier–Stokes/PPE/STE literature and the differences between AutoFlow's Cartesian solvers and the published formulations.
+
 Temporal acceleration uses a periodic central difference over the cardiac cycle. Valid support requires a complete six-neighbour spatial stencil, finite velocities and both temporal neighbours inside segmentation. Optional 26-neighbour erosion adds a margin. Velocity is not zeroed outside the vessel before differentiation; optional smoothing is normalized by valid-mask weights. Work is cropped to the vessel bounding box plus one stencil voxel, then embedded in the original shape.
 
-Least squares fits `(p_j-p_i)/h` to face-average PG. PPE uses a finite-volume negative Laplacian and matching boundary flux. Their discrete equations are equivalent on this Cartesian grid. A hard zero gauge per connected component uses symmetric row/column elimination. Large systems use cached AMG-preconditioned CG, with a Jacobi fallback if AMG is unavailable. Family signatures and derived plane samples avoid repeated calculations.
+The default `ppe` reconstruction is the merged Cartesian pressure solver: the historical `least_squares` and `ppe` names now use the same face-gradient normal equations and `least_squares` is retained only as a compatibility alias. A zero-pressure gauge is applied independently to each connected component. `ste` selects the Stokes estimator, which solves an auxiliary divergence-free velocity and pressure system on a staggered MAC grid with zero velocity on the support boundary. Small STE systems use a sparse direct solve; larger systems use AMG-preconditioned MINRES. Family signatures and derived plane samples avoid repeated calculations.
 
 ## When to use it
 
@@ -30,7 +32,7 @@ Python:
 
 ```python
 from autoflow import AutoFlowConfig, run_case
-config = AutoFlowConfig.from_config_dir('./configs', requested_metrics=['pg'], pressure_method='least_squares')
+config = AutoFlowConfig.from_config_dir('./configs', requested_metrics=['pg'], pressure_method='ppe')
 summary = run_case('case.h5', config=config)
 ```
 
@@ -40,7 +42,7 @@ Calibrated velocity, segmentation, spacing/origin and RR. Phase timing assumes a
 
 ## Parameters
 
-[All pressure parameters](../user/parameters.md#pressure_gradient) and [shared fluid properties](../user/parameters.md#fluid). Methods are `least_squares` and `ppe`; default extra erosion is one iteration. `support_erosion_iters=0` disables only the additional margin. Display ranges/opacity do not change numerical results.
+[All pressure parameters](../user/parameters.md#pressure_gradient) and [shared fluid properties](../user/parameters.md#fluid). Methods are `ppe` and `ste`; `least_squares` remains an input compatibility alias for `ppe`. Default extra erosion is one iteration. `support_erosion_iters=0` disables only the additional margin. Display ranges/opacity do not change numerical results.
 
 ## Outputs
 
@@ -65,4 +67,4 @@ PYVISTA_OFF_SCREEN=true python -m pytest tests/test_smoke_phantoms.py tests/test
 
 ## Common problems
 
-Trimmed edges: inspect the support mask; excluded boundary stencils are expected. Large historical pressure differences: regenerate the case with the corrected algorithm. Unrealistic gradients: check RR, spacing, component orientation, phase order and velocity calibration.
+Trimmed edges: inspect the support mask; excluded boundary stencils are expected. STE is more sensitive to thin or disconnected supports because it needs interior face unknowns and imposes zero auxiliary velocity at the support boundary. Large historical pressure differences: regenerate the case with the corrected algorithm. Unrealistic gradients: check RR, spacing, component orientation, phase order and velocity calibration.

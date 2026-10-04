@@ -32,11 +32,10 @@ python -m pytest tests/test_pressure_gradient_phantom.py -q
 ## Documentation checks
 
 ```bash
-python tools/build_parameter_reference.py --check
 mkdocs build --strict
 ```
 
-The generator reads API/CLI declaration AST nodes without importing optional GUI/inference runtimes, and documents learned-method choices with their installation requirements. It checks 19 configuration modules plus all public API fields/CLI actions against descriptions and generated tables. Each functional feature page uses the eleven-section template (including all GUI/CLI/Python entry points or explicit unavailable status). The --check mode also verifies feature section order and entry-point explanations, English-only prose, and coverage of every Python module in the code-owner map. Keep configuration descriptions in `docs/en/developer/parameter-descriptions.json`, then regenerate rather than editing the generated tables.
+Review parameter tables against the merged configuration bundle, public dataclass fields and argparse declarations whenever a control changes. Every feature page must retain the eleven-section template and explain GUI, CLI and Python use or explicit unavailable status. Update the code-owner map for new modules. `mkdocs build --strict` checks site structure and links.
 
 ## Verify code provenance
 
@@ -49,3 +48,13 @@ The retained smoke suite checks backend/config selection, duplicate-root collect
 Manual verification with the pinned submodule converted 24 synthetic GE single-frame DICOM files into one native H5. AutoFlow loaded flow shape (4,5,3,2,3), 2 mm spacing, RR 1000 ms, and canonical component means [-10,20,-30] cm/s from the known GE polarities. TKE remained unavailable. The public CLI completed conversion and loading; absent segmentation was reported and vessel steps skipped.
 
 An offscreen Qt check exercised the new GUI menu and real background conversion worker with that acquisition. It verified output/case handoff and continuing GUI timer events during conversion. The [worked example](../user/demo-case.md) documents a separate real GUI walkthrough on the supplied DV H5.
+
+## Correction regression checks
+
+Smoke coverage checks Correction Run All order, method-dependent mask defaults, unavailable-segmask rejection, display-only noise masking and preservation of downstream artifacts after background correction, unwrap and revert. Run GUI checks in `autoflow311`: verify Input & QC → Correction → Segmentation, default LAP4D/none, method-specific mask choices and segmask availability after import/generation. The new controls were inspected with the existing software-rendering adapter on a virtual display; this does not establish clinical masking accuracy or GPU rendering performance.
+
+Smoke/phantom checks also cover absent PC-MRA before explicit generation, PC-MRA generation last in the group, stored-image persistence and phase actor reuse, excluded-region surface bounds, and available-only Content entries with stable selection when results appear/disappear.
+
+## Task and geometry smoke coverage
+
+The retained smoke file covers frame-specific plane ROI sampling, static slice reuse, serial/process derived equivalence, segmentation topology retention/invalidation, modal input locking and cancellation without partial workspace publication. Qt checks use `QT_QPA_PLATFORM=offscreen` and skip only when the optional PySide6 runtime is absent. Real-data speed comparisons and rendering-process checks are recorded in [Performance](performance.md); no private validation data is copied into tests.

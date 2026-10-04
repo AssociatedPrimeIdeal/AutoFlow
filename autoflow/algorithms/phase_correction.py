@@ -5,6 +5,7 @@ import numpy as np
 from skimage import exposure, filters
 
 from ..case_types import BackgroundPhaseCorrectionConfig
+from ..task_control import TaskCancelled, check_cancelled
 
 
 _CORRECTION_ALGORITHM_VERSION = {"msac": 1, "wrls_arto": 1}
@@ -70,6 +71,7 @@ def background_phase_correction_cache_metadata(config=None):
 
 
 def _emit_progress(progress_callback, stage, current=None, total=None, message=""):
+    check_cancelled()
     if progress_callback is None:
         return
     payload = {
@@ -80,6 +82,8 @@ def _emit_progress(progress_callback, stage, current=None, total=None, message="
     }
     try:
         progress_callback(payload)
+    except TaskCancelled:
+        raise
     except Exception:
         pass
 
@@ -424,18 +428,20 @@ def _build_normalized_polynomial_basis(shape, order):
         return basis
 
 
-def _fista_l1_normal_equations(gram, rhs, initial, lam, iterations):
+def _fista_l1_normal_equations(gram, rhs, initial, lam, iterations, *, lipschitz=None):
     gram = np.asarray(gram, dtype=np.float64)
     rhs = np.asarray(rhs, dtype=np.float64)
     x = np.asarray(initial, dtype=np.float64).copy()
     y = x.copy()
     t_value = 1.0
-    largest_eigenvalue = float(np.max(np.linalg.eigvalsh(gram))) if gram.size else 0.0
-    lipschitz = 2.05 * largest_eigenvalue
+    if lipschitz is None:
+        largest_eigenvalue = float(np.max(np.linalg.eigvalsh(gram))) if gram.size else 0.0
+        lipschitz = 2.05 * largest_eigenvalue
     if not np.isfinite(lipschitz) or lipschitz <= np.finfo(np.float64).eps:
         return x
     shrink_threshold = float(lam) / lipschitz
     for _ in range(max(0, int(iterations))):
+        check_cancelled()
         alpha = y - (2.0 / lipschitz) * (gram @ y - rhs)
         x_new = np.sign(alpha) * np.maximum(np.abs(alpha) - shrink_threshold, 0.0)
         t_new = (1.0 + np.sqrt(1.0 + 4.0 * t_value * t_value)) / 2.0
@@ -862,9 +868,22 @@ def _wrls_fit_torch(phi, sigma, fit_mask, basis, order, lam, fista_iterations, t
     lipschitz = 2.05 * largest_eigenvalue
     if not bool(torch.isfinite(lipschitz).item()) or float(lipschitz.item()) <= np.finfo(np.float64).eps:
         coefficients = x
+    elif exponent_count <= 64:
+        # FISTA updates only 4--20 coefficients for the shipped fit orders.
+        # Keep the large-volume Gram construction and final evaluation on
+        # CUDA, but avoid thousands of tiny CUDA launches in this loop.
+        # Preserve the GPU initial solution/Lipschitz value, float64 arithmetic
+        # and the configured iteration count; there is no early stopping.
+        coefficients_cpu = _fista_l1_normal_equations(
+            gram.detach().cpu().numpy(), rhs.detach().cpu().numpy(),
+            initial.detach().cpu().numpy(), float(lam), int(fista_iterations),
+            lipschitz=float(lipschitz.item()),
+        )
+        coefficients = torch.as_tensor(coefficients_cpu, dtype=torch.float64, device=gram.device)
     else:
         shrink_threshold = float(lam) / lipschitz
         for _ in range(max(0, int(fista_iterations))):
+            check_cancelled()
             alpha = y - (2.0 / lipschitz) * (gram @ y - rhs)
             x_new = torch.sign(alpha) * torch.clamp(torch.abs(alpha) - shrink_threshold, min=0.0)
             t_new = (1.0 + torch.sqrt(1.0 + 4.0 * t_value * t_value)) / 2.0
@@ -1013,10 +1032,13 @@ def execute_wrls_arto(
         "gmm_iterations": gmm_iterations,
         "progress_callback": progress_callback,
     }
+    check_cancelled()
     torch, _reason = _available_torch_cuda()
     if torch is not None:
         try:
             return _execute_wrls_arto_gpu(im, **kwargs)
+        except TaskCancelled:
+            raise
         except Exception:
             torch.cuda.empty_cache()
     return _execute_wrls_arto_impl(im, **kwargs)

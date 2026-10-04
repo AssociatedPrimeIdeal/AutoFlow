@@ -1,5 +1,5 @@
 {
-  "mask_source": "segmask",
+  "mask_source": "auto",
   "device": "auto",
   "tfc": true,
   "lap4d_ts": 2.0,

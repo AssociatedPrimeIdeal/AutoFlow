@@ -64,7 +64,13 @@ class AutoFlowConfig:
     ignore_embedded_segmentation: bool = False
     phase_unwrap_enabled: bool = False
     phase_unwrap_method: str = "none"
-    phase_unwrap_mask: str = "segmask"
+    phase_unwrap_mask: str = "auto"
+    correction_all: bool = False
+    generate_pcmra: bool = False
+    noise_removal: bool = False
+    noise_removal_method: str = "magnitude_temporal"
+    noise_magnitude_fraction: float = 0.05
+    noise_velocity_std_max: float = 0.80
     phase_unwrap_device: str = "auto"
     phase_unwrap_tfc: bool = True
     phase_unwrap_lap4d_ts: float = 2.0
@@ -115,7 +121,7 @@ class AutoFlowConfig:
     plane_pathline_color: Optional[str] = None
     pathline_color_mode: str = "per_plane"
     pathline_temporal_cache_mb: float = 512.0
-    pressure_method: str = "least_squares"
+    pressure_method: str = "ppe"
 
     autoseg: bool = False
     autoseg_backend: str = "nnUNet4D"
@@ -213,7 +219,10 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
     ws.loader_params.ignore_embedded_segmentation = bool(cfg.ignore_embedded_segmentation)
     ws.phase_unwrap_params.enabled = bool(cfg.phase_unwrap_enabled)
     ws.phase_unwrap_params.method = str(cfg.phase_unwrap_method or "none")
-    ws.phase_unwrap_params.mask_source = str(cfg.phase_unwrap_mask or "segmask")
+    ws.phase_unwrap_params.mask_source = str(cfg.phase_unwrap_mask or "auto")
+    from .case_types import NoiseRemovalConfig
+    ws.noise_removal_params = NoiseRemovalConfig(enabled=cfg.noise_removal, method=cfg.noise_removal_method,
+        magnitude_fraction=cfg.noise_magnitude_fraction, velocity_std_max=cfg.noise_velocity_std_max)
     ws.phase_unwrap_params.device = str(cfg.phase_unwrap_device or "auto")
     ws.phase_unwrap_params.tfc = bool(cfg.phase_unwrap_tfc)
     ws.phase_unwrap_params.lap4d_ts = float(cfg.phase_unwrap_lap4d_ts)
@@ -280,9 +289,13 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
     color_mode = str(cfg.pathline_color_mode or "per_plane").strip().lower()
     ws.streamline_params.pathline_color_mode = color_mode if color_mode in {"uniform", "per_plane", "per_group"} else "per_plane"
     ws.streamline_params.pathline_temporal_cache_mb = max(0.0, float(cfg.pathline_temporal_cache_mb))
-    pressure_method = str(getattr(cfg, "pressure_method", "least_squares") or "least_squares").strip().lower()
-    if pressure_method not in {"least_squares", "ppe"}:
-        pressure_method = "least_squares"
+    pressure_method = str(getattr(cfg, "pressure_method", "ppe") or "ppe").strip().lower()
+    if pressure_method in {"ls", "least_squares", "least-squares", "least squares", "poisson", "ppe", "poisson_pressure_equation"}:
+        pressure_method = "ppe"
+    elif pressure_method in {"ste", "stokes", "stokes_estimator", "stokes-estimator"}:
+        pressure_method = "ste"
+    else:
+        pressure_method = "ppe"
     ws.derived_params.pressure_method = pressure_method
     ws.derived_params.use_multithread = bool(cfg.use_multithread)
     return ws
@@ -327,6 +340,12 @@ def run_case(
         autoseg_device=cfg.autoseg_device,
         autoseg_label_map=cfg.autoseg_label_map,
         segmentation_only=cfg.segmentation_only,
+        correction_all=cfg.correction_all,
+        generate_pcmra=cfg.generate_pcmra,
+        noise_removal=cfg.noise_removal,
+        noise_removal_method=cfg.noise_removal_method,
+        noise_magnitude_fraction=cfg.noise_magnitude_fraction,
+        noise_velocity_std_max=cfg.noise_velocity_std_max,
         phase_unwrap_enabled=cfg.phase_unwrap_enabled,
         phase_unwrap_method=cfg.phase_unwrap_method,
         phase_unwrap_mask=cfg.phase_unwrap_mask,
@@ -504,6 +523,12 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 autoseg_device=config.autoseg_device,
                 autoseg_label_map=config.autoseg_label_map,
                 segmentation_only=config.segmentation_only,
+                correction_all=config.correction_all,
+                generate_pcmra=config.generate_pcmra,
+                noise_removal=config.noise_removal,
+                noise_removal_method=config.noise_removal_method,
+                noise_magnitude_fraction=config.noise_magnitude_fraction,
+                noise_velocity_std_max=config.noise_velocity_std_max,
                 requested_metrics=list(config.requested_metrics),
                 requested_videos=list(config.requested_videos),
                 fps=config.fps,

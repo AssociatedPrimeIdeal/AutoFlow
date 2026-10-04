@@ -6,6 +6,9 @@ import json
 from pathlib import Path
 import shutil
 import time
+import os
+import tempfile
+from ..task_control import check_cancelled, current_cancellation_token, task_scope
 
 import numpy as np
 
@@ -24,6 +27,7 @@ def _array_digest(array):
     digest.update(str((values.shape, values.dtype.str)).encode("ascii"))
     # Bound extra memory for noncontiguous flow components and large cases.
     for slab in values:
+        check_cancelled()
         digest.update(np.ascontiguousarray(slab).view(np.uint8))
     return digest.hexdigest()
 
@@ -88,16 +92,21 @@ def export_labeler_exchange(directory, metadata, mag, flow, segmentation, resolu
         previous_label_path = directory / f"segmentation.previous.{time.time_ns()}.nii"
         shutil.copy2(label_path, previous_label_path)
 
+    token = current_cancellation_token()
     def write(job):
         path, volume, is_label = job
-        if is_label:
-            save_segmentation_file(
-                path, volume, resolution=resolution, origin=origin,
-                provenance={"source": "autoflow_spatiotemporal_labeler_exchange",
-                            "created_at": segmentation_timestamp()},
-            )
-        else:
-            save_nifti_volume(path, volume, resolution=resolution, origin=origin)
+        with task_scope(token), tempfile.TemporaryDirectory(prefix=".autoflow_labeler_", dir=directory) as temp_dir:
+            temporary = Path(temp_dir) / path.name
+            if is_label:
+                save_segmentation_file(
+                    temporary, volume, resolution=resolution, origin=origin,
+                    provenance={"source": "autoflow_spatiotemporal_labeler_exchange",
+                                "created_at": segmentation_timestamp()},
+                )
+            else:
+                save_nifti_volume(temporary, volume, resolution=resolution, origin=origin)
+            check_cancelled()
+            os.replace(temporary, path)
         return path.name
 
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="autoflow-labeler-nifti") as pool:
@@ -105,6 +114,7 @@ def export_labeler_exchange(directory, metadata, mag, flow, segmentation, resolu
             name = future.result()
             if progress_callback is not None:
                 progress_callback(name)
+    check_cancelled()
     manifest_path.write_text(
         json.dumps(dict(metadata, seed_digest=seed_digest), indent=2, sort_keys=True), encoding="utf-8"
     )

@@ -1866,7 +1866,12 @@ def test_nnunet_autoseg_progress_callback_reports_stage_updates(monkeypatch, tmp
     )
     (model_dir / "plans.json").write_text(json.dumps({"plans": "ok"}), encoding="utf-8")
 
-    def fake_run_subprocess(command, *, env=None, cwd=None, runner=None):
+    def fake_run_subprocess(command, *, env=None, cwd=None, runner=None,
+                            progress_callback=None, output_dir=None,
+                            expected_predictions=1, progress_total=5):
+        assert callable(progress_callback)
+        assert str(output_dir) == command[command.index("-o") + 1]
+        assert expected_predictions == 1
         out_dir = Path(command[command.index("-o") + 1])
         pred = out_dir / "autoflow_case.nii.gz"
         pred.write_bytes(b"fake")
@@ -2518,7 +2523,10 @@ def test_plane_video_label_style_uses_plane_render_config(monkeypatch, tmp_path)
     monkeypatch.setattr("autoflow.rendering.videos._plane_mesh", lambda center_world, normal, size: SimpleNamespace(n_points=4))
     monkeypatch.setattr("autoflow.rendering.videos._path_polydata", lambda path_world: SimpleNamespace(n_points=len(path_world)))
     monkeypatch.setattr("autoflow.rendering.videos._orbit_camera", lambda poly, azimuth_deg, elevation_deg=0.0, distance_scale=1.0: [tuple([0.0, 0.0, 0.0]), tuple([0.0, 0.0, 0.0]), (0.0, 0.0, 1.0)])
-    monkeypatch.setattr("autoflow.rendering.videos._write_video", lambda frames, out_path, fps=24: str(out_path))
+    def consume_video(frames, out_path, fps=24):
+        assert len(list(frames() if callable(frames) else frames)) == 1
+        return str(out_path)
+    monkeypatch.setattr("autoflow.rendering.videos._write_video", consume_video)
 
     out = render_plane_rotation_video(
         ws,
@@ -2900,6 +2908,9 @@ def test_pathline_rejects_invalid_plane_before_vtk_execution():
 def test_gui_run_all_scopes_steps_to_the_active_workflow_panel():
     from autoflow.ui.app import _workflow_run_all_steps
 
+    assert _workflow_run_all_steps("correction") == [
+        StepId.BACKGROUND_CORRECTION, StepId.REMOVE_NOISE, StepId.UNWRAP_PHASE, StepId.GENERATE_PCMRA,
+    ]
     assert _workflow_run_all_steps("centerline") == [
         StepId.GENERATE_SKELETON,
         StepId.GENERATE_GRAPH,
@@ -3154,6 +3165,8 @@ def test_pcmra_phantom_phase_updates_preserve_window_opacity_and_actor(static_ma
     workspace = Workspace()
     workspace.mag_raw = magnitude if static_magnitude else np.repeat(magnitude[..., None], 3, axis=3)
     workspace.flow_raw = flow
+    workspace.data_loaded = True
+    assert PipelineEngine().run_step(workspace, StepId.GENERATE_PCMRA, lambda _: None).success
     original_mag, original_flow = workspace.mag_raw.copy(), flow.copy()
     obj = SceneObject("pcmra", "PC-MRA", ObjectKind.AUX, "pcmra_volume",
                       scalars="PC-MRA", cmap="gray", opacity=0.8, dynamic=True)
@@ -3184,6 +3197,8 @@ def test_pcmra_phantom_phase_updates_preserve_window_opacity_and_actor(static_ma
         assert obj.actor is actor
         assert np.allclose(actor.GetProperty().GetRGBTransferFunction(0).GetRange(),
                            np.percentile(magnitude * 2.0, (5.0, 99.0)))
+        controller._apply_volume_window_level(obj, (-50.0, 80.0), render=False)
+        assert actor.GetProperty().GetScalarOpacity(0).GetValue(0.0) == 0.0
         obj.opacity = 0.0
         controller.apply_object_properties(obj, render=False)
         assert actor.GetProperty().GetScalarOpacity(0).GetValue(80.0) == 0.0
@@ -3298,3 +3313,782 @@ def test_dicom2h5_loader_config_and_cli_selection():
     assert args.dicom_backend == "dicom2h5" and args.dicom_h5_dir == "converted"
     with pytest.raises(ValueError, match="Unknown DICOM backend"):
         collect_input_cases([], dicom_backend="unsupported")
+
+
+@pytest.mark.parametrize("method,default", [
+    ("lap4D", "none"), ("gc3D", "none"), ("nprs", "none"),
+    ("pudip", "pcmra_std"), ("gust", "pcmra_std"),
+])
+def test_correction_method_mask_defaults(method, default):
+    from autoflow.algorithms.phase_unwrapping import mask_sources_for_method, resolve_mask_source
+    assert resolve_mask_source(method) == default
+    assert "segmask" in mask_sources_for_method(method)
+    if default == "none":
+        with pytest.raises(ValueError):
+            resolve_mask_source(method, "pcmra_std")
+    else:
+        assert resolve_mask_source(method, "pcmramean") == "pcmra_mean"
+
+
+def test_noise_removal_only_masks_pcmra_and_keeps_steady_flow():
+    from autoflow.algorithms.noise_removal import pcmra_render_mask
+    magnitude = np.ones((4, 3, 2, 4), dtype=np.float32)
+    velocity = np.full(magnitude.shape + (3,), 30.0, dtype=np.float32)
+    magnitude[0] = 0.001
+    velocity[1, 0, 0, :, 0] = [0, 149, 0, 149]
+    original_m, original_v = magnitude.copy(), velocity.copy()
+    mask, report = pcmra_render_mask(magnitude, velocity, [150, 150, 150], magnitude_fraction=0.04)
+    assert not mask[0].any()
+    assert not mask[1, 0, 0]
+    assert mask[2:].all()  # Steady flow is not discarded as static tissue.
+    assert report["scope"] == "pcmra_rendering_only"
+    np.testing.assert_array_equal(magnitude, original_m)
+    np.testing.assert_array_equal(velocity, original_v)
+    whole, report = pcmra_render_mask(np.ones_like(magnitude), np.ones_like(velocity), 150)
+    assert whole.all() and report["magnitude_threshold_mode"] == "fraction_of_max"
+    assert report["magnitude_threshold"] == pytest.approx(0.05)
+    assert report["temporal_std_threshold"] == 0.0
+    empty, _ = pcmra_render_mask(np.zeros_like(magnitude), velocity, 150)
+    assert not empty.any()
+
+
+def test_noise_removal_defaults_and_manual_configuration():
+    import inspect
+    from autoflow.case_types import NoiseRemovalConfig
+    from autoflow.cli import build_parser
+    from autoflow.config import load_config_bundle
+    from autoflow.processing import process_single
+
+    defaults = NoiseRemovalConfig()
+    assert defaults.magnitude_fraction == 0.05
+    assert defaults.velocity_std_max == 0.80
+    bundle = load_config_bundle()
+    for resolved in (bundle_to_autoflow_kwargs(bundle), bundle_to_autoflow_kwargs({})):
+        assert resolved["noise_magnitude_fraction"] == 0.05
+        assert resolved["noise_velocity_std_max"] == 0.80
+    api_config = AutoFlowConfig()
+    assert api_config.noise_magnitude_fraction == 0.05
+    assert api_config.noise_velocity_std_max == 0.80
+    signature = inspect.signature(process_single)
+    assert signature.parameters["noise_magnitude_fraction"].default == 0.05
+    assert signature.parameters["noise_velocity_std_max"].default == 0.80
+    assert Workspace().noise_removal_params == defaults
+    assert build_workspace(api_config).noise_removal_params == defaults
+    args = build_parser().parse_args(["case.h5", "--noise-magnitude-fraction", "0.06",
+                                     "--noise-velocity-std-max", "0.24"])
+    custom = AutoFlowConfig(noise_magnitude_fraction=args.noise_magnitude_fraction,
+                            noise_velocity_std_max=args.noise_velocity_std_max)
+    workspace = build_workspace(custom)
+    assert workspace.noise_removal_params.magnitude_fraction == 0.06
+    assert workspace.noise_removal_params.velocity_std_max == 0.24
+    restored = Workspace()
+    restored.restore_dict(workspace.snapshot_dict())
+    assert restored.noise_removal_params == workspace.noise_removal_params
+    for name in ("magnitude_fraction", "velocity_std_max"):
+        for invalid in (-0.01, 1.01, np.nan, np.inf):
+            with pytest.raises(ValueError):
+                NoiseRemovalConfig(**{name: invalid})
+
+
+def test_noise_removal_phantom_gui_controls_have_no_explanation(monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtWidgets
+    from autoflow.ui.app import MainWindow
+
+    application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = QtWidgets.QWidget()
+    owner = SimpleNamespace(params_layout=QtWidgets.QVBoxLayout(panel), _reset_noise_removal=lambda: None)
+    try:
+        MainWindow._build_noise_removal_params(owner)
+        assert owner.spin_noise_magnitude.value() == 0.05
+        assert owner.spin_noise_std_max.value() == 0.80
+        assert [label.text() for label in panel.findChildren(QtWidgets.QLabel)] == [
+            "Method", "Magnitude fraction of maximum", "Temporal SD fraction of maximum"]
+        owner.spin_noise_magnitude.setValue(0.03)
+        owner.spin_noise_std_max.setValue(0.90)
+        assert owner.spin_noise_magnitude.value() == 0.03
+        assert owner.spin_noise_std_max.value() == 0.90
+    finally:
+        panel.close()
+        panel.deleteLater()
+        application.processEvents()
+
+
+def test_noise_removal_phantom_uses_maximum_magnitude_and_speed_sd():
+    from autoflow.algorithms.noise_removal import pcmra_render_mask
+
+    magnitude = np.ones((102, 1, 1, 4), dtype=np.float32)
+    magnitude[0] = 0.4
+    magnitude[2] = 0.01
+    magnitude[-1] = [4, 8, 12, 16]
+    velocity = np.zeros(magnitude.shape + (3,), dtype=np.float32)
+    velocity[..., 0] = 30
+    velocity[1, 0, 0, :, 0] = [10, 90, 10, 90]
+    velocity[2, 0, 0, :, 0] = [0, 100, 0, 100]
+    velocity[3, 0, 0, :, 0] = [0, 81, 0, 81]
+    velocity[4, 0, 0, :, 0] = [-30, 30, -30, 30]
+    velocity[5] = np.inf
+    velocity[6] = np.nan
+    magnitude[7] = np.nan
+    magnitude[8] = np.inf
+    mask, report = pcmra_render_mask(magnitude, velocity, 150)
+    assert not mask[0] and mask[1] and not mask[2] and not mask[3]
+    assert mask[4] and not mask[5:9].any() and mask[9:].all()
+    assert report["magnitude_statistic"] == "temporal_mean"
+    assert report["magnitude_reference_max"] == 10.0
+    assert report["magnitude_threshold"] == pytest.approx(0.5)
+    assert report["temporal_std_statistic"] == "speed"
+    assert report["temporal_std_reference_max"] == 50.0
+    assert report["temporal_std_threshold"] == 40.0
+    different_venc, _ = pcmra_render_mask(magnitude, velocity, [50, 100, 200])
+    np.testing.assert_array_equal(mask, different_venc)
+    relaxed, _ = pcmra_render_mask(magnitude, velocity, 150,
+                                   magnitude_fraction=0.03, velocity_std_max=0.90)
+    assert relaxed[0] and relaxed[3]
+    magnitude_only, report = pcmra_render_mask(magnitude, velocity, 150, method="magnitude")
+    assert magnitude_only[3] and not report["temporal_screening_applied"]
+    assert report["temporal_std_threshold"] is None
+    positive_only, report = pcmra_render_mask(magnitude, velocity, 150,
+                                             magnitude_fraction=0, velocity_std_max=0)
+    assert positive_only[:5].all() and not positive_only[5:9].any()
+    assert not report["temporal_screening_applied"]
+    magnitude[0] = 0
+    positive_only, _ = pcmra_render_mask(magnitude, velocity, 150,
+                                        magnitude_fraction=0, velocity_std_max=0)
+    assert not positive_only[0]
+
+
+@pytest.mark.parametrize("frames", [1, 3, 15])
+def test_noise_removal_phantom_shared_magnitude_and_constant_speed(frames):
+    from autoflow.algorithms.noise_removal import pcmra_render_mask
+
+    magnitude = np.ones((2, 2, 2), dtype=np.float32)
+    velocity = np.full(magnitude.shape + (frames, 3), 30, dtype=np.float32)
+    mask, report = pcmra_render_mask(magnitude, velocity, 150)
+    assert mask.all()
+    assert report["temporal_screening_applied"] == (frames > 1)
+    assert report["temporal_std_threshold"] == (0.0 if frames > 1 else None)
+    velocity[:] = np.nan
+    mask, _ = pcmra_render_mask(magnitude, velocity, 150)
+    assert not mask.any()
+
+
+def test_correction_updates_working_flow_and_preserves_downstream(monkeypatch, tmp_path):
+    from autoflow.core import pipeline as module
+    from autoflow.case_types import LoadedCase, PhaseUnwrappingConfig
+    shape = (4, 4, 4, 3)
+    flow = np.full(shape + (3,), 10.0, dtype=np.float32)
+    seg = np.ones(shape, dtype=np.int16)
+    calls = []
+    def load(_source, **kwargs):
+        cfg = kwargs["correction_config"]
+        enabled = cfg.get("enabled", False) if isinstance(cfg, dict) else cfg.enabled
+        calls.append(enabled)
+        return LoadedCase(mag=np.ones(shape, dtype=np.float32), flow=flow + (5 if enabled else 0),
+            resolution=np.ones(3), origin=np.zeros(3), venc=np.full(3, 150.0), rr=1000,
+            segmentation=seg, metadata={"background_phase_correction": {"applied": enabled}})
+    monkeypatch.setattr(module, "load_input_data", load)
+    ws = Workspace()
+    ws.paths.flow_path = str(tmp_path / "source.h5")
+    ws.loader_params.background_phase_correction.enabled = True
+    engine = PipelineEngine()
+    engine.load_data(ws, lambda _: None)
+    assert calls == [False]  # Correction is an explicit action after loading.
+    assert ws.pcmra_array is None and not any(obj.data_key == "pcmra_volume" for obj in ws.scene_objects.values())
+    planes = [PlaneData(center=np.zeros(3), normal=np.ones(3), label=1)]
+    metrics = [{"sentinel": 1}]
+    ws.planes = planes
+    ws.derived.plane_metrics = metrics
+    ws.pathline_cache = {"sentinel": object()}
+    old_trajectories = ws.pathline_cache
+    old_seg = ws.segmask_raw
+    ws.pipeline.mark_done(StepId.COMPUTE_PLANE_METRICS)
+    assert engine.run_step(ws, StepId.BACKGROUND_CORRECTION, lambda _: None).success
+    np.testing.assert_array_equal(ws.flow_raw, flow + 5)
+    np.testing.assert_array_equal(ws.flow_input, flow + 5)
+    assert ws.segmask_raw is old_seg and ws.planes is planes and ws.derived.plane_metrics is metrics
+    assert ws.pathline_cache is old_trajectories
+    assert ws.pipeline.is_done(StepId.COMPUTE_PLANE_METRICS)
+    before = ws.flow_raw.copy()
+    assert engine.run_step(ws, StepId.REMOVE_NOISE, lambda _: None).success
+    np.testing.assert_array_equal(ws.flow_raw, before)
+    assert ws.planes is planes and ws.derived.plane_metrics is metrics
+    ws.phase_unwrap_params = PhaseUnwrappingConfig(method="lap4D", mask_source="segmask")
+    old_seg[2:] = 0
+    def unwrap(phase, mask, venc, method, **kwargs):
+        assert method == "lap4D"
+        output = phase * np.asarray(venc).reshape(1, 1, 1, 1, 3) / np.pi + 300
+        return {"flow_unwrapped": output, "phase_unwrapped": phase + 2*np.pi,
+                "mask_used": mask, "statistics": {}}
+    monkeypatch.setattr(module, "unwrap_phase", unwrap)
+    ws.flow_raw[2:] = 50  # Preserve an earlier whole-volume result outside the new mask.
+    assert engine.run_step(ws, StepId.UNWRAP_PHASE, lambda _: None).success
+    np.testing.assert_allclose(ws.flow_raw[:2], 315, atol=1e-4)
+    np.testing.assert_allclose(ws.flow_raw[2:], 50, atol=1e-4)
+    np.testing.assert_allclose(ws.phase_unwrap_result["phase_unwrapped"] * 150 / np.pi, ws.flow_raw, atol=1e-4)
+    assert ws.segmask_raw is old_seg and ws.planes is planes and ws.derived.plane_metrics is metrics
+    assert ws.pathline_cache is old_trajectories and ws.pipeline.is_done(StepId.COMPUTE_PLANE_METRICS)
+    assert engine.revert_phase_unwrap(ws).success
+    np.testing.assert_array_equal(ws.flow_raw, before)
+    assert ws.planes is planes and ws.derived.plane_metrics is metrics
+
+
+def test_phase_segmask_requires_an_available_segmentation():
+    from autoflow.case_types import PhaseUnwrappingConfig
+    ws = Workspace()
+    ws.phase_wrapped = np.zeros((4, 4, 4, 3, 3), dtype=np.float32)
+    ws.phase_unwrap_params = PhaseUnwrappingConfig(method="lap4D", mask_source="segmask")
+    result = PipelineEngine().run_step(ws, StepId.UNWRAP_PHASE, lambda _: None)
+    assert not result.success and "segmask requires" in result.message
+
+
+def test_correction_cli_api_order_and_default_mask(monkeypatch, tmp_path):
+    from autoflow.core import pipeline as module
+    from autoflow import processing
+    from autoflow.case_types import LoadedCase, InputCase
+    from autoflow.cli import build_parser
+    events = []
+    shape = (4, 4, 4, 3)
+    velocity = np.ones(shape + (3,), dtype=np.float32)
+    def load(_source, **kwargs):
+        cfg = kwargs["correction_config"]
+        enabled = cfg.get("enabled", False) if isinstance(cfg, dict) else cfg.enabled
+        events.append("background" if enabled else "load")
+        return LoadedCase(mag=np.ones(shape, dtype=np.float32), flow=velocity * (2 if enabled else 1),
+            resolution=np.ones(3), origin=np.zeros(3), venc=np.full(3, 150.0), rr=1000,
+            metadata={"background_phase_correction": {"applied": enabled}})
+    monkeypatch.setattr(module, "load_input_data", load)
+    original_noise = module.pcmra_render_mask
+    def noise(*args, **kwargs):
+        events.append("noise")
+        return original_noise(*args, **kwargs)
+    monkeypatch.setattr(module, "pcmra_render_mask", noise)
+    original_generate = PipelineEngine._step_generate_pcmra
+    def generate(engine, ws):
+        events.append("pcmra")
+        return original_generate(engine, ws)
+    monkeypatch.setattr(PipelineEngine, "_step_generate_pcmra", generate)
+    def unwrap(phase, mask, venc, method, **kwargs):
+        events.append("unwrap")
+        assert method == "lap4D" and mask.all()
+        return {"flow_unwrapped": np.full_like(phase, 20), "phase_unwrapped": phase,
+            "wrap_count": np.zeros_like(phase, dtype=np.int16), "wrap_mask": np.zeros_like(phase, dtype=bool),
+            "mask_used": mask, "method": method, "statistics": {}}
+    monkeypatch.setattr(module, "unwrap_phase", unwrap)
+    def segment(ws, _out_dir, **kwargs):
+        events.append("segmentation")
+        np.testing.assert_allclose(ws.flow_raw, 20)
+        ws.set_segmentation_source("auto", np.ones(shape, dtype=np.int16))
+        ws.activate_segmentation_source("auto")
+        return ""
+    monkeypatch.setattr(processing, "_run_cli_auto_segmentation", segment)
+    args = build_parser().parse_args(["case.h5", "--correction", "--noise-removal"])
+    assert args.correction and args.noise_removal
+    summary = run_case(InputCase(str(tmp_path / "case.h5"), "h5"), output_dir=str(tmp_path / "results"),
+        config=AutoFlowConfig(correction_all=True, autoseg=True, segmentation_only=True,
+                              background_phase_write_cache=False))
+    assert events == ["load", "background", "noise", "unwrap", "pcmra", "segmentation"]
+    assert summary["phase_unwrap"]["mask_source"] == "none"
+    with np.load(summary["pcmra_file"]) as saved:
+        np.testing.assert_allclose(saved["pcmra"], 20 * np.sqrt(3), rtol=1e-6)
+    mask_file = Path(summary["noise_removal_file"])
+    assert mask_file.is_file()
+    with np.load(mask_file) as saved:
+        assert saved["mask"].shape == shape[:3]
+        np.testing.assert_allclose(saved["resolution"], 1)
+
+
+
+def test_generated_pcmra_is_explicit_and_noise_region_is_renderable():
+    import pyvista as pv
+    from contextlib import closing
+    from autoflow.ui.viewer import SceneController
+    ws = Workspace()
+    ws.data_loaded = True
+    ws.mag_raw = np.ones((5, 5, 5, 3), dtype=np.float32)
+    ws.mag_raw[:2] = 0.001
+    ws.flow_raw = np.full(ws.mag_raw.shape + (3,), 20, dtype=np.float32)
+    ws.venc = np.full(3, 150.0)
+    ws.resolution = np.array([1.2, 2.3, 3.4])
+    ws.origin = np.array([-2.0, 5.0, 12.0])
+    engine = PipelineEngine()
+    with closing(pv.Plotter(off_screen=True)) as plotter:
+        controller = SceneController(plotter, ws, lambda _: None)
+        assert controller._build_dataset("pcmra_volume") is None
+        ws.noise_removal_params.magnitude_fraction = 0.04
+        assert engine.run_step(ws, StepId.REMOVE_NOISE, lambda _: None).success
+        assert ws.pcmra_array is None
+        noise = next(obj for obj in ws.scene_objects.values() if obj.data_key == "noise_region")
+        assert not noise.visible
+        assert noise.color == "#ff0000"
+        mesh = controller._build_dataset("noise_region")
+        assert isinstance(mesh, pv.ImageData)
+        rejected = mesh.point_data["Noise mask"] > 0
+        assert np.count_nonzero(rejected) == np.count_nonzero(~ws.pcmra_render_mask)
+        noise_positions = mesh.points[rejected]
+        indices = np.rint((noise_positions - ws.origin) / ws.resolution - 0.5).astype(int)
+        assert not ws.pcmra_render_mask[tuple(indices.T)].any()
+        assert engine.run_step(ws, StepId.GENERATE_PCMRA, lambda _: None).success
+        stored = ws.pcmra_array.copy()
+        ws.flow_raw *= 2
+        controller.invalidate_cache("pcmra_volume")
+        dataset = controller._build_dataset("pcmra_volume")
+        display = dataset.point_data["PC-MRA"].reshape(tuple(np.array(ws.pcmra_render_mask.shape) + 2), order="F")
+        np.testing.assert_allclose(display[1:-1, 1:-1, 1:-1], np.where(ws.pcmra_render_mask, stored[..., 0], 0.0))
+        assert not display[0].any() and not display[-1].any()
+        assert not display[:, 0].any() and not display[:, -1].any()
+        assert not display[:, :, 0].any() and not display[:, :, -1].any()
+        sampled = pv.PolyData(noise_positions).sample(dataset)
+        np.testing.assert_array_equal(sampled["vtkValidPointMask"], 1)
+        np.testing.assert_allclose(sampled["PC-MRA"], 0.0, atol=1e-6)
+        # Display refreshes do not regenerate PC-MRA after a velocity change.
+        assert np.isclose(dataset.get_data_range("PC-MRA")[1], 20 * np.sqrt(3))
+        np.testing.assert_array_equal(ws.pcmra_array, stored)
+        assert engine.run_step(ws, StepId.GENERATE_PCMRA, lambda _: None).success
+        np.testing.assert_allclose(ws.pcmra_array, stored * 2, rtol=1e-6)
+        restored = Workspace()
+        restored.restore_dict(ws.snapshot_dict())
+        np.testing.assert_allclose(restored.pcmra_array, ws.pcmra_array)
+        np.testing.assert_array_equal(restored.pcmra_render_mask, ws.pcmra_render_mask)
+
+
+@pytest.mark.parametrize("selected_plane", [False, True])
+def test_noise_overlay_phantom_paints_over_segmentation_and_refreshes(monkeypatch, selected_plane):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtCore, QtWidgets
+    from autoflow.ui.ortho_viewer import OrthoViewer
+
+    application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    ws = Workspace()
+    ws.mag_raw = np.full((12, 12, 12, 2), 0.2, dtype=np.float32)
+    ws.pcmra_render_mask = np.ones(ws.mag_raw.shape[:3], dtype=bool)
+    ws.pcmra_render_mask[:6, :6, :6] = False
+    ws.segmask_raw = np.ones(ws.mag_raw.shape, dtype=np.int16)
+    ws.segmentation.opacity = 1.0
+    ws.segmentation.label_colors = {"1": "#00ff00"}
+    ws.planes = [PlaneData(center=np.array([5.0, 5.0, 5.0]), normal=np.array([1.0, 1.0, 1.0]), label=1)]
+    viewer = OrthoViewer(ws)
+    try:
+        viewer.resize(1100, 850)
+        viewer.show()
+        viewer.update_slider_ranges()
+        for slider in (viewer.slider_x, viewer.slider_y, viewer.slider_z):
+            slider.setValue(4)
+        viewer._apply_pending_cursor()
+        if selected_plane:
+            viewer.set_selected_plane(0)
+        assert viewer.btn_noise_overlay.isEnabled()
+        assert not viewer.btn_noise_overlay.isChecked()
+        assert isinstance(viewer.btn_noise_overlay, QtWidgets.QCheckBox)
+        assert viewer.slider_noise_overlay_opacity.value() == 0
+        viewer.slider_noise_overlay_opacity.setValue(100)
+        assert viewer.btn_noise_overlay.isChecked()
+        application.processEvents()
+        for view in viewer.slice_views.values():
+            view.reset_view(zoom=1.0)
+        application.processEvents()
+
+        def painted_color(view, rejected):
+            image = view.grab().toImage()
+            noise = view.noise_overlay_item.image[..., 3] > 0
+            labels = view.overlay_item.image[..., 3] > 0
+            positions = np.argwhere(labels & (noise if rejected else ~noise))
+            for row, column in positions[len(positions) // 3:]:
+                horizontal = view._sample_origin[0] + column * view._spacing[0]
+                vertical = view._sample_origin[1] + row * view._spacing[1]
+                if abs(horizontal - view.vertical_line.value()) < view._spacing[0]:
+                    continue
+                if abs(vertical - view.horizontal_line.value()) < view._spacing[1]:
+                    continue
+                position = view.view_box.mapViewToScene(QtCore.QPointF(horizontal, vertical))
+                viewport_position = view.plot.mapFromScene(position)
+                widget_position = view.plot.viewport().mapTo(view, viewport_position)
+                if image.rect().contains(widget_position):
+                    return image.pixelColor(widget_position).getRgb()[:3]
+            pytest.fail("No unobscured overlay pixel available")
+
+        for view in viewer.slice_views.values():
+            assert view.noise_overlay_item.isVisible()
+            assert view.noise_overlay_item.zValue() > view.overlay_item.zValue()
+            assert painted_color(view, True) == (255, 0, 0)
+            assert painted_color(view, False) == (0, 255, 0)
+        viewer.slider_noise_overlay_opacity.setValue(50)
+        application.processEvents()
+        for view in viewer.slice_views.values():
+            assert view.noise_overlay_item.opacity() == 0.5
+            red, green, blue = painted_color(view, True)
+            assert 120 <= red <= 135 and 120 <= green <= 135 and blue == 0
+        viewer.set_playback_active(True)
+        ws.current_t = 1
+        viewer.refresh(update_plane=False)
+        for view in viewer.slice_views.values():
+            assert view.noise_overlay_item.isVisible()
+            assert view.noise_overlay_item.opacity() == 0.5
+        viewer.btn_noise_overlay.setChecked(False)
+        assert viewer.slider_noise_overlay_opacity.value() == 0
+        assert all(not view.noise_overlay_item.isVisible() for view in viewer.slice_views.values())
+        viewer.btn_noise_overlay.setChecked(True)
+        assert viewer.slider_noise_overlay_opacity.value() == 50
+        viewer.slider_noise_overlay_opacity.setValue(0)
+        assert not viewer.btn_noise_overlay.isChecked()
+        viewer.btn_noise_overlay.setChecked(True)
+        assert viewer.slider_noise_overlay_opacity.value() == 35
+        ws.pcmra_render_mask = np.ones(ws.mag_raw.shape[:3], dtype=bool)
+        viewer.refresh(update_plane=False)
+        assert all(not view.noise_overlay_item.image[..., 3].any() for view in viewer.slice_views.values())
+        ws.pcmra_render_mask = None
+        viewer.refresh(update_plane=False)
+        assert not viewer.btn_noise_overlay.isEnabled() and not viewer.btn_noise_overlay.isChecked()
+        assert all(not view.noise_overlay_item.isVisible() for view in viewer.slice_views.values())
+    finally:
+        viewer.close()
+        viewer.deleteLater()
+        application.processEvents()
+
+
+@pytest.mark.parametrize("mapper", ["smart", "fixed_point"])
+def test_noise_region_phantom_opacity_does_not_accumulate_with_depth(mapper):
+    from contextlib import closing
+    import pyvista as pv
+    from autoflow.core.models import ObjectKind
+    from autoflow.ui.viewer import SceneController
+
+    pixels = []
+    for depth in (2, 60):
+        ws = Workspace()
+        ws.pcmra_render_mask = np.zeros((5, depth, 5), dtype=bool)
+        uid = ws.add_object("Noise Region", ObjectKind.AUX, "noise_region", visible=True, color="#ff0000", opacity=0.15)
+        errors = []
+        with closing(pv.Plotter(off_screen=True, window_size=(128, 128))) as plotter:
+            plotter.set_background("black")
+            controller = SceneController(plotter, ws, errors.append)
+            controller._volume_mapper_name = lambda: mapper
+            controller.render_all()
+            obj = ws.scene_objects[uid]
+            assert obj.actor is not None
+            assert obj.actor.GetMapper().GetBlendMode() == 1
+            assert obj.actor.GetProperty().GetScalarOpacity(0).GetValue(0.0) == 0.0
+            assert obj.actor.GetProperty().GetScalarOpacity(0).GetValue(1.0) == 0.15
+            plotter.camera_position = [(2.5, -150.0, 2.5), (2.5, 2.5, 2.5), (0.0, 0.0, 1.0)]
+            plotter.enable_parallel_projection()
+            plotter.camera.parallel_scale = 4.0
+            image = plotter.screenshot()
+            pixels.append(image[64, 64])
+            assert 30 <= int(image[64, 64, 0]) <= 45
+            assert not image[64, 64, 1:].any()
+            obj.opacity = 0.05
+            controller.apply_object_properties(obj)
+            assert obj.actor.GetProperty().GetScalarOpacity(0).GetValue(1.0) == 0.05
+            image = plotter.screenshot()
+            assert 8 <= int(image[64, 64, 0]) <= 18
+            ws.pcmra_render_mask = np.ones_like(ws.pcmra_render_mask)
+            controller.readd_object(obj)
+            assert obj.actor is None
+        assert not errors
+    np.testing.assert_allclose(pixels[0], pixels[1], atol=1)
+
+
+def test_correction_phantom_gui_refresh_enables_noise_overlay_and_pcmra_controls(monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtWidgets
+    from unittest.mock import Mock
+    from autoflow.ui.app import MainWindow
+    from autoflow.ui.ortho_viewer import OrthoViewer
+
+    application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    ws = Workspace()
+    ws.mag_raw = np.ones((6, 6, 6, 2), dtype=np.float32)
+    ws.pcmra_render_mask = np.ones(ws.mag_raw.shape[:3], dtype=bool)
+    ws.pcmra_render_mask[:2] = False
+    viewer = OrthoViewer(ws)
+    owner = Mock(workspace=ws, ortho_viewer=viewer, _pipeline_progress_dialog=None)
+    try:
+        MainWindow._finish_pipeline_scene_refresh(owner, [StepId.REMOVE_NOISE, StepId.GENERATE_PCMRA])
+        owner._refresh_render_range_control.assert_called_once()
+        assert viewer.btn_noise_overlay.isChecked()
+        assert viewer.slider_noise_overlay_opacity.value() == 35
+        assert all(view.noise_overlay_item.isVisible() for view in viewer.slice_views.values())
+        volume = SimpleNamespace(data_key="pcmra_volume", scalars="PC-MRA")
+        segmentation = SimpleNamespace(data_key="segmask_raw_surface", scalars="label")
+        noise = SimpleNamespace(data_key="noise_region", scalars="")
+        owner.scene._visible_volume_object.return_value = volume
+        owner._browser_selected_objects.return_value = []
+        assert MainWindow._selected_render_object(owner) is volume
+        owner._browser_selected_objects.return_value = [segmentation, noise]
+        assert MainWindow._selected_render_object(owner) is volume
+        quantitative = SimpleNamespace(data_key="streamlines_live", scalars="Velocity")
+        owner._browser_selected_objects.return_value = [quantitative]
+        assert MainWindow._selected_render_object(owner) is quantitative
+    finally:
+        viewer.close()
+        viewer.deleteLater()
+        application.processEvents()
+
+
+def test_content_menu_only_exposes_available_results_and_keeps_selection(monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtWidgets
+    from autoflow.ui.ortho_viewer import OrthoViewer
+    application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    ws = Workspace()
+    viewer = OrthoViewer(ws)
+    assert viewer._noise_region_overlay(np.ones((2, 2), dtype=bool)) is None
+    viewer._noise_overlay_visible = True
+    overlay = viewer._noise_region_overlay(np.array([[True, False], [False, True]], dtype=bool))
+    np.testing.assert_array_equal(overlay[..., 3], np.array([[255, 0], [0, 255]], dtype=np.uint8))
+    np.testing.assert_array_equal(overlay[..., :3][overlay[..., 3] > 0], np.array([[255, 0, 0], [255, 0, 0]], dtype=np.uint8))
+    def keys():
+        return [viewer.combo_content.itemData(i) for i in range(viewer.combo_content.count())]
+    assert keys() == []
+    ws.mag_raw = np.ones((4, 4, 4, 3), dtype=np.float32)
+    ws.flow_raw = np.ones(ws.mag_raw.shape + (3,), dtype=np.float32)
+    viewer._refresh_content_choices()
+    assert keys() == [0, 1, 2, 3, 5]  # No PC-MRA or uncomputed derived metrics.
+    viewer.combo_content.setCurrentIndex(viewer.combo_content.findData(1))
+    ws.pcmra_array = np.full_like(ws.mag_raw, 4.0)
+    ws.derived.pressure_gradient_array = np.ones_like(ws.flow_raw)
+    viewer._refresh_content_choices()
+    assert viewer.combo_content.currentData() == 1
+    assert keys() == [0, 1, 2, 3, 4, 5, 8, 9, 10, 11]
+    viewer.combo_content.setCurrentIndex(viewer.combo_content.findData(11))
+    volume, title, _ = viewer._get_scalar_slice(0)
+    assert title == "|Pressure Grad| (Pa/m)"
+    np.testing.assert_allclose(volume, np.sqrt(3), rtol=1e-6)
+    ws.derived.pressure_gradient_array = None
+    viewer._refresh_content_choices()
+    assert viewer.combo_content.currentData() == 3
+    assert all(key not in keys() for key in (6, 7, 8, 9, 10, 11, 12, 13, 14, 15))
+    ws.planes = [PlaneData(center=np.zeros(3), normal=np.array([1., 0, 0]), label=1)]
+    viewer.set_selected_plane(0)
+    assert 27 in keys()
+    viewer.set_selected_plane(None)
+    assert 27 not in keys()
+    viewer.close()
+    application.processEvents()
+
+
+def test_derived_plane_cube_reuses_geometry_and_applies_frame_roi(monkeypatch):
+    from autoflow.algorithms import metrics as module
+    shape = (12, 12, 12)
+    mask = np.ones(shape + (2,), dtype=bool)
+    pressure = np.repeat(np.indices(shape)[1][..., None], 2, axis=3).astype(np.float32)
+    plane = PlaneData(center=np.array([5.5, 5.5, 5.5]), normal=np.array([1., 0., 0.]))
+    original = module._build_plane_slice_spec
+    frames = []
+    def counted(*args, **kwargs):
+        frames.append(kwargs.get("frame_index"))
+        return original(*args, **kwargs)
+    monkeypatch.setattr(module, "_build_plane_slice_spec", counted)
+    _, payload = module.summarize_plane_derived_metrics(plane, mask, (1, 1, 1), (0, 0, 0),
+                                                       relative_pressure_array=pressure)
+    assert frames == [0]
+    assert len(payload["timepoints"][1]["relative_pressure_Pa"]) == 144
+    plane.roi_edit_operations = {"1": [{"mode": "replace", "polygon": [[0, 0], [3, 0], [3, 3], [0, 3]]}]}
+    frames.clear()
+    _, payload = module.summarize_plane_derived_metrics(plane, mask, (1, 1, 1), (0, 0, 0),
+                                                       relative_pressure_array=pressure)
+    assert frames == [0, 1]
+    values = payload["timepoints"][1]["relative_pressure_Pa"]
+    assert len(values) == 16
+    assert np.mean(values) == pytest.approx(6.5)
+
+
+@pytest.mark.parametrize("change, expected", [
+    ("identical", "unchanged"), ("temporal", "geometry"),
+    ("topology", "reset"), ("config", "reset"),
+])
+def test_segmentation_cube_retains_only_valid_geometry(change, expected):
+    ws = Workspace()
+    ws.flow_raw = np.zeros((14, 14, 14, 3, 3), dtype=np.float32)
+    ws.segmask_raw = np.zeros((14, 14, 14, 3), dtype=np.int16)
+    ws.segmask_raw[3:11, 3:11, 3:11, :] = 1
+    ws.skeleton_params = SkeletonParams(label_groups={"vessel": {"labels": [1]}},
+        remove_small_cc=False, do_closing=False, do_opening=False, gaussian_enabled=False,
+        dilation_iters=0, erosion_iters=0)
+    engine = PipelineEngine()
+    engine.preprocess(ws)
+    plane = PlaneData(center=np.array([7., 7., 7.]), normal=np.array([1., 0., 0.]),
+                      metrics={"flow": [1., 2., 3.]})
+    ws.planes = [plane]
+    ws.derived.plane_metrics = [dict(plane.metrics)]
+    ws.pipeline.mark_done(StepId.GENERATE_PLANES)
+    ws.pipeline.mark_done(StepId.COMPUTE_PLANE_METRICS)
+    ws.pathline_cache = {0: {0: "old trajectory"}}
+    changed = ws.segmask_raw.copy()
+    if change == "temporal":
+        changed[3, 3:11, 3:11, 0] = 0
+    elif change == "topology":
+        changed[3, 3:11, 3:11, :] = 0
+    elif change == "config":
+        ws.skeleton_params.erosion_iters = 1
+    ws.segmask_raw = changed
+    assert engine.refresh_segmentation_dependents(ws) == expected
+    if expected == "reset":
+        assert ws.planes == []
+        assert not ws.pipeline.is_done(StepId.GENERATE_PLANES)
+    else:
+        assert ws.planes[0] is plane
+        assert ws.pipeline.is_done(StepId.GENERATE_PLANES)
+    if expected == "geometry":
+        assert ws.derived.plane_metrics == []
+        assert ws.pathline_cache == {}
+        assert plane.metrics == {}
+        assert not ws.pipeline.is_done(StepId.COMPUTE_PLANE_METRICS)
+    elif expected == "unchanged":
+        assert ws.derived.plane_metrics == [{"flow": [1., 2., 3.]}]
+
+
+def test_derived_plane_processes_preserve_cube_roi_and_pixelwise_order():
+    from autoflow.algorithms.metrics import augment_plane_metrics_with_derived
+    shape = (12, 12, 12)
+    mask = np.ones(shape + (2,), dtype=bool)
+    pressure = np.repeat(np.indices(shape)[1][..., None], 2, axis=3).astype(np.float32)
+    planes = [
+        PlaneData(center=np.array([5.5, 5.5, 5.5]), normal=np.array([1., 0., 0.])),
+        PlaneData(center=np.array([5.5, 5.5, 5.5]), normal=np.array([0., 0., 1.])),
+    ]
+    planes[0].roi_edit_operations = {"1": [{"mode": "replace", "polygon": [[0, 0], [3, 0], [3, 3], [0, 3]]}]}
+    args = ([{"plane_index": 0}, {"plane_index": 1}], planes, mask, (1, 1, 1), (0, 0, 0))
+    serial = augment_plane_metrics_with_derived(*args, relative_pressure_array=pressure)
+    events = []
+    process = augment_plane_metrics_with_derived(*args, relative_pressure_array=pressure,
+        use_multithread=True, max_workers=2, progress_callback=events.append)
+    def equivalent(left, right):
+        if isinstance(left, dict):
+            assert left.keys() == right.keys()
+            for key in left:
+                equivalent(left[key], right[key])
+        elif isinstance(left, (list, tuple)):
+            assert len(left) == len(right)
+            for a, b in zip(left, right):
+                equivalent(a, b)
+        elif isinstance(left, (np.ndarray, np.number, int, float)):
+            np.testing.assert_allclose(left, right, rtol=1e-6, atol=1e-7, equal_nan=True)
+        else:
+            assert left == right
+    equivalent(serial, process)
+    assert [p["plane_index"] for p in process[1]] == [0, 1]
+    assert events[-1]["current"] == 2
+
+
+def test_streaming_video_cancellation_preserves_existing_mp4(monkeypatch, tmp_path):
+    from autoflow.task_control import CancellationToken, TaskCancelled, task_scope
+    target = tmp_path / "existing.mp4"
+    target.write_bytes(b"previous complete export")
+    token = CancellationToken()
+    closed = []
+    class Writer:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            closed.append(True)
+        def append_data(self, frame):
+            assert frame.shape == (8, 8, 3)
+    def frames():
+        yield np.zeros((8, 8, 3), dtype=np.uint8)
+        token.cancel()
+        yield np.ones((8, 8, 3), dtype=np.uint8)
+    monkeypatch.setattr("autoflow.rendering.videos.imageio.get_writer", lambda *args, **kwargs: Writer())
+    with task_scope(token), pytest.raises(TaskCancelled):
+        _write_video(frames, target)
+    assert target.read_bytes() == b"previous complete export"
+    assert closed == [True]
+    assert not list(tmp_path.glob(".autoflow_video_*"))
+
+
+_qt_smoke_application = None
+
+
+def _smoke_qt_application(monkeypatch):
+    global _qt_smoke_application
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6")
+    from PySide6 import QtWidgets
+    _qt_smoke_application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    return _qt_smoke_application
+
+
+def test_progress_dialog_blocks_other_windows_and_keeps_activity_until_cancel_stops(monkeypatch):
+    app = _smoke_qt_application(monkeypatch)
+    from PySide6 import QtCore, QtGui, QtTest, QtWidgets
+    from autoflow.ui.progress import TaskProgressDialog
+    main = QtWidgets.QWidget()
+    button = QtWidgets.QPushButton("Other operation", main)
+    layout = QtWidgets.QVBoxLayout(main)
+    layout.addWidget(button)
+    operations = []
+    button.clicked.connect(lambda: operations.append("clicked"))
+    shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+R"), main)
+    shortcut.setContext(QtCore.Qt.ApplicationShortcut)
+    shortcut.activated.connect(lambda: operations.append("shortcut"))
+    main.show()
+    dialog = TaskProgressDialog("Processing", "Computing planes", main)
+    dialog.show()
+    try:
+        dialog.update_progress({"current": 1, "total": 4, "detail_current": 3, "detail_total": 20})
+        phase = dialog.activity.phase
+        QtTest.QTest.qWait(240)
+        assert dialog.activity.phase > phase
+        assert dialog.bar.value() == 1 and dialog.detail_bar.value() == 3
+        QtTest.QTest.mouseClick(button, QtCore.Qt.LeftButton)
+        QtTest.QTest.keyClick(main, QtCore.Qt.Key_R, QtCore.Qt.ControlModifier)
+        main.close()
+        assert operations == [] and main.isVisible()
+        QtTest.QTest.keyClick(dialog, QtCore.Qt.Key_Escape)
+        assert dialog.isVisible() and not dialog.cancel_token.cancelled
+        dialog.close()
+        assert dialog.cancel_token.cancelled and dialog.isVisible()
+        QtTest.QTest.mouseClick(button, QtCore.Qt.LeftButton)
+        assert operations == []
+        dialog.finish()
+        app.processEvents()
+        QtTest.QTest.mouseClick(button, QtCore.Qt.LeftButton)
+        assert operations == ["clicked"]
+    finally:
+        dialog.finish()
+        main.close()
+
+
+def test_pipeline_cancel_retains_completed_steps_without_partial_workspace(monkeypatch):
+    _smoke_qt_application(monkeypatch)
+    monkeypatch.setenv("AUTOFLOW_SSH_RENDERING", "1")
+    from autoflow.ui.app import _PipelineTaskWorker
+    from autoflow.core.pipeline import StepResult
+    ws = Workspace()
+    ws.flow_raw = np.zeros((2, 2, 2, 1, 3), dtype=np.float32)
+    worker = None
+    class Engine:
+        def run_step(self, workspace, step, log, progress_callback=None):
+            workspace.flow_raw = np.full_like(workspace.flow_raw, 1 if step == StepId.GENERATE_PCMRA else 2)
+            workspace.pipeline.mark_done(step)
+            if step == StepId.REMOVE_NOISE:
+                worker.cancel_token.cancel()
+            return StepResult(step)
+    worker = _PipelineTaskWorker(Engine(), ws, [StepId.GENERATE_PCMRA, StepId.REMOVE_NOISE])
+    errors = []
+    worker.failed.connect(errors.append)
+    worker.run()
+    assert errors == ["Cancelled"]
+    assert worker.completed_steps == [StepId.GENERATE_PCMRA]
+    assert np.all(ws.flow_raw == 1)
+    assert ws.pipeline.is_done(StepId.GENERATE_PCMRA)
+    assert not ws.pipeline.is_done(StepId.REMOVE_NOISE)
+
+
+def test_cancelled_plane_h5_export_preserves_previous_complete_file(tmp_path):
+    from autoflow.algorithms.metrics import save_plane_pixelwise_h5
+    from autoflow.task_control import CancellationToken, TaskCancelled, task_scope
+    path = tmp_path / "plane_metrics_pixelwise.h5"
+    with h5py.File(path, "w") as saved:
+        saved["completed"] = [123]
+    token = CancellationToken()
+    def payloads():
+        yield {"plane_index": 0, "timepoints": [{"time_index": 0, "relative_pressure_Pa": [1., 2.]}]}
+        token.cancel()
+        yield {"plane_index": 1}
+    with task_scope(token), pytest.raises(TaskCancelled):
+        save_plane_pixelwise_h5(path, payloads())
+    with h5py.File(path) as saved:
+        assert saved["completed"][0] == 123
+        assert "planes" not in saved
+    assert not list(tmp_path.glob(".autoflow_plane_*"))

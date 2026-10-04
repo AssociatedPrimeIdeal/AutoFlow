@@ -318,10 +318,13 @@ class SliceView(QtWidgets.QFrame):
         layout.addWidget(self.plot, 1)
 
         self.image_item = pg.ImageItem(axisOrder="row-major")
+        self.noise_overlay_item = pg.ImageItem(axisOrder="row-major")
         self.overlay_item = pg.ImageItem(axisOrder="row-major")
         self.image_item.setZValue(0)
+        self.noise_overlay_item.setZValue(11)
         self.overlay_item.setZValue(10)
         self.view_box.addItem(self.image_item)
+        self.view_box.addItem(self.noise_overlay_item)
         self.view_box.addItem(self.overlay_item)
         self.contour_items = []
         self.draft_stroke_item = pg.PlotCurveItem(pen=pg.mkPen("#ffd43b", width=2.0))
@@ -526,6 +529,7 @@ class SliceView(QtWidgets.QFrame):
         levels,
         extent=None,
         view_center=None,
+        noise_overlay=None,
     ):
         data = np.asarray(image)
         self._shape = tuple(int(value) for value in data.shape[:2])
@@ -569,6 +573,7 @@ class SliceView(QtWidgets.QFrame):
         self.image_item.setLookupTable(colormap.getLookupTable(nPts=256, alpha=True))
         self.image_item.setRect(rect)
         self.set_overlay(overlay, rect=rect)
+        self.set_noise_overlay(noise_overlay, rect=rect)
 
         self.update_cursor(cursor, fixed_index, levels)
         x0 = self._sample_origin[0]
@@ -589,19 +594,58 @@ class SliceView(QtWidgets.QFrame):
             self.overlay_item.hide()
             return
         if rect is None:
-            rect = QtCore.QRectF(
-                -0.5 * self._spacing[0],
-                -0.5 * self._spacing[1],
-                self._shape[0] * self._spacing[0],
-                self._shape[1] * self._spacing[1],
-            )
+            if self._extent is not None:
+                rect = QtCore.QRectF(
+                    self._extent[0], self._extent[2],
+                    self._extent[1] - self._extent[0],
+                    self._extent[3] - self._extent[2],
+                )
+            else:
+                rect = QtCore.QRectF(
+                    -0.5 * self._spacing[0],
+                    -0.5 * self._spacing[1],
+                    self._shape[0] * self._spacing[0],
+                    self._shape[1] * self._spacing[1],
+                )
         rgba = np.asarray(overlay, dtype=np.uint8)
         self.overlay_item.setImage(np.transpose(rgba, (1, 0, 2)), autoLevels=False)
         self.overlay_item.setOpacity(float(np.max(rgba[..., 3])) / 255.0)
         self.overlay_item.setRect(rect)
         self.overlay_item.show()
 
-    def update_image(self, image: np.ndarray, overlay: np.ndarray | None, cursor, fixed_index: int, levels):
+    def set_noise_overlay(self, overlay: np.ndarray | None, rect=None):
+        if overlay is None:
+            self.noise_overlay_item.clear()
+            self.noise_overlay_item.hide()
+            return
+        if rect is None:
+            if self._extent is not None:
+                rect = QtCore.QRectF(
+                    self._extent[0], self._extent[2],
+                    self._extent[1] - self._extent[0],
+                    self._extent[3] - self._extent[2],
+                )
+            else:
+                rect = QtCore.QRectF(
+                    -0.5 * self._spacing[0],
+                    -0.5 * self._spacing[1],
+                    self._shape[0] * self._spacing[0],
+                    self._shape[1] * self._spacing[1],
+                )
+        rgba = np.asarray(overlay, dtype=np.uint8)
+        self.noise_overlay_item.setImage(np.transpose(rgba, (1, 0, 2)), autoLevels=False)
+        self.noise_overlay_item.setRect(rect)
+        self.noise_overlay_item.show()
+
+    def update_image(
+        self,
+        image: np.ndarray,
+        overlay: np.ndarray | None,
+        cursor,
+        fixed_index: int,
+        levels,
+        noise_overlay=None,
+    ):
         """Replace pixels during playback without rebuilding static presentation."""
         self.image_item.setImage(np.asarray(image).T, autoLevels=False, levels=levels)
         if overlay is None:
@@ -612,6 +656,7 @@ class SliceView(QtWidgets.QFrame):
             self.overlay_item.setImage(np.transpose(rgba, (1, 0, 2)), autoLevels=False)
             self.overlay_item.setOpacity(float(np.max(rgba[..., 3])) / 255.0)
             self.overlay_item.show()
+        self.set_noise_overlay(noise_overlay)
         self.update_cursor(cursor, fixed_index, levels)
 
     def update_cursor(self, cursor, fixed_index: int, levels=None):
@@ -632,6 +677,8 @@ class SliceView(QtWidgets.QFrame):
 
     def clear(self):
         self.image_item.clear()
+        self.noise_overlay_item.clear()
+        self.noise_overlay_item.hide()
         self.overlay_item.clear()
         self.overlay_item.hide()
         self.plane_line.hide()

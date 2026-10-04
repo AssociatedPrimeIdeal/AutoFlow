@@ -3,9 +3,10 @@ import os
 import h5py
 import numpy as np
 import pyvista as pv
+from ..task_control import TaskCancelled, check_cancelled, current_cancellation_token, report_progress, task_scope
 from scipy.ndimage import binary_erosion, gaussian_filter, generate_binary_structure, label
-from scipy.sparse import csc_matrix, csr_matrix, diags
-from scipy.sparse.linalg import cg, factorized
+from scipy.sparse import bmat, csc_matrix, csr_matrix, diags
+from scipy.sparse.linalg import LinearOperator, cg, factorized, minres, spsolve
 
 try:
     import pyamg
@@ -303,6 +304,7 @@ def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes
     results = []
     total_planes = len(planes)
     for plane_index, plane in enumerate(planes, start=1):
+        check_cancelled()
         target_label = None
         if branch_labels_3d is not None:
             target_label = int(getattr(plane, "label", 0) or 0)
@@ -431,12 +433,18 @@ def _add_labeled_plane_support_meshes(cache, mask4d, labels4d, planes, spacing, 
         if int(getattr(plane, "segmentation_label", 0) or 0) > 0
     })
     for label in requested:
+        representatives = {}
         for tidx in range(int(mask.shape[3])):
             label_t = 0 if labels_was_3d else min(int(tidx), int(labels.shape[3]) - 1)
-            cache[("seg4d", int(tidx), int(label))] = _build_plane_support_mesh(
-                mask[..., tidx] & (labels[..., label_t] == int(label)), spacing, origin
-            )
+            label_mask = mask[..., tidx] & (labels[..., label_t] == int(label))
+            token = label_mask.tobytes()
+            rep_t = representatives.setdefault(token, int(tidx))
+            mesh_key = ("seg4d", rep_t, int(label))
+            if mesh_key not in cache:
+                cache[mesh_key] = _build_plane_support_mesh(label_mask, spacing, origin)
+            cache[("seg4d", int(tidx), int(label))] = cache[mesh_key]
             cache[("seg3d", int(tidx), int(label))] = cache[("seg4d", int(tidx), int(label))]
+            cache[("seg_phase", int(tidx), int(label))] = rep_t
 
 
 def filter_planes_by_branch_support(
@@ -577,7 +585,7 @@ def _build_plane_slice_region(
     frame_index=0,
 ):
     mask_xyz = np.asarray(mask_xyz, dtype=bool)
-    if not np.any(mask_xyz):
+    if support_mesh is None and not np.any(mask_xyz):
         return None
     operations = list((getattr(plane, "roi_edit_operations", {}) or {}).get(str(int(frame_index)), []) or [])
     replacement_polygon = None
@@ -985,7 +993,7 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
             rep_t = int(mask_phase_lookup[tidx])
             slice_spec = _get_cached_plane_slice_spec(
                 slice_cache,
-                (rep_t, tidx),
+                (rep_t, tidx) if getattr(plane, "roi_edit_operations", {}) else rep_t,
                 mask4d[..., rep_t],
                 plane,
                 spacing,
@@ -994,6 +1002,7 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
                 target_label=target_label,
                 select_connected=False,
                 support_mesh=support_mesh_cache.get(rep_t) if support_mesh_cache is not None else None,
+                frame_index=tidx,
             )
 
         if has_tke and slice_spec is not None:
@@ -1132,9 +1141,9 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
     return summary, pixelwise
 
 
-def augment_plane_metrics_with_derived(plane_metrics, planes, mask4d, spacing, origin, branch_labels_3d=None,
-                                       tke_array=None, pressure_gradient_array=None,
-                                       relative_pressure_array=None, wss_surfaces=None):
+def _augment_plane_metrics_serial(plane_metrics, planes, mask4d, spacing, origin, branch_labels_3d=None,
+                                 tke_array=None, pressure_gradient_array=None,
+                                 relative_pressure_array=None, wss_surfaces=None, progress_callback=None):
     mask4d = _ensure_mask4d(mask4d)
     shared_branch_grid = _build_branch_grid(branch_labels_3d, spacing, origin)
     mask_phase_lookup = _build_mask_phase_lookup(mask4d)
@@ -1142,6 +1151,7 @@ def augment_plane_metrics_with_derived(plane_metrics, planes, mask4d, spacing, o
     metrics = [dict(m) for m in plane_metrics]
     pixelwise = []
     for idx, metric in enumerate(metrics):
+        check_cancelled()
         if idx >= len(planes):
             pixelwise.append({"plane_index": int(idx), "timepoints": []})
             continue
@@ -1161,10 +1171,86 @@ def augment_plane_metrics_with_derived(plane_metrics, planes, mask4d, spacing, o
         payload["label"] = int(getattr(planes[idx], "label", 0) or 0)
         payload["path_index"] = int(getattr(planes[idx], "path_index", -1))
         pixelwise.append(payload)
+        if progress_callback is not None:
+            progress_callback({"stage": "plane_derived", "current": idx + 1, "total": len(metrics),
+                               "message": f"Sampled derived plane metrics ({idx + 1}/{len(metrics)})"})
     return metrics, pixelwise
 
 
+def _augment_plane_metrics_chunk(indexed_metrics, planes, mask4d, spacing, origin, branch_labels_3d,
+                                 tke_array, pressure_gradient_array, relative_pressure_array, wss_surfaces,
+                                 progress_path):
+    indices = [index for index, _metric in indexed_metrics]
+    local_planes = [planes[index] for index in indices]
+    with task_scope(_PlaneProcessToken(progress_path)):
+        metrics, payloads = _augment_plane_metrics_serial(
+            [metric for _index, metric in indexed_metrics], local_planes, mask4d, spacing, origin,
+            branch_labels_3d, tke_array, pressure_gradient_array, relative_pressure_array, wss_surfaces,
+            progress_callback=lambda _payload: _mark_plane_process_progress(progress_path),
+        )
+    for index, payload in zip(indices, payloads):
+        payload["plane_index"] = int(index)
+    return list(zip(indices, metrics, payloads))
+
+
+def augment_plane_metrics_with_derived(plane_metrics, planes, mask4d, spacing, origin, branch_labels_3d=None,
+                                       tke_array=None, pressure_gradient_array=None,
+                                       relative_pressure_array=None, wss_surfaces=None, *,
+                                       use_multithread=False, max_workers=None, progress_callback=None):
+    mask4d = _ensure_mask4d(mask4d)
+    count = min(len(plane_metrics), len(planes))
+    if max_workers is None:
+        max_workers = min(4, count, max(1, os.cpu_count() or 1)) if use_multithread and count * mask4d.shape[3] >= 1920 else 1
+    if int(max_workers) <= 1 or count != len(plane_metrics):
+        return _augment_plane_metrics_serial(
+            plane_metrics, planes, mask4d, spacing, origin, branch_labels_3d,
+            tke_array, pressure_gradient_array, relative_pressure_array, wss_surfaces, progress_callback,
+        )
+    import tempfile
+    from joblib import Parallel, delayed
+    workers = min(int(max_workers), count)
+    indexed = list(enumerate(plane_metrics))
+    with tempfile.TemporaryDirectory(prefix="autoflow_plane_derived_") as progress_dir:
+        progress_path = os.path.join(progress_dir, "progress.log")
+        open(progress_path, "ab").close()
+        def calculate():
+            return Parallel(n_jobs=workers, backend="loky", max_nbytes="10M", mmap_mode="r")(
+                delayed(_augment_plane_metrics_chunk)(
+                    indexed[offset::workers], planes, mask4d, spacing, origin, branch_labels_3d,
+                    tke_array, pressure_gradient_array, relative_pressure_array, wss_surfaces, progress_path,
+                ) for offset in range(workers)
+            )
+        chunks = _wait_plane_processes(calculate, progress_path, count, progress_callback, stage="plane_derived")
+    metrics = [None] * count
+    payloads = [None] * count
+    for chunk in chunks:
+        for index, metric, payload in chunk:
+            metrics[index] = metric
+            payloads[index] = payload
+    return metrics, payloads
+
+
 def save_plane_pixelwise_h5(path, plane_payloads, rr_ms=None, source_format=""):
+    """Publish a complete file, preserving the previous export on cancellation."""
+    import uuid
+    import stat
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    temporary = os.path.join(directory, f".autoflow_plane_{uuid.uuid4().hex}.h5")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    os.close(fd)
+    try:
+        _write_plane_pixelwise_h5(temporary, plane_payloads, rr_ms, source_format)
+        check_cancelled()
+        if os.path.isfile(path):
+            os.chmod(temporary, stat.S_IMODE(os.stat(path).st_mode))
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+
+
+def _write_plane_pixelwise_h5(path, plane_payloads, rr_ms=None, source_format=""):
     with h5py.File(path, "w") as h5:
         meta = h5.create_group("meta")
         meta.create_dataset("version", data=np.bytes_("1.0"))
@@ -1172,7 +1258,10 @@ def save_plane_pixelwise_h5(path, plane_payloads, rr_ms=None, source_format=""):
         if rr_ms is not None:
             meta.create_dataset("rr_ms", data=float(rr_ms))
         planes_group = h5.create_group("planes")
-        for payload in plane_payloads:
+        for export_index, payload in enumerate(plane_payloads):
+            report_progress({"stage": "plane_pixelwise_export", "current": export_index,
+                             "total": len(plane_payloads) if hasattr(plane_payloads, "__len__") else 0,
+                             "message": f"Writing pixelwise plane {export_index + 1}"})
             plane_idx = int(payload.get("plane_index", len(planes_group)))
             grp = planes_group.create_group(f"{plane_idx:03d}")
             grp.create_dataset("center_xyz", data=np.asarray(payload.get("center", [0.0, 0.0, 0.0]), dtype=np.float32))
@@ -1261,6 +1350,8 @@ def compute_wss_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
     support_cache = {}
     surfs = []
     for showt in range(int(mask4d.shape[-1])):
+        report_progress({"stage": "wss", "current": showt, "total": mask4d.shape[3],
+                         "message": f"Computing WSS phase {showt + 1}/{mask4d.shape[3]}"})
         rep_t = int(mask_phase_lookup[showt])
         if rep_t not in surface_cache:
             support_cache[rep_t] = create_uniform_grid(
@@ -1331,11 +1422,14 @@ def _finite_percentile_abs(values, q, default=0.0):
 
 
 def _normalize_pressure_method(method):
-    token = str(method or "least_squares").strip().lower()
-    if token in {"ls", "least_squares", "least-squares", "least squares"}:
-        return "least_squares"
-    if token in {"ppe", "poisson", "poisson_pressure_equation"}:
+    token = str(method or "ppe").strip().lower()
+    if token in {
+        "ls", "least_squares", "least-squares", "least squares",
+        "ppe", "poisson", "poisson_pressure_equation",
+    }:
         return "ppe"
+    if token in {"ste", "stokes", "stokes_estimator", "stokes-estimator"}:
+        return "ste"
     raise ValueError(f"unsupported pressure reconstruction method: {method}")
 
 
@@ -1407,7 +1501,7 @@ def _solve_reconstruction_system(system, rhs, *, tol=1e-5, max_iter=2000):
     return sol.astype(np.float32)
 
 
-def _build_least_squares_system(mask_t, spacing_m):
+def _build_pressure_reconstruction_system(mask_t, spacing_m):
     coords = np.argwhere(mask_t)
     n = int(len(coords))
     if n == 0:
@@ -1474,18 +1568,7 @@ def _build_least_squares_system(mask_t, spacing_m):
     }
 
 
-def _build_ppe_system(mask_t, spacing_m):
-    """Finite-volume negative Laplacian with gradient boundary fluxes.
-
-    On this Cartesian grid its matrix equals the edge-gradient LS normal
-    matrix. Use the same gauge elimination and construct the RHS as fluxes.
-    """
-    system = _build_least_squares_system(mask_t, spacing_m)
-    system.pop("rhs_operator", None)
-    return system
-
-
-def _least_squares_rhs(grad_t, system):
+def _pressure_reconstruction_rhs(grad_t, system):
     edge_pairs = system["edge_pairs"]
     if edge_pairs.size == 0:
         return np.zeros(0, dtype=np.float64)
@@ -1500,19 +1583,248 @@ def _least_squares_rhs(grad_t, system):
                   + np.asarray(grad_t[dst[:, 0], dst[:, 1], dst[:, 2], edge_axes], dtype=np.float64))
 
 
+def _build_least_squares_system(mask_t, spacing_m):
+    """Backward-compatible name for the merged Cartesian PPE system."""
+    return _build_pressure_reconstruction_system(mask_t, spacing_m)
+
+
+def _build_ppe_system(mask_t, spacing_m):
+    """Backward-compatible name for the merged Cartesian PPE system."""
+    system = _build_pressure_reconstruction_system(mask_t, spacing_m)
+    system.pop("rhs_operator", None)
+    return system
+
+
+def _least_squares_rhs(grad_t, system):
+    """Backward-compatible name for the merged pressure RHS."""
+    return _pressure_reconstruction_rhs(grad_t, system)
+
+
 def _ppe_rhs(grad_t, mask_t, spacing_m, system):
+    """Backward-compatible name for the merged pressure RHS."""
     rhs = np.zeros(system["matrix"].shape[0], dtype=np.float64)
     pairs = system["edge_pairs"]
     if pairs.size:
-        flux = _least_squares_rhs(grad_t, system) * system["edge_scales"]
+        flux = _pressure_reconstruction_rhs(grad_t, system) * system["edge_scales"]
         np.add.at(rhs, pairs[:, 0], -flux)
         np.add.at(rhs, pairs[:, 1], flux)
-    # Boundary rows retain the matching normal-gradient contribution instead
-    # of implicitly imposing zero Neumann data and losing constant gradients.
     return rhs
 
 
-def reconstruct_relative_pressure_map(pressure_gradient_array, support_mask, spacing, *, method="least_squares"):
+def _build_ste_mac_system(mask_t, spacing_m):
+    """Build a staggered-grid Stokes estimator system.
+
+    The pressure is cell-centred and the auxiliary velocity is face-centred.
+    Interior faces carry unknown velocities; faces on the support boundary
+    are zero (no-slip). This MAC layout avoids the checkerboard pressure
+    modes that occur when all variables are collocated on voxel centres.
+    """
+    mask_t = np.asarray(mask_t, dtype=bool)
+    coords = np.argwhere(mask_t)
+    n_cells = int(len(coords))
+    if n_cells == 0:
+        return {
+            "coords": coords,
+            "matrix": csr_matrix((0, 0), dtype=np.float64),
+            "face_count": 0,
+            "pressure_indices": np.zeros(0, dtype=np.int32),
+            "pressure_count": 0,
+            "fallback": True,
+        }
+
+    spacing_m = tuple(float(value) for value in spacing_m)
+    cell_index = -np.ones(mask_t.shape, dtype=np.int32)
+    cell_index[mask_t] = np.arange(n_cells, dtype=np.int32)
+    face_maps = []
+    face_low = []
+    face_high = []
+    face_axis = []
+    face_offsets = []
+    face_count = 0
+    for axis in range(3):
+        low_slices = [slice(None), slice(None), slice(None)]
+        high_slices = [slice(None), slice(None), slice(None)]
+        low_slices[axis] = slice(0, -1)
+        high_slices[axis] = slice(1, None)
+        low_slices = tuple(low_slices)
+        high_slices = tuple(high_slices)
+        adjacent = mask_t[low_slices] & mask_t[high_slices]
+        low_coords = np.argwhere(adjacent)
+        local_count = int(len(low_coords))
+        face_map = -np.ones(mask_t.shape, dtype=np.int32)
+        if local_count:
+            face_map[tuple(low_coords.T)] = np.arange(local_count, dtype=np.int32)
+            high_coords = low_coords.copy()
+            high_coords[:, axis] += 1
+            face_low.append(low_coords)
+            face_high.append(high_coords)
+            face_axis.append(np.full(local_count, axis, dtype=np.int8))
+        else:
+            face_low.append(np.zeros((0, 3), dtype=np.int32))
+            face_high.append(np.zeros((0, 3), dtype=np.int32))
+            face_axis.append(np.zeros(0, dtype=np.int8))
+        face_maps.append(face_map)
+        face_offsets.append(face_count)
+        face_count += local_count
+
+    if face_count == 0:
+        return {
+            "coords": coords,
+            "matrix": csr_matrix((0, 0), dtype=np.float64),
+            "face_count": 0,
+            "pressure_indices": np.zeros(0, dtype=np.int32),
+            "pressure_count": 0,
+            "fallback": True,
+        }
+
+    all_low = np.concatenate(face_low, axis=0)
+    all_high = np.concatenate(face_high, axis=0)
+    all_axis = np.concatenate(face_axis, axis=0)
+    matrix_rows = []
+    matrix_cols = []
+    matrix_data = []
+    diagonal = 2.0 * sum(1.0 / (step * step) for step in spacing_m)
+    for axis in range(3):
+        low_coords = face_low[axis]
+        offset = int(face_offsets[axis])
+        face_map = face_maps[axis]
+        for local_id, low_coord in enumerate(low_coords):
+            row = offset + int(local_id)
+            matrix_rows.append(row)
+            matrix_cols.append(row)
+            matrix_data.append(diagonal)
+            for direction, step in enumerate(spacing_m):
+                for sign in (-1, 1):
+                    neighbour = low_coord.copy()
+                    neighbour[direction] += sign
+                    if np.any(neighbour < 0) or np.any(neighbour >= np.asarray(mask_t.shape)):
+                        continue
+                    neighbour_id = int(face_map[tuple(neighbour)])
+                    if neighbour_id >= 0:
+                        matrix_rows.append(row)
+                        matrix_cols.append(offset + neighbour_id)
+                        matrix_data.append(-1.0 / (step * step))
+    velocity_laplacian = csr_matrix(
+        (matrix_data, (matrix_rows, matrix_cols)),
+        shape=(face_count, face_count),
+        dtype=np.float64,
+    )
+
+    div_rows = []
+    div_cols = []
+    div_data = []
+    for face_id, (low_coord, high_coord, axis) in enumerate(zip(all_low, all_high, all_axis)):
+        scale = 1.0 / spacing_m[int(axis)]
+        low_id = int(cell_index[tuple(low_coord)])
+        high_id = int(cell_index[tuple(high_coord)])
+        div_rows.extend((low_id, high_id))
+        div_cols.extend((face_id, face_id))
+        div_data.extend((scale, -scale))
+    divergence = csr_matrix(
+        (div_data, (div_rows, div_cols)),
+        shape=(n_cells, face_count),
+        dtype=np.float64,
+    )
+
+    components, count = label(mask_t, structure=generate_binary_structure(3, 1))
+    component_ids = components[mask_t] - 1
+    anchors = np.full(count, n_cells, dtype=np.int32)
+    np.minimum.at(anchors, component_ids, np.arange(n_cells, dtype=np.int32))
+    pressure_keep = np.ones(n_cells, dtype=bool)
+    pressure_keep[anchors] = False
+    reduced_divergence = divergence[pressure_keep, :].tocsr()
+    matrix = bmat(
+        [[velocity_laplacian, reduced_divergence.T],
+         [reduced_divergence, None]],
+        format="csr",
+    )
+    diagonal_values = np.abs(np.asarray(matrix.diagonal(), dtype=np.float64))
+    diagonal_values[diagonal_values < 1e-8] = 1.0
+    return {
+        "coords": coords,
+        "matrix": matrix,
+        "preconditioner": diags(1.0 / diagonal_values, format="csr"),
+        "face_count": face_count,
+        "pressure_indices": np.flatnonzero(pressure_keep).astype(np.int32),
+        "pressure_count": int(np.sum(pressure_keep)),
+        "anchors": anchors,
+        "face_low": all_low,
+        "face_high": all_high,
+        "face_axis": all_axis,
+        "fallback": False,
+    }
+
+
+def _solve_ste_mac_pressure(grad_t, system):
+    if system.get("fallback", False):
+        return np.zeros(len(system.get("coords", [])), dtype=np.float32)
+    face_low = system["face_low"]
+    face_high = system["face_high"]
+    face_axis = system["face_axis"]
+    rhs = np.zeros(system["matrix"].shape[0], dtype=np.float64)
+    if len(face_low):
+        low_values = np.asarray(grad_t[tuple(face_low.T)], dtype=np.float64)
+        high_values = np.asarray(grad_t[tuple(face_high.T)], dtype=np.float64)
+        rhs[: system["face_count"]] = 0.5 * (
+            low_values[np.arange(len(face_axis)), face_axis]
+            + high_values[np.arange(len(face_axis)), face_axis]
+        )
+
+    matrix = system["matrix"]
+    solution = None
+    if matrix.shape[0] <= 12000:
+        try:
+            candidate = np.asarray(spsolve(matrix.tocsc(), rhs), dtype=np.float64)
+            if np.all(np.isfinite(candidate)):
+                solution = candidate
+        except Exception:
+            solution = None
+    if solution is None:
+        preconditioner = system.get("iterative_preconditioner")
+        if preconditioner is None:
+            preconditioner = system["preconditioner"]
+            if pyamg is not None and system["face_count"] > 0:
+                try:
+                    velocity_matrix = matrix[: system["face_count"], : system["face_count"]].tocsr()
+                    hierarchy = pyamg.smoothed_aggregation_solver(velocity_matrix, max_coarse=50)
+
+                    def apply_preconditioner(vector):
+                        result = np.zeros_like(vector, dtype=np.float64)
+                        result[: system["face_count"]] = hierarchy.solve(
+                            vector[: system["face_count"]],
+                            tol=1e-6,
+                            maxiter=5,
+                            cycle="V",
+                        )
+                        result[system["face_count"]:] = vector[system["face_count"]:]
+                        return result
+
+                    preconditioner = LinearOperator(
+                        matrix.shape,
+                        matvec=apply_preconditioner,
+                        dtype=np.float64,
+                    )
+                except Exception:
+                    preconditioner = system["preconditioner"]
+            system["iterative_preconditioner"] = preconditioner
+        solution, info = minres(
+            matrix,
+            rhs,
+            M=preconditioner,
+            maxiter=10000,
+            rtol=1e-8,
+        )
+        solution = np.asarray(solution, dtype=np.float64)
+        residual = np.linalg.norm(matrix @ solution - rhs) / max(np.linalg.norm(rhs), 1.0)
+        if info != 0 or not np.all(np.isfinite(solution)) or not np.isfinite(residual) or residual > 1e-4:
+            raise RuntimeError(f"Stokes pressure solve failed to converge: info={info}, residual={residual:.3g}")
+
+    pressure = np.zeros(len(system["coords"]), dtype=np.float32)
+    pressure[system["pressure_indices"]] = -solution[system["face_count"]:].astype(np.float32)
+    return pressure
+
+
+def reconstruct_relative_pressure_map(pressure_gradient_array, support_mask, spacing, *, method="ppe"):
     method = _normalize_pressure_method(method)
     grad = np.asarray(pressure_gradient_array, dtype=np.float32)
     if grad.ndim != 5 or grad.shape[-1] != 3:
@@ -1532,24 +1844,25 @@ def reconstruct_relative_pressure_map(pressure_gradient_array, support_mask, spa
 
     system_cache = {}
     for tidx in range(nt):
+        report_progress({"stage": "relative_pressure", "current": tidx, "total": nt,
+                         "message": f"Reconstructing relative pressure phase {tidx + 1}/{nt}"})
         mask_t = support[..., tidx]
         if not np.any(mask_t):
             continue
         cache_key = mask_t.tobytes()
-        if method == "least_squares":
+        if method == "ste":
             system = system_cache.get(cache_key)
             if system is None:
-                system = _build_least_squares_system(mask_t, (dx, dy, dz))
+                system = _build_ste_mac_system(mask_t, (dx, dy, dz))
                 system_cache[cache_key] = system
-            rhs_rows = _least_squares_rhs(grad[..., tidx, :], system)
-            rhs = system["rhs_operator"] @ rhs_rows
-            sol = _solve_reconstruction_system(system, rhs)
+            sol = _solve_ste_mac_pressure(grad[..., tidx, :], system)
         else:
             system = system_cache.get(cache_key)
             if system is None:
-                system = _build_ppe_system(mask_t, (dx, dy, dz))
+                system = _build_pressure_reconstruction_system(mask_t, (dx, dy, dz))
                 system_cache[cache_key] = system
-            rhs = _ppe_rhs(grad[..., tidx, :], mask_t, (dx, dy, dz), system)
+            rhs_rows = _pressure_reconstruction_rhs(grad[..., tidx, :], system)
+            rhs = system["rhs_operator"] @ rhs_rows
             sol = _solve_reconstruction_system(system, rhs)
 
         pressure_t = np.zeros(mask_t.shape, dtype=np.float32)
@@ -1828,7 +2141,7 @@ def compute_vortex_metrics(mask4d, flow, spacing, *, smoothing_sigma=0.0,
 
 def compute_pressure_gradient_metrics(mask4d, flow, spacing, rr, rho=1060.0, viscosity=4.0,
                                       smoothing_sigma=0.0, support_erosion_iters=1, use_convective_acceleration=True,
-                                      pressure_method="least_squares", centerline_paths=None,
+                                      pressure_method="ppe", centerline_paths=None,
                                       origin=(0, 0, 0)):
     mask4d = _ensure_mask4d(mask4d)
     flow = np.asarray(flow, dtype=np.float32)
@@ -2016,7 +2329,7 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
                             pressure_gradient_viscosity=None,
                             vortex_smoothing_sigma=0.0,
                             vortex_support_erosion_iters=1,
-                            pressure_method="least_squares",
+                            pressure_method="ppe",
                             centerline_paths=None):
     mask4d = _ensure_mask4d(mask4d)
     wss_smoothing_iteration = smoothing_iteration if wss_smoothing_iteration is None else wss_smoothing_iteration
@@ -2159,23 +2472,37 @@ def _compute_single_plane_metric(args):
     labels3d_arr = None if segmentation_labels_3d is None else np.asarray(segmentation_labels_3d)
 
     for t in range(Nt):
+        check_cancelled()
         rep_t = int(mask_phase_lookup[t]) if mask_phase_lookup else int(t)
         mask_t = mask_template if mask_template is not None else mask[..., rep_t]
         plane_seg_label = int(getattr(plane, "segmentation_label", 0) or 0)
         mask_t = np.asarray(mask_t, dtype=bool)
+        label_support = None
+        if plane_seg_label > 0 and support_mesh_cache is not None:
+            label_support = support_mesh_cache.get(
+                ("seg4d", int(t), plane_seg_label) if segmentation_labels_4d is not None
+                else ("seg3d", rep_t, plane_seg_label)
+            )
         if plane_seg_label > 0:
             # Prefer phase-specific labels when available, while retaining
             # the legacy 3-D label behavior for older workspaces and H5
             # inputs that do not carry a 4-D label sequence.
             if labels4d_arr is not None and labels4d_arr.ndim == 4 and labels4d_arr.shape[:3] == mask_t.shape[:3]:
-                mask_t = mask_t & (labels4d_arr[..., int(t)] == plane_seg_label)
+                if label_support is None:
+                    mask_t = mask_t & (labels4d_arr[..., int(t)] == plane_seg_label)
             elif labels3d_arr is not None:
                 labels3d = labels3d_arr[..., 0] if labels3d_arr.ndim == 4 else labels3d_arr
-                if labels3d.shape == mask_t.shape[:3]:
+                if labels3d.shape == mask_t.shape[:3] and label_support is None:
                     mask_t = mask_t & (labels3d == plane_seg_label)
         frame_specific_roi = bool(getattr(plane, "roi_edit_operations", {}) or {})
         frame_specific_labels = plane_seg_label > 0 and segmentation_labels_4d is not None
-        slice_cache_key = (rep_t, t) if (frame_specific_roi or frame_specific_labels) else rep_t
+        label_phase = (
+            support_mesh_cache.get(("seg_phase", int(t), plane_seg_label), t)
+            if support_mesh_cache is not None else t
+        )
+        slice_cache_key = (rep_t, t) if frame_specific_roi else (
+            (rep_t, label_phase) if frame_specific_labels else rep_t
+        )
         slice_spec = _get_cached_plane_slice_spec(
             slice_cache,
             slice_cache_key,
@@ -2187,11 +2514,7 @@ def _compute_single_plane_metric(args):
             target_label=target_label,
             select_connected=True,
             support_mesh=(
-                (
-                    support_mesh_cache.get(("seg4d", int(t), plane_seg_label))
-                    if segmentation_labels_4d is not None
-                    else support_mesh_cache.get(("seg3d", rep_t, plane_seg_label))
-                )
+                label_support
                 if plane_seg_label > 0 and support_mesh_cache is not None
                 else (support_mesh_cache.get(rep_t) if support_mesh_cache is not None else None)
             ),
@@ -2311,6 +2634,67 @@ def _compute_single_plane_metric(args):
     return metric
 
 
+class _PlaneProcessToken:
+    def __init__(self, progress_path):
+        self.path = f"{progress_path}.cancel" if progress_path else ""
+
+    def check(self):
+        if self.path and os.path.exists(self.path):
+            raise TaskCancelled("Cancelled by user")
+
+
+def _mark_plane_process_progress(progress_path):
+    check_cancelled()
+    if progress_path:
+        fd = os.open(progress_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, b"1\n")
+        finally:
+            os.close(fd)
+
+
+def _wait_plane_processes(calculate, progress_path, total, progress_callback, *, stage="plane_metric"):
+    if progress_callback is None and current_cancellation_token() is None:
+        return calculate()
+    import threading
+    state = {"result": None, "error": None}
+    def run():
+        try:
+            state["result"] = calculate()
+        except BaseException as exc:
+            state["error"] = exc
+    runner = threading.Thread(target=run, name="autoflow-plane-processes")
+    runner.start()
+    offset = completed = 0
+    def update():
+        nonlocal offset, completed
+        with open(progress_path, "rb") as handle:
+            handle.seek(offset)
+            events = handle.readlines()
+            offset = handle.tell()
+        if events:
+            completed += len(events)
+            if progress_callback is not None:
+                progress_callback({"stage": stage, "current": completed, "total": total,
+                                   "message": f"{'Sampled derived' if stage == 'plane_derived' else 'Calculated'} plane metrics ({completed}/{total})"})
+    try:
+        while runner.is_alive():
+            check_cancelled()
+            update()
+            runner.join(timeout=0.05)
+        check_cancelled()
+        update()
+        if state["error"] is not None:
+            raise state["error"]
+        return state["result"]
+    except BaseException:
+        # Workers observe this marker at phase/plane boundaries. Join before
+        # deleting shared files or unlocking the workspace.
+        open(f"{progress_path}.cancel", "ab").close()
+        runner.join()
+        raise
+
+
 def _compute_plane_metrics_process_chunk(
     indexed_planes, flow, mask, spacing, origin, RR, branch_labels_3d,
     path_info, paths, segmentation_labels_3d, segmentation_labels_4d,
@@ -2320,26 +2704,21 @@ def _compute_plane_metrics_process_chunk(
     planes = [plane for _index, plane in indexed_planes]
 
     def _mark_progress(_payload):
-        if not progress_path:
-            return
-        fd = os.open(progress_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            os.write(fd, b"1\n")
-        finally:
-            os.close(fd)
+        _mark_plane_process_progress(progress_path)
 
-    metrics = compute_plane_metrics(
-        flow, mask, spacing, origin, planes,
-        RR=RR,
-        branch_labels_3d=branch_labels_3d,
-        path_info=path_info,
-        forks=None,
-        paths=paths,
-        return_qc=False,
-        segmentation_labels_3d=segmentation_labels_3d,
-        segmentation_labels_4d=segmentation_labels_4d,
-        progress_callback=_mark_progress if progress_path else None,
-    )
+    with task_scope(_PlaneProcessToken(progress_path)):
+        metrics = compute_plane_metrics(
+            flow, mask, spacing, origin, planes,
+            RR=RR,
+            branch_labels_3d=branch_labels_3d,
+            path_info=path_info,
+            forks=None,
+            paths=paths,
+            return_qc=False,
+            segmentation_labels_3d=segmentation_labels_3d,
+            segmentation_labels_4d=segmentation_labels_4d,
+            progress_callback=_mark_progress if progress_path else None,
+        )
     return list(zip(indices, metrics))
 
 
@@ -2349,84 +2728,26 @@ def _run_plane_metric_processes(
     progress_callback,
 ):
     import tempfile
-    import threading
-    import time
     from joblib import Parallel, delayed
-
     worker_count = max(1, min(int(max_workers), len(planes)))
-    chunks = [list(enumerate(planes))[offset::worker_count] for offset in range(worker_count)]
-    progress_dir = tempfile.TemporaryDirectory(prefix="autoflow_plane_metrics_")
-    progress_path = os.path.join(progress_dir.name, "progress.log") if progress_callback is not None else ""
-    if progress_path:
+    indexed = list(enumerate(planes))
+    chunks = [indexed[offset::worker_count] for offset in range(worker_count)]
+    with tempfile.TemporaryDirectory(prefix="autoflow_plane_metrics_") as progress_dir:
+        progress_path = os.path.join(progress_dir, "progress.log")
         open(progress_path, "ab").close()
-
-    def _calculate():
-        return Parallel(
-            n_jobs=worker_count,
-            backend="loky",
-            max_nbytes="10M",
-            mmap_mode="r",
-        )(
-            delayed(_compute_plane_metrics_process_chunk)(
-                chunk, flow, mask, spacing, origin, RR, branch_labels_3d,
-                path_info, paths, segmentation_labels_3d, segmentation_labels_4d,
-                progress_path,
+        def calculate():
+            return Parallel(n_jobs=worker_count, backend="loky", max_nbytes="10M", mmap_mode="r")(
+                delayed(_compute_plane_metrics_process_chunk)(
+                    chunk, flow, mask, spacing, origin, RR, branch_labels_3d,
+                    path_info, paths, segmentation_labels_3d, segmentation_labels_4d, progress_path,
+                ) for chunk in chunks if chunk
             )
-            for chunk in chunks if chunk
-        )
-
-    completed = 0
-    try:
-        if progress_callback is None:
-            chunk_results = _calculate()
-        else:
-            state = {"result": None, "error": None}
-
-            def _target():
-                try:
-                    state["result"] = _calculate()
-                except BaseException as exc:
-                    state["error"] = exc
-
-            runner = threading.Thread(target=_target, name="autoflow-plane-processes", daemon=True)
-            runner.start()
-            read_offset = 0
-            while runner.is_alive():
-                with open(progress_path, "rb") as handle:
-                    handle.seek(read_offset)
-                    new_events = handle.readlines()
-                    read_offset = handle.tell()
-                for _event in new_events:
-                    completed += 1
-                    progress_callback({
-                        "stage": "plane_metric",
-                        "current": int(completed),
-                        "total": int(len(planes)),
-                        "message": f"Calculated plane metrics ({completed}/{len(planes)})",
-                    })
-                runner.join(timeout=0.05)
-            runner.join()
-            with open(progress_path, "rb") as handle:
-                handle.seek(read_offset)
-                remaining_events = handle.readlines()
-            for _event in remaining_events:
-                completed += 1
-                progress_callback({
-                    "stage": "plane_metric",
-                    "current": int(completed),
-                    "total": int(len(planes)),
-                    "message": f"Calculated plane metrics ({completed}/{len(planes)})",
-                })
-            if state["error"] is not None:
-                raise state["error"]
-            chunk_results = state["result"]
-        results = [None] * len(planes)
-        for chunk in chunk_results or []:
-            for plane_index, metric in chunk:
-                results[int(plane_index)] = metric
-        return results
-    finally:
-        progress_dir.cleanup()
+        chunk_results = _wait_plane_processes(calculate, progress_path, len(planes), progress_callback)
+    results = [None] * len(planes)
+    for chunk in chunk_results or []:
+        for plane_index, metric in chunk:
+            results[int(plane_index)] = metric
+    return results
 
 
 def compute_plane_metrics_multithread(flow_xyzt3, segmask_binary_4d, spacing, origin, planes, RR=1000.0,

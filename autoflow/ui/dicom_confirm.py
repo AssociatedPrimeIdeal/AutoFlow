@@ -1,3 +1,5 @@
+from ..task_control import TaskCancelled
+
 from PySide6 import QtCore, QtWidgets
 
 
@@ -246,7 +248,7 @@ class DicomImportDialog(QtWidgets.QDialog):
             self.edit_spatial_order.clear()
             self.edit_venc_order.clear()
             self.edit_rr.clear()
-            self.label_preview_status.setText(f"Preview failed: {type(exc).__name__}: {exc}")
+            self.label_preview_status.setText("Preview cancelled." if isinstance(exc, TaskCancelled) else f"Preview failed: {type(exc).__name__}: {exc}")
             return
         info = [
             case.display_name or case.input_path,

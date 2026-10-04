@@ -150,14 +150,11 @@ class SceneController:
         if respect_clim and getattr(obj, "clim", None) is not None:
             lo, hi = (float(x) for x in obj.clim)
         else:
-            if self._is_volume_object(obj) and self.workspace.mag_raw is not None and self.workspace.flow_raw is not None:
-                key = (id(self.workspace.mag_raw), id(self.workspace.flow_raw), int(self.workspace.current_t))
+            if self._is_volume_object(obj) and self.workspace.pcmra_array is not None:
+                key = (id(self.workspace.pcmra_array), id(self.workspace.pcmra_render_mask), int(self.workspace.current_t))
                 cached = self._volume_range_cache.get(key)
                 if cached is not None:
                     return cached
-                # Dataset construction computes the raw-frame range before
-                # cell-to-point interpolation; reuse it instead of calculating
-                # magnitude * speed a second time for every new phase.
                 volume = self._build_dataset(obj.data_key)
                 cached = self._volume_range_cache.get(key)
                 if cached is None and volume is not None and "PC-MRA display range" in volume.field_data:
@@ -225,11 +222,28 @@ class SceneController:
                     (0.82, 0.28),
                     (1.00, 0.42),
                 ):
-                    transfer.AddPoint(lo + width * fraction, alpha * opacity_scale)
+                    value = lo + width * fraction
+                    transfer.AddPoint(value, alpha * opacity_scale if value > 0.0 else 0.0)
+                transfer.AddPoint(0.0, 0.0)
             except Exception:
                 pass
         except Exception:
             pass
+
+    def _set_noise_volume_opacity(self, obj):
+        prop = obj.actor.GetProperty()
+        colors = prop.GetRGBTransferFunction(0)
+        colors.RemoveAllPoints()
+        color = pv.Color(obj.color or "#ff0000").float_rgb
+        colors.AddRGBPoint(0.0, *color)
+        colors.AddRGBPoint(1.0, *color)
+        transfer = prop.GetScalarOpacity(0)
+        transfer.RemoveAllPoints()
+        transfer.AddPoint(0.0, 0.0)
+        transfer.AddPoint(0.49, 0.0)
+        transfer.AddPoint(0.5, float(np.clip(obj.opacity, 0.0, 1.0)))
+        transfer.AddPoint(1.0, float(np.clip(obj.opacity, 0.0, 1.0)))
+        prop.SetInterpolationTypeToNearest()
 
     def initialize(self):
         self.plotter.set_background(self._background_color)
@@ -950,6 +964,11 @@ class SceneController:
                 except Exception:
                     pass
             return
+        if obj.data_key == "noise_region":
+            self._set_noise_volume_opacity(obj)
+            if render:
+                self.plotter.render()
+            return
         try:
             prop = obj.actor.GetProperty()
             prop.SetOpacity(float(obj.opacity))
@@ -1248,13 +1267,16 @@ class SceneController:
         try:
             data_show = self._display_dataset(obj, data)
             data_show = self._transform_display_dataset(data_show)
-            if self._is_volume_object(obj):
+            if self._is_volume_object(obj) or obj.data_key == "noise_region":
                 obj.actor = self.plotter.add_volume(data_show, name=obj.uid, **kwargs)
                 try:
                     obj.actor.PickableOff()
                 except Exception:
                     pass
-                self._set_volume_opacity(obj, data_show)
+                if self._is_volume_object(obj):
+                    self._set_volume_opacity(obj, data_show)
+                else:
+                    self._set_noise_volume_opacity(obj)
             else:
                 obj.actor = self.plotter.add_mesh(data_show, name=obj.uid, **kwargs)
                 if obj.kind == ObjectKind.PLANE:
@@ -1274,6 +1296,9 @@ class SceneController:
         if self._is_volume_object(obj):
             self._set_volume_opacity(obj)
             return
+        if obj.data_key == "noise_region":
+            self._set_noise_volume_opacity(obj)
+            return
         try:
             prop = obj.actor.GetProperty()
             prop.SetOpacity(float(obj.opacity))
@@ -1283,6 +1308,19 @@ class SceneController:
             pass
 
     def _mesh_kwargs(self, obj, data):
+        if obj.data_key == "noise_region":
+            return {
+                "scalars": "Noise mask",
+                "cmap": [obj.color or "#ff0000"] * 2,
+                "clim": (0.0, 1.0),
+                "opacity": [0.0, float(obj.opacity)],
+                "shade": False,
+                "blending": "maximum",
+                "mapper": self._volume_mapper_name(),
+                "show_scalar_bar": False,
+                "render": False,
+                "reset_camera": False,
+            }
         if self._is_volume_object(obj):
             return {
                 "scalars": str(obj.scalars or "PC-MRA"),
@@ -1526,45 +1564,56 @@ class SceneController:
             except Exception:
                 pass
 
+    def _voxel_centered_grid(self, values, name):
+        spacing = np.asarray(self.workspace.resolution, dtype=float).reshape(-1)[:3]
+        origin = np.asarray(self.workspace.origin, dtype=float).reshape(-1)[:3] - 0.5 * spacing
+        grid = pv.ImageData(
+            dimensions=tuple((np.asarray(values.shape, dtype=int) + 2).tolist()),
+            spacing=tuple(spacing.tolist()),
+            origin=tuple(origin.tolist()),
+        )
+        grid.point_data[name] = np.pad(values, 1).ravel(order="F")
+        return grid
+
     def _build_dataset(self, data_key):
         ws = self.workspace
         t = ws.current_t
         sp = ws.resolution
         org = ws.origin
 
+        if data_key == "noise_region":
+            if ws.pcmra_render_mask is None:
+                return None
+            def _build_noise_region():
+                mask = np.asarray(ws.pcmra_render_mask, dtype=bool)
+                rejected = ~mask if mask.ndim == 3 else ~np.any(mask, axis=3)
+                if not np.any(rejected):
+                    return None
+                return self._voxel_centered_grid(rejected.astype(np.float32), "Noise mask")
+            return self._cached(f"noise_region_{id(ws.pcmra_render_mask)}", 0, _build_noise_region)
+
         if data_key == "pcmra_volume":
-            if ws.mag_raw is None or ws.flow_raw is None:
+            if ws.pcmra_array is None:
                 return None
-            mag = np.asarray(ws.mag_raw)
-            flow = np.asarray(ws.flow_raw)
-            if flow.ndim != 5 or mag.ndim not in (3, 4):
+            pcmra = np.asarray(ws.pcmra_array)
+            if pcmra.ndim != 4 or pcmra.shape[3] == 0:
                 return None
-            cache_key = f"pcmra_volume_{id(ws.mag_raw)}_{id(ws.flow_raw)}"
+            cache_key = f"pcmra_volume_{id(ws.pcmra_array)}_{id(ws.pcmra_render_mask)}"
             def _build_pcmra():
-                if mag.shape[:3] != flow.shape[:3]:
-                    return None
-                nt = int(flow.shape[3]) if mag.ndim == 3 else min(int(mag.shape[3]), int(flow.shape[3]))
-                if nt <= 0:
-                    return None
-                tidx = min(max(0, int(t)), nt - 1)
-                mag_t = np.asarray(mag if mag.ndim == 3 else mag[..., tidx], dtype=np.float32)
-                flow_t = np.asarray(flow[..., tidx, :], dtype=np.float32)
-                values = mag_t * np.linalg.norm(flow_t, axis=-1)
-                range_key = (id(ws.mag_raw), id(ws.flow_raw), int(t))
+                tidx = min(max(0, int(t)), pcmra.shape[3] - 1)
+                values = np.asarray(pcmra[..., tidx], dtype=np.float32)
+                if ws.pcmra_render_mask is not None:
+                    region = np.asarray(ws.pcmra_render_mask)
+                    if region.shape == pcmra.shape[:3]:
+                        values = np.where(region, values, 0.0)
+                    elif region.shape == pcmra.shape:
+                        values = np.where(region[..., tidx], values, 0.0)
+                range_key = (id(ws.pcmra_array), id(ws.pcmra_render_mask), int(t))
                 self._volume_range_cache[range_key] = self._foreground_volume_range(values)
-                values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
-                grid = pv.ImageData(
-                    dimensions=tuple((np.asarray(values.shape, dtype=int) + 1).tolist()),
-                    spacing=tuple(np.asarray(sp, dtype=float).reshape(-1)[:3].tolist()),
-                    origin=tuple(np.asarray(org, dtype=float).reshape(-1)[:3].tolist()),
-                )
-                grid.cell_data["PC-MRA"] = values.flatten(order="F")
+                grid = self._voxel_centered_grid(values, "PC-MRA")
                 grid.field_data["PC-MRA display range"] = self._volume_range_cache[range_key]
-                # Volume mappers consume point scalars.  Convert once here so
-                # timeline updates can swap mapper input directly instead of
-                # recreating the VTK volume actor for every cardiac frame.
-                return grid.cell_data_to_point_data(pass_cell_data=False)
-            return self._cached(cache_key, int(t), _build_pcmra)
+                return grid
+            return self._cached(cache_key, t, _build_pcmra)
 
         if data_key == "segmask_raw_surface":
             seg_display = ws.segmentation_display_4d()

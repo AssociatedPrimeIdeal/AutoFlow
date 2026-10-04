@@ -8,6 +8,8 @@ Partial in GUI, CLI and Python: requires source TKE or supported complex-derived
 
 Retains or computes optional turbulent kinetic energy density. Complex-derived velocity dispersion permits `TKE = 0.5*rho*(sigma_x²+sigma_y²+sigma_z²)` in J/m3. The loader keeps sigma optional and does not eagerly materialize TKE. Requested TKE is reused for volume export and plane summaries.
 
+See [Scientific references: TKE](../references/index.md#turbulent-kinetic-energy) for intravoxel dispersion measurement; it is distinct from the cardiac-cycle temporal SD used by noise masking.
+
 ## When to use it
 
 Use only when the acquisition or normalized input provides valid turbulence information. Mean velocity magnitude alone does not establish dispersion.

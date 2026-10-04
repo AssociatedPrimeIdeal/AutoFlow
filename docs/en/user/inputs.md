@@ -62,14 +62,16 @@ Legacy complex data must be channels-last `XYZT4` (single VENC) or `XYZT7` (dual
 
 ## H5 Background Correction Cache
 
-- after the user selects an H5 case group, the GUI inspects that group before loading: an existing `corr` cache (or both `corr_low` and `corr_high` for dual-venc data) enables background correction and skips the correction prompt
-- when the selected H5 case has no correction cache, the GUI first asks whether background correction should run for that load
+The GUI/CLI/API pipeline separates acquisition loading from the explicit correction action. Low-level `load_h5_data` / `load_input_data` callers may still request correction during a direct load. Noise removal changes only the PC-MRA display region, while background correction and phase unwrapping update working velocity without overwriting source velocity datasets.
+
+- after selecting an H5 case group, the GUI loads acquisition arrays with correction disabled; run Correction explicitly to apply or reuse a compatible cache
+- loading does not prompt for correction; choose its method and run it in the Correction stage
 - after loading, an embedded `segmask`, `segmentation`, or `seg` is activated without another prompt; when no segmentation is available, the GUI leaves the case unloaded from segmentation work and directs the user to the `Segmentation` stage's explicit `Run Automatic Segmentation` command
-- consequently, a selected H5 group that already contains both correction and segmentation artifacts loads directly after case selection
+- embedded segmentation remains available for review; changing correction does not automatically regenerate it
 - when background phase correction is disabled, the correction stage preserves the same normalized output values while bypassing its extra full-volume copy and synthetic complex conversion
 - when background phase correction is enabled for an H5 input, AutoFlow first looks for a reusable `corr` dataset in the selected H5 data group, then at the file root
 - if no compatible cache is found, AutoFlow runs the configured background-correction method and writes the resulting correction field back to the original H5 as `corr` when the file is writable
-- WRLS + ARTO is the default; when an H5 correction cache is missing and correction is enabled, the GUI asks the user to select `MSAC` or `WRLS + ARTO`
+- WRLS + ARTO is the default method in Correction; MSAC is also available
 - WRLS+ARTO automatically runs its dominant ARTO GMM stage on CUDA when PyTorch and a usable CUDA device are available, with automatic CPU fallback and no device setting
 - the GUI shows its standard progress dialog for enabled H5 background correction, including method-specific fitting and the H5 cache-write stage; closing the dialog only hides progress
 - legacy dual-venc H5 stores separate correction caches as `corr_low` and `corr_high`
@@ -172,3 +174,5 @@ AutoFlow normalizes loaders to `LoadedCase`.
 - DICOM scan and load: `autoflow/algorithms/dicom.py`
 - pipeline load step: `autoflow/core/pipeline.py`
 - types: `autoflow/case_types.py`
+
+Loading does not compute PC-MRA, even when correction or segmentation caches exist. Generate it explicitly as the final Correction step. Raw magnitude/velocity remain available in the right Content menu immediately after loading; derived entries appear only after their data exists.

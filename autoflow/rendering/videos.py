@@ -1,11 +1,16 @@
 from concurrent.futures import ThreadPoolExecutor
 import os
 import sys
+import uuid
+import stat
+import inspect
+from functools import wraps
 
 import imageio.v2 as imageio
 import numpy as np
 import pyvista as pv
 from PIL import Image
+from ..task_control import TaskCancelled, check_cancelled, report_progress
 
 from ..algorithms import (
     automatic_streamline_clim,
@@ -147,35 +152,63 @@ def _scalar_bar_mesh_kwargs(show_scalar_bar, title, bar_cfg=None):
 
 
 def _write_video(frames, out_path, fps=24):
-    if not frames:
+    """Encode a list or replayable frame factory with bounded frame memory."""
+    if not callable(frames) and not frames:
         return None
-    out_path = os.path.splitext(out_path)[0] + ".mp4"
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    attempts = [
-        {"codec": "libx264", "macro_block_size": None},
-        {"codec": "mpeg4", "macro_block_size": None},
-        {"macro_block_size": None},
-    ]
+    out_path = os.path.splitext(str(out_path))[0] + ".mp4"
+    directory = os.path.dirname(out_path) or "."
+    os.makedirs(directory, exist_ok=True)
+    attempts = [{"codec": "libx264", "macro_block_size": None},
+                {"codec": "mpeg4", "macro_block_size": None},
+                {"macro_block_size": None}]
     last_error = None
     for writer_kwargs in attempts:
+        check_cancelled()
+        temporary = os.path.join(directory, f".autoflow_video_{uuid.uuid4().hex}.mp4")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        os.close(fd)
+        iterator = iter(frames() if callable(frames) else frames)
         try:
-            if os.path.exists(out_path):
-                os.remove(out_path)
-        except Exception:
-            pass
-        try:
-            with imageio.get_writer(out_path, format="ffmpeg", fps=fps, **writer_kwargs) as writer:
-                for frame in frames:
+            count = 0
+            with imageio.get_writer(temporary, format="ffmpeg", fps=fps, **writer_kwargs) as writer:
+                for frame in iterator:
+                    check_cancelled()
                     writer.append_data(np.asarray(frame))
+                    count += 1
+            check_cancelled()
+            if count == 0:
+                return None
+            if os.path.isfile(out_path):
+                os.chmod(temporary, stat.S_IMODE(os.stat(out_path).st_mode))
+            os.replace(temporary, out_path)
             return out_path
+        except TaskCancelled:
+            raise
         except Exception as exc:
             last_error = exc
-    try:
-        if os.path.exists(out_path):
-            os.remove(out_path)
-    except Exception:
-        pass
+        finally:
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                close()
+            if os.path.exists(temporary):
+                os.remove(temporary)
     raise RuntimeError(f"failed to write MP4 video: {out_path}") from last_error
+
+
+def _stream_video(name):
+    def decorate(function):
+        signature = inspect.signature(function)
+        @wraps(function)
+        def render(*args, **kwargs):
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            suffix = "rotate" if bound.arguments.get("rotate", False) else "video"
+            filename = "planes_rotate.mp4" if name == "planes" else f"{name}_{suffix}.mp4"
+            return _write_video(lambda: function(*args, **kwargs),
+                                os.path.join(bound.arguments["out_dir"], filename),
+                                fps=bound.arguments["fps"])
+        return render
+    return decorate
 
 
 def _surface_center_radius(poly):
@@ -437,6 +470,7 @@ def _plane_label_style(plane_video_cfg):
     }
 
 
+@_stream_video("planes")
 def render_plane_rotation_video(
     ws,
     out_dir,
@@ -478,134 +512,140 @@ def render_plane_rotation_video(
     default_plane_size = _plane_size_from_surface(surf)
     origin = np.asarray(ws.origin, dtype=float).reshape(3)
     plotter = _make_plotter(window_size=_resolve_window_size(window_size))
-    plotter.add_mesh(surf, opacity=0.18, color="white")
+    try:
+        plotter.add_mesh(surf, opacity=0.18, color="white")
 
-    if bool(base_cfg.get("show_skeleton", True)):
-        if list(getattr(ws, "group_order", []) or []):
-            for group_name in list(getattr(ws, "group_order", []) or []):
-                group_state = dict(getattr(ws, "multilabel_groups", {}).get(group_name, {}) or {})
-                pts = group_state.get("skeleton_points")
-                if pts is None or len(pts) == 0:
-                    continue
-                style = _plane_video_style(ws, str(group_name), base_cfg, default_plane_size)
+        if bool(base_cfg.get("show_skeleton", True)):
+            if list(getattr(ws, "group_order", []) or []):
+                for group_name in list(getattr(ws, "group_order", []) or []):
+                    group_state = dict(getattr(ws, "multilabel_groups", {}).get(group_name, {}) or {})
+                    pts = group_state.get("skeleton_points")
+                    if pts is None or len(pts) == 0:
+                        continue
+                    style = _plane_video_style(ws, str(group_name), base_cfg, default_plane_size)
+                    plotter.add_mesh(
+                        pv.PolyData(np.asarray(pts, dtype=float) + origin.reshape(1, 3)),
+                        color=style["skeleton_color"],
+                        point_size=skeleton_point_size,
+                        render_points_as_spheres=True,
+                    )
+            elif ws.skeleton_points is not None and len(ws.skeleton_points) > 0:
+                style = _plane_video_style(ws, "", base_cfg, default_plane_size)
                 plotter.add_mesh(
-                    pv.PolyData(np.asarray(pts, dtype=float) + origin.reshape(1, 3)),
+                    pv.PolyData(np.asarray(ws.skeleton_points, dtype=float) + origin.reshape(1, 3)),
                     color=style["skeleton_color"],
                     point_size=skeleton_point_size,
                     render_points_as_spheres=True,
                 )
-        elif ws.skeleton_points is not None and len(ws.skeleton_points) > 0:
-            style = _plane_video_style(ws, "", base_cfg, default_plane_size)
+
+        paths_world = []
+        for path_idx, path in enumerate(ws.centerline_paths_smooth):
+            path_world = np.asarray(path, dtype=float) + origin.reshape(1, 3)
+            paths_world.append(path_world)
+            poly = _path_polydata(path_world)
+            if poly is not None and poly.n_points > 0:
+                plotter.add_mesh(
+                    poly,
+                    color=_path_color(ws, path_idx),
+                    line_width=5,
+                    render_lines_as_tubes=True,
+                )
+
+        centers = []
+        plane_labels = []
+        for i, plane in enumerate(ws.planes):
+            style = _plane_video_style(ws, _plane_group_name(ws, plane), base_cfg, default_plane_size)
+            center_world = np.asarray(plane.center, dtype=float).reshape(3) + origin
+            plane_mesh = _plane_mesh(center_world, plane.normal, style["plane_size"])
             plotter.add_mesh(
-                pv.PolyData(np.asarray(ws.skeleton_points, dtype=float) + origin.reshape(1, 3)),
-                color=style["skeleton_color"],
-                point_size=skeleton_point_size,
-                render_points_as_spheres=True,
+                plane_mesh,
+                color=style["plane_color"],
+                opacity=style["plane_opacity"],
+                show_edges=True,
+                edge_color="black",
+                line_width=2,
             )
+            centers.append(center_world)
+            plane_labels.append(f'{label_style["prefix"]}{i}')
 
-    paths_world = []
-    for path_idx, path in enumerate(ws.centerline_paths_smooth):
-        path_world = np.asarray(path, dtype=float) + origin.reshape(1, 3)
-        paths_world.append(path_world)
-        poly = _path_polydata(path_world)
-        if poly is not None and poly.n_points > 0:
-            plotter.add_mesh(
-                poly,
-                color=_path_color(ws, path_idx),
-                line_width=5,
-                render_lines_as_tubes=True,
-            )
-
-    centers = []
-    plane_labels = []
-    for i, plane in enumerate(ws.planes):
-        style = _plane_video_style(ws, _plane_group_name(ws, plane), base_cfg, default_plane_size)
-        center_world = np.asarray(plane.center, dtype=float).reshape(3) + origin
-        plane_mesh = _plane_mesh(center_world, plane.normal, style["plane_size"])
-        plotter.add_mesh(
-            plane_mesh,
-            color=style["plane_color"],
-            opacity=style["plane_opacity"],
-            show_edges=True,
-            edge_color="black",
-            line_width=2,
-        )
-        centers.append(center_world)
-        plane_labels.append(f'{label_style["prefix"]}{i}')
-
-    if add_plane_idx and centers:
-        plotter.add_point_labels(
-            np.asarray(centers, dtype=float),
-            plane_labels,
-            font_size=label_style["font_size"],
-            bold=True,
-            text_color=label_style["text_color"],
-            fill_shape=True,
-            shape="rounded_rect",
-            shape_color=label_style["shape_color"],
-            shape_opacity=label_style["shape_opacity"],
-            margin=5,
-            always_visible=True,
-        )
-
-    if add_path_idx and paths_world:
-        path_label_points = []
-        path_label_texts = []
-        offsets = [
-            np.array([0, 0, 0]),
-            np.array([3, 0, 0]),
-            np.array([-3, 0, 0]),
-            np.array([0, 3, 0]),
-            np.array([0, -3, 0]),
-        ]
-        frac_choices = [0.25, 0.5, 0.75, 0.35, 0.65]
-
-        for idx, path_world in enumerate(paths_world):
-            if path_world is None or len(path_world) == 0:
-                continue
-            n_points = len(path_world)
-            frac = frac_choices[idx % len(frac_choices)]
-            k = min(max(int(frac * (n_points - 1)), 0), n_points - 1)
-            anchor = np.asarray(path_world[k], dtype=float) + offsets[idx % len(offsets)]
-            path_label_points.append(anchor)
-            path_label_texts.append(f"Branch {idx}")
-
-        if path_label_points:
+        if add_plane_idx and centers:
             plotter.add_point_labels(
-                np.asarray(path_label_points, dtype=float),
-                path_label_texts,
-                font_size=20,
+                np.asarray(centers, dtype=float),
+                plane_labels,
+                font_size=label_style["font_size"],
                 bold=True,
-                text_color="black",
+                text_color=label_style["text_color"],
                 fill_shape=True,
                 shape="rounded_rect",
-                shape_color="deepskyblue",
-                shape_opacity=0.85,
-                margin=2,
+                shape_color=label_style["shape_color"],
+                shape_opacity=label_style["shape_opacity"],
+                margin=5,
                 always_visible=True,
             )
 
-    frames = []
-    for frame_idx in range(int(max(n_frames, 1))):
-        azimuth_deg = 360.0 * frame_idx / max(n_frames, 1)
-        plotter.camera_position = _orbit_camera(surf, azimuth_deg, elevation_deg, distance_scale)
-        plotter.add_text(
-            f"Rotating {frame_idx + 1}/{int(max(n_frames, 1))}",
-            position="upper_left",
-            font_size=14,
-            color="black",
-            name="frame_text",
-        )
-        plotter.render()
-        frames.append(np.asarray(plotter.screenshot(return_img=True)))
-        try:
-            plotter.remove_actor("frame_text")
-        except Exception:
-            pass
-    plotter.close()
-    return _write_video(frames, os.path.join(out_dir, "planes_rotate.mp4"), fps=fps)
+        if add_path_idx and paths_world:
+            path_label_points = []
+            path_label_texts = []
+            offsets = [
+                np.array([0, 0, 0]),
+                np.array([3, 0, 0]),
+                np.array([-3, 0, 0]),
+                np.array([0, 3, 0]),
+                np.array([0, -3, 0]),
+            ]
+            frac_choices = [0.25, 0.5, 0.75, 0.35, 0.65]
+
+            for idx, path_world in enumerate(paths_world):
+                if path_world is None or len(path_world) == 0:
+                    continue
+                n_points = len(path_world)
+                frac = frac_choices[idx % len(frac_choices)]
+                k = min(max(int(frac * (n_points - 1)), 0), n_points - 1)
+                anchor = np.asarray(path_world[k], dtype=float) + offsets[idx % len(offsets)]
+                path_label_points.append(anchor)
+                path_label_texts.append(f"Branch {idx}")
+
+            if path_label_points:
+                plotter.add_point_labels(
+                    np.asarray(path_label_points, dtype=float),
+                    path_label_texts,
+                    font_size=20,
+                    bold=True,
+                    text_color="black",
+                    fill_shape=True,
+                    shape="rounded_rect",
+                    shape_color="deepskyblue",
+                    shape_opacity=0.85,
+                    margin=2,
+                    always_visible=True,
+                )
+
+        total_frames = int(max(n_frames, 1))
+        for frame_idx in range(total_frames):
+            check_cancelled()
+            azimuth_deg = 360.0 * frame_idx / max(n_frames, 1)
+            plotter.camera_position = _orbit_camera(surf, azimuth_deg, elevation_deg, distance_scale)
+            plotter.add_text(
+                f"Rotating {frame_idx + 1}/{int(max(n_frames, 1))}",
+                position="upper_left",
+                font_size=14,
+                color="black",
+                name="frame_text",
+            )
+            plotter.render()
+            check_cancelled()
+            yield np.asarray(plotter.screenshot(return_img=True))
+            report_progress({"stage": "video_frame", "current": frame_idx + 1, "total": total_frames,
+                             "message": f"Rendered frame {frame_idx + 1}/{total_frames}"})
+            try:
+                plotter.remove_actor("frame_text")
+            except Exception:
+                pass
+    finally:
+        plotter.close()
 
 
+@_stream_video("wss")
 def render_wss_video(
     ws,
     out_dir,
@@ -653,48 +693,51 @@ def render_wss_video(
         total_frames = n_time * int(max(time_repeat, 1))
 
     plotter = _make_plotter(window_size=_resolve_window_size(window_size))
-    frames = []
+    try:
 
-    for frame_idx in range(total_frames):
-        if rotate:
-            t, azimuth_deg = _time_and_azimuth(
-                frame_idx,
-                rotation_frames=rotation_frames if rotation_frames is not None else total_frames,
-                n_time=n_time,
-                time_repeat=time_repeat,
-            )
-            camera_position = _orbit_camera(context_surf, azimuth_deg, elevation_deg, distance_scale)
-        else:
-            t = min(frame_idx, n_time - 1)
-            camera_position = _camera_from_view(context_surf, view, distance_scale)
+        for frame_idx in range(total_frames):
+            check_cancelled()
+            if rotate:
+                t, azimuth_deg = _time_and_azimuth(
+                    frame_idx,
+                    rotation_frames=rotation_frames if rotation_frames is not None else total_frames,
+                    n_time=n_time,
+                    time_repeat=time_repeat,
+                )
+                camera_position = _orbit_camera(context_surf, azimuth_deg, elevation_deg, distance_scale)
+            else:
+                t = min(frame_idx, n_time - 1)
+                camera_position = _camera_from_view(context_surf, view, distance_scale)
 
-        plotter.clear()
-        plotter.set_background("white")
-        plotter.add_mesh(context_surf, opacity=0.08, color="white")
+            plotter.clear()
+            plotter.set_background("white")
+            plotter.add_mesh(context_surf, opacity=0.08, color="white")
 
-        surf = ws.derived.wss_surfaces[min(max(0, t), len(ws.derived.wss_surfaces) - 1)]
-        if surf is not None and surf.n_points > 0 and "wss" in surf.point_data:
-            plotter.add_mesh(
-                surf,
-                scalars="wss",
-                cmap="jet",
-                clim=clim,
-                **_scalar_bar_mesh_kwargs(show_scalar_bar, "WSS (Pa)", wss_bar_cfg),
-            )
+            surf = ws.derived.wss_surfaces[min(max(0, t), len(ws.derived.wss_surfaces) - 1)]
+            if surf is not None and surf.n_points > 0 and "wss" in surf.point_data:
+                plotter.add_mesh(
+                    surf,
+                    scalars="wss",
+                    cmap="jet",
+                    clim=clim,
+                    **_scalar_bar_mesh_kwargs(show_scalar_bar, "WSS (Pa)", wss_bar_cfg),
+                )
 
-        if rotate:
-            txt = f"t={t} | rot {frame_idx + 1}/{total_frames}"
-        else:
-            txt = f"t={t}"
+            if rotate:
+                txt = f"t={t} | rot {frame_idx + 1}/{total_frames}"
+            else:
+                txt = f"t={t}"
 
-        plotter.add_text(txt, position="upper_left", font_size=14, color="black")
-        plotter.camera_position = camera_position
-        plotter.render()
-        frames.append(np.asarray(plotter.screenshot(return_img=True)))
+            plotter.add_text(txt, position="upper_left", font_size=14, color="black")
+            plotter.camera_position = camera_position
+            plotter.render()
+            check_cancelled()
+            yield np.asarray(plotter.screenshot(return_img=True))
+            report_progress({"stage": "video_frame", "current": frame_idx + 1, "total": total_frames,
+                             "message": f"Rendered frame {frame_idx + 1}/{total_frames}"})
 
-    plotter.close()
-    suffix = "rotate" if rotate else "video"
-    return _write_video(frames, os.path.join(out_dir, f"wss_{suffix}.mp4"), fps=fps)
+    finally:
+        plotter.close()
 
 
 def _streamline_speed_max(ws):
@@ -715,6 +758,7 @@ def _ensure_streamline_scalars(sl):
     return sl
 
 
+@_stream_video("streamlines")
 def render_streamlines_video(
     ws,
     out_dir,
@@ -809,68 +853,71 @@ def render_streamlines_video(
         tube_cache = {}
 
     plotter = _make_plotter(window_size=_resolve_window_size(window_size))
-    frames = []
-    plotter.set_background("white")
-    plotter.add_mesh(surf, opacity=0.18, color="lightgray")
-    streamline_actor = None
-    text_actor = plotter.add_text("", position="upper_left", font_size=14, color="black")
+    try:
+        plotter.set_background("white")
+        plotter.add_mesh(surf, opacity=0.18, color="lightgray")
+        streamline_actor = None
+        text_actor = plotter.add_text("", position="upper_left", font_size=14, color="black")
 
-    for frame_idx in range(total_frames):
-        if rotate:
-            t, azimuth_deg = _time_and_azimuth(
-                frame_idx,
-                rotation_frames=rotation_frames if rotation_frames is not None else total_frames,
-                n_time=n_time,
-                time_repeat=time_repeat,
-            )
-            camera_position = _orbit_camera(surf, azimuth_deg, elevation_deg, distance_scale)
-        else:
-            t = min(frame_idx, n_time - 1)
-            camera_position = _camera_from_view(surf, view, distance_scale)
+        for frame_idx in range(total_frames):
+            check_cancelled()
+            if rotate:
+                t, azimuth_deg = _time_and_azimuth(
+                    frame_idx,
+                    rotation_frames=rotation_frames if rotation_frames is not None else total_frames,
+                    n_time=n_time,
+                    time_repeat=time_repeat,
+                )
+                camera_position = _orbit_camera(surf, azimuth_deg, elevation_deg, distance_scale)
+            else:
+                t = min(frame_idx, n_time - 1)
+                camera_position = _camera_from_view(surf, view, distance_scale)
 
-        sl = streamline_cache[t]
+            sl = streamline_cache[t]
 
-        if sl is not None and sl.n_points > 0:
-            sl_show = tube_cache.get(t) if tube_radius > 0.0 else sl
-            if sl_show is not None:
-                if streamline_actor is None:
-                    streamline_actor = plotter.add_mesh(
-                        sl_show,
-                        scalars="Velocity",
-                        cmap="turbo",
-                        clim=clim,
-                        render_lines_as_tubes=tube_radius <= 0.0,
-                        line_width=3,
-                        lighting=False,
-                        **_scalar_bar_mesh_kwargs(show_scalar_bar, "Velocity (m/s)", streamline_bar_cfg),
-                    )
-                else:
-                    streamline_actor.SetVisibility(1)
-                    mapper = streamline_actor.GetMapper()
-                    mapper.dataset = sl_show
-                    mapper.Update()
-        elif streamline_actor is not None:
-            streamline_actor.SetVisibility(0)
+            if sl is not None and sl.n_points > 0:
+                sl_show = tube_cache.get(t) if tube_radius > 0.0 else sl
+                if sl_show is not None:
+                    if streamline_actor is None:
+                        streamline_actor = plotter.add_mesh(
+                            sl_show,
+                            scalars="Velocity",
+                            cmap="turbo",
+                            clim=clim,
+                            render_lines_as_tubes=tube_radius <= 0.0,
+                            line_width=3,
+                            lighting=False,
+                            **_scalar_bar_mesh_kwargs(show_scalar_bar, "Velocity (m/s)", streamline_bar_cfg),
+                        )
+                    else:
+                        streamline_actor.SetVisibility(1)
+                        mapper = streamline_actor.GetMapper()
+                        mapper.dataset = sl_show
+                        mapper.Update()
+            elif streamline_actor is not None:
+                streamline_actor.SetVisibility(0)
 
-        if rotate:
-            txt = f"t={t} | rot {frame_idx + 1}/{total_frames}"
-        else:
-            txt = f"t={t}"
+            if rotate:
+                txt = f"t={t} | rot {frame_idx + 1}/{total_frames}"
+            else:
+                txt = f"t={t}"
 
-        try:
-            text_actor.SetText(2, txt)
-        except Exception:
             try:
-                text_actor.SetInput(txt)
+                text_actor.SetText(2, txt)
             except Exception:
-                pass
-        plotter.camera_position = camera_position
-        plotter.render()
-        frames.append(np.asarray(plotter.screenshot(return_img=True)))
+                try:
+                    text_actor.SetInput(txt)
+                except Exception:
+                    pass
+            plotter.camera_position = camera_position
+            plotter.render()
+            check_cancelled()
+            yield np.asarray(plotter.screenshot(return_img=True))
+            report_progress({"stage": "video_frame", "current": frame_idx + 1, "total": total_frames,
+                             "message": f"Rendered frame {frame_idx + 1}/{total_frames}"})
 
-    plotter.close()
-    suffix = "rotate" if rotate else "video"
-    return _write_video(frames, os.path.join(out_dir, f"streamlines_{suffix}.mp4"), fps=fps)
+    finally:
+        plotter.close()
 
 
 def _tke_max(ws):
@@ -886,6 +933,7 @@ def _tke_max(ws):
     return 1e-6
 
 
+@_stream_video("tke")
 def render_tke_video(
     ws,
     out_dir,
@@ -927,70 +975,73 @@ def render_tke_video(
         total_frames = n_time * int(max(time_repeat, 1))
 
     plotter = _make_plotter(window_size=_resolve_window_size(window_size))
-    frames = []
-    tke_mesh_cache = {}
-    mesh_union = None
-    if ws.derived.tke_array is not None:
-        mesh_union = create_uniform_grid(
-            np.max(ws.segmask_binary > 0, axis=-1),
-            ws.resolution,
-            origin=ws.origin,
-        ).threshold(0.1)
-
-    for frame_idx in range(total_frames):
-        if rotate:
-            t, azimuth_deg = _time_and_azimuth(
-                frame_idx,
-                rotation_frames=rotation_frames if rotation_frames is not None else total_frames,
-                n_time=n_time,
-                time_repeat=time_repeat,
-            )
-            camera_position = _orbit_camera(surf, azimuth_deg, elevation_deg, distance_scale)
-        else:
-            t = min(frame_idx, n_time - 1)
-            camera_position = _camera_from_view(surf, view, distance_scale)
-
-        plotter.clear()
-        plotter.set_background("white")
-        plotter.add_mesh(surf, opacity=0.08, color="white")
-
+    try:
+        tke_mesh_cache = {}
+        mesh_union = None
         if ws.derived.tke_array is not None:
-            arr = np.asarray(ws.derived.tke_array, dtype=np.float32)
-            tidx = min(max(0, t), arr.shape[3] - 1) if arr.ndim == 4 else 0
-            if tidx not in tke_mesh_cache:
-                vol_t = arr[..., tidx] if arr.ndim == 4 else arr
-                tke_grid = create_uniform_grid(vol_t, ws.resolution, origin=ws.origin, name="TKE")
-                tke_mesh_cache[tidx] = mesh_union.sample(tke_grid)
-            tke_mesh = tke_mesh_cache[tidx]
-            plotter.add_mesh(
-                tke_mesh,
-                scalars="TKE",
-                cmap="hot",
-                clim=clim,
-                **_scalar_bar_mesh_kwargs(show_scalar_bar, "TKE (J/m³)", tke_bar_cfg),
-            )
-        else:
-            plotter.add_mesh(
-                ws.derived.tke_volume,
-                scalars="TKE",
-                cmap="hot",
-                clim=clim,
-                **_scalar_bar_mesh_kwargs(show_scalar_bar, "TKE (J/m³)", tke_bar_cfg),
-            )
+            mesh_union = create_uniform_grid(
+                np.max(ws.segmask_binary > 0, axis=-1),
+                ws.resolution,
+                origin=ws.origin,
+            ).threshold(0.1)
 
-        if rotate:
-            txt = f"t={t} | rot {frame_idx + 1}/{total_frames}"
-        else:
-            txt = f"t={t}"
+        for frame_idx in range(total_frames):
+            check_cancelled()
+            if rotate:
+                t, azimuth_deg = _time_and_azimuth(
+                    frame_idx,
+                    rotation_frames=rotation_frames if rotation_frames is not None else total_frames,
+                    n_time=n_time,
+                    time_repeat=time_repeat,
+                )
+                camera_position = _orbit_camera(surf, azimuth_deg, elevation_deg, distance_scale)
+            else:
+                t = min(frame_idx, n_time - 1)
+                camera_position = _camera_from_view(surf, view, distance_scale)
 
-        plotter.add_text(txt, position="upper_left", font_size=14, color="black")
-        plotter.camera_position = camera_position
-        plotter.render()
-        frames.append(np.asarray(plotter.screenshot(return_img=True)))
+            plotter.clear()
+            plotter.set_background("white")
+            plotter.add_mesh(surf, opacity=0.08, color="white")
 
-    plotter.close()
-    suffix = "rotate" if rotate else "video"
-    return _write_video(frames, os.path.join(out_dir, f"tke_{suffix}.mp4"), fps=fps)
+            if ws.derived.tke_array is not None:
+                arr = np.asarray(ws.derived.tke_array, dtype=np.float32)
+                tidx = min(max(0, t), arr.shape[3] - 1) if arr.ndim == 4 else 0
+                if tidx not in tke_mesh_cache:
+                    vol_t = arr[..., tidx] if arr.ndim == 4 else arr
+                    tke_grid = create_uniform_grid(vol_t, ws.resolution, origin=ws.origin, name="TKE")
+                    tke_mesh_cache[tidx] = mesh_union.sample(tke_grid)
+                tke_mesh = tke_mesh_cache[tidx]
+                plotter.add_mesh(
+                    tke_mesh,
+                    scalars="TKE",
+                    cmap="hot",
+                    clim=clim,
+                    **_scalar_bar_mesh_kwargs(show_scalar_bar, "TKE (J/m³)", tke_bar_cfg),
+                )
+            else:
+                plotter.add_mesh(
+                    ws.derived.tke_volume,
+                    scalars="TKE",
+                    cmap="hot",
+                    clim=clim,
+                    **_scalar_bar_mesh_kwargs(show_scalar_bar, "TKE (J/m³)", tke_bar_cfg),
+                )
+
+            if rotate:
+                txt = f"t={t} | rot {frame_idx + 1}/{total_frames}"
+            else:
+                txt = f"t={t}"
+
+            plotter.add_text(txt, position="upper_left", font_size=14, color="black")
+            plotter.camera_position = camera_position
+            plotter.render()
+            check_cancelled()
+            yield np.asarray(plotter.screenshot(return_img=True))
+            report_progress({"stage": "video_frame", "current": frame_idx + 1, "total": total_frames,
+                             "message": f"Rendered frame {frame_idx + 1}/{total_frames}"})
+
+    finally:
+        plotter.close()
 
 
 def _pressure_gradient_max(ws):
@@ -1019,6 +1070,7 @@ def _relative_pressure_max(ws):
     return max(value, 1e-6)
 
 
+@_stream_video("pressure_gradient")
 def render_pressure_gradient_video(
     ws,
     out_dir,
@@ -1067,71 +1119,75 @@ def render_pressure_gradient_video(
         support_source = ws.segmask_3d if ws.segmask_3d is not None else np.max(ws.segmask_binary > 0, axis=-1)
     support_arr = np.asarray(support_source, dtype=bool)
     plotter = _make_plotter(window_size=_resolve_window_size(window_size))
-    frames = []
-    pg_mesh_cache = {}
-    plotter.set_background("white")
-    plotter.add_mesh(surf, opacity=0.08, color="white")
-    pg_actor = None
-    text_actor = plotter.add_text("", position="upper_left", font_size=14, color="black")
+    try:
+        pg_mesh_cache = {}
+        plotter.set_background("white")
+        plotter.add_mesh(surf, opacity=0.08, color="white")
+        pg_actor = None
+        text_actor = plotter.add_text("", position="upper_left", font_size=14, color="black")
 
-    for frame_idx in range(total_frames):
-        if rotate:
-            t, azimuth_deg = _time_and_azimuth(
-                frame_idx,
-                rotation_frames=rotation_frames if rotation_frames is not None else total_frames,
-                n_time=n_time,
-                time_repeat=time_repeat,
-            )
-            camera_position = _orbit_camera(surf, azimuth_deg, elevation_deg, distance_scale)
-        else:
-            t = min(frame_idx, n_time - 1)
-            camera_position = _camera_from_view(surf, view, distance_scale)
-
-        tidx = min(max(0, t), pg_arr.shape[3] - 1) if pg_arr.ndim == 4 else 0
-        if tidx not in pg_mesh_cache:
-            vol_t = pg_arr if pg_arr.ndim == 3 else pg_arr[..., tidx]
-            support_t = support_arr if support_arr.ndim == 3 else support_arr[..., tidx]
-            vol_t = np.where(support_t, vol_t, 0.0)
-            support_surface = _pressure_support_surface(ws, support_source, tidx, smooth_iter=80)
-            pg_mesh_cache[tidx] = sample_volume_on_existing_surface(
-                vol_t, support_surface, ws.resolution, origin=ws.origin,
-                name="PressureGradient",
-            )
-        pg_mesh = pg_mesh_cache[tidx]
-        if pg_mesh is not None and pg_mesh.n_points > 0:
-            if pg_actor is None:
-                pg_actor = plotter.add_mesh(
-                    pg_mesh,
-                    scalars="PressureGradient",
-                    cmap="magma",
-                    clim=clim,
-                    **_scalar_bar_mesh_kwargs(show_scalar_bar, "|Pressure Grad| (Pa/m)", pressure_gradient_bar_cfg),
+        for frame_idx in range(total_frames):
+            check_cancelled()
+            if rotate:
+                t, azimuth_deg = _time_and_azimuth(
+                    frame_idx,
+                    rotation_frames=rotation_frames if rotation_frames is not None else total_frames,
+                    n_time=n_time,
+                    time_repeat=time_repeat,
                 )
+                camera_position = _orbit_camera(surf, azimuth_deg, elevation_deg, distance_scale)
             else:
-                pg_actor.SetVisibility(1)
-                mapper = pg_actor.GetMapper()
-                mapper.SetInputData(pg_mesh)
-                mapper.Update()
-        elif pg_actor is not None:
-            pg_actor.SetVisibility(0)
+                t = min(frame_idx, n_time - 1)
+                camera_position = _camera_from_view(surf, view, distance_scale)
 
-        txt = f"t={t} | rot {frame_idx + 1}/{total_frames}" if rotate else f"t={t}"
-        try:
-            text_actor.SetText(2, txt)
-        except Exception:
+            tidx = min(max(0, t), pg_arr.shape[3] - 1) if pg_arr.ndim == 4 else 0
+            if tidx not in pg_mesh_cache:
+                vol_t = pg_arr if pg_arr.ndim == 3 else pg_arr[..., tidx]
+                support_t = support_arr if support_arr.ndim == 3 else support_arr[..., tidx]
+                vol_t = np.where(support_t, vol_t, 0.0)
+                support_surface = _pressure_support_surface(ws, support_source, tidx, smooth_iter=80)
+                pg_mesh_cache[tidx] = sample_volume_on_existing_surface(
+                    vol_t, support_surface, ws.resolution, origin=ws.origin,
+                    name="PressureGradient",
+                )
+            pg_mesh = pg_mesh_cache[tidx]
+            if pg_mesh is not None and pg_mesh.n_points > 0:
+                if pg_actor is None:
+                    pg_actor = plotter.add_mesh(
+                        pg_mesh,
+                        scalars="PressureGradient",
+                        cmap="magma",
+                        clim=clim,
+                        **_scalar_bar_mesh_kwargs(show_scalar_bar, "|Pressure Grad| (Pa/m)", pressure_gradient_bar_cfg),
+                    )
+                else:
+                    pg_actor.SetVisibility(1)
+                    mapper = pg_actor.GetMapper()
+                    mapper.SetInputData(pg_mesh)
+                    mapper.Update()
+            elif pg_actor is not None:
+                pg_actor.SetVisibility(0)
+
+            txt = f"t={t} | rot {frame_idx + 1}/{total_frames}" if rotate else f"t={t}"
             try:
-                text_actor.SetInput(txt)
+                text_actor.SetText(2, txt)
             except Exception:
-                pass
-        plotter.camera_position = camera_position
-        plotter.render()
-        frames.append(np.asarray(plotter.screenshot(return_img=True)))
+                try:
+                    text_actor.SetInput(txt)
+                except Exception:
+                    pass
+            plotter.camera_position = camera_position
+            plotter.render()
+            check_cancelled()
+            yield np.asarray(plotter.screenshot(return_img=True))
+            report_progress({"stage": "video_frame", "current": frame_idx + 1, "total": total_frames,
+                             "message": f"Rendered frame {frame_idx + 1}/{total_frames}"})
 
-    plotter.close()
-    suffix = "rotate" if rotate else "video"
-    return _write_video(frames, os.path.join(out_dir, f"pressure_gradient_{suffix}.mp4"), fps=fps)
+    finally:
+        plotter.close()
 
 
+@_stream_video("relative_pressure")
 def render_relative_pressure_video(
     ws,
     out_dir,
@@ -1180,69 +1236,72 @@ def render_relative_pressure_video(
         support_source = ws.segmask_3d if ws.segmask_3d is not None else np.max(ws.segmask_binary > 0, axis=-1)
     support_arr = np.asarray(support_source, dtype=bool)
     plotter = _make_plotter(window_size=_resolve_window_size(window_size))
-    frames = []
-    rp_mesh_cache = {}
-    plotter.set_background("white")
-    plotter.add_mesh(surf, opacity=0.08, color="white")
-    rp_actor = None
-    text_actor = plotter.add_text("", position="upper_left", font_size=14, color="black")
+    try:
+        rp_mesh_cache = {}
+        plotter.set_background("white")
+        plotter.add_mesh(surf, opacity=0.08, color="white")
+        rp_actor = None
+        text_actor = plotter.add_text("", position="upper_left", font_size=14, color="black")
 
-    for frame_idx in range(total_frames):
-        if rotate:
-            t, azimuth_deg = _time_and_azimuth(
-                frame_idx,
-                rotation_frames=rotation_frames if rotation_frames is not None else total_frames,
-                n_time=n_time,
-                time_repeat=time_repeat,
-            )
-            camera_position = _orbit_camera(surf, azimuth_deg, elevation_deg, distance_scale)
-        else:
-            t = min(frame_idx, n_time - 1)
-            camera_position = _camera_from_view(surf, view, distance_scale)
-
-        tidx = min(max(0, t), rp_arr.shape[3] - 1) if rp_arr.ndim == 4 else 0
-        if tidx not in rp_mesh_cache:
-            vol_t = rp_arr if rp_arr.ndim == 3 else rp_arr[..., tidx]
-            support_t = support_arr if support_arr.ndim == 3 else support_arr[..., tidx]
-            vol_t = np.where(support_t, vol_t, 0.0)
-            support_surface = _pressure_support_surface(ws, support_source, tidx, smooth_iter=80)
-            rp_mesh_cache[tidx] = sample_volume_on_existing_surface(
-                vol_t, support_surface, ws.resolution, origin=ws.origin,
-                name="RelativePressure",
-            )
-        rp_mesh = rp_mesh_cache[tidx]
-        if rp_mesh is not None and rp_mesh.n_points > 0:
-            if rp_actor is None:
-                rp_actor = plotter.add_mesh(
-                    rp_mesh,
-                    scalars="RelativePressure",
-                    cmap="RdBu_r",
-                    clim=clim,
-                    **_scalar_bar_mesh_kwargs(show_scalar_bar, "Relative Pressure (Pa)", relative_pressure_bar_cfg),
+        for frame_idx in range(total_frames):
+            check_cancelled()
+            if rotate:
+                t, azimuth_deg = _time_and_azimuth(
+                    frame_idx,
+                    rotation_frames=rotation_frames if rotation_frames is not None else total_frames,
+                    n_time=n_time,
+                    time_repeat=time_repeat,
                 )
+                camera_position = _orbit_camera(surf, azimuth_deg, elevation_deg, distance_scale)
             else:
-                rp_actor.SetVisibility(1)
-                mapper = rp_actor.GetMapper()
-                mapper.SetInputData(rp_mesh)
-                mapper.Update()
-        elif rp_actor is not None:
-            rp_actor.SetVisibility(0)
+                t = min(frame_idx, n_time - 1)
+                camera_position = _camera_from_view(surf, view, distance_scale)
 
-        txt = f"t={t} | rot {frame_idx + 1}/{total_frames}" if rotate else f"t={t}"
-        try:
-            text_actor.SetText(2, txt)
-        except Exception:
+            tidx = min(max(0, t), rp_arr.shape[3] - 1) if rp_arr.ndim == 4 else 0
+            if tidx not in rp_mesh_cache:
+                vol_t = rp_arr if rp_arr.ndim == 3 else rp_arr[..., tidx]
+                support_t = support_arr if support_arr.ndim == 3 else support_arr[..., tidx]
+                vol_t = np.where(support_t, vol_t, 0.0)
+                support_surface = _pressure_support_surface(ws, support_source, tidx, smooth_iter=80)
+                rp_mesh_cache[tidx] = sample_volume_on_existing_surface(
+                    vol_t, support_surface, ws.resolution, origin=ws.origin,
+                    name="RelativePressure",
+                )
+            rp_mesh = rp_mesh_cache[tidx]
+            if rp_mesh is not None and rp_mesh.n_points > 0:
+                if rp_actor is None:
+                    rp_actor = plotter.add_mesh(
+                        rp_mesh,
+                        scalars="RelativePressure",
+                        cmap="RdBu_r",
+                        clim=clim,
+                        **_scalar_bar_mesh_kwargs(show_scalar_bar, "Relative Pressure (Pa)", relative_pressure_bar_cfg),
+                    )
+                else:
+                    rp_actor.SetVisibility(1)
+                    mapper = rp_actor.GetMapper()
+                    mapper.SetInputData(rp_mesh)
+                    mapper.Update()
+            elif rp_actor is not None:
+                rp_actor.SetVisibility(0)
+
+            txt = f"t={t} | rot {frame_idx + 1}/{total_frames}" if rotate else f"t={t}"
             try:
-                text_actor.SetInput(txt)
+                text_actor.SetText(2, txt)
             except Exception:
-                pass
-        plotter.camera_position = camera_position
-        plotter.render()
-        frames.append(np.asarray(plotter.screenshot(return_img=True)))
+                try:
+                    text_actor.SetInput(txt)
+                except Exception:
+                    pass
+            plotter.camera_position = camera_position
+            plotter.render()
+            check_cancelled()
+            yield np.asarray(plotter.screenshot(return_img=True))
+            report_progress({"stage": "video_frame", "current": frame_idx + 1, "total": total_frames,
+                             "message": f"Rendered frame {frame_idx + 1}/{total_frames}"})
 
-    plotter.close()
-    suffix = "rotate" if rotate else "video"
-    return _write_video(frames, os.path.join(out_dir, f"relative_pressure_{suffix}.mp4"), fps=fps)
+    finally:
+        plotter.close()
 
 
 def extract_frame(mp4_path, frame_index, out_png):

@@ -18,6 +18,8 @@ sampling.
 ## What It Does
 Segmentation gives AutoFlow the lumen mask needed for skeletons, graphs, planes, plane metrics, WSS, streamlines, and pathlines.
 
+The nnU-Net framework citation and distinction from local checkpoint/4-D validation are recorded in [Scientific references: segmentation](../references/index.md#segmentation).
+
 ## When To Use It
 - use it whenever the input has no usable vessel mask
 - use imported segmentation when the mask already exists externally
@@ -131,6 +133,8 @@ See [segmentation parameters](../user/parameters.md#segmentation), [labels param
 | `spatiotemporal_labeler/<case>/exchange.json` | Labeler exchange is prepared | source/geometry metadata, image digests, and active seed digest for safe reuse |
 | `segmentation.previous.<timestamp_ns>.nii` | a different or legacy exchange mask must be replaced | recoverable copy of previous Labeler work |
 
+Changing the active segmentation compares the processed masks and skeleton/group configuration. Identical processed 4D labels retain geometry and numerical results. Changed temporal labels with identical voted 3D labels and per-group topology retain centerlines and planes, while clearing all segmentation-dependent metrics, PWV and trajectories for explicit recomputation. Changed 3D topology or preprocessing/group configuration clears downstream geometry. No phase-local pressure or PWV shortcut is applied.
+
 ## Limitations
 - automatic backends are `nnUNet` (3D/static) and `nnUNet4D` (Dataset7020 temporal-channel model)
 - the `nnUNet` backend predicts one 3D label volume from Dataset7010's 12 summary channels and broadcasts that unchanged volume across the input time count
@@ -146,7 +150,7 @@ See [segmentation parameters](../user/parameters.md#segmentation), [labels param
 - the supplied `run_7020_4d_full_ssd_20260824.sh` is a training/batch orchestration script. AutoFlow parses its Dataset7020 result location when used as `--autoseg-model`; it does not rerun training during a case analysis
 - when that script contains an existing `PYTHON_BIN` executable, AutoFlow uses it for the nnUNet subprocess so the custom Dataset7020 trainer/resampler remains importable; otherwise it uses the active AutoFlow Python environment
 - `auto_folds=all` delegates fold averaging to nnUNet. Use `single` while validating a checkpoint, then switch to `all` when `fold_0`...`fold_4` are present
-- GUI auto segmentation runs in a background worker and uses the same closeable window-modal progress dialog as other long-running GUI tasks; closing it hides progress permanently for that run without cancelling inference, foreground-label validation, H5 cache writing, or workspace refresh
+- GUI automatic segmentation uses application-modal task progress. × requests cancellation of its inference child process; the window stays open and other actions stay locked until the task stops. A cancelled prediction is not applied. Animated dots and prediction-file counts show activity; an unchanged count is not fabricated inference progress.
 - AutoFlow uses the nnUNet predictor available in the active environment or on its existing `PATH`; it does not search or switch to another Conda environment
 - an all-background nnUNet prediction is reported as a failure instead of being applied as an invisible segmentation
 - CLI auto segmentation only runs when the loaded case has no segmentation
@@ -155,7 +159,8 @@ See [segmentation parameters](../user/parameters.md#segmentation), [labels param
 - the optional SpatioTemporal Labeler bridge launches a separate process and exchanges six uncompressed 4D NIfTI files; it is not embedded into the AutoFlow Qt process. It uses the checked-out `third_party/SpatioTemporalLabeler` source with AutoFlow's Python/Qt/VTK runtime, so install `pip install ".[gui,labeler]"` in that environment
 - when AutoFlow is running through forwarded X11, it clears AutoFlow's EGL/off-screen VTK environment variables only for the separate Labeler process. Labeler's unmodified embedded VTK view then uses native X11/GLX rendering instead of opening with a blank 3D panel
 - the exchange directory is stable for a loaded case. Image reuse checks source metadata, geometry, and digests of the actual magnitude/flow arrays. An unchanged active seed retains Labeler's saved working mask; applying that exact edited mask also retains its file and label definitions. A different active segmentation refreshes only `segmentation.nii`, avoiding a full image export and stale labels after another automatic run
-- the export progress dialog advances as files finish. Export and digest calculation run outside the GUI thread, with at most two concurrent NIfTI writers; no worker accesses Qt widgets. The five features and segmentation remain uncompressed `.nii`, with unchanged float32/int16 values and spatial affines
+- Labeler export progress advances as files finish. Export and digest calculation run outside the GUI thread, with at most two concurrent NIfTI writers; no worker accesses Qt widgets. × stops at a safe digest/file boundary and waits for active writes; the editor is not launched after cancellation. Files are replaced only after complete writes. The five features and segmentation remain uncompressed `.nii`, with unchanged float32/int16 values and spatial affines.
+- a saved Labeler result is offered for import only after active task/dialog locks are released. Results from a previous loaded case are retained on disk instead of being applied to a replacement case
 - before replacing a different or legacy exchange mask, AutoFlow preserves it as `segmentation.previous.<timestamp_ns>.nii`; saved manual revisions remain recoverable. Existing schema-2 workspaces refresh their feature manifest once
 - GUI 4D nnUNet preparation encodes each distinct feature map once and links the usual per-frame channel filenames to it, falling back to byte copies when hard links are unavailable. For 20 phases and 37 channels this encodes 112 maps rather than 740. Channel order, per-sample cropping/normalization, folds, checkpoint, sliding-window settings, TTA, and precision are unchanged; the CLI grouped path remains separate
 - the standard Python 4D subprocess moves unpadded tensors to CUDA before nnUNet's original padding and inference when enough memory is free, and skips an inspected preprocessing copy whose pinned result is discarded. CPU inference, CPU accumulation, low-memory devices, and CUDA allocation failures use the original padding path. Model arithmetic and labels are unchanged; the standalone frozen predictor retains its existing path

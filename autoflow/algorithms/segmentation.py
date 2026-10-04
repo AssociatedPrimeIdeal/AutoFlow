@@ -10,12 +10,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, TemporaryFile
 
 import h5py
 import nibabel as nib
 import numpy as np
 from scipy.ndimage import binary_closing, binary_opening
+from ..task_control import TaskCancelled, check_cancelled, stop_process
 
 from .data import (
     _canonical_h5_key,
@@ -702,7 +703,7 @@ def _resolve_nnunet_channel_token(channel_name, channel_index):
     )
 
 
-def _nnunet_channel_volumes(channel_names, mag, flow):
+def _nnunet_channel_volumes(channel_names, mag, flow, *, speed=None, pcmra=None):
     tokens = [
         _resolve_nnunet_channel_token(channel_name, channel_index)
         for channel_index, channel_name in enumerate(channel_names)
@@ -735,13 +736,15 @@ def _nnunet_channel_volumes(channel_names, mag, flow):
         # Compute the norm once.  The 4D model requests several speed/PCMRA
         # channels and recalculating this volume for each channel is a large
         # avoidable allocation for clinical-size inputs.
-        speed = np.linalg.norm(flow, axis=-1)
+        if speed is None:
+            speed = np.linalg.norm(flow, axis=-1)
         if "flow_mag_mean_xyz" in requested:
             channels["flow_mag_mean_xyz"] = np.mean(speed, axis=3)
         if "flow_mag_std_xyz" in requested:
             channels["flow_mag_std_xyz"] = np.std(speed, axis=3)
         if "pcmra_mean_xyz" in requested or "pcmra_std_xyz" in requested:
-            pcmra = mag * speed
+            if pcmra is None:
+                pcmra = mag * speed
             if "pcmra_mean_xyz" in requested:
                 channels["pcmra_mean_xyz"] = np.mean(pcmra, axis=3)
             if "pcmra_std_xyz" in requested:
@@ -919,22 +922,50 @@ def _link_or_copy_file(source, destination):
 
 
 def _read_nifti_segmentation(path):
-    arr = np.asarray(nib.load(str(path)).get_fdata(), dtype=np.float32)
+    arr = np.asarray(nib.load(str(path)).dataobj, dtype=np.float32)
     if arr.ndim != 3:
         raise ValueError(f"expected 3D nnUNet segmentation, got shape={arr.shape}")
     return np.rint(arr).astype(np.int16)
 
 
-def _run_subprocess(command, *, env=None, cwd=None, runner=None):
-    runner = subprocess.run if runner is None else runner
-    return runner(
-        command,
-        check=False,
-        capture_output=True,
-        text=True,
-        env=env,
-        cwd=cwd,
-    )
+def _run_subprocess(command, *, env=None, cwd=None, runner=None, progress_callback=None,
+                    output_dir=None, expected_predictions=1, progress_total=5):
+    check_cancelled()
+    if runner is not None:
+        return runner(command, check=False, capture_output=True, text=True, env=env, cwd=cwd)
+    started = time.perf_counter()
+    options = {"start_new_session": True} if os.name != "nt" else {
+        "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP
+    }
+    with TemporaryFile(mode="w+b") as stdout, TemporaryFile(mode="w+b") as stderr:
+        process = subprocess.Popen(command, stdout=stdout, stderr=stderr, env=env, cwd=cwd, **options)
+        try:
+            next_update = 0.0
+            while process.poll() is None:
+                check_cancelled()
+                now = time.perf_counter()
+                if progress_callback is not None and now >= next_update:
+                    completed = sum(
+                        path.name.endswith((".nii", ".nii.gz"))
+                        for path in Path(output_dir).iterdir()
+                    ) if output_dir is not None else 0
+                    _emit_progress(
+                        progress_callback, stage="autoseg_inference_progress", current=3, total=progress_total,
+                        message=f"nnUNet inference active — prediction files observed {completed}/{expected_predictions}",
+                        detail_current=completed, detail_total=expected_predictions,
+                        detail_message=f"Exported predictions: {completed} / {expected_predictions}",
+                        elapsed_sec=now - started,
+                    )
+                    next_update = now + 0.5
+                time.sleep(0.1)
+            check_cancelled()
+        except BaseException:
+            stop_process(process)
+            raise
+        stdout.seek(0)
+        stderr.seek(0)
+        return subprocess.CompletedProcess(command, process.returncode,
+            stdout.read().decode("utf-8", errors="replace"), stderr.read().decode("utf-8", errors="replace"))
 
 
 def _subprocess_failure_details(result):
@@ -982,6 +1013,7 @@ def _nnunet_inference_command(
 
 
 def _emit_progress(progress_callback, *, stage, message, current=None, total=None, elapsed_sec=None, **extra):
+    check_cancelled()
     if progress_callback is None:
         return
     payload = {
@@ -1269,10 +1301,10 @@ def _generate_nnunet_4d_grouped(
         "flow_x_mean_xyz", "flow_y_mean_xyz", "flow_z_mean_xyz", "flow_mag_mean_xyz",
         "flow_x_std_xyz", "flow_y_std_xyz", "flow_z_std_xyz", "flow_mag_std_xyz",
     ]
-    global_values = _nnunet_channel_volumes(global_names, mag_nnunet, flow_nnunet)
-    global_by_name = dict(zip(global_names, global_values))
     speed = np.linalg.norm(flow_nnunet, axis=-1).astype(np.float32, copy=False)
     pcmra = (mag_nnunet * speed).astype(np.float32, copy=False)
+    global_values = _nnunet_channel_volumes(global_names, mag_nnunet, flow_nnunet, speed=speed, pcmra=pcmra)
+    global_by_name = dict(zip(global_names, global_values))
 
     with TemporaryDirectory(prefix="autoflow_nnunet4d_grouped_") as tmp_root:
         tmp_root = Path(tmp_root)
@@ -1792,7 +1824,8 @@ def generate_nnunet_auto_segmentation(
             command=[str(x) for x in command],
             preprocessing_device=preprocessing_device,
         )
-        result = _run_subprocess(command, runner=runner)
+        result = _run_subprocess(command, runner=runner, progress_callback=progress_callback,
+                                 output_dir=output_dir, progress_total=total_stages)
         if getattr(result, "returncode", 0) != 0 and use_gpu_preprocessing:
             gpu_preprocessing_fallback_reason = _subprocess_failure_details(result)
             output_dir = tmp_root / "output_cpu_preprocessing"
@@ -1821,7 +1854,8 @@ def generate_nnunet_auto_segmentation(
                 preprocessing_device=preprocessing_device,
                 fallback_reason=gpu_preprocessing_fallback_reason,
             )
-            result = _run_subprocess(command, runner=runner)
+            result = _run_subprocess(command, runner=runner, progress_callback=progress_callback,
+                                     output_dir=output_dir, progress_total=total_stages)
         if getattr(result, "returncode", 0) != 0:
             stdout = getattr(result, "stdout", "") or ""
             stderr = getattr(result, "stderr", "") or ""
@@ -2014,6 +2048,8 @@ def generate_nnunet_4d_auto_segmentation(
                 progress_callback,
                 t_total_start,
             )
+        except TaskCancelled:
+            raise
         except Exception as exc:
             grouped_fallback_reason = f"{type(exc).__name__}: {exc}"
             token = str(os.environ.get("AUTOFLOW_NNUNET4D_GROUPED", "auto") or "auto").strip().lower()
@@ -2041,7 +2077,6 @@ def generate_nnunet_4d_auto_segmentation(
             "flow_x_mean_xyz", "flow_y_mean_xyz", "flow_z_mean_xyz", "flow_mag_mean_xyz",
             "flow_x_std_xyz", "flow_y_std_xyz", "flow_z_std_xyz", "flow_mag_std_xyz",
         ]
-        global_by_name = dict(zip(global_names, _nnunet_channel_volumes(global_names, mag_nnunet, flow_nnunet)))
         temporal_speed = np.linalg.norm(flow_nnunet, axis=-1).astype(np.float32, copy=False)
         temporal_cache = {
             "mag": mag_nnunet,
@@ -2050,6 +2085,9 @@ def generate_nnunet_4d_auto_segmentation(
             "flow_y": flow_nnunet[..., 1],
             "flow_z": flow_nnunet[..., 2],
         }
+        global_by_name = dict(zip(global_names, _nnunet_channel_volumes(
+            global_names, mag_nnunet, flow_nnunet, speed=temporal_speed, pcmra=temporal_cache["pcmra"]
+        )))
         _emit_progress(
             progress_callback,
             stage="autoseg_prepare_inputs",
@@ -2147,7 +2185,8 @@ def generate_nnunet_4d_auto_segmentation(
             preprocessing_device="model",
         )
         subprocess_env = _nnunet_4d_subprocess_env(pipeline_script, model_path)
-        result = _run_subprocess(command, env=subprocess_env, runner=runner)
+        result = _run_subprocess(command, env=subprocess_env, runner=runner, progress_callback=progress_callback,
+                                 output_dir=output_dir, expected_predictions=time_count, progress_total=total_stages)
         if getattr(result, "returncode", 0) != 0:
             raise RuntimeError(
                 "4D nnUNet inference failed\n"

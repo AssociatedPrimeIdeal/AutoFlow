@@ -1,7 +1,7 @@
 import argparse
 
 from .api import AutoFlowConfig, run_batch
-from .algorithms.phase_unwrapping import backend_available
+from .algorithms.phase_unwrapping import backend_available, resolve_mask_source
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,7 +38,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-pressure-gradient", action="store_true", help="Skip relative-pressure reconstruction, centerline pressure-drop outputs, and pressure-gradient-derived summaries.")
     parser.add_argument("--skip-plane-metrics", action="store_true", help="Skip plane metric export.")
     parser.add_argument("--single-thread", dest="use_multithread", action="store_false", help="Disable parallel plane metric calculation.")
-    parser.add_argument("--bgc", dest="background_phase_correction", action="store_true", help="Enable background phase offset correction during loading.")
+    parser.add_argument("--correction", action="store_true", help="Run background correction, noise masking, phase unwrapping, and PC-MRA generation before segmentation; defaults to lap4D with no mask.")
+    parser.add_argument("--generate-pcmra", action="store_true", default=None, help="Generate PC-MRA from current working velocity after requested correction steps.")
+    parser.add_argument("--noise-removal", action="store_true", default=None, help="Screen only the PC-MRA display region; preserve magnitude and velocity.")
+    parser.add_argument("--noise-removal-method", choices=["magnitude_temporal", "magnitude"], default=None)
+    parser.add_argument("--noise-magnitude-fraction", type=float, default=None, help="Fraction of maximum temporal-mean magnitude; default 0.05. 0 keeps all positive magnitude.")
+    parser.add_argument("--noise-velocity-std-max", type=float, default=None, help="Fraction of maximum temporal speed SD; default 0.80. 0 disables temporal screening; not VENC-normalized.")
+    parser.add_argument("--bgc", dest="background_phase_correction", action="store_true", help="Run background phase correction after loading, before segmentation.")
     parser.add_argument(
         "--bgc-method",
         choices=["msac", "wrls_arto"],
@@ -155,9 +161,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tube-radius", type=float, default=None, help="Tube radius used in streamline rendering.")
     parser.add_argument(
         "--pressure-method",
-        choices=["least_squares", "ppe"],
+        choices=["ppe", "ste", "least_squares"],
         default=None,
-        help="Relative-pressure reconstruction method used by the pg metric/video outputs.",
+        help="Pressure reconstruction method: ppe (the merged LS/PPE solver), ste (Stokes estimator), or legacy least_squares alias.",
     )
 
     parser.add_argument("--autoseg", action="store_true", help="If the loaded case has no segmentation, run auto segmentation before segmentation-dependent steps.")
@@ -196,9 +202,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--phase-unwrap-mask",
-        choices=["segmask", "pcmra_std"],
+        choices=["auto", "none", "segmask", "pcmra_std", "pcmra_mean"],
         default=None,
-        help="Segmentation mask or PC-MRA temporal standard deviation used by phase unwrapping.",
+        help="Method-specific mask: traditional methods support none/segmask; learned methods also support pcmra_std/pcmra_mean. Auto defaults to none or pcmra_std.",
     )
     parser.add_argument("--phase-unwrap-device", choices=["auto", "cpu", "cuda"], default=None, help="Device for phase unwrapping; lap4D uses CUDA when available.")
 
@@ -244,6 +250,12 @@ def main() -> None:
         "export_planes": args.export_planes,
         "use_multithread": args.use_multithread,
         "background_phase_correction": args.background_phase_correction,
+        "correction_all": True if args.correction else None,
+        "generate_pcmra": args.generate_pcmra,
+        "noise_removal": args.noise_removal,
+        "noise_removal_method": args.noise_removal_method,
+        "noise_magnitude_fraction": args.noise_magnitude_fraction,
+        "noise_velocity_std_max": args.noise_velocity_std_max,
         "background_phase_method": args.bgc_method,
         "background_phase_corr_fit_order": args.background_phase_fit_order,
         "background_phase_threshold": args.background_phase_threshold,
@@ -342,6 +354,20 @@ def main() -> None:
                 "install them with pip install .[pu]"
             )
 
+    method = config.phase_unwrap_method
+    if config.correction_all and str(method).lower() in {"", "none", "disabled"}:
+        method = "lap4D"
+    if str(method).lower() not in {"", "none", "disabled"}:
+        try:
+            resolve_mask_source(method, config.phase_unwrap_mask)
+        except ValueError as exc:
+            parser.error(str(exc))
+    from .case_types import NoiseRemovalConfig
+    try:
+        NoiseRemovalConfig(method=config.noise_removal_method, magnitude_fraction=config.noise_magnitude_fraction,
+                           velocity_std_max=config.noise_velocity_std_max)
+    except ValueError as exc:
+        parser.error(str(exc))
     run_batch(config)
 
 

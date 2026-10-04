@@ -15,6 +15,8 @@
 | `derived_metrics_pixelwise.npz` | derived metrics run | whole-volume WSS, pressure-gradient intermediates, reconstructed relative pressure, optional TKE, and requested vortex-kinematics arrays (uncompressed NPZ for faster export) | `autoflow/processing.py` |
 | `quality_report.json` | every processed case | staged automated QC plus a label-named, flow-directed path/branch/plane hierarchy with summary statistics and conservation equations | `autoflow/quality.py`, `autoflow/processing.py` |
 | `summary.json` | every processed case; also updated by GUI video export when present | single-case summary including request flags plus stage and video timings | `autoflow/processing.py`, `autoflow/ui/app.py` |
+| `pcmra.npz` | explicit generation or Correction group in CLI/API | unmasked magnitude × working speed with resolution/origin |
+| `pcmra_noise_mask.npz` | noise removal requested by CLI/API | boolean XYZ PC-MRA rendering mask with resolution and origin; source magnitude and velocity are unchanged |
 | `phase_unwrap.npz` | optional phase-unwrapping run | wrapped/unwrapped phase, flow, signed `wrap_count`, `wrap_mask`, and `mask_used` | `autoflow/processing.py` |
 | `batch_report.json` | batch run | batch summary report | `autoflow/api.py`, `autoflow/processing.py` |
 | `time_summary.txt` | batch run | timing summary | `autoflow/api.py`, `autoflow/processing.py` |
@@ -63,3 +65,9 @@
 ## Preserved DICOM conversion
 
 The optional Dicom2H5 route saves a new H5 before analysis, under `dicom_h5_dir` (default `output_dir/_dicom_h5`). It contains normalized `mag + flow` acquisition groups and geometry/patient/scanner/acquisition metadata. Existing destinations are never overwritten. Subsequent analysis uses ordinary H5 case output directories. See [DICOM loading and conversion](../features/dicom-loading.md).
+
+## Correction records
+
+`summary.json.noise_removal` records actual screening parameters, magnitude threshold/mode, `magnitude_reference_max`, `magnitude_statistic`, `temporal_std_threshold`, `temporal_std_reference_max`, `temporal_std_statistic`, temporal-screening status and retained fraction; `noise_removal_file` points to the NPZ. The SD threshold/reference are `null` when screening is bypassed. Default magnitude and temporal-speed SD fractions are `0.05` and `0.80` of their respective maxima, not P99 or VENC; see [Noise removal](../features/noise-removal.md). Phase records include `mask_source` and `diagnostic_scope`. `phase_unwrap.npz` velocity/phase include preserved values outside a masked rerun, while wrap-count diagnostics describe the latest requested mask. GUI workspaces preserve the display mask, correction fields and working velocity. Source H5 correction-cache writes remain controlled by `write_cache` / `--no-cache-write`; noise masking and unwrapping do not overwrite source magnitude/flow.
+
+`pcmra.npz` is created by CLI/API `--generate-pcmra` / `generate_pcmra=True` or the full Correction group. It contains unmasked `XYZT` `pcmra`, `resolution` and `origin`; the companion `pcmra_noise_mask.npz` defines the display region when requested. `summary.json.pcmra_file` points to it. Input loading alone creates neither PC-MRA arrays nor this file.

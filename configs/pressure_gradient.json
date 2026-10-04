@@ -1,5 +1,5 @@
 {
-  "method": "least_squares",
+  "method": "ppe",
   "smoothing_sigma": 0.0,
   "support_erosion_iters": 1,
   "layer_opacity": 0.6,

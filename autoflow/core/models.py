@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
-from ..case_types import BackgroundPhaseCorrectionConfig, PhaseUnwrappingConfig, InputState, LoadedCase, LoaderCapabilities
+from ..case_types import BackgroundPhaseCorrectionConfig, PhaseUnwrappingConfig, NoiseRemovalConfig, InputState, LoadedCase, LoaderCapabilities
 
 
 PATHLINE_CATEGORICAL_COLORS = (
@@ -41,7 +41,10 @@ class ObjectKind(Enum):
 
 
 class StepId(Enum):
+    BACKGROUND_CORRECTION = "step_background_correction"
+    REMOVE_NOISE = "step_noise_removal"
     UNWRAP_PHASE = "step_unwrap_phase"
+    GENERATE_PCMRA = "step_pcmra"
     GENERATE_SKELETON = "step_skeleton"
     EDIT_SKELETON = "step_edit_skeleton"
     GENERATE_GRAPH = "step_graph"
@@ -57,7 +60,10 @@ class StepId(Enum):
     @property
     def label(self):
         return {
+            StepId.BACKGROUND_CORRECTION: "Background Correction",
+            StepId.REMOVE_NOISE: "Noise Removal",
             StepId.UNWRAP_PHASE: "Unwrap Phase",
+            StepId.GENERATE_PCMRA: "Generate PC-MRA",
             StepId.GENERATE_SKELETON: "Generate Skeleton",
             StepId.EDIT_SKELETON: "Edit Skeleton",
             StepId.GENERATE_GRAPH: "Generate Graph",
@@ -491,7 +497,7 @@ class DerivedMetricsParams:
     pressure_gradient_layer_opacity: float = 0.6
     relative_pressure_layer_opacity: float = 0.6
     pressure_gradient_use_convective_acceleration: bool = True
-    pressure_method: str = "least_squares"
+    pressure_method: str = "ppe"
     vortex_smoothing_sigma: float = 0.0
     vortex_support_erosion_iters: int = 1
     step_size: int = 5
@@ -532,9 +538,13 @@ class DerivedMetricsParams:
             inward_distance = float(inward_distance)
         legacy_viscosity = float(payload.get("viscosity", 4.0))
         legacy_rho = float(payload.get("rho", 1060.0))
-        pressure_method = str(payload.get("pressure_method", payload.get("pressure_gradient_method", "least_squares")) or "least_squares").strip().lower()
-        if pressure_method not in {"least_squares", "ppe"}:
-            pressure_method = "least_squares"
+        pressure_method = str(payload.get("pressure_method", payload.get("pressure_gradient_method", "ppe")) or "ppe").strip().lower()
+        if pressure_method in {"ls", "least_squares", "least-squares", "least squares", "poisson", "ppe", "poisson_pressure_equation"}:
+            pressure_method = "ppe"
+        elif pressure_method in {"ste", "stokes", "stokes_estimator", "stokes-estimator"}:
+            pressure_method = "ste"
+        else:
+            pressure_method = "ppe"
         return DerivedMetricsParams(
             wss_smoothing_iteration=int(payload.get("wss_smoothing_iteration", payload.get("smoothing_iteration", 200))),
             wss_viscosity=float(payload.get("wss_viscosity", legacy_viscosity)),
@@ -1216,6 +1226,10 @@ class Workspace:
     pipeline: PipelineFlags = field(default_factory=PipelineFlags)
     loader_params: LoaderParams = field(default_factory=LoaderParams)
     phase_unwrap_params: PhaseUnwrappingConfig = field(default_factory=PhaseUnwrappingConfig)
+    noise_removal_params: NoiseRemovalConfig = field(default_factory=NoiseRemovalConfig)
+    pcmra_render_mask: Optional[np.ndarray] = None
+    pcmra_array: Optional[np.ndarray] = None
+    noise_removal_result: Dict[str, Any] = field(default_factory=dict)
     preprocess_params: PreprocessParams = field(default_factory=PreprocessParams)
     skeleton_params: SkeletonParams = field(default_factory=SkeletonParams)
     label_params: LabelParams = field(default_factory=LabelParams)
@@ -1285,6 +1299,40 @@ class Workspace:
     ortho_cursor: np.ndarray = field(default_factory=lambda: np.array([0, 0, 0], dtype=int))
     selected_path_index: int = -1
     _preprocess_signature: Any = field(default=None, repr=False, compare=False)
+
+    def copy_for_task(self):
+        """Copy mutable state containers; numerical input arrays remain shared.
+
+        Pipeline algorithms treat input arrays/meshes as read-only and assign
+        newly computed arrays. Live renderer actors stay on the GUI thread.
+        """
+        from dataclasses import is_dataclass
+        memo = {}
+        def clone(value):
+            if id(value) in memo:
+                return memo[id(value)]
+            if is_dataclass(value) and not isinstance(value, type):
+                result = copy.copy(value)
+                memo[id(value)] = result
+                for name, item in vars(value).items():
+                    setattr(result, name, item if name in {"actor", "label_actor"} else clone(item))
+                return result
+            if isinstance(value, dict):
+                result = {}
+                memo[id(value)] = result
+                result.update((key, clone(item)) for key, item in value.items())
+                return result
+            if isinstance(value, list):
+                result = []
+                memo[id(value)] = result
+                result.extend(clone(item) for item in value)
+                return result
+            if isinstance(value, tuple):
+                return tuple(clone(item) for item in value)
+            if isinstance(value, set):
+                return set(value)
+            return value
+        return clone(self)
 
     def _segmentation_version(self, source):
         if source not in ("original", "imported", "threshold", "auto"):
@@ -1553,6 +1601,12 @@ class Workspace:
         self.selected_path_index = -1
         self._preprocess_signature = None
         self.phase_unwrap_result = {}
+        self.noise_removal_params = NoiseRemovalConfig()
+        self.noise_removal_result = {}
+        self.pcmra_render_mask = None
+        self.pcmra_array = None
+        self._loaded_input_source = None
+        self._loaded_input_kwargs = {}
 
     def snapshot_dict(self):
         def arr(v):
@@ -1594,6 +1648,10 @@ class Workspace:
             "pipeline": {"completed": dict(self.pipeline.completed), "skipped": dict(self.pipeline.skipped)},
             "loader_params": self.loader_params.to_dict(),
             "phase_unwrap_params": self.phase_unwrap_params.to_dict(),
+            "noise_removal_params": self.noise_removal_params.to_dict(),
+            "pcmra_render_mask": arr(self.pcmra_render_mask),
+            "pcmra_array": arr(self.pcmra_array),
+            "noise_removal_result": copy.deepcopy(self.noise_removal_result),
             "preprocess_params": self.preprocess_params.to_dict(),
             "skeleton_params": self.skeleton_params.to_dict(),
             "label_params": self.label_params.to_dict(),
@@ -1679,11 +1737,17 @@ class Workspace:
         }
 
     def restore_dict(self, d):
+        self._loaded_input_source = None
+        self._loaded_input_kwargs = {}
         self.paths = PathsState(**{k: d.get("paths", {}).get(k, "") for k in ["segmask_path", "flow_path", "workspace_path", "output_dir"]})
         self.pipeline = PipelineFlags(completed=dict(d.get("pipeline", {}).get("completed", {})),
                                       skipped=dict(d.get("pipeline", {}).get("skipped", {})))
         self.loader_params = LoaderParams.from_dict(d.get("loader_params", {}))
         self.phase_unwrap_params = PhaseUnwrappingConfig.from_dict(d.get("phase_unwrap_params", {}))
+        self.noise_removal_params = NoiseRemovalConfig.from_dict(d.get("noise_removal_params", {}))
+        self.noise_removal_result = copy.deepcopy(d.get("noise_removal_result", {}))
+        self.pcmra_render_mask = None if d.get("pcmra_render_mask") is None else np.asarray(d["pcmra_render_mask"], dtype=bool)
+        self.pcmra_array = None if d.get("pcmra_array") is None else np.asarray(d["pcmra_array"], dtype=np.float32)
         self.preprocess_params = PreprocessParams.from_dict(d.get("preprocess_params", {}))
         self.skeleton_params = SkeletonParams.from_dict(d.get("skeleton_params", {}))
         self.label_params = LabelParams.from_dict(d.get("label_params", {}))

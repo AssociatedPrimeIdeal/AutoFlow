@@ -8,6 +8,8 @@ Supported in GUI, CLI and Python.
 
 Computes wall shear vectors in Pa and their magnitude from tangential velocity derivatives at the segmented vessel wall. The cell-centred velocity field is interpolated to points for continuous probing. Each tangential component uses wall-normal samples at 0, h and 2h; quadratic mode evaluates the derivative analytically at the wall, while linear mode uses the first slope. Default no-slip sets the wall velocity to zero.
 
+See [Scientific references: WSS](../references/index.md#wall-shear-stress) for MRI wall-shear estimation and Taubin smoothing. AutoFlow's probe-based derivative is not the original B-spline estimator.
+
 Taubin smoothing reduces surface shrinkage. Byte-identical segmentation phases reuse prepared geometry; velocity and attached WSS values remain independent per phase. Finite probes and intermediate lumen checks identify invalid sample segments. Family signatures include source arrays, geometry, parameters and algorithm version; cached arrays are reused by plane summaries and exports.
 
 ## When to use it

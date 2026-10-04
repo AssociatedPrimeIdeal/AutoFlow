@@ -248,8 +248,9 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "dicom_h5_dir": "",
         "ignore_embedded_segmentation": False,
     },
+    "noise_removal": {"enabled": False, "method": "magnitude_temporal", "magnitude_fraction": 0.05, "velocity_std_max": 0.80},
     "phase_unwrapping": {
-        "mask_source": "segmask",
+        "mask_source": "auto",
         "device": "auto",
         "tfc": True,
         "lap4d_ts": 2.0,
@@ -353,7 +354,7 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         },
     },
     "pressure_gradient": {
-        "method": "least_squares",
+        "method": "ppe",
         "smoothing_sigma": 0.0,
         "support_erosion_iters": 1,
         "layer_opacity": 0.6,
@@ -737,7 +738,7 @@ def _build_derived_metrics_config(config_bundle: Dict[str, Dict[str, Any]]) -> D
         "pressure_gradient_layer_opacity": float(pressure_gradient_cfg.get("layer_opacity", legacy_cfg.get("pressure_gradient_layer_opacity", 0.6))),
         "relative_pressure_layer_opacity": float(pressure_gradient_cfg.get("relative_pressure_opacity", legacy_cfg.get("relative_pressure_layer_opacity", 0.6))),
         "pressure_gradient_use_convective_acceleration": bool(pressure_gradient_cfg.get("use_convective_acceleration", legacy_cfg.get("pressure_gradient_use_convective_acceleration", True))),
-        "pressure_method": str(pressure_gradient_cfg.get("method", legacy_cfg.get("pressure_method", legacy_cfg.get("pressure_gradient_method", "least_squares"))) or "least_squares"),
+        "pressure_method": str(pressure_gradient_cfg.get("method", legacy_cfg.get("pressure_method", legacy_cfg.get("pressure_gradient_method", "ppe"))) or "ppe"),
         "vortex_smoothing_sigma": max(float(vortex_cfg.get("smoothing_sigma", legacy_cfg.get("vortex_smoothing_sigma", 0.0))), 0.0),
         "vortex_support_erosion_iters": max(int(vortex_cfg.get("support_erosion_iters", legacy_cfg.get("vortex_support_erosion_iters", 1))), 0),
         "step_size": int(legacy_cfg.get("step_size", 5)),
@@ -758,8 +759,9 @@ def apply_config_bundle_to_workspace(workspace: Workspace, config_bundle: Dict[s
         if key not in labels_cfg and key in skeleton_cfg:
             labels_cfg[key] = copy.deepcopy(skeleton_cfg[key])
     workspace.loader_params = LoaderParams.from_dict(config_bundle.get("loader", {}))
-    from .case_types import PhaseUnwrappingConfig
+    from .case_types import PhaseUnwrappingConfig, NoiseRemovalConfig
     workspace.phase_unwrap_params = PhaseUnwrappingConfig.from_dict(config_bundle.get("phase_unwrapping", {}))
+    workspace.noise_removal_params = NoiseRemovalConfig.from_dict(config_bundle.get("noise_removal", {}))
     workspace.skeleton_params = SkeletonParams.from_dict(skeleton_cfg)
     workspace.label_params = LabelParams.from_dict(labels_cfg)
     workspace.skeleton_params.label_map = copy.deepcopy(workspace.label_params.label_map)
@@ -786,6 +788,7 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
     loader_cfg = config_bundle.get("loader", {})
     bpc_cfg = loader_cfg.get("background_phase_correction", {})
     unwrap_cfg = config_bundle.get("phase_unwrapping", {}) or {}
+    noise_cfg = config_bundle.get("noise_removal", {}) or {}
     plane_cfg = config_bundle.get("planes", {})
     skeleton_cfg = config_bundle.get("skeleton", {})
     streamline_cfg = config_bundle.get("streamlines", {})
@@ -825,7 +828,12 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
         "background_phase_write_cache": bool(bpc_cfg.get("write_cache", True)),
         "phase_unwrap_enabled": bool(unwrap_cfg.get("enabled", False)),
         "phase_unwrap_method": str(unwrap_cfg.get("method", "none") or "none"),
-        "phase_unwrap_mask": str(unwrap_cfg.get("mask_source", "segmask") or "segmask"),
+        "phase_unwrap_mask": str(unwrap_cfg.get("mask_source", "auto") or "auto"),
+        "correction_all": bool(batch_cfg.get("correction_all", False)),
+        "noise_removal": bool(noise_cfg.get("enabled", False)),
+        "noise_removal_method": str(noise_cfg.get("method", "magnitude_temporal")),
+        "noise_magnitude_fraction": float(noise_cfg.get("magnitude_fraction", 0.05)),
+        "noise_velocity_std_max": float(noise_cfg.get("velocity_std_max", 0.80)),
         "phase_unwrap_device": str(unwrap_cfg.get("device", "auto") or "auto"),
         "phase_unwrap_tfc": bool(unwrap_cfg.get("tfc", True)),
         "phase_unwrap_lap4d_ts": float(unwrap_cfg.get("lap4d_ts", 2.0)),
@@ -875,7 +883,7 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
         "pathline_color": str(pathline_cfg["pathline_color"] or "deepskyblue"),
         "pathline_color_mode": (str(pathline_cfg["pathline_color_mode"] or "per_plane").strip().lower() if str(pathline_cfg["pathline_color_mode"] or "per_plane").strip().lower() in {"uniform", "per_plane", "per_group"} else "per_plane"),
         "pathline_temporal_cache_mb": max(0.0, float(pathline_cfg["pathline_temporal_cache_mb"])),
-        "pressure_method": str(derived_cfg.get("pressure_method", "least_squares") or "least_squares"),
+        "pressure_method": str(derived_cfg.get("pressure_method", "ppe") or "ppe"),
         "force_recompute_seg": bool(config_bundle.get("segmentation", {}).get("force_recompute_auto_cache", False)),
         "write_segmentation_cache": bool(config_bundle.get("segmentation", {}).get("write_auto_cache", True)),
         "autoseg_backend": str(config_bundle.get("segmentation", {}).get("auto_backend", "nnUNet") or "nnUNet"),

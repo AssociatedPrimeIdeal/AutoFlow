@@ -11,6 +11,8 @@
 ## What it does
 Skeleton generation reduces the vessel mask to a centerline-style structure that seeds graph construction.
 
+See [Scientific references: centerline](../references/index.md#centerline-skeleton-and-paths) for Lee 3-D thinning and subsequent Savitzky–Golay path smoothing. Group handling and graph cleanup are AutoFlow-specific; this is not a VMTK centerline workflow.
+
 For grouped multi-label segmentations, AutoFlow now:
 
 1. reduces 4D labels to 3D by majority vote along time

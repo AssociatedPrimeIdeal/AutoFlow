@@ -1,0 +1,6 @@
+{
+  "enabled": false,
+  "method": "magnitude_temporal",
+  "magnitude_fraction": 0.05,
+  "velocity_std_max": 0.80
+}

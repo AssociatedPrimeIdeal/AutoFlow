@@ -313,7 +313,7 @@ def process_single(
     segmentation_only=False,
     phase_unwrap_enabled=False,
     phase_unwrap_method="none",
-    phase_unwrap_mask="segmask",
+    phase_unwrap_mask="auto",
     phase_unwrap_device="auto",
     phase_unwrap_tfc=True,
     phase_unwrap_lap4d_ts=2.0,
@@ -357,6 +357,12 @@ def process_single(
     shared_colorbar_show=True,
     shared_colorbar_bar_cfg=None,
     phase_unwrap_backend_params=None,
+    correction_all=False,
+    noise_removal=False,
+    noise_removal_method="magnitude_temporal",
+    noise_magnitude_fraction=0.05,
+    noise_velocity_std_max=0.80,
+    generate_pcmra=False,
 ):
     loader = getattr(workspace, "loader_params", None)
     case = resolve_input_case(input_source, getattr(loader, "dicom_backend", "native"), getattr(loader, "dicom_h5_dir", ""))
@@ -394,7 +400,13 @@ def process_single(
     ws.derived_params.use_multithread = use_multithread
     ws.phase_unwrap_params.enabled = bool(phase_unwrap_enabled)
     ws.phase_unwrap_params.method = str(phase_unwrap_method or "none")
-    ws.phase_unwrap_params.mask_source = str(phase_unwrap_mask or "segmask")
+    ws.phase_unwrap_params.mask_source = str(phase_unwrap_mask or "auto")
+    from .case_types import NoiseRemovalConfig
+    from .algorithms.phase_unwrapping import resolve_mask_source
+    ws.noise_removal_params = NoiseRemovalConfig(enabled=noise_removal, method=noise_removal_method,
+        magnitude_fraction=noise_magnitude_fraction, velocity_std_max=noise_velocity_std_max)
+    if correction_all and str(ws.phase_unwrap_params.method).lower() in {"", "none", "disabled"}:
+        ws.phase_unwrap_params.method = "lap4D"
     ws.phase_unwrap_params.device = str(phase_unwrap_device or "auto")
     ws.phase_unwrap_params.tfc = bool(phase_unwrap_tfc)
     ws.phase_unwrap_params.lap4d_ts = float(phase_unwrap_lap4d_ts)
@@ -418,6 +430,33 @@ def process_single(
     _record_timing(stage_times, "load", elapsed)
     print(f"  -> load={elapsed:.2f}s")
 
+    def run_correction_step(step, timing_key):
+        print(f"[Correction] {step.label}...")
+        started = _time.perf_counter()
+        result = engine.run_step(ws, step, logger)
+        _record_timing(stage_times, timing_key, _time.perf_counter() - started)
+        print(f"  -> {result.message}")
+        if not result.success:
+            raise RuntimeError(result.message)
+
+    if correction_all or ws.loader_params.background_phase_correction.enabled:
+        run_correction_step(StepId.BACKGROUND_CORRECTION, "background_correction")
+    if correction_all or noise_removal:
+        run_correction_step(StepId.REMOVE_NOISE, "noise_removal")
+    unwrap_enabled = str(ws.phase_unwrap_params.method).lower() not in {"", "none", "disabled"}
+    unwrap_needs_seg = unwrap_enabled and resolve_mask_source(ws.phase_unwrap_params.method, ws.phase_unwrap_params.mask_source) == "segmask" and ws.segmask_raw is None
+    if correction_all and unwrap_needs_seg:
+        raise ValueError("Correction before segmentation cannot use unavailable segmask; use none/PCMRA or run segmentation first")
+    if unwrap_enabled and not unwrap_needs_seg:
+        run_correction_step(StepId.UNWRAP_PHASE, "phase_unwrap")
+    if (correction_all or generate_pcmra) and not unwrap_needs_seg:
+        run_correction_step(StepId.GENERATE_PCMRA, "pcmra")
+    noise_removal_file = ""
+    if ws.pcmra_render_mask is not None:
+        noise_removal_file = os.path.join(out_dir, "pcmra_noise_mask.npz")
+        np.savez_compressed(noise_removal_file, mask=ws.pcmra_render_mask,
+                            resolution=ws.resolution, origin=ws.origin)
+
     auto_seg_cache_bypassed = bool(getattr(ws.segmentation, "force_recompute_auto_cache", False) and ws.segmask_raw is None)
     segmentation_output = ""
     if ws.segmask_raw is None and autoseg:
@@ -438,16 +477,15 @@ def process_single(
         _record_timing(stage_times, "autoseg", elapsed)
         print(f"  -> auto segmentation ready: {segmentation_output} | time={elapsed:.2f}s")
 
-    # Choosing a method is the opt-in switch.  The legacy ``enabled`` field
-    # is still loaded for old configs but is no longer required.
-    if str(getattr(ws.phase_unwrap_params, "method", "") or "").strip().lower() not in {"", "none", "disabled"}:
-        print("[1.75/7] Phase unwrapping...")
-        t_unwrap = _time.perf_counter()
-        unwrap_result = engine.run_step(ws, StepId.UNWRAP_PHASE, logger)
-        _record_timing(stage_times, "phase_unwrap", _time.perf_counter() - t_unwrap)
-        print(f"  -> {unwrap_result.message}")
-        if not unwrap_result.success:
-            raise RuntimeError(unwrap_result.message)
+    if unwrap_needs_seg:
+        run_correction_step(StepId.UNWRAP_PHASE, "phase_unwrap")
+        if generate_pcmra:
+            run_correction_step(StepId.GENERATE_PCMRA, "pcmra")
+
+    pcmra_file = ""
+    if ws.pcmra_array is not None:
+        pcmra_file = os.path.join(out_dir, "pcmra.npz")
+        np.savez_compressed(pcmra_file, pcmra=ws.pcmra_array, resolution=ws.resolution, origin=ws.origin)
 
     if segmentation_only:
         if ws.segmask_raw is None:
@@ -490,8 +528,13 @@ def process_single(
             "source_group": ws.input_state.source_group,
             "capabilities": ws.input_state.capabilities.to_dict(),
             "segmentation_only": True,
+            "noise_removal": dict(ws.noise_removal_result),
+            "noise_removal_file": noise_removal_file,
+            "pcmra_file": pcmra_file,
             "phase_unwrap": {
                 "method": phase_info.get("method"),
+                "mask_source": phase_info.get("mask_source"),
+                "diagnostic_scope": phase_info.get("diagnostic_scope", "latest_masked_run"),
                 "device": phase_info.get("device"),
                 "elapsed_sec": phase_info.get("elapsed_sec"),
                 "statistics": phase_info.get("statistics", {}),
@@ -880,6 +923,8 @@ def process_single(
     if ws.phase_unwrap_result:
         phase_unwrap_summary = {
             "method": ws.phase_unwrap_result.get("method"),
+            "mask_source": ws.phase_unwrap_result.get("mask_source"),
+            "diagnostic_scope": ws.phase_unwrap_result.get("diagnostic_scope", "latest_masked_run"),
             "device": ws.phase_unwrap_result.get("device"),
             "elapsed_sec": ws.phase_unwrap_result.get("elapsed_sec"),
             "statistics": ws.phase_unwrap_result.get("statistics", {}),
@@ -911,6 +956,9 @@ def process_single(
         "source_group": ws.input_state.source_group,
         "capabilities": ws.input_state.capabilities.to_dict(),
         "phase_unwrap": phase_unwrap_summary,
+        "noise_removal": dict(ws.noise_removal_result),
+        "noise_removal_file": noise_removal_file,
+        "pcmra_file": pcmra_file,
         "phase_unwrap_file": phase_unwrap_file,
         "requested_metrics": dict(metric_flags),
         "requested_videos": dict(video_flags),
@@ -950,7 +998,7 @@ def process_single(
         "videos": video_paths,
         "pixelwise_export": {k: list(np.asarray(v).shape) for k, v in pixelwise_result.items()} if pixelwise_result else {},
         "centerline_pressure_profiles": list(ws.derived.centerline_pressure_profiles or []),
-        "pressure_method": str(getattr(ws.derived_params, "pressure_method", "least_squares") or "least_squares"),
+        "pressure_method": str(getattr(ws.derived_params, "pressure_method", "ppe") or "ppe"),
         "pressure_gradient_dt_s": ws.derived.pressure_gradient_dt_s,
         "pressure_gradient_temporal_scheme": str(ws.derived.pressure_gradient_temporal_scheme or ""),
         "plane_pixelwise_file": ws.derived.plane_pixelwise_file,

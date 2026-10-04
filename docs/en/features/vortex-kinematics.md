@@ -10,6 +10,8 @@
 
 ## What it does
 
+See [Scientific references: vortex kinematics](../references/index.md#vortex-kinematics) for velocity-gradient vortex identifiers and swirling strength. The cited `lambda_2` literature does not mean that AutoFlow implements that criterion.
+
 Vortex kinematics derives spatial velocity-gradient fields from the normalized 4D flow velocity: vorticity vector and magnitude, Q-criterion, and swirling strength (`λci`). Velocity is converted from cm/s to m/s and spacing from mm to m, so vorticity and `λci` are in `s^-1` and Q is in `s^-2`.
 
 The feature creates a separate `vortex_support_mask`. It is an eroded copy of the lumen mask used only for these spatial derivatives; it never changes the loaded segmentation or WSS surface.

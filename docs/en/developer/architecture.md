@@ -40,7 +40,7 @@ This page explains where the major runtime responsibilities live so maintainers 
 
 1. loader returns `LoadedCase`
 2. workspace stores normalized source arrays and metadata
-3. segmentation availability controls downstream step eligibility
+3. optional Correction runs background correction → display noise mask → phase unwrap → PC-MRA generation before segmentation; segmentation availability then controls downstream eligibility
 4. skeleton feeds graph and paths
 5. graph and paths feed planes
 6. planes feed metrics
@@ -72,4 +72,16 @@ vote, while `Workspace.segmask_binary` remains temporal for phase-wise metrics.
 
 Plane metrics cache thresholded support geometry per unique mask phase and slice specifications per plane and representative phase. WSS caches the extracted and smoothed base surface per unique mask phase, then copies that geometry before attaching phase-specific arrays. Geometry caches must never share mutable phase-specific scalar data.
 
-Long-running compute-oriented GUI pipeline steps are dispatched by `_PipelineTaskWorker` in `autoflow/ui/app.py`. The worker mutates the active workspace while a window-modal progress dialog prevents competing user actions; scene cache invalidation and VTK actor refresh happen on the GUI thread after completion. Interactive editors and live streamline/pathline actions are deliberately excluded from this worker path.
+Long-running compute-oriented GUI pipeline steps are dispatched by `_PipelineTaskWorker` in `autoflow/ui/app.py`. The worker computes each step in a detached copy of mutable workspace containers, sharing read-only numerical inputs. It publishes only completed successful steps. An application-modal progress dialog prevents competing user actions until the thread stops; scene cache invalidation and VTK actor refresh happen on the GUI thread after completion. Interactive editors and live streamlines use their existing scene paths; pathlines have a separate cancellable worker. H5/DICOM loading, DICOM scan/preview, segmentation preparation and Labeler exchange use the shared background function runner. Case loading retains the current workspace until the replacement load succeeds.
+
+`autoflow/task_control.py` owns thread-local cancellation/progress scopes and task-owned subprocess termination. `autoflow/ui/progress.py` owns application modality, input filtering, animated activity, elapsed/update age, and the close-to-cancel lifecycle. A progress window is dismissed only after worker termination. × requests cancellation; Escape does not dismiss the task lock. Native calculations and file writes stop at safe boundaries.
+
+GUI video preparation uses detached workspace state; `autoflow/rendering/jobs.py` launches an isolated renderer with its own VTK context and streamed frame progress. The child renders into a private directory and the parent publishes completed files after success. CLI/API renderers share the replayable frame generators and atomic MP4 encoder.
+
+Segmentation updates call `PipelineEngine.refresh_segmentation_dependents()`: retain all artifacts only for identical processed 4D masks; retain geometry but invalidate all numerical families/trajectories for temporal-only changes with identical processed 3D topology and configuration; otherwise reset segmentation dependents.
+
+## Correction state and reruns
+
+`PipelineEngine.load_data` disables loader correction and remembers the original selected input. Background Correction rereads that source/group with current correction parameters, preserving true complex and dual-VENC processing and avoiding repeated subtraction. It updates working velocity and the unwrap baseline without resetting downstream state. Unwrap always starts from stored wrapped phase and preserves working velocity outside the selected mask. Noise Removal writes only `pcmra_render_mask`, read by the 3D PC-MRA renderer. GUI refreshes affected display layers without invoking segmentation or metric recomputation. CLI `process_single` executes the group before segmentation; standalone unavailable-segmask unwrap can be deferred until automatic segmentation.
+
+`Workspace.pcmra_array` is an explicitly generated `XYZT` snapshot of magnitude times working speed. It is unset on input load, computed frame by frame by `StepId.GENERATE_PCMRA`, saved/restored in workspaces and consumed by both 3D rendering and the PC-MRA Content entry. Noise Removal adds a `noise_region` review surface from the excluded mask. `OrthoViewer` filters Content by available arrays/results and stores stable field IDs in combo item data; never interpret row positions as field identities.

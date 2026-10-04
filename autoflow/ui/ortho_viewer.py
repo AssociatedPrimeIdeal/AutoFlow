@@ -125,7 +125,8 @@ class OrthoViewer(QtWidgets.QWidget):
         self._maximized_view = None
         self._slice_keys = {}
         self._colorbar_state = None
-        self._correction_content_available = None
+        self._noise_overlay_visible = False
+        self._noise_overlay_opacity = 0.35
         self._plane_region_surface_cache = {}
         self._contour_stroke = []
         self._contour_preview = None
@@ -164,7 +165,7 @@ class OrthoViewer(QtWidgets.QWidget):
 
         ctrl = QtWidgets.QHBoxLayout()
         self.combo_content = QtWidgets.QComboBox()
-        self.combo_content.addItems([
+        self._content_labels = [
             "Flow LR (cm/s)", "Flow AP (cm/s)", "Flow FH (cm/s)",
             "Magnitude", "PC-MRA", "Speed (cm/s)",
             "WSS (Pa)", "TKE (J/m³)",
@@ -172,24 +173,16 @@ class OrthoViewer(QtWidgets.QWidget):
             "Relative Pressure (Pa)",
             "Vorticity Magnitude (s⁻¹)", "Q-Criterion (s⁻²)", "Swirling Strength λci (s⁻¹)",
             "Corr Low LR (rad)", "Corr Low AP (rad)", "Corr Low FH (rad)",
-            "Corr High LR (rad)", "Corr High AP (rad)", "Corr High FH (rad)"
-            , "Wrap Mask (any component)", "Wrap Count LR", "Wrap Count AP", "Wrap Count FH",
-            "Unwrapped − Wrapped Speed (cm/s)"
-        ])
-        self.combo_content.addItem("Through-plane Flow (cm/s)")
-        self.combo_content.setCurrentIndex(4)
-        through_plane_item = self.combo_content.model().item(self.combo_content.count() - 1)
-        if through_plane_item is not None:
-            through_plane_item.setEnabled(False)
-        self.combo_content.setItemData(
-            self.combo_content.count() - 1,
-            "Select a plane to enable this content",
-            QtCore.Qt.ToolTipRole,
-        )
+            "Corr High LR (rad)", "Corr High AP (rad)", "Corr High FH (rad)",
+            "Wrap Mask (any component)", "Wrap Count LR", "Wrap Count AP", "Wrap Count FH",
+            "Unwrapped − Wrapped Speed (cm/s)", "Through-plane Flow (cm/s)",
+        ]
+        self.combo_content.setPlaceholderText("Load data to view content")
+        self._refresh_content_choices()
         self.combo_content.currentIndexChanged.connect(self._on_content_changed)
         ctrl.addWidget(QtWidgets.QLabel("Content:"))
         ctrl.addWidget(self.combo_content, 1)
-        ctrl.addWidget(QtWidgets.QLabel("Overlay:"))
+        ctrl.addWidget(QtWidgets.QLabel("Segmentation:"))
         self.slider_overlay_opacity = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.slider_overlay_opacity.setRange(0, 100)
         self.slider_overlay_opacity.setFixedWidth(78)
@@ -199,6 +192,21 @@ class OrthoViewer(QtWidgets.QWidget):
         self.label_overlay_opacity = QtWidgets.QLabel("35%")
         self.label_overlay_opacity.setMinimumWidth(34)
         ctrl.addWidget(self.label_overlay_opacity)
+        self.btn_noise_overlay = QtWidgets.QCheckBox("Noise mask")
+        self.btn_noise_overlay.setChecked(False)
+        self.btn_noise_overlay.setToolTip("Show excluded voxels (weak signal or unstable velocity) in red on orthogonal slices")
+        self.btn_noise_overlay.toggled.connect(self._on_noise_overlay_toggled)
+        ctrl.addWidget(self.btn_noise_overlay)
+        self.slider_noise_overlay_opacity = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.slider_noise_overlay_opacity.setRange(0, 100)
+        self.slider_noise_overlay_opacity.setFixedWidth(78)
+        self.slider_noise_overlay_opacity.setToolTip("Noise mask overlay opacity")
+        self.slider_noise_overlay_opacity.setValue(0)
+        self.slider_noise_overlay_opacity.valueChanged.connect(self._on_noise_overlay_opacity_changed)
+        ctrl.addWidget(self.slider_noise_overlay_opacity)
+        self.label_noise_overlay_opacity = QtWidgets.QLabel("0%")
+        self.label_noise_overlay_opacity.setMinimumWidth(34)
+        ctrl.addWidget(self.label_noise_overlay_opacity)
         self.btn_reset_views = QtWidgets.QPushButton()
         self.btn_reset_views.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_BrowserReload)
@@ -661,7 +669,7 @@ class OrthoViewer(QtWidgets.QWidget):
         pointer = int(array.__array_interface__["data"][0]) if array.size else 0
         return (pointer, tuple(int(item) for item in array.shape), tuple(int(item) for item in array.strides), array.dtype.str)
 
-    def _plane_orthogonal_slices(self, vol, labels, plane, center, fov_mm, spacing_mm):
+    def _plane_orthogonal_slices(self, vol, labels, noise_region, plane, center, fov_mm, spacing_mm):
         normal = np.asarray(plane.normal, dtype=float); normal /= np.linalg.norm(normal) + 1e-12
         center = np.asarray(center, dtype=float).reshape(3)
         key = (
@@ -672,6 +680,7 @@ class OrthoViewer(QtWidgets.QWidget):
             round(float(spacing_mm), 3),
             tuple(np.round(self._get_resolution(), 6).tolist()),
             tuple(np.round(np.asarray(getattr(self.workspace, "origin", np.zeros(3)), dtype=float), 6).tolist()),
+            self._array_cache_token(noise_region),
         )
 
         def _build():
@@ -696,12 +705,18 @@ class OrthoViewer(QtWidgets.QWidget):
                     order=0, cell_centered=True,
                 )
                 overlay = np.rint(sampled).astype(np.int16)
-            out.append((image, overlay, title))
+            noise_overlay = None
+            if noise_region is not None:
+                sampled_noise, _ = self._resample_basis(
+                    noise_region, center, axis_u, axis_v, fov_mm, spacing_mm,
+                    order=0, cell_centered=True,
+                )
+                noise_overlay = sampled_noise >= 0.5
+            out.append((image, overlay, noise_overlay, title))
         return out
 
     def update_slider_ranges(self):
-        self._refresh_correction_content_availability()
-        self._refresh_phase_unwrap_content_availability()
+        self._refresh_content_choices()
         shape = self._get_volume_shape()
         if shape is None:
             return
@@ -1018,6 +1033,24 @@ class OrthoViewer(QtWidgets.QWidget):
                     scene.apply_object_properties(obj, render=False, refresh_scalar_bar=False)
         self.refresh(update_plane=False)
 
+    def _on_noise_overlay_toggled(self, checked):
+        self._noise_overlay_visible = bool(checked)
+        if checked and self._noise_overlay_opacity <= 0.0:
+            self._noise_overlay_opacity = 0.35
+        self._slice_keys.clear()
+        self.refresh(update_plane=False)
+        self._apply_noise_overlay_opacity()
+
+    def _on_noise_overlay_opacity_changed(self, value):
+        self._noise_overlay_opacity = float(np.clip(float(value) / 100.0, 0.0, 1.0))
+        self.btn_noise_overlay.setChecked(value > 0)
+        self.label_noise_overlay_opacity.setText(f"{int(value)}%")
+        self._apply_noise_overlay_opacity()
+
+    def _apply_noise_overlay_opacity(self):
+        for view in self.slice_views.values():
+            view.noise_overlay_item.setOpacity(self._noise_overlay_opacity)
+
     def _sync_overlay_opacity_control(self):
         value = int(round(float(np.clip(getattr(self.workspace.segmentation, "opacity", 0.35), 0.0, 1.0)) * 100.0))
         self.slider_overlay_opacity.blockSignals(True)
@@ -1025,44 +1058,102 @@ class OrthoViewer(QtWidgets.QWidget):
         self.slider_overlay_opacity.blockSignals(False)
         self.label_overlay_opacity.setText(f"{value}%")
 
-    def _refresh_correction_content_availability(self):
-        def valid(field):
-            value = getattr(self.workspace, field, None)
-            return bool(value is not None and np.asarray(value).ndim == 5 and np.asarray(value).shape[-1] == 3)
+    def _sync_noise_overlay_control(self):
+        available = self._get_noise_region_3d() is not None
+        self.btn_noise_overlay.blockSignals(True)
+        self.btn_noise_overlay.setEnabled(available)
+        if not available:
+            self.btn_noise_overlay.setChecked(False)
+            self._noise_overlay_visible = False
+        self.btn_noise_overlay.blockSignals(False)
+        self.slider_noise_overlay_opacity.setEnabled(available)
+        self.slider_noise_overlay_opacity.blockSignals(True)
+        value = int(round(self._noise_overlay_opacity * 100.0)) if self._noise_overlay_visible else 0
+        self.slider_noise_overlay_opacity.setValue(value)
+        self.slider_noise_overlay_opacity.blockSignals(False)
+        self.label_noise_overlay_opacity.setText(f"{value}%")
 
-        low_available = valid("correction_raw")
-        high_available = valid("correction_high_raw")
-        availability = (low_available, high_available)
-        if availability == self._correction_content_available:
+    def _get_noise_region_3d(self):
+        mask = getattr(self.workspace, "pcmra_render_mask", None)
+        if mask is None:
+            return None
+        region = np.asarray(mask, dtype=bool)
+        if region.ndim == 4:
+            frame_index = min(max(0, int(self.workspace.current_t)), region.shape[3] - 1)
+            region = region[..., frame_index]
+        if region.ndim != 3:
+            return None
+        shape = self._get_volume_shape()
+        if shape is None or tuple(region.shape) != tuple(shape):
+            return None
+        return ~region
+
+    def _noise_region_overlay(self, region_2d):
+        if not self._noise_overlay_visible or region_2d is None:
+            return None
+        region = np.asarray(region_2d, dtype=bool)
+        rgba = np.zeros((*region.shape, 4), dtype=np.uint8)
+        rgba[region] = (255, 0, 0, 255)
+        return rgba
+
+    def _available_content_keys(self):
+        """Only expose acquired data and derived fields that actually exist."""
+        ws = self.workspace
+        available = set()
+        if ws.flow_raw is not None:
+            available.update((0, 1, 2, 5))
+        if ws.mag_raw is not None:
+            available.add(3)
+        if ws.pcmra_array is not None:
+            available.add(4)
+        derived = ws.derived
+        if derived.wss_volume is not None or any(surf is not None for surf in derived.wss_surfaces):
+            available.add(6)
+        if derived.tke_array is not None or derived.tke_volume is not None:
+            available.add(7)
+        if derived.pressure_gradient_array is not None:
+            available.update(range(8, 12))
+        for key, field in ((12, "relative_pressure_array"), (13, "vorticity_magnitude"),
+                           (14, "q_criterion_array"), (15, "swirling_strength_array")):
+            if getattr(derived, field) is not None:
+                available.add(key)
+        for first, field in ((16, "correction_raw"), (19, "correction_high_raw")):
+            value = getattr(ws, field, None)
+            if value is not None and np.asarray(value).ndim == 5 and np.asarray(value).shape[-1] == 3:
+                available.update(range(first, first + 3))
+        unwrap = ws.phase_unwrap_result or {}
+        if unwrap.get("wrap_mask") is not None:
+            available.add(22)
+        if unwrap.get("wrap_count") is not None:
+            available.update((23, 24, 25))
+        if unwrap.get("flow_unwrapped") is not None and unwrap.get("flow_wrapped") is not None:
+            available.add(26)
+        idx = self._selected_plane_idx
+        if ws.flow_raw is not None and idx is not None and 0 <= int(idx) < len(ws.planes):
+            available.add(27)
+        return sorted(available)
+
+    def _refresh_content_choices(self):
+        # Stable item data identifies a field after insertions/removals; row
+        # indices must never be used as field IDs in this filtered menu.
+        available = self._available_content_keys()
+        combo = self.combo_content
+        existing = [combo.itemData(index) for index in range(combo.count())]
+        if existing == available:
+            combo.setEnabled(bool(available))
             return
-        self._correction_content_available = availability
-        model = self.combo_content.model()
-        for index, available, name in (
-            (16, low_available, "low-VENC"),
-            (17, low_available, "low-VENC"),
-            (18, low_available, "low-VENC"),
-            (19, high_available, "high-VENC"),
-            (20, high_available, "high-VENC"),
-            (21, high_available, "high-VENC"),
-        ):
-            item = model.item(index) if hasattr(model, "item") else None
-            if item is not None:
-                item.setEnabled(available)
-            tooltip = f"{name} background-phase correction field." if available else "Unavailable: enable background phase correction and reload the input."
-            self.combo_content.setItemData(index, tooltip, QtCore.Qt.ToolTipRole)
-        if not self.combo_content.model().item(int(self.combo_content.currentIndex())).isEnabled():
-            self.combo_content.setCurrentIndex(4)
-
-    def _refresh_phase_unwrap_content_availability(self):
-        available = "wrap_mask" in (getattr(self.workspace, "phase_unwrap_result", {}) or {})
-        model = self.combo_content.model()
-        for index in range(22, 27):
-            item = model.item(index) if hasattr(model, "item") else None
-            if item is not None:
-                item.setEnabled(bool(available))
-            self.combo_content.setItemData(index, "Estimated wrap diagnostics from the selected unwrapping run." if available else "Unavailable: run phase unwrapping first.", QtCore.Qt.ToolTipRole)
-        if not model.item(int(self.combo_content.currentIndex())).isEnabled():
-            self.combo_content.setCurrentIndex(4)
+        selected = combo.currentData()
+        if selected not in available:
+            selected = 3 if 3 in available else (available[0] if available else None)
+        combo.blockSignals(True)
+        combo.clear()
+        for key in available:
+            combo.addItem(self._content_labels[key], key)
+        combo.setCurrentIndex(combo.findData(selected) if selected is not None else -1)
+        combo.setEnabled(bool(available))
+        combo.blockSignals(False)
+        self._manual_levels = None
+        self._slice_keys.clear()
 
     def _reset_views(self):
         self._manual_levels = None
@@ -1088,17 +1179,7 @@ class OrthoViewer(QtWidgets.QWidget):
         has_plane = idx is not None and 0 <= int(idx) < len(self.workspace.planes)
         self.btn_edit_contour.setEnabled(has_plane)
         self.contour_controls.setVisible(has_plane)
-        through_plane_index = self.combo_content.count() - 1
-        through_plane_item = self.combo_content.model().item(through_plane_index)
-        if through_plane_item is not None:
-            through_plane_item.setEnabled(has_plane)
-        self.combo_content.setItemData(
-            through_plane_index,
-            "Velocity projected onto the selected plane normal" if has_plane else "Select a plane to enable this content",
-            QtCore.Qt.ToolTipRole,
-        )
-        if not has_plane and self.combo_content.currentIndex() == through_plane_index:
-            self.combo_content.setCurrentIndex(4)
+        self._refresh_content_choices()
         self._slice_keys.clear()
         for view in self.slice_views.values():
             view.plane_line.hide()
@@ -1330,7 +1411,7 @@ class OrthoViewer(QtWidgets.QWidget):
 
     def _get_scalar_slice(self, t):
         ws = self.workspace
-        content_idx = self.combo_content.currentIndex()
+        content_idx = self.combo_content.currentData()
         if content_idx == 0 and ws.flow_raw is not None:
             vol = np.asarray(ws.flow_raw[..., t, 0], dtype=np.float32)
             vmax = self._cached("scalar_clim", ("flow", id(ws.flow_raw), int(t), 0), lambda: max(abs(float(np.nanmin(vol))), abs(float(np.nanmax(vol))), 1e-6))
@@ -1347,13 +1428,11 @@ class OrthoViewer(QtWidgets.QWidget):
             vol = np.asarray(ws.mag_raw[..., t], dtype=np.float32)
             clim = self._cached("scalar_clim", ("magnitude", id(ws.mag_raw), int(t)), lambda: (float(np.nanmin(vol)), float(np.nanmax(vol))))
             return vol, "Magnitude", {"cmap": "gray", "clim": clim}
-        if content_idx == 4 and ws.mag_raw is not None and ws.flow_raw is not None:
-            key = (id(ws.mag_raw), id(ws.flow_raw), int(t))
-            def _build():
-                flow_t = np.asarray(ws.flow_raw[..., t, :], dtype=np.float32)
-                speed = np.sqrt(np.sum(np.square(flow_t, dtype=np.float32), axis=-1))
-                return np.asarray(ws.mag_raw[..., t], dtype=np.float32) * speed
-            vol = self._cached("scalar_volume", ("pcmra",) + key, _build)
+        if content_idx == 4 and ws.pcmra_array is not None:
+            pcmra = np.asarray(ws.pcmra_array)
+            tidx = min(max(0, int(t)), pcmra.shape[3] - 1)
+            vol = np.asarray(pcmra[..., tidx], dtype=np.float32)
+            key = (id(ws.pcmra_array), tidx)
             clim = self._cached("scalar_clim", ("pcmra",) + key, lambda: (float(np.nanmin(vol)), float(np.nanmax(vol))))
             return vol, "PC-MRA", {"cmap": "gray", "clim": clim}
         if content_idx == 5 and ws.flow_raw is not None:
@@ -1622,14 +1701,14 @@ class OrthoViewer(QtWidgets.QWidget):
             self._updating_colorbar = False
 
     def refresh(self, update_plane=True):
-        self._refresh_correction_content_availability()
-        self._refresh_phase_unwrap_content_availability()
+        self._refresh_content_choices()
         ws = self.workspace
         # Never carry an intersection from a previous plane, time frame, or
         # slice while the new geometry is being rebuilt.
         for view in self.slice_views.values():
             view.plane_line.hide()
         self._sync_overlay_opacity_control()
+        self._sync_noise_overlay_control()
         t = int(ws.current_t)
         if update_plane:
             self._slice_keys.clear()
@@ -1644,6 +1723,7 @@ class OrthoViewer(QtWidgets.QWidget):
         cx, cy, cz = self.slider_x.value(), self.slider_y.value(), self.slider_z.value()
         vol, title, style = self._get_scalar_slice(t)
         labels_3d = self._get_mask_3d()
+        noise_region_3d = self._get_noise_region_3d()
         res = self._get_resolution()
         self._current_volume = vol
         self._current_title = title
@@ -1671,7 +1751,7 @@ class OrthoViewer(QtWidgets.QWidget):
                 display_labels = self._display_labels_for_frame(t)
                 orth_center, orth_fov = self._plane_orthogonal_geometry(selected_plane, t)
                 orthogonal = self._plane_orthogonal_slices(
-                    vol, display_labels, selected_plane, center=orth_center, fov_mm=orth_fov,
+                    vol, display_labels, noise_region_3d, selected_plane, center=orth_center, fov_mm=orth_fov,
                     spacing_mm=max(float(np.min(res)) * 0.75, 0.25),
                 )
                 orth_spacing = max(float(orth_fov) / max(int(orthogonal[0][0].shape[0]) - 1, 1), 1e-3)
@@ -1685,10 +1765,11 @@ class OrthoViewer(QtWidgets.QWidget):
                     name: (
                         item[0],
                         item[1],
+                        item[2],
                         (item[0].shape[0] // 2, item[0].shape[1] // 2),
                         0,
                         (orth_spacing, orth_spacing),
-                        item[2],
+                        item[3],
                         orth_extent,
                         (0.0, 0.0),
                     )
@@ -1708,21 +1789,23 @@ class OrthoViewer(QtWidgets.QWidget):
                         "sagittal": (plane_center[1], plane_center[2]),
                     }
                 slices = {
-                    "axial": (vol[:, :, cz], None if labels_3d is None else labels_3d[:, :, cz], (cx, cy), cz, (res[0], res[1]), "Axial", None, plane_centers["axial"]),
-                    "coronal": (vol[:, cy, :], None if labels_3d is None else labels_3d[:, cy, :], (cx, cz), cy, (res[0], res[2]), "Coronal", None, plane_centers["coronal"]),
-                    "sagittal": (vol[cx, :, :], None if labels_3d is None else labels_3d[cx, :, :], (cy, cz), cx, (res[1], res[2]), "Sagittal", None, plane_centers["sagittal"]),
+                    "axial": (vol[:, :, cz], None if labels_3d is None else labels_3d[:, :, cz], None if noise_region_3d is None else noise_region_3d[:, :, cz], (cx, cy), cz, (res[0], res[1]), "Axial", None, plane_centers["axial"]),
+                    "coronal": (vol[:, cy, :], None if labels_3d is None else labels_3d[:, cy, :], None if noise_region_3d is None else noise_region_3d[:, cy, :], (cx, cz), cy, (res[0], res[2]), "Coronal", None, plane_centers["coronal"]),
+                    "sagittal": (vol[cx, :, :], None if labels_3d is None else labels_3d[cx, :, :], None if noise_region_3d is None else noise_region_3d[cx, :, :], (cy, cz), cx, (res[1], res[2]), "Sagittal", None, plane_centers["sagittal"]),
                 }
-            for plane, (image, labels, cursor, fixed, view_spacing, view_title, extent, view_center) in slices.items():
+            for plane, (image, labels, noise_region, cursor, fixed, view_spacing, view_title, extent, view_center) in slices.items():
                 spec = PLANE_SPECS[plane]
                 slice_key = (
-                    mode, int(self.combo_content.currentIndex()), int(t), int(fixed),
+                    mode, self.combo_content.currentData(), int(t), int(fixed),
                     None if selected_plane is None else tuple(np.round(np.asarray(selected_plane.center), 4)),
                     None if selected_plane is None else tuple(np.round(np.asarray(selected_plane.normal), 6)),
                     None if orth_center is None else tuple(np.round(orth_center, 4)),
                     None if orth_fov is None else round(float(orth_fov), 3),
+                    id(ws.pcmra_render_mask), bool(self._noise_overlay_visible),
                 )
                 previous_key = self._slice_keys.get(plane)
                 view_levels = clim if self._manual_levels is not None else self._cached_image_levels(image, clim)
+                noise_overlay = self._noise_region_overlay(noise_region)
                 if previous_key == slice_key:
                     self.slice_views[plane].update_cursor(cursor, fixed, view_levels)
                 elif (
@@ -1737,6 +1820,7 @@ class OrthoViewer(QtWidgets.QWidget):
                         cursor,
                         fixed,
                         view_levels,
+                        noise_overlay=noise_overlay,
                     )
                     self._slice_keys[plane] = slice_key
                 else:
@@ -1750,6 +1834,7 @@ class OrthoViewer(QtWidgets.QWidget):
                         view_levels,
                         extent=extent,
                         view_center=view_center,
+                        noise_overlay=noise_overlay,
                     )
                     self._slice_keys[plane] = slice_key
                 if mode == "plane" and selected_plane is not None:
@@ -2533,6 +2618,8 @@ class OrthoViewer(QtWidgets.QWidget):
         self._manual_levels = None
         self._current_volume = None
         self._current_title = ""
+        self._noise_overlay_visible = False
+        self._noise_overlay_opacity = 0.35
         self._slice_keys.clear()
         self._colorbar_state = None
         self._plane_roi_undo.clear()
@@ -2541,10 +2628,13 @@ class OrthoViewer(QtWidgets.QWidget):
         self.label_plane_metric.setText("Plane metrics: -")
         self.contour_controls.hide()
         self.btn_edit_contour.setEnabled(False)
-        through_plane_item = self.combo_content.model().item(self.combo_content.count() - 1)
-        if through_plane_item is not None:
-            through_plane_item.setEnabled(False)
-        if self.combo_content.currentIndex() == self.combo_content.count() - 1:
-            self.combo_content.setCurrentIndex(4)
+        self.btn_noise_overlay.blockSignals(True)
+        self.btn_noise_overlay.setChecked(False)
+        self.btn_noise_overlay.blockSignals(False)
+        self.slider_noise_overlay_opacity.blockSignals(True)
+        self.slider_noise_overlay_opacity.setValue(0)
+        self.slider_noise_overlay_opacity.blockSignals(False)
+        self.label_noise_overlay_opacity.setText("0%")
+        self._refresh_content_choices()
         for view in self.slice_views.values():
             view.clear()
