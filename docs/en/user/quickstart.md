@@ -85,7 +85,7 @@ autoflow-gui
 
 Typical GUI flow:
 
-1. `File > Open H5` or `File > Import DICOM Directory` (converts to a new H5 first)
+1. `File > Load H5` or `File > Load DICOM` (the single DICOM action directly below `Load H5`; converts to a new H5 first)
 2. inspect the case in the 3D view and ortho viewer
 3. if needed, choose or generate segmentation
 4. click `Run All`

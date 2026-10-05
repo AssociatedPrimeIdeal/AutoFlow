@@ -54,11 +54,31 @@ def _append_summary(metric, prefix, series):
     metric[prefix] = float(np.mean(arr)) if arr.size else 0.0
 
 
+def _available_pressure_statistics(values, areas, absolute=False):
+    values = np.asarray(values, dtype=float).reshape(-1)
+    areas = np.asarray(areas, dtype=float).reshape(-1)
+    if values.size != areas.size:
+        return None, None, None
+    valid = np.isfinite(values) & np.isfinite(areas) & (areas > 0)
+    if not np.any(valid):
+        return None, None, None
+    values, areas = values[valid], areas[valid]
+    magnitude = np.abs(values) if absolute else values
+    return _weighted_mean(values, areas), float(np.max(magnitude)), _nanpercentile_safe(magnitude, 95)
+
+
+def _append_available_summary(metric, prefix, series):
+    values = np.asarray(series, dtype=float)
+    valid = np.isfinite(values)
+    metric[f"{prefix}_t"] = [float(x) if ok else None for x, ok in zip(values, valid)]
+    metric[prefix] = float(np.mean(values[valid])) if np.any(valid) else None
+
+
 def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_labels_3d=None,
                                     tke_array=None, pressure_gradient_array=None,
                                     relative_pressure_array=None, wss_surfaces=None,
                                     branch_grid=None, mask_phase_lookup=None,
-                                    support_mesh_cache=None):
+                                    support_mesh_cache=None, pressure_gradient_support_mask=None):
     mask4d = _ensure_mask4d(mask4d)
     spacing = np.asarray(spacing, dtype=float).reshape(3)
     origin = np.asarray(origin, dtype=float).reshape(3)
@@ -87,6 +107,12 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
         relative_pressure_array = np.asarray(relative_pressure_array, dtype=np.float32)
         if relative_pressure_array.ndim != 4:
             raise ValueError(f"relative_pressure_array must be XYZT, got {relative_pressure_array.shape}")
+    pressure_support = None
+    if pressure_gradient_support_mask is not None:
+        pressure_support = _ensure_mask4d(pressure_gradient_support_mask)
+        if pressure_support.shape[:3] != mask4d.shape[:3] or pressure_support.shape[3] not in (1, Nt):
+            raise ValueError("pressure_gradient_support_mask must match the spatial mask and have one or all phases")
+
     if mask_phase_lookup is None:
         mask_phase_lookup = _build_mask_phase_lookup(mask4d) if needs_volume_slice else []
     if support_mesh_cache is None and needs_volume_slice:
@@ -105,6 +131,8 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
     rp_mean_t = []
     rp_peak_t = []
     rp_p95_t = []
+    pg_valid_count_t = []
+    rp_valid_count_t = []
     wss_mean_t = []
     wss_peak_t = []
     wss_p95_t = []
@@ -134,6 +162,12 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
                 frame_index=tidx,
             )
 
+        sampled_pressure_support = None
+        if pressure_support is not None and slice_spec is not None:
+            sampled_pressure_support = np.asarray(_sample_field_from_slice_spec(
+                pressure_support[..., min(tidx, pressure_support.shape[3] - 1)],
+                mask4d.shape[:3], "pressure_support", slice_spec), dtype=bool).reshape(-1)
+
         if has_tke and slice_spec is not None:
             tke_series_vals = np.asarray(
                 _sample_field_from_slice_spec(tke_array[..., tidx], mask4d.shape[:3], "tke", slice_spec),
@@ -160,6 +194,11 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
                     areas = np.asarray(slice_spec["areas"], dtype=float).reshape(-1)
                     entry.setdefault("cell_area_mm2", areas.astype(np.float32))
                     entry.setdefault("lumen_mask", np.ones(len(areas), dtype=np.uint8))
+                valid = np.all(np.isfinite(vec), axis=1)
+                if sampled_pressure_support is not None:
+                    valid &= sampled_pressure_support
+                vec = np.where(valid[:, None], vec, np.nan)
+                entry["pressure_gradient_valid"] = valid.astype(np.uint8)
                 pg_mag_vals = np.linalg.norm(vec, axis=1)
                 pg_normal_vals = np.dot(vec, normal)
                 entry["pressure_gradient_mag_Pa_m"] = pg_mag_vals.astype(np.float32)
@@ -181,7 +220,11 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
                     areas = np.asarray(slice_spec["areas"], dtype=float).reshape(-1)
                     entry.setdefault("cell_area_mm2", areas.astype(np.float32))
                     entry.setdefault("lumen_mask", np.ones(len(areas), dtype=np.uint8))
-                rp_vals = vals
+                valid = np.isfinite(vals)
+                if sampled_pressure_support is not None:
+                    valid &= sampled_pressure_support
+                rp_vals = np.where(valid, vals, np.nan)
+                entry["relative_pressure_valid"] = valid.astype(np.uint8)
                 entry["relative_pressure_Pa"] = rp_vals.astype(np.float32)
 
         if tke_series_vals.size:
@@ -193,29 +236,17 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
             tke_peak_t.append(0.0)
             tke_p95_t.append(0.0)
 
-        if pg_mag_vals.size:
-            pg_mag_mean_t.append(_weighted_mean(pg_mag_vals, areas))
-            pg_mag_peak_t.append(float(np.max(pg_mag_vals)))
-            pg_mag_p95_t.append(_nanpercentile_safe(pg_mag_vals, 95.0))
-            pg_normal_mean_t.append(_weighted_mean(pg_normal_vals, areas))
-            pg_normal_peak_t.append(float(np.max(np.abs(pg_normal_vals))))
-            pg_normal_p95_t.append(_nanpercentile_safe(np.abs(pg_normal_vals), 95.0))
-        else:
-            pg_mag_mean_t.append(0.0)
-            pg_mag_peak_t.append(0.0)
-            pg_mag_p95_t.append(0.0)
-            pg_normal_mean_t.append(0.0)
-            pg_normal_peak_t.append(0.0)
-            pg_normal_p95_t.append(0.0)
-
-        if rp_vals.size:
-            rp_mean_t.append(_weighted_mean(rp_vals, areas))
-            rp_peak_t.append(float(np.max(np.abs(rp_vals))))
-            rp_p95_t.append(_nanpercentile_safe(np.abs(rp_vals), 95.0))
-        else:
-            rp_mean_t.append(0.0)
-            rp_peak_t.append(0.0)
-            rp_p95_t.append(0.0)
+        pg_stats = _available_pressure_statistics(pg_mag_vals, areas)
+        for series, value in zip((pg_mag_mean_t, pg_mag_peak_t, pg_mag_p95_t), pg_stats):
+            series.append(value)
+        normal_stats = _available_pressure_statistics(pg_normal_vals, areas, absolute=True)
+        for series, value in zip((pg_normal_mean_t, pg_normal_peak_t, pg_normal_p95_t), normal_stats):
+            series.append(value)
+        rp_stats = _available_pressure_statistics(rp_vals, areas, absolute=True)
+        for series, value in zip((rp_mean_t, rp_peak_t, rp_p95_t), rp_stats):
+            series.append(value)
+        pg_valid_count_t.append(int(np.count_nonzero(np.isfinite(pg_mag_vals))))
+        rp_valid_count_t.append(int(np.count_nonzero(np.isfinite(rp_vals))))
 
         wss_vals = np.array([], dtype=float)
         surf = None if not has_wss or tidx >= len(wss_surfaces) else wss_surfaces[tidx]
@@ -253,16 +284,18 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
         _append_summary(summary, "tke_peak_J_m3", tke_peak_t)
         _append_summary(summary, "tke_p95_J_m3", tke_p95_t)
     if has_pressure_gradient:
-        _append_summary(summary, "pressure_gradient_mag_mean_Pa_m", pg_mag_mean_t)
-        _append_summary(summary, "pressure_gradient_mag_peak_Pa_m", pg_mag_peak_t)
-        _append_summary(summary, "pressure_gradient_mag_p95_Pa_m", pg_mag_p95_t)
-        _append_summary(summary, "pressure_gradient_normal_mean_Pa_m", pg_normal_mean_t)
-        _append_summary(summary, "pressure_gradient_normal_peak_Pa_m", pg_normal_peak_t)
-        _append_summary(summary, "pressure_gradient_normal_p95_Pa_m", pg_normal_p95_t)
+        summary["pressure_gradient_valid_cell_count_t"] = pg_valid_count_t
+        _append_available_summary(summary, "pressure_gradient_mag_mean_Pa_m", pg_mag_mean_t)
+        _append_available_summary(summary, "pressure_gradient_mag_peak_Pa_m", pg_mag_peak_t)
+        _append_available_summary(summary, "pressure_gradient_mag_p95_Pa_m", pg_mag_p95_t)
+        _append_available_summary(summary, "pressure_gradient_normal_mean_Pa_m", pg_normal_mean_t)
+        _append_available_summary(summary, "pressure_gradient_normal_peak_Pa_m", pg_normal_peak_t)
+        _append_available_summary(summary, "pressure_gradient_normal_p95_Pa_m", pg_normal_p95_t)
     if has_relative_pressure:
-        _append_summary(summary, "relative_pressure_mean_Pa", rp_mean_t)
-        _append_summary(summary, "relative_pressure_peak_Pa", rp_peak_t)
-        _append_summary(summary, "relative_pressure_p95_Pa", rp_p95_t)
+        summary["relative_pressure_valid_cell_count_t"] = rp_valid_count_t
+        _append_available_summary(summary, "relative_pressure_mean_Pa", rp_mean_t)
+        _append_available_summary(summary, "relative_pressure_peak_Pa", rp_peak_t)
+        _append_available_summary(summary, "relative_pressure_p95_Pa", rp_p95_t)
     if has_wss:
         _append_summary(summary, "wss_wall_mean_Pa", wss_mean_t)
         _append_summary(summary, "wss_wall_peak_Pa", wss_peak_t)
@@ -272,7 +305,8 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
 
 def _augment_plane_metrics_serial(plane_metrics, planes, mask4d, spacing, origin, branch_labels_3d=None,
                                  tke_array=None, pressure_gradient_array=None,
-                                 relative_pressure_array=None, wss_surfaces=None, progress_callback=None):
+                                 relative_pressure_array=None, wss_surfaces=None, progress_callback=None,
+                                 pressure_gradient_support_mask=None):
     mask4d = _ensure_mask4d(mask4d)
     shared_branch_grid = _build_branch_grid(branch_labels_3d, spacing, origin)
     mask_phase_lookup = _build_mask_phase_lookup(mask4d)
@@ -292,6 +326,7 @@ def _augment_plane_metrics_serial(plane_metrics, planes, mask4d, spacing, origin
             branch_grid=shared_branch_grid,
             mask_phase_lookup=mask_phase_lookup,
             support_mesh_cache=support_mesh_cache,
+            pressure_gradient_support_mask=pressure_gradient_support_mask,
         )
         metric.update(summary)
         payload["plane_index"] = int(idx)
@@ -308,7 +343,7 @@ def _augment_plane_metrics_serial(plane_metrics, planes, mask4d, spacing, origin
 
 def _augment_plane_metrics_chunk(indexed_metrics, planes, mask4d, spacing, origin, branch_labels_3d,
                                  tke_array, pressure_gradient_array, relative_pressure_array, wss_surfaces,
-                                 progress_path):
+                                 progress_path, pressure_gradient_support_mask):
     indices = [index for index, _metric in indexed_metrics]
     local_planes = [planes[index] for index in indices]
     with task_scope(_PlaneProcessToken(progress_path)):
@@ -316,6 +351,7 @@ def _augment_plane_metrics_chunk(indexed_metrics, planes, mask4d, spacing, origi
             [metric for _index, metric in indexed_metrics], local_planes, mask4d, spacing, origin,
             branch_labels_3d, tke_array, pressure_gradient_array, relative_pressure_array, wss_surfaces,
             progress_callback=lambda _payload: _mark_plane_process_progress(progress_path),
+            pressure_gradient_support_mask=pressure_gradient_support_mask,
         )
     for index, payload in zip(indices, payloads):
         payload["plane_index"] = int(index)
@@ -325,7 +361,8 @@ def _augment_plane_metrics_chunk(indexed_metrics, planes, mask4d, spacing, origi
 def augment_plane_metrics_with_derived(plane_metrics, planes, mask4d, spacing, origin, branch_labels_3d=None,
                                        tke_array=None, pressure_gradient_array=None,
                                        relative_pressure_array=None, wss_surfaces=None, *,
-                                       use_multithread=False, max_workers=None, progress_callback=None):
+                                       use_multithread=False, max_workers=None, progress_callback=None,
+                                       pressure_gradient_support_mask=None):
     mask4d = _ensure_mask4d(mask4d)
     count = min(len(plane_metrics), len(planes))
     if max_workers is None:
@@ -334,6 +371,7 @@ def augment_plane_metrics_with_derived(plane_metrics, planes, mask4d, spacing, o
         return _augment_plane_metrics_serial(
             plane_metrics, planes, mask4d, spacing, origin, branch_labels_3d,
             tke_array, pressure_gradient_array, relative_pressure_array, wss_surfaces, progress_callback,
+            pressure_gradient_support_mask,
         )
     import tempfile
     from joblib import Parallel, delayed
@@ -347,6 +385,7 @@ def augment_plane_metrics_with_derived(plane_metrics, planes, mask4d, spacing, o
                 delayed(_augment_plane_metrics_chunk)(
                     indexed[offset::workers], planes, mask4d, spacing, origin, branch_labels_3d,
                     tke_array, pressure_gradient_array, relative_pressure_array, wss_surfaces, progress_path,
+                    pressure_gradient_support_mask,
                 ) for offset in range(workers)
             )
         chunks = _wait_plane_processes(calculate, progress_path, count, progress_callback, stage="plane_derived")

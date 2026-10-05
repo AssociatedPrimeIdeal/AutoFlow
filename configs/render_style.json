@@ -1,0 +1,27 @@
+{
+  "anti_aliasing": "auto",
+  "context": {
+    "color": "#8296a8",
+    "opacity": 0.15
+  },
+  "text": {
+    "dark": "#17212b",
+    "light": "#edf2f7"
+  },
+  "surfaces": {
+    "anatomical": {
+      "smooth_shading": true,
+      "lighting": true,
+      "ambient": 0.4,
+      "diffuse": 0.6,
+      "specular": 0.08,
+      "specular_power": 16.0
+    },
+    "quantitative": {
+      "lighting": false,
+      "nan_color": "#8296a8",
+      "nan_opacity": 0.0,
+      "interpolate_before_map": true
+    }
+  }
+}

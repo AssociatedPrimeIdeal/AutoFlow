@@ -1,7 +1,7 @@
 """Velocity-gradient vortex identifiers and swirling strength."""
 
 import numpy as np
-from scipy.ndimage import binary_erosion, gaussian_filter
+from scipy.ndimage import binary_erosion, gaussian_filter, generate_binary_structure
 
 from ._common import _ensure_flow5d, _ensure_mask4d
 
@@ -24,6 +24,12 @@ def compute_vortex_metrics(mask4d, flow, spacing, *, smoothing_sigma=0.0,
         )
     if flow.shape[3] != mask4d.shape[3]:
         raise ValueError(f"flow time dimension {flow.shape[3]} does not match mask {mask4d.shape[3]}")
+
+    spacing = np.asarray(spacing, dtype=float).reshape(3)
+    if not np.all(np.isfinite(spacing)) or np.any(spacing <= 0):
+        raise ValueError('Vortex spacing must be finite and positive (mm)')
+    if not np.isfinite(smoothing_sigma):
+        raise ValueError('Vortex smoothing sigma must be finite')
 
     spatial_shape = tuple(int(value) for value in flow.shape[:3])
     output_shape = flow.shape[:4]
@@ -68,8 +74,10 @@ def compute_vortex_metrics(mask4d, flow, spacing, *, smoothing_sigma=0.0,
 
     # Convert cm/s to m/s before differentiating over meter spacing.
     velocity = work_flow / 100.0
-    mask_float = work_mask.astype(np.float32)
-    velocity = velocity * mask_float[..., None]
+    finite = np.all(np.isfinite(work_flow), axis=-1)
+    valid_samples = work_mask & finite
+    mask_float = valid_samples.astype(np.float32)
+    velocity = np.where(valid_samples[..., None], velocity, 0.0)
     sigma = max(float(smoothing_sigma), 0.0)
     if sigma > 0.0:
         # Normalize the filtered field by filtered mask weights so a zero
@@ -83,12 +91,17 @@ def compute_vortex_metrics(mask4d, flow, spacing, *, smoothing_sigma=0.0,
             )
         velocity *= mask_float[..., None]
 
-    support_work = work_mask.copy()
+    # Central differences always need finite lumen neighbours, even when
+    # optional extra erosion is disabled.
+    support_work = np.zeros(work_mask.shape, dtype=bool)
+    for tidx in range(work_mask.shape[3]):
+        support_work[..., tidx] = binary_erosion(
+            valid_samples[..., tidx], structure=generate_binary_structure(3, 1), border_value=0)
     erosion_iters = max(int(support_erosion_iters), 0)
     if erosion_iters > 0:
         structure = np.ones((3, 3, 3), dtype=bool)
         for tidx in range(work_mask.shape[3]):
-            support_work[..., tidx] = binary_erosion(
+            support_work[..., tidx] &= binary_erosion(
                 work_mask[..., tidx],
                 structure=structure,
                 iterations=erosion_iters,

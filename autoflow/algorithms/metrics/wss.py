@@ -2,8 +2,11 @@
 
 import numpy as np
 import pyvista as pv
+from scipy.ndimage import distance_transform_edt, gaussian_filter
+from vtkmodules.vtkFiltersCore import vtkImplicitPolyDataDistance
+from vtkmodules.vtkCommonCore import vtkDoubleArray
+from vtkmodules.util.numpy_support import numpy_to_vtk, vtk_to_numpy
 from ...task_control import report_progress
-from ..surfaces import _extract_surface, create_uniform_grid, create_uniform_vector
 
 from ._common import _ensure_mask4d
 from .sampling import _build_mask_phase_lookup
@@ -56,6 +59,53 @@ def calculate_gradient(pc0_tangent_mag, pc1_tangent_mag, pc2_tangent_mag, inward
     return (v1 - v0) / distance
 
 
+class _WssWallSupport:
+    """Reuse the signed-distance locator of the actual numerical wall."""
+
+    def __init__(self, wall, spacing):
+        self.spacing = np.asarray(spacing, dtype=float)
+        self.wall = wall.copy(deep=True)
+        self.implicit = vtkImplicitPolyDataDistance()
+        self.implicit.SetInput(self.wall)
+
+    def contains(self, points):
+        values = vtkDoubleArray()
+        self.implicit.FunctionValue(
+            numpy_to_vtk(np.ascontiguousarray(points, dtype=float), deep=False), values)
+        signed = vtk_to_numpy(values)
+        return np.isfinite(signed) & (signed <= 0.0)
+
+
+def _prepare_wss_wall(mask, spacing, origin, smoothing_iteration):
+    """Reconstruct a closed wall at the boundary between voxel centres."""
+    mask = np.asarray(mask, dtype=bool)
+    if not np.any(mask):
+        return None, None
+    padded = np.pad(mask, 1, constant_values=False)
+    phi = (distance_transform_edt(padded, sampling=spacing)
+           - distance_transform_edt(~padded, sampling=spacing))
+    if int(smoothing_iteration) > 0:
+        # A fixed half-smallest-voxel physical scale avoids excessive smoothing
+        # of anisotropic or narrow vessels. Zero iterations disables both steps.
+        phi = gaussian_filter(phi, 0.5 * np.min(spacing) / spacing, mode="nearest")
+    grid = pv.ImageData(dimensions=padded.shape, spacing=spacing,
+                        origin=origin - 0.5 * spacing)
+    grid.point_data["wss_lumen"] = phi.ravel(order="F")
+    wall = grid.contour([0.0], scalars="wss_lumen")
+    wall.clear_data()
+    if int(smoothing_iteration) > 0:
+        wall = wall.smooth_taubin(n_iter=int(smoothing_iteration), pass_band=0.1)
+    return wall, _WssWallSupport(wall, spacing)
+
+
+def _inside_wss_lumen(points, support_grid):
+    if isinstance(support_grid, _WssWallSupport):
+        return support_grid.contains(points)
+    probe = pv.PolyData(points).sample(support_grid)
+    return (np.asarray(probe["vtkValidPointMask"], dtype=bool)
+            & (np.asarray(probe["wss_lumen"], dtype=float) > 0.5))
+
+
 def cal_wss_from_surf(surf, velocity, viscosity=4.0, inward_distance=0.6,
                       parabolic_fitting=True, no_slip_condition=True, support_grid=None):
     """Compute tangential WSS vectors (Pa) using inward-normal derivatives.
@@ -74,8 +124,20 @@ def cal_wss_from_surf(surf, velocity, viscosity=4.0, inward_distance=0.6,
     surf.compute_normals(point_normals=True, cell_normals=True, inplace=True,
                          consistent_normals=True, auto_orient_normals=(surf.n_open_edges == 0),
                          flip_normals=True)
-    normals = np.asarray(surf.point_normals, dtype=float)
+    normals = np.asarray(surf.point_normals, dtype=float).copy()
     normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12)
+    flipped = np.zeros(surf.n_points, dtype=bool)
+    if support_grid is not None:
+        # Mesh winding alone can leave local normals pointing out of a
+        # segmented lumen. Flip only when a nearby reverse probe is supported
+        # and the forward probe is outside; preserve ambiguous directions.
+        support_step = float(np.min(getattr(support_grid, "spacing", [distance])))
+        local_step = 0.25 * min(distance, support_step)
+        forward = _inside_wss_lumen(surf.points + local_step * normals, support_grid)
+        backward = _inside_wss_lumen(surf.points - local_step * normals, support_grid)
+        flipped = ~forward & backward
+        normals[flipped] *= -1.0
+    surf.point_data["Normals"] = normals
     pc0 = pv.PolyData(surf.points).sample(velocity)
     pc1 = pv.PolyData(pc0.points + distance * normals).sample(velocity)
     pc2 = pv.PolyData(pc0.points + 2.0 * distance * normals).sample(velocity)
@@ -99,9 +161,7 @@ def cal_wss_from_surf(surf, velocity, viscosity=4.0, inward_distance=0.6,
         # through background into another branch or the opposite vessel wall.
         fractions = (0.25, 0.5, 1.0, 1.5, 2.0) if parabolic_fitting else (0.25, 0.5, 1.0)
         for fraction in fractions:
-            probe = pv.PolyData(pc0.points + fraction * distance * normals).sample(support_grid)
-            valid &= np.asarray(probe["vtkValidPointMask"], dtype=bool)
-            valid &= np.asarray(probe["wss_lumen"], dtype=float) > 0.5
+            valid &= _inside_wss_lumen(pc0.points + fraction * distance * normals, support_grid)
     # mPa s * (m/s)/mm is numerically Pa; keep signed vector components.
     vectors = calculate_gradient(tang0, tang1, tang2, distance,
                                  use_parabolic=parabolic_fitting) * viscosity
@@ -109,6 +169,7 @@ def cal_wss_from_surf(surf, velocity, viscosity=4.0, inward_distance=0.6,
     surf["wss_vectors"] = vectors
     surf["wss"] = get_vector_magnitude(vectors)
     surf["wss_valid"] = valid.astype(np.uint8)
+    surf["wss_normal_flipped"] = flipped.astype(np.uint8)
     return surf
 
 
@@ -136,18 +197,8 @@ def compute_wss_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
                          "message": f"Computing WSS phase {showt + 1}/{mask4d.shape[3]}"})
         rep_t = int(mask_phase_lookup[showt])
         if rep_t not in surface_cache:
-            support_cache[rep_t] = create_uniform_grid(
-                (mask4d[..., rep_t] > 0).astype(np.uint8), spacing, origin=origin, name="wss_lumen")
-            mesh = support_cache[rep_t]
-            mesh = mesh.threshold(0.1)
-            if mesh is None or mesh.n_cells == 0:
-                surface_cache[rep_t] = None
-                surfs.append(None)
-                continue
-            base_surface = _extract_surface(mesh)
-            if int(smoothing_iteration) > 0:
-                base_surface = base_surface.smooth_taubin(n_iter=int(smoothing_iteration), pass_band=0.1)
-            surface_cache[rep_t] = base_surface
+            surface_cache[rep_t], support_cache[rep_t] = _prepare_wss_wall(
+                mask4d[..., rep_t] > 0, spacing, origin, smoothing_iteration)
         base_surface = surface_cache[rep_t]
         if base_surface is None:
             surfs.append(None)
@@ -155,9 +206,10 @@ def compute_wss_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
         # Preserve double-precision sampling without duplicating the whole
         # multi-phase velocity field just to process one phase at a time.
         flow_t = np.asarray(flow[..., showt, :], dtype=float)
-        velocity = create_uniform_vector(
-            flow_t[..., 0] / 100.0, flow_t[..., 1] / 100.0,
-            flow_t[..., 2] / 100.0, spacing, origin=origin)
+        velocity = pv.ImageData(dimensions=flow_t.shape[:3], spacing=spacing,
+                                origin=origin + 0.5 * spacing)
+        for component, name in enumerate(("u", "v", "w")):
+            velocity.point_data[name] = (flow_t[..., component] / 100.0).ravel(order="F")
         # cal_wss_from_surf writes phase-specific point data, so each phase
         # gets a cheap geometry copy while the expensive surface preparation
         # remains shared for identical masks.

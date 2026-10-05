@@ -8,7 +8,8 @@ from ..phase_correction import apply_background_phase_correction_to_complex, app
 from .correction_cache import (
     _loader_correction_config,
     _progress_prefix,
-    _read_background_phase_corr_cache_from_scopes,
+    _prepare_background_phase_corr_cache,
+    _merge_background_phase_cache_report,
     _write_background_phase_corr_cache,
 )
 from .dual_venc import _load_legacy_dual_venc_h5
@@ -45,12 +46,13 @@ def load_h5_data(
     force_recompute_seg=False,
     ignore_embedded_segmentation=False,
     dual_venc_mode="dv",
+    reuse_existing_corr=False,
 ):
     target_spatial_order = ("LR", "AP", "FH")
     target_venc_order = ("LR", "AP", "FH")
     dual_venc_mode = _coerce_dual_venc_mode(dual_venc_mode)
     cfg = _loader_correction_config(correction_config)
-    h5_mode = "r+" if bool(cfg.enabled) and bool(cfg.write_cache) else "r"
+    h5_mode = "r+" if bool(cfg.enabled) and bool(cfg.write_cache) and not reuse_existing_corr else "r"
     try:
         handle_ctx = h5py.File(path, h5_mode)
     except OSError:
@@ -132,26 +134,18 @@ def load_h5_data(
                     source_group=group_name,
                     allow_untagged_root=allow_untagged_root,
                     dual_venc_mode=dual_venc_mode,
+                    reuse_existing_corr=reuse_existing_corr,
                 )
                 loaded.source_group = group_name
                 loaded.metadata = dict(loaded.metadata or {})
                 loaded.metadata.setdefault("h5_layout", "complex_img")
                 return loaded
-            if bool(cfg.enabled):
-                cached_corr, cache_report = _read_background_phase_corr_cache_from_scopes(
-                    scopes,
-                    "corr",
-                    tuple(img_complex.shape[:-1]) + (3,),
-                    cfg,
-                    expected_source_group=group_name,
-                    allow_untagged_root=allow_untagged_root,
-                )
-            else:
-                cached_corr, cache_report = None, {
-                    "cache_hit": False,
-                    "cache_reason": "hit",
-                    "cache_name": "corr",
-                }
+            cfg, cached_corr, cache_report = _prepare_background_phase_corr_cache(
+                scopes, "corr", tuple(img_complex.shape[:-1]) + (3,), cfg,
+                expected_source_group=group_name, allow_untagged_root=allow_untagged_root,
+                reuse_existing_corr=reuse_existing_corr,
+                progress_callback=_progress_prefix(progress_callback, "h5_"),
+            )
             img_complex_corr, _stationary_mask_raw, corr_report = apply_background_phase_correction_to_complex(
                 img_complex,
                 config=cfg,
@@ -160,10 +154,7 @@ def load_h5_data(
                 cached_corr=cached_corr,
             )
             corr_report["cache_name"] = "corr"
-            if not bool(corr_report.get("cache_hit", False)):
-                corr_report["cache_reason"] = cache_report.get("cache_reason", "missing")
-            if "stationary_voxels" in cache_report and bool(corr_report.get("cache_hit", False)):
-                corr_report["stationary_voxels"] = int(cache_report["stationary_voxels"])
+            _merge_background_phase_cache_report(corr_report, cache_report, reuse_existing_corr)
             if bool(cfg.write_cache) and bool(corr_report.get("applied", False)) and not bool(corr_report.get("cache_hit", False)):
                 corr_report["cache_written"] = bool(_write_background_phase_corr_cache(
                     group,
@@ -300,21 +291,12 @@ def load_h5_data(
                     return_velocity=False,
                     normalize_mag=False,
                 )
-            if bool(cfg.enabled):
-                cached_corr, cache_report = _read_background_phase_corr_cache_from_scopes(
-                    scopes,
-                    "corr",
-                    tuple(flow_raw.shape[:-1]) + (3,),
-                    cfg,
-                    expected_source_group=group_name,
-                    allow_untagged_root=allow_untagged_root,
-                )
-            else:
-                cached_corr, cache_report = None, {
-                    "cache_hit": False,
-                    "cache_reason": "hit",
-                    "cache_name": "corr",
-                }
+            cfg, cached_corr, cache_report = _prepare_background_phase_corr_cache(
+                scopes, "corr", tuple(flow_raw.shape[:-1]) + (3,), cfg,
+                expected_source_group=group_name, allow_untagged_root=allow_untagged_root,
+                reuse_existing_corr=reuse_existing_corr,
+                progress_callback=_progress_prefix(progress_callback, "h5_"),
+            )
             flow_corr, _stationary_mask, corr_report = apply_background_phase_correction_to_mag_flow(
                 mag_raw,
                 flow_raw,
@@ -324,10 +306,10 @@ def load_h5_data(
                 cached_corr=cached_corr,
             )
             corr_report["cache_name"] = "corr"
-            if not bool(corr_report.get("cache_hit", False)):
-                corr_report["cache_reason"] = cache_report.get("cache_reason", "missing")
-            if "stationary_voxels" in cache_report and bool(corr_report.get("cache_hit", False)):
-                corr_report["stationary_voxels"] = int(cache_report["stationary_voxels"])
+            _merge_background_phase_cache_report(corr_report, cache_report, reuse_existing_corr)
+            if phase_wrapped_r is not None and corr_report.get("applied"):
+                phase = np.pi * flow_corr / np.asarray(venc_new).reshape((1, 1, 1, 1, 3))
+                phase_wrapped_r = np.angle(np.exp(1j * phase)).astype(np.float32)
             if bool(cfg.write_cache) and bool(corr_report.get("applied", False)) and not bool(corr_report.get("cache_hit", False)):
                 corr_report["cache_written"] = bool(_write_background_phase_corr_cache(
                     group,

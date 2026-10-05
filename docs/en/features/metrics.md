@@ -80,6 +80,9 @@ Low-level Python users can call `augment_plane_metrics_with_derived(...)` with:
 
 ## Outputs
 
+Plane pressure statistics use the valid pressure-derivative support, excluding zero padding outside it. Unavailable phases are JSON `null`; valid measured zero remains `0`. Cycle summaries average available phases, and `pressure_gradient_valid_cell_count_t` / `relative_pressure_valid_cell_count_t` expose per-phase sample counts. Plane pixelwise H5 adds `pressure_gradient_valid` and `relative_pressure_valid` flags; invalid pressure samples are NaN.
+
+
 | Output file or object | Created when | Meaning |
 | --- | --- | --- |
 | `plane_metrics.json` | plane metrics run | one metric record per plane with explicit `plane_index` and time-resolved fields |

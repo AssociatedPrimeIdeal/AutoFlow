@@ -1,7 +1,7 @@
 """Background-correction cache validation/publication and loader progress."""
 
 import numpy as np
-from ..phase_correction import background_phase_correction_cache_metadata, coerce_background_phase_correction_config
+from ..phase_correction import _emit_progress, background_phase_correction_cache_metadata, coerce_background_phase_correction_config
 
 from .h5_metadata import (
     _canonical_h5_key,
@@ -19,6 +19,9 @@ def _progress_prefix(progress_callback, prefix):
         data = dict(payload or {})
         stage = str(data.get("stage", ""))
         data["stage"] = f"{prefix}{stage}" if prefix else stage
+        if prefix in {"h5_dual_lv_", "h5_dual_hv_"}:
+            label = "Low VENC" if prefix == "h5_dual_lv_" else "High VENC"
+            data["message"] = f"{label}: {data.get('message', '')}"
         progress_callback(data)
 
     return _wrapped
@@ -54,7 +57,7 @@ def _background_phase_corr_attr_scalar(attrs, name, default=None):
     return item
 
 
-def _read_background_phase_corr_cache(scope, cache_name, expected_shape, cfg, expected_source_group=None, allow_untagged_root=True):
+def _read_background_phase_corr_cache(scope, cache_name, expected_shape, cfg, expected_source_group=None, allow_untagged_root=True, match_config=True):
     report = {
         "cache_hit": False,
         "cache_name": str(cache_name),
@@ -90,6 +93,27 @@ def _read_background_phase_corr_cache(scope, cache_name, expected_shape, cfg, ex
         if scope_group is None and not allow_untagged_root:
             report["cache_reason"] = "missing_group_tag"
             return None, report
+
+    if not match_config:
+        if expected_source_group is None and stored_group is not None and str(stored_group).strip("/"):
+            report["cache_reason"] = f"group_mismatch:{stored_group}"
+            return None, report
+        # Loading a saved result checks geometry/ownership, not the settings
+        # selected for the next manual computation.
+        if not np.all(np.isfinite(corr)):
+            report["cache_reason"] = "nonfinite_correction"
+            return None, report
+        for name in ds.attrs:
+            if str(name).startswith("corr_"):
+                value = _background_phase_corr_attr_scalar(ds.attrs, name)
+                if isinstance(value, (str, int, float, bool, np.generic)):
+                    report[str(name)] = value.item() if isinstance(value, np.generic) else value
+        report.update(cache_hit=True, cache_reason="hit", corr_components=int(corr.shape[-1]))
+        report.setdefault("corr_algorithm", "msac")
+        report.setdefault("corr_version", 1)
+        if "corr_stationary_voxels" in report:
+            report["stationary_voxels"] = int(report["corr_stationary_voxels"])
+        return corr, report
 
     expected_metadata = background_phase_correction_cache_metadata(cfg)
     expected_algorithm = str(expected_metadata["corr_algorithm"])
@@ -158,8 +182,8 @@ def _read_background_phase_corr_cache(scope, cache_name, expected_shape, cfg, ex
     return corr, report
 
 
-def _read_background_phase_corr_cache_from_scopes(scopes, cache_name, expected_shape, cfg, expected_source_group=None, allow_untagged_root=True):
-    if bool(getattr(cfg, "force_recompute", False)):
+def _read_background_phase_corr_cache_from_scopes(scopes, cache_name, expected_shape, cfg, expected_source_group=None, allow_untagged_root=True, match_config=True):
+    if match_config and bool(getattr(cfg, "force_recompute", False)):
         return None, {"cache_hit": False, "cache_reason": "force_recompute", "cache_name": str(cache_name)}
     last_report = None
     for scope in scopes:
@@ -170,6 +194,7 @@ def _read_background_phase_corr_cache_from_scopes(scopes, cache_name, expected_s
             cfg,
             expected_source_group=expected_source_group,
             allow_untagged_root=allow_untagged_root,
+            match_config=match_config,
         )
         if (
             last_report is not None
@@ -182,6 +207,48 @@ def _read_background_phase_corr_cache_from_scopes(scopes, cache_name, expected_s
         if bool(report.get("cache_hit", False)):
             return corr, report
     return None, last_report or {"cache_hit": False, "cache_reason": "missing", "cache_name": str(cache_name)}
+
+
+def _prepare_background_phase_corr_cache(scopes, cache_name, expected_shape, cfg,
+                                       expected_source_group=None, allow_untagged_root=True,
+                                       reuse_existing_corr=False, progress_callback=None):
+    """Prepare a normal correction or a read-only application of saved results."""
+    if not cfg.enabled and not reuse_existing_corr:
+        return cfg, None, {"cache_hit": False, "cache_reason": "hit", "cache_name": cache_name}
+    if reuse_existing_corr:
+        _emit_progress(progress_callback, "background_phase_cache_read",
+                       message=f"Loading saved background correction: {cache_name}")
+    corr, report = _read_background_phase_corr_cache_from_scopes(
+        scopes, cache_name, expected_shape, cfg,
+        expected_source_group=expected_source_group,
+        allow_untagged_root=allow_untagged_root,
+        match_config=not reuse_existing_corr,
+    )
+    if reuse_existing_corr:
+        cfg = coerce_background_phase_correction_config(cfg)
+        cfg.enabled = corr is not None
+        cfg.force_recompute = False
+        cfg.write_cache = False
+        if corr is None:
+            _emit_progress(progress_callback, "background_phase_cache_skip",
+                           message=f"Saved background correction unavailable: {cache_name} ({report['cache_reason']})")
+    return cfg, corr, report
+
+
+def _merge_background_phase_cache_report(report, cache_report, reuse_existing_corr=False):
+    if reuse_existing_corr:
+        report["cache_only"] = True
+        if report.get("cache_hit"):
+            # Do not attribute saved corrections to the current UI parameters.
+            for key in list(report):
+                if key.startswith("corr_") and key not in {"corr_source", "corr_components"}:
+                    report.pop(key)
+            report.pop("threshold", None)
+            report.update(cache_report)
+    if not report.get("cache_hit"):
+        report["cache_reason"] = cache_report.get("cache_reason", "missing")
+    if "stationary_voxels" in cache_report and report.get("cache_hit"):
+        report["stationary_voxels"] = int(cache_report["stationary_voxels"])
 
 
 def _write_background_phase_corr_cache(

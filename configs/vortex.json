@@ -1,4 +1,24 @@
 {
   "smoothing_sigma": 0.0,
-  "support_erosion_iters": 1
+  "support_erosion_iters": 1,
+  "render": {
+    "vorticity_magnitude": {
+      "cmap": "turbo",
+      "opacity": 1.0,
+      "clim": null,
+      "show_scalar_bar": true
+    },
+    "q_criterion": {
+      "cmap": "RdBu_r",
+      "opacity": 1.0,
+      "clim": null,
+      "show_scalar_bar": true
+    },
+    "swirling_strength": {
+      "cmap": "turbo",
+      "opacity": 1.0,
+      "clim": null,
+      "show_scalar_bar": true
+    }
+  }
 }

@@ -1,6 +1,7 @@
 from .case_types import normalize_dicom_backend
 import copy
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -15,6 +16,77 @@ from .core.models import (
     StreamlineParams,
     Workspace,
 )
+
+BACKGROUND_COLOR = "#101820"
+CONTEXT_COLOR = "#8296a8"
+METRIC_CMAPS = {
+    "wss_surface_live": "turbo",
+    "tke_volume": "inferno",
+    "pressure_gradient_volume": "magma",
+    "relative_pressure_volume": "RdBu_r",
+    "streamlines_live": "turbo",
+}
+METRIC_OPACITIES = {
+    "wss_surface_live": 1.0,
+    "tke_volume": 1.0,
+    "pressure_gradient_volume": 1.0,
+    "relative_pressure_volume": 1.0,
+    "streamlines_live": 1.0,
+}
+
+
+DEFAULT_FOREGROUND_COLORS = {"dark": "#17212b", "light": "#edf2f7"}
+DEFAULT_QUANTITATIVE_SURFACE_STYLE = {
+    "lighting": False,
+    "nan_color": CONTEXT_COLOR,
+    "nan_opacity": 0.0,
+    "interpolate_before_map": True,
+}
+DEFAULT_ANATOMICAL_SURFACE_STYLE = {
+    "smooth_shading": True, "lighting": True,
+    "ambient": 0.4, "diffuse": 0.6,
+    "specular": 0.08, "specular_power": 16.0,
+}
+DEFAULT_METRIC_VOLUME_OPACITY_POINTS = (
+    (0.0, 0.0), (0.05, 0.0), (0.2, 0.015),
+    (0.45, 0.08), (0.7, 0.25), (1.0, 0.65),
+)
+
+METRIC_CMAPS.update({
+    "vorticity_magnitude_volume": "turbo",
+    "q_criterion_volume": "RdBu_r",
+    "swirling_strength_volume": "turbo",
+})
+METRIC_OPACITIES.update({key: 1.0 for key in METRIC_CMAPS if key not in METRIC_OPACITIES})
+METRIC_DATA_KEYS = {
+    "wss_surface_live": "wss", "tke_volume": "tke",
+    "pressure_gradient_volume": "pressure_gradient",
+    "relative_pressure_volume": "relative_pressure", "streamlines_live": "streamlines",
+    "vorticity_magnitude_volume": "vorticity_magnitude",
+    "q_criterion_volume": "q_criterion", "swirling_strength_volume": "swirling_strength",
+}
+DEFAULT_METRIC_RENDER_STYLES = {
+    name: {"cmap": METRIC_CMAPS[key], "opacity": METRIC_OPACITIES[key]}
+    for key, name in METRIC_DATA_KEYS.items()
+}
+DEFAULT_METRIC_RENDER_STYLES["streamlines"]["line_width"] = 2.0
+DEFAULT_METRIC_RENDER_STYLES["tke"]["volume"] = {
+    "opacity_points": [list(point) for point in DEFAULT_METRIC_VOLUME_OPACITY_POINTS],
+    "shade": False, "blending": "composite", "interpolation": "linear",
+    "opacity_unit_distance_scale": 1.0,
+}
+for _metric_name in ("vorticity_magnitude", "q_criterion", "swirling_strength"):
+    DEFAULT_METRIC_RENDER_STYLES[_metric_name].update(clim=None, show_scalar_bar=True)
+DEFAULT_RENDER_STYLE_CFG = {
+    "anti_aliasing": "auto",
+    "context": {"color": CONTEXT_COLOR, "opacity": 0.15},
+    "text": dict(DEFAULT_FOREGROUND_COLORS),
+    "surfaces": {
+        "anatomical": dict(DEFAULT_ANATOMICAL_SURFACE_STYLE),
+        "quantitative": dict(DEFAULT_QUANTITATIVE_SURFACE_STYLE),
+    },
+    "metrics": copy.deepcopy(DEFAULT_METRIC_RENDER_STYLES),
+}
 
 DEFAULT_WSS_BAR_CFG = {
     "position_x": 0.75,
@@ -64,14 +136,24 @@ DEFAULT_RELATIVE_PRESSURE_BAR_CFG = {
 DEFAULT_SHARED_COLORBAR_CFG = {
     "show": True,
     "bar_cfg": {
-        "position_x": 0.87,
+        "position_x": 0.82,
         "position_y": 0.15,
         "height": 0.65,
-        "width": 0.08,
+        "width": 0.045,
         "title_font_size": 14,
         "label_font_size": 11,
     },
 }
+
+# Common scalar-bar appearance; the JSON shared layout uses the same base.
+DEFAULT_SCALAR_BAR_STYLE = {
+    "vertical": True,
+    **copy.deepcopy(DEFAULT_SHARED_COLORBAR_CFG["bar_cfg"]),
+    "n_labels": 5, "fmt": "%.3g", "font_family": "arial",
+    "bold": False, "italic": False, "shadow": False,
+}
+
+DEFAULT_SHARED_COLORBAR_CFG["bar_cfg"].update(DEFAULT_SCALAR_BAR_STYLE)
 
 DEFAULT_PLANE_LABEL_CFG = {
     "prefix": "planeidx=",
@@ -82,6 +164,8 @@ DEFAULT_PLANE_LABEL_CFG = {
 }
 
 DEFAULT_PLANE_RENDER_CFG = {
+    "plane_size_mm": 10.0,
+    "selected_only": False,
     "default": {
         "plane_color": "yellow",
         "plane_opacity": 0.75,
@@ -219,9 +303,9 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "use_multithread": True,
         "reuse_planes": "",
     },
-    "ui": {
-        "background_color": "#000000",
-    },
+    "ui": {"background_color": BACKGROUND_COLOR},
+    "render_style": {key: copy.deepcopy(value) for key, value in DEFAULT_RENDER_STYLE_CFG.items()
+                     if key != "metrics"},
     "loader": {
         "background_phase_correction": {
             "enabled": False,
@@ -310,9 +394,9 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "rng_seed": 0,
         "tube_radius": 0.05,
         "render": {
+            **copy.deepcopy(DEFAULT_METRIC_RENDER_STYLES["streamlines"]),
             "clim": None,
             "show_scalar_bar": True,
-            "bar_cfg": dict(DEFAULT_STREAMLINE_BAR_CFG),
         },
     },
     "pathlines": {
@@ -340,34 +424,36 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "parabolic_fitting": True,
         "no_slip_condition": True,
         "render": {
+            **copy.deepcopy(DEFAULT_METRIC_RENDER_STYLES["wss"]),
             "clim": [0.0, 10.0],
             "show_scalar_bar": True,
-            "bar_cfg": dict(DEFAULT_WSS_BAR_CFG),
         },
     },
     "tke": {
         "render": {
+            **copy.deepcopy(DEFAULT_METRIC_RENDER_STYLES["tke"]),
             "clim": [0.0, 100.0],
             "show_scalar_bar": True,
-            "bar_cfg": dict(DEFAULT_TKE_BAR_CFG),
         },
     },
     "pressure_gradient": {
         "method": "ppe",
         "smoothing_sigma": 0.0,
         "support_erosion_iters": 1,
-        "layer_opacity": 0.6,
-        "relative_pressure_opacity": 0.6,
         "use_convective_acceleration": True,
         "render": {
+            **copy.deepcopy(DEFAULT_METRIC_RENDER_STYLES["pressure_gradient"]),
+            "relative_pressure": dict(DEFAULT_METRIC_RENDER_STYLES["relative_pressure"],
+                                      clim=None, show_scalar_bar=True),
             "clim": None,
             "show_scalar_bar": True,
-            "bar_cfg": dict(DEFAULT_PRESSURE_GRADIENT_BAR_CFG),
         },
     },
     "vortex": {
         "smoothing_sigma": 0.0,
         "support_erosion_iters": 1,
+        "render": {name: copy.deepcopy(DEFAULT_METRIC_RENDER_STYLES[name])
+                   for name in ("vorticity_magnitude", "q_criterion", "swirling_strength")},
     },
     "pwv": {
         "enabled": False,
@@ -475,6 +561,108 @@ def _deep_merge(base: Any, override: Any) -> Any:
     return copy.deepcopy(override)
 
 
+def normalize_render_style_cfg(payload):
+    """Fill style defaults and reject malformed display parameters early."""
+    if not isinstance(payload, dict):
+        raise ValueError("render_style must be an object")
+    cfg = _deep_merge(DEFAULT_RENDER_STYLE_CFG, payload)
+    def number(value, name, lower=0.0, upper=None):
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be a finite number")
+        try:
+            value = float(value)
+        except (ValueError, TypeError) as error:
+            raise ValueError(f"{name} must be a finite number") from error
+        if not math.isfinite(value) or value < lower or (upper is not None and value > upper):
+            raise ValueError(f"{name} is outside its permitted range")
+        return value
+    def boolean(value, name):
+        if not isinstance(value, bool):
+            raise ValueError(f"{name} must be a boolean")
+        return value
+    def color(value, name):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} must be a colour string")
+        return value
+    if cfg["anti_aliasing"] not in {"auto", "none", "ssaa", "fxaa", "msaa"}:
+        raise ValueError("render_style.anti_aliasing must be auto/none/ssaa/fxaa/msaa")
+    for name in ("context", "text", "surfaces", "metrics"):
+        if not isinstance(cfg[name], dict):
+            raise ValueError(f"render_style.{name} must be an object")
+    cfg["context"]["color"] = color(cfg["context"]["color"], "context.color")
+    cfg["context"]["opacity"] = number(cfg["context"]["opacity"], "context.opacity", upper=1.0)
+    for name in ("dark", "light"):
+        cfg["text"][name] = color(cfg["text"][name], f"text.{name}")
+    allowed = {"anatomical": set(DEFAULT_ANATOMICAL_SURFACE_STYLE),
+               "quantitative": set(DEFAULT_QUANTITATIVE_SURFACE_STYLE)}
+    for group, keys in allowed.items():
+        surface = cfg["surfaces"][group]
+        if not isinstance(surface, dict) or set(surface) - keys:
+            raise ValueError(f"unsupported render_style.surfaces.{group} fields")
+        for name, value in surface.items():
+            path = f"surfaces.{group}.{name}"
+            if name in {"lighting", "smooth_shading", "interpolate_before_map"}:
+                surface[name] = boolean(value, path)
+            elif name == "nan_color":
+                surface[name] = color(value, path)
+            else:
+                surface[name] = number(value, path, upper=None if name == "specular_power" else 1.0)
+    for name, layer in cfg["metrics"].items():
+        if name not in DEFAULT_METRIC_RENDER_STYLES or not isinstance(layer, dict):
+            raise ValueError(f"unsupported metric render style: {name}")
+        layer["cmap"] = color(layer["cmap"], f"{name}.cmap")
+        layer["opacity"] = number(layer["opacity"], f"{name}.opacity", upper=1.0)
+        if "line_width" in layer:
+            layer["line_width"] = number(layer["line_width"], f"{name}.line_width", lower=0.01)
+        if "volume" not in layer:
+            continue
+        volume = layer["volume"]
+        if not isinstance(volume, dict):
+            raise ValueError(f"{name}.volume must be an object")
+        points = volume["opacity_points"]
+        if not isinstance(points, (list, tuple)) or len(points) < 2:
+            raise ValueError("volume.opacity_points needs at least two [fraction, opacity] pairs")
+        normalized = []
+        for pair in points:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                raise ValueError("volume.opacity_points must contain [fraction, opacity] pairs")
+            normalized.append([number(pair[0], "opacity fraction", upper=1.0),
+                               number(pair[1], "opacity value", upper=1.0)])
+        if (normalized[0] != [0.0, 0.0] or normalized[-1][0] != 1.0
+                or any(b[0] <= a[0] for a, b in zip(normalized, normalized[1:]))):
+            raise ValueError("volume.opacity_points must start at [0,0], end at fraction 1 and increase strictly")
+        volume["opacity_points"] = normalized
+        volume["shade"] = boolean(volume["shade"], "volume.shade")
+        if volume["blending"] not in {"composite", "maximum", "minimum", "average", "additive"}:
+            raise ValueError("unsupported volume.blending")
+        if volume["interpolation"] not in {"linear", "nearest"}:
+            raise ValueError("volume.interpolation must be linear or nearest")
+        volume["opacity_unit_distance_scale"] = number(volume["opacity_unit_distance_scale"],
+                                                        "volume.opacity_unit_distance_scale", lower=1e-6)
+    return cfg
+
+
+def _resolve_render_style_cfg(config_bundle):
+    shared = copy.deepcopy(config_bundle.get("render_style", {}))
+    metrics = {}
+    pressure = _feature_render_cfg(config_bundle.get("pressure_gradient", {}))
+    vortex = _feature_render_cfg(config_bundle.get("vortex", {}))
+    for name, defaults in DEFAULT_METRIC_RENDER_STYLES.items():
+        if name == "relative_pressure":
+            feature = pressure.get("relative_pressure", {})
+        elif name in ("vorticity_magnitude", "q_criterion", "swirling_strength"):
+            feature = vortex.get(name, {})
+        elif name == "pressure_gradient":
+            feature = pressure
+        else:
+            feature = _feature_render_cfg(config_bundle.get(name, {}))
+        if not isinstance(feature, dict):
+            raise ValueError(f"{name}.render must be an object")
+        metrics[name] = _deep_merge(defaults, feature)
+    shared["metrics"] = metrics
+    return normalize_render_style_cfg(shared)
+
+
 def load_config_module(module_name: str, config_dir: Optional[str] = None) -> Dict[str, Any]:
     if module_name not in DEFAULT_CONFIG_BUNDLE:
         raise KeyError(f"unknown config module: {module_name}")
@@ -578,6 +766,14 @@ def _feature_render_cfg(module_cfg: Dict[str, Any]) -> Dict[str, Any]:
 def _plane_render_cfg(render_cfg: Dict[str, Any]) -> Dict[str, Any]:
     resolved = copy.deepcopy(DEFAULT_PLANE_RENDER_CFG)
     cfg = render_cfg if isinstance(render_cfg, dict) else {}
+    size_mm = float(cfg.get("plane_size_mm", resolved["plane_size_mm"]))
+    if not math.isfinite(size_mm) or not 1.0 <= size_mm <= 200.0:
+        raise ValueError("planes.render.plane_size_mm must be between 1 and 200 mm")
+    selected_only = cfg.get("selected_only", resolved["selected_only"])
+    if not isinstance(selected_only, bool):
+        raise ValueError("planes.render.selected_only must be a boolean")
+    resolved["plane_size_mm"] = size_mm
+    resolved["selected_only"] = selected_only
     default_cfg = cfg.get("default", {}) if isinstance(cfg.get("default"), dict) else {}
     group_cfgs = cfg.get("groups", {}) if isinstance(cfg.get("groups"), dict) else {}
 
@@ -662,6 +858,7 @@ def resolve_render_settings(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[st
     wss_render_cfg = _feature_render_cfg(wss_cfg)
     tke_render_cfg = _feature_render_cfg(tke_cfg)
     pressure_gradient_render_cfg = _feature_render_cfg(pressure_gradient_cfg)
+    relative_pressure_render_cfg = pressure_gradient_render_cfg.get("relative_pressure", {})
     streamline_render_cfg = _feature_render_cfg(streamline_cfg)
     shared_colorbar_bar_cfg = _resolve_bar_cfg(colorbar_cfg.get("bar_cfg", None), video_exporting_cfg.get("shared_colorbar_bar_cfg", None), DEFAULT_SHARED_COLORBAR_CFG["bar_cfg"])
     shared_colorbar_show = bool(colorbar_cfg.get("show", video_exporting_cfg.get("shared_colorbar_show", True)))
@@ -676,6 +873,8 @@ def resolve_render_settings(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[st
             plane_video_cfg = _deep_merge(plane_video_cfg, legacy_plane_video_cfg)
 
     return {
+        "render_style_cfg": _resolve_render_style_cfg(config_bundle),
+        "render_background_color": str(config_bundle.get("ui", {}).get("background_color") or BACKGROUND_COLOR),
         "fps": int(video_exporting_cfg.get("fps", 12)),
         "plane_rotation_frames": int(video_exporting_cfg.get("plane_rotation_frames", 180)),
         "make_plane_video": bool(video_exporting_cfg.get("make_plane_video", False)),
@@ -705,9 +904,9 @@ def resolve_render_settings(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[st
         "pressure_gradient_clim": _resolve_clim(pressure_gradient_render_cfg.get("clim", None), video_exporting_cfg.get("pressure_gradient_clim", None), None),
         "pressure_gradient_show_scalar_bar": bool(pressure_gradient_render_cfg.get("show_scalar_bar", video_exporting_cfg.get("pressure_gradient_show_scalar_bar", True))),
         "pressure_gradient_bar_cfg": _resolve_bar_cfg(pressure_gradient_render_cfg.get("bar_cfg", None), video_exporting_cfg.get("pressure_gradient_bar_cfg", None), DEFAULT_PRESSURE_GRADIENT_BAR_CFG),
-        "relative_pressure_clim": _resolve_clim(pressure_gradient_render_cfg.get("relative_pressure_clim", None), video_exporting_cfg.get("relative_pressure_clim", None), None),
-        "relative_pressure_show_scalar_bar": bool(pressure_gradient_render_cfg.get("relative_pressure_show_scalar_bar", video_exporting_cfg.get("show_relative_pressure_scalar_bar", video_exporting_cfg.get("pressure_gradient_show_scalar_bar", True)))),
-        "relative_pressure_bar_cfg": _resolve_bar_cfg(pressure_gradient_render_cfg.get("relative_pressure_bar_cfg", None), video_exporting_cfg.get("relative_pressure_bar_cfg", None), DEFAULT_RELATIVE_PRESSURE_BAR_CFG),
+        "relative_pressure_clim": _resolve_clim(relative_pressure_render_cfg.get("clim", None), video_exporting_cfg.get("relative_pressure_clim", None), None),
+        "relative_pressure_show_scalar_bar": bool(relative_pressure_render_cfg.get("show_scalar_bar", video_exporting_cfg.get("show_relative_pressure_scalar_bar", video_exporting_cfg.get("pressure_gradient_show_scalar_bar", True)))),
+        "relative_pressure_bar_cfg": _resolve_bar_cfg(relative_pressure_render_cfg.get("bar_cfg", None), video_exporting_cfg.get("relative_pressure_bar_cfg", None), DEFAULT_RELATIVE_PRESSURE_BAR_CFG),
         "streamline_clim": _resolve_clim(streamline_render_cfg.get("clim", None), video_exporting_cfg.get("streamline_clim", None), None),
         "streamline_show_scalar_bar": bool(streamline_render_cfg.get("show_scalar_bar", video_exporting_cfg.get("streamline_show_scalar_bar", True))),
         "streamline_bar_cfg": _resolve_bar_cfg(streamline_render_cfg.get("bar_cfg", None), video_exporting_cfg.get("streamline_bar_cfg", None), DEFAULT_STREAMLINE_BAR_CFG),
@@ -734,8 +933,8 @@ def _build_derived_metrics_config(config_bundle: Dict[str, Dict[str, Any]]) -> D
         "pressure_gradient_viscosity": float(pressure_gradient_cfg.get("viscosity", legacy_cfg.get("pressure_gradient_viscosity", shared_viscosity))),
         "pressure_gradient_smoothing_sigma": float(pressure_gradient_cfg.get("smoothing_sigma", legacy_cfg.get("pressure_gradient_smoothing_sigma", 0.0))),
         "pressure_gradient_support_erosion_iters": int(pressure_gradient_cfg.get("support_erosion_iters", legacy_cfg.get("pressure_gradient_support_erosion_iters", 1))),
-        "pressure_gradient_layer_opacity": float(pressure_gradient_cfg.get("layer_opacity", legacy_cfg.get("pressure_gradient_layer_opacity", 0.6))),
-        "relative_pressure_layer_opacity": float(pressure_gradient_cfg.get("relative_pressure_opacity", legacy_cfg.get("relative_pressure_layer_opacity", 0.6))),
+        "pressure_gradient_layer_opacity": float(pressure_gradient_cfg.get("render", {}).get("opacity", legacy_cfg.get("pressure_gradient_layer_opacity", 1.0))),
+        "relative_pressure_layer_opacity": float(pressure_gradient_cfg.get("render", {}).get("relative_pressure", {}).get("opacity", legacy_cfg.get("relative_pressure_layer_opacity", 1.0))),
         "pressure_gradient_use_convective_acceleration": bool(pressure_gradient_cfg.get("use_convective_acceleration", legacy_cfg.get("pressure_gradient_use_convective_acceleration", True))),
         "pressure_method": str(pressure_gradient_cfg.get("method", legacy_cfg.get("pressure_method", legacy_cfg.get("pressure_gradient_method", "ppe"))) or "ppe"),
         "vortex_smoothing_sigma": max(float(vortex_cfg.get("smoothing_sigma", legacy_cfg.get("vortex_smoothing_sigma", 0.0))), 0.0),
@@ -794,6 +993,8 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
     pathline_cfg = _pathline_model_payload(config_bundle)
     render_settings = copy.deepcopy(resolve_render_settings(config_bundle))
     render_settings.pop("plane_render_cfg", None)
+    # Shared/per-metric style stays in the workspace; it is not a flat API field.
+    render_settings.pop("render_style_cfg", None)
     derived_cfg = _build_derived_metrics_config(config_bundle)
     plane_count = int(plane_cfg.get("plane_count", 1) or 1)
     if plane_count != -1:

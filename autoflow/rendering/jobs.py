@@ -88,6 +88,9 @@ def _render_request(request_path):
     request = joblib.load(request_path, mmap_mode="r")
     ws, config, requested = request["workspace"], request["config"], request["requested"]
     directory = request["directory"]
+    ws.render_settings.update({key: config[key] for key in
+                              ("render_background_color", "shared_colorbar_show", "shared_colorbar_bar_cfg", "render_style_cfg", "plane_render_cfg")
+                              if key in config})
     progress_path = Path(request["progress"])
     common = dict(fps=config["fps"], smoothing_iteration=ws.derived_params.smoothing_iteration,
                   view=config["camera_view"], distance_scale=config["camera_distance_scale"],

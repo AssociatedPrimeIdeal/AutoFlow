@@ -3,17 +3,22 @@ import pyvista as pv
 from pyvista import _vtk
 
 from ..core.models import ObjectKind
+from ..config import BACKGROUND_COLOR
+from ..rendering.style import (
+    configure_plotter, scalar_bar_args, surface_style, plane_display_size,
+    wss_display_surface, metric_volume_kwargs, apply_metric_volume_opacity,
+)
+from ..rendering.datasets import (tke_display_mesh, display_support_surface,
+                                  sample_display_field, active_wrap_mesh, noise_display_points)
 from ..algorithms import (
     build_multilabel_surface_t,
     build_surface_from_mask3d,
-    build_cell_mask_surface,
     graph_to_polydata,
     generate_seed_points,
     generate_streamlines_at_t,
     generate_streamlines_from_plane_at_t,
     generate_pathlines_from_plane_at_t,
     create_uniform_grid,
-    sample_volume_on_existing_surface,
 )
 from ..algorithms.streamlines import (
     _plane_seeds,
@@ -94,7 +99,7 @@ class SceneController:
         self._automatic_clim_cache = {}
         self._tracked_actors = {}
         self._saved_camera = None
-        self._background_color = "#000000"
+        self._background_color = BACKGROUND_COLOR
         self._display_axis_directions = list(_DISPLAY_AXIS_DEFAULTS)
         self._display_axis_signs = np.ones(3, dtype=float)
         self._display_center = None
@@ -127,7 +132,7 @@ class SceneController:
     @staticmethod
     def _is_volume_object(obj):
         """Return whether *obj* should be drawn with VTK volume rendering."""
-        return str(getattr(obj, "data_key", "")) == "pcmra_volume"
+        return str(getattr(obj, "data_key", "")) in {"pcmra_volume", "tke_volume"}
 
     @staticmethod
     def _foreground_volume_range(values):
@@ -147,10 +152,15 @@ class SceneController:
 
     def _volume_scalar_range(self, obj, data, respect_clim=True):
         """Resolve the PC-MRA window from the current frame foreground."""
+        if obj.data_key == 'tke_volume' and obj.clim is None:
+            values = self.workspace.derived.tke_array
+            values = np.asarray(data['TKE'] if values is None else values)
+            finite = values[np.isfinite(values)]
+            return 0.0, max(float(np.max(finite)) if finite.size else 1.0, 1e-6)
         if respect_clim and getattr(obj, "clim", None) is not None:
             lo, hi = (float(x) for x in obj.clim)
         else:
-            if self._is_volume_object(obj) and self.workspace.pcmra_array is not None:
+            if obj.data_key == "pcmra_volume" and self.workspace.pcmra_array is not None:
                 key = (id(self.workspace.pcmra_array), id(self.workspace.pcmra_render_mask), int(self.workspace.current_t))
                 cached = self._volume_range_cache.get(key)
                 if cached is not None:
@@ -192,6 +202,11 @@ class SceneController:
             if data is None:
                 return
             lo, hi = self._volume_scalar_range(obj, data)
+            if obj.data_key == 'tke_volume':
+                actor.GetMapper().scalar_range = (lo, hi)
+                apply_metric_volume_opacity(actor, (lo, hi), obj.opacity, self.workspace.resolution,
+                                            workspace=self.workspace, data_key=obj.data_key)
+                return
             mapper = actor.GetMapper()
             try:
                 mapper.scalar_range = (lo, hi)
@@ -230,23 +245,19 @@ class SceneController:
         except Exception:
             pass
 
-    def _set_noise_volume_opacity(self, obj):
-        prop = obj.actor.GetProperty()
-        colors = prop.GetRGBTransferFunction(0)
-        colors.RemoveAllPoints()
-        color = pv.Color(obj.color or "#ff0000").float_rgb
-        colors.AddRGBPoint(0.0, *color)
-        colors.AddRGBPoint(1.0, *color)
-        transfer = prop.GetScalarOpacity(0)
-        transfer.RemoveAllPoints()
-        transfer.AddPoint(0.0, 0.0)
-        transfer.AddPoint(0.49, 0.0)
-        transfer.AddPoint(0.5, float(np.clip(obj.opacity, 0.0, 1.0)))
-        transfer.AddPoint(1.0, float(np.clip(obj.opacity, 0.0, 1.0)))
-        prop.SetInterpolationTypeToNearest()
+    def _set_noise_point_opacity(self, obj):
+        data = obj.actor.GetMapper().dataset
+        weights = np.asarray(data.point_data['Noise mask'], dtype=float)
+        rgba = np.zeros((data.n_points, 4), dtype=np.uint8)
+        rgba[:, :3] = pv.Color(obj.color or '#ff0000').int_rgb
+        rgba[:, 3] = np.rint(255 * np.clip(weights * obj.opacity, 0.0, 1.0)).astype(np.uint8)
+        data.point_data['Noise RGBA'] = rgba
+        obj.actor.GetMapper().Update()
+        obj.actor.GetProperty().SetOpacity(1.0)
+        obj.actor.GetProperty().SetPointSize(float(obj.point_size))
 
     def initialize(self):
-        self.plotter.set_background(self._background_color)
+        configure_plotter(self.plotter, self._background_color, workspace=self.workspace)
         self._ensure_plane_overlay_renderer()
         self._add_orientation_axes()
         self._ensure_volume_window_level_interaction()
@@ -267,7 +278,10 @@ class SceneController:
                 renderer = _vtk.vtkRenderer()
                 renderer.SetLayer(1)
                 renderer.SetInteractive(0)
-                renderer.SetErase(False)
+                # Clear this layer's depth on every frame while retaining the
+                # main scene's colours. EraseOff also disables depth clearing.
+                renderer.SetErase(True)
+                renderer.SetPreserveColorBuffer(True)
                 renderer.SetPreserveDepthBuffer(False)
                 renderer.SetBackgroundAlpha(0.0)
                 renderer.SetActiveCamera(main_renderer.GetActiveCamera())
@@ -739,19 +753,21 @@ class SceneController:
             }
 
     def set_background(self, color):
-        self._background_color = str(color or "#000000")
+        self._background_color = str(color or BACKGROUND_COLOR)
+        self.workspace.render_settings["render_background_color"] = self._background_color
         self.plotter.set_background(self._background_color)
         self.render_all()
 
     def toggle_axes(self):
         self._axes_shown = not self._axes_shown
-        self.reset_scene()
-        if not self._axes_shown:
-            try:
+        try:
+            if self._axes_shown:
+                self.plotter.show_axes()
+            else:
                 self.plotter.hide_axes()
-            except Exception:
-                pass
-        self.render_all()
+            self.plotter.render()
+        except Exception:
+            pass
 
     def reset_camera(self):
         try:
@@ -784,17 +800,15 @@ class SceneController:
             self._display_center = self._workspace_scene_center()
         prefixes = None if rebuild_prefixes is None else tuple(str(x) for x in rebuild_prefixes)
         current_uids = set(self.workspace.scene_objects.keys())
+        if self._highlight_plane_uid is not None and self._highlight_plane_uid not in current_uids:
+            self._remove_plane_highlight()
+        if self._highlight_path_uid is not None and self._highlight_path_uid not in current_uids:
+            self._remove_path_highlight()
+            self._clear_fork_and_context_actors()
         stale = set(self._tracked_actors.keys()) - current_uids
         for uid in stale:
             actor = self._tracked_actors.pop(uid, None)
-            if actor is not None:
-                try:
-                    self.plotter.remove_actor(actor, render=False)
-                except Exception:
-                    try:
-                        self.plotter.renderer.RemoveActor(actor)
-                    except Exception:
-                        pass
+            self._detach_actor(actor)
         for obj in self.workspace.scene_objects.values():
             rebuild = prefixes is None or any(obj.data_key.startswith(prefix) for prefix in prefixes)
             if obj.actor is None or rebuild:
@@ -815,11 +829,7 @@ class SceneController:
             self._remove_actor(obj)
             del self.workspace.scene_objects[uid]
         actor = self._tracked_actors.pop(uid, None)
-        if actor is not None:
-            try:
-                self.plotter.remove_actor(actor)
-            except Exception:
-                pass
+        self._detach_actor(actor)
         if self._highlight_plane_uid == uid:
             self._remove_plane_highlight()
         if self._highlight_path_uid == uid:
@@ -938,6 +948,7 @@ class SceneController:
         return updated
 
     def apply_object_properties(self, obj, *, render=True, refresh_scalar_bar=True):
+        self._sync_plane_highlight_visibility(obj)
         if obj.actor is None:
             self._render_object(obj, refresh_scalar_bar=refresh_scalar_bar)
             if render:
@@ -951,7 +962,7 @@ class SceneController:
         if obj.dynamic and obj.visible and not was_visible:
             self._update_dynamic_object(obj)
         try:
-            obj.actor.SetVisibility(1 if obj.visible else 0)
+            obj.actor.SetVisibility(1 if self._object_visible_in_view(obj) else 0)
         except Exception:
             pass
         if self._is_volume_object(obj):
@@ -965,7 +976,7 @@ class SceneController:
                     pass
             return
         if obj.data_key == "noise_region":
-            self._set_noise_volume_opacity(obj)
+            self._set_noise_point_opacity(obj)
             if render:
                 self.plotter.render()
             return
@@ -993,9 +1004,52 @@ class SceneController:
             except Exception:
                 pass
 
+
+    def plane_display_size(self):
+        return plane_display_size(self.workspace)
+
+    def _object_visible_in_view(self, obj):
+        if not bool(obj.visible):
+            return False
+        if obj.kind == ObjectKind.PLANE:
+            cfg = self.workspace.render_settings.get("plane_render_cfg", {}) or {}
+            if cfg.get("selected_only", False):
+                return obj.uid == self._highlight_plane_uid
+        return True
+
+    def _sync_plane_highlight_visibility(self, obj):
+        if obj.uid == self._highlight_plane_uid and self._highlight_plane_actor is not None:
+            self._highlight_plane_actor.SetVisibility(1 if self._object_visible_in_view(obj) else 0)
+
+    def _refresh_plane_visibility(self):
+        for obj in self.workspace.scene_objects.values():
+            if obj.kind != ObjectKind.PLANE:
+                continue
+            if obj.actor is None and self._object_visible_in_view(obj):
+                self._render_object(obj, refresh_scalar_bar=False)
+            elif obj.actor is not None:
+                self._apply_basic_properties_only(obj)
+
+    def set_plane_display_settings(self, *, size_mm=None, selected_only=None, render=True):
+        cfg = self.workspace.render_settings.setdefault("plane_render_cfg", {})
+        if size_mm is not None:
+            value = float(size_mm)
+            if not np.isfinite(value) or not 1.0 <= value <= 200.0:
+                raise ValueError("plane display size must be between 1 and 200 mm")
+            cfg["plane_size_mm"] = value
+            for obj in self.workspace.scene_objects.values():
+                if obj.kind == ObjectKind.PLANE:
+                    self.update_plane_geometry(obj.uid, render=False)
+        if selected_only is not None:
+            cfg["selected_only"] = bool(selected_only)
+        self._refresh_plane_visibility()
+        if render:
+            self.plotter.render()
+
     def highlight_plane(self, uid):
         self._remove_plane_highlight()
         self._highlight_plane_uid = uid
+        self._refresh_plane_visibility()
         if uid is None:
             try:
                 self.plotter.render()
@@ -1015,6 +1069,7 @@ class SceneController:
                 data, color="magenta", opacity=0.9, line_width=4,
                 style="wireframe", name="__plane_highlight__")
             self._promote_overlay_actor(self._highlight_plane_actor)
+            self._sync_plane_highlight_visibility(obj)
         except Exception:
             self._highlight_plane_actor = None
         try:
@@ -1219,34 +1274,31 @@ class SceneController:
     def remove_all_plane_labels(self):
         pass
 
-    def _remove_actor(self, obj):
-        if obj.actor is not None:
+    def _detach_actor(self, actor):
+        """Remove an actor from every renderer that can own a scene object."""
+        if actor is not None:
             if self._plane_overlay_renderer is not None:
                 try:
-                    self._plane_overlay_renderer.RemoveActor(obj.actor)
+                    self._plane_overlay_renderer.RemoveActor(actor)
                 except Exception:
                     pass
             try:
-                self.plotter.remove_actor(obj.actor, render=False)
+                self.plotter.remove_actor(actor, render=False)
             except Exception:
                 try:
-                    self.plotter.renderer.RemoveActor(obj.actor)
+                    self.plotter.renderer.RemoveActor(actor)
                 except Exception:
                     pass
-        if getattr(obj, "label_actor", None) is not None:
-            try:
-                self.plotter.remove_actor(obj.label_actor, render=False)
-            except Exception:
-                try:
-                    self.plotter.renderer.RemoveActor(obj.label_actor)
-                except Exception:
-                    pass
+
+    def _remove_actor(self, obj):
+        self._detach_actor(obj.actor)
+        self._detach_actor(getattr(obj, "label_actor", None))
         self._tracked_actors.pop(obj.uid, None)
         obj.actor = None
         obj.label_actor = None
 
     def _render_object(self, obj, refresh_scalar_bar=True):
-        if not obj.visible:
+        if not self._object_visible_in_view(obj):
             if obj.actor is not None:
                 try:
                     obj.actor.SetVisibility(0)
@@ -1267,16 +1319,13 @@ class SceneController:
         try:
             data_show = self._display_dataset(obj, data)
             data_show = self._transform_display_dataset(data_show)
-            if self._is_volume_object(obj) or obj.data_key == "noise_region":
+            if self._is_volume_object(obj):
                 obj.actor = self.plotter.add_volume(data_show, name=obj.uid, **kwargs)
                 try:
                     obj.actor.PickableOff()
                 except Exception:
                     pass
-                if self._is_volume_object(obj):
-                    self._set_volume_opacity(obj, data_show)
-                else:
-                    self._set_noise_volume_opacity(obj)
+                self._set_volume_opacity(obj, data_show)
             else:
                 obj.actor = self.plotter.add_mesh(data_show, name=obj.uid, **kwargs)
                 if obj.kind == ObjectKind.PLANE:
@@ -1289,38 +1338,43 @@ class SceneController:
             self._refresh_shared_scalar_bar(preferred_uid=obj.uid if obj.visible else None, render=False)
 
     def _apply_basic_properties_only(self, obj):
+        self._sync_plane_highlight_visibility(obj)
         try:
-            obj.actor.SetVisibility(1 if obj.visible else 0)
+            obj.actor.SetVisibility(1 if self._object_visible_in_view(obj) else 0)
         except Exception:
             pass
         if self._is_volume_object(obj):
             self._set_volume_opacity(obj)
             return
         if obj.data_key == "noise_region":
-            self._set_noise_volume_opacity(obj)
+            self._set_noise_point_opacity(obj)
             return
         try:
             prop = obj.actor.GetProperty()
             prop.SetOpacity(float(obj.opacity))
             prop.SetLineWidth(max(float(obj.line_width), 4.0) if obj.kind == ObjectKind.PLANE else float(obj.line_width))
             prop.SetPointSize(float(obj.point_size))
+            if obj.kind == ObjectKind.PLANE:
+                prop.SetRepresentationToWireframe()
+                prop.SetLighting(False)
+                obj.actor.ForceOpaqueOn()
         except Exception:
             pass
 
     def _mesh_kwargs(self, obj, data):
-        if obj.data_key == "noise_region":
-            return {
-                "scalars": "Noise mask",
-                "cmap": [obj.color or "#ff0000"] * 2,
-                "clim": (0.0, 1.0),
-                "opacity": [0.0, float(obj.opacity)],
-                "shade": False,
-                "blending": "maximum",
-                "mapper": self._volume_mapper_name(),
-                "show_scalar_bar": False,
-                "render": False,
-                "reset_camera": False,
-            }
+        if obj.data_key == 'tke_volume':
+            kwargs = metric_volume_kwargs(self.workspace, obj.data_key, self._volume_scalar_range(obj, data))
+            return dict(kwargs, scalars='TKE', mapper=self._volume_mapper_name(),
+                        show_scalar_bar=False, render=False, reset_camera=False)
+        if obj.data_key == 'noise_region':
+            weights = np.asarray(data['Noise mask'], dtype=float)
+            rgba = np.zeros((data.n_points, 4), dtype=np.uint8)
+            rgba[:, :3] = pv.Color(obj.color or '#ff0000').int_rgb
+            rgba[:, 3] = np.rint(255 * np.clip(weights * obj.opacity, 0.0, 1.0)).astype(np.uint8)
+            data.point_data['Noise RGBA'] = rgba
+            return dict(scalars='Noise RGBA', rgba=True, opacity=1.0,
+                        point_size=float(obj.point_size), render_points_as_spheres=False,
+                        lighting=False, show_scalar_bar=False, render=False, reset_camera=False)
         if self._is_volume_object(obj):
             return {
                 "scalars": str(obj.scalars or "PC-MRA"),
@@ -1369,6 +1423,7 @@ class SceneController:
                 kw["clim"] = clim
         else:
             kw["color"] = obj.color
+        kw.update(surface_style(quantitative=use_scalars and obj.kind != ObjectKind.SEGMENTATION, workspace=self.workspace))
         if obj.data_key == "pwv_planes":
             kw["show_edges"] = True
             kw["edge_color"] = "black"
@@ -1409,6 +1464,11 @@ class SceneController:
         return clim
 
     def _display_dataset(self, obj, data):
+        if obj.data_key == "wss_surface_live":
+            key = (obj.data_key, id(data), "wss_display")
+            if key not in self._display_mesh_cache:
+                self._display_mesh_cache[key] = wss_display_surface(data)
+            return self._display_mesh_cache[key]
         if not (
             obj.tube_radius > 0
             and hasattr(data, "tube")
@@ -1451,38 +1511,14 @@ class SceneController:
         return display_name, labels
 
     def _scalar_bar_args_for_object(self, obj):
-        scalar_bar_args = {
-            "title": str(obj.scalar_bar_title or ""),
-            "vertical": True,
-            "title_font_size": 14,
-            "label_font_size": 12,
-            "n_labels": 5,
-            "fmt": "%.3g",
-        }
-        shared_cfg = dict(getattr(self.workspace, "render_settings", {}).get("shared_colorbar_bar_cfg", {}) or {})
-        if shared_cfg:
-            scalar_bar_args.update({k: v for k, v in shared_cfg.items() if k != "stack_gap"})
-        width = min(max(float(scalar_bar_args.get("width", 0.08)), 0.02), 0.4)
-        height = min(max(float(scalar_bar_args.get("height", 0.6)), 0.15), 0.95)
-        scalar_bar_args["width"] = width
-        scalar_bar_args["height"] = height
-        scalar_bar_args["position_x"] = min(
-            max(float(scalar_bar_args.get("position_x", 0.87)), 0.0),
-            max(0.0, 0.98 - width),
+        settings = getattr(self.workspace, "render_settings", {}) or {}
+        args = scalar_bar_args(
+            obj.scalar_bar_title, obj.scalar_bar_cfg,
+            settings.get("shared_colorbar_bar_cfg"), self.plotter.background_color, workspace=self.workspace,
         )
-        scalar_bar_args["position_y"] = min(
-            max(float(scalar_bar_args.get("position_y", 0.15)), 0.0),
-            max(0.0, 0.98 - height),
-        )
-        try:
-            background = np.asarray(pv.Color(self.plotter.background_color).float_rgb, dtype=float)
-            luminance = float(np.dot(background, [0.2126, 0.7152, 0.0722]))
-            scalar_bar_args.setdefault("color", "black" if luminance >= 0.5 else "white")
-        except Exception:
-            pass
         if obj.kind == ObjectKind.SEGMENTATION:
-            scalar_bar_args["n_labels"] = 0
-        return scalar_bar_args
+            args["n_labels"] = 0
+        return args
 
     def _object_can_drive_scalar_bar(self, obj):
         render_settings = getattr(self.workspace, "render_settings", {}) or {}
@@ -1581,16 +1617,9 @@ class SceneController:
         sp = ws.resolution
         org = ws.origin
 
-        if data_key == "noise_region":
-            if ws.pcmra_render_mask is None:
-                return None
-            def _build_noise_region():
-                mask = np.asarray(ws.pcmra_render_mask, dtype=bool)
-                rejected = ~mask if mask.ndim == 3 else ~np.any(mask, axis=3)
-                if not np.any(rejected):
-                    return None
-                return self._voxel_centered_grid(rejected.astype(np.float32), "Noise mask")
-            return self._cached(f"noise_region_{id(ws.pcmra_render_mask)}", 0, _build_noise_region)
+        if data_key == 'noise_region':
+            return self._cached(f'noise_region_{id(ws.pcmra_render_mask)}_{id(ws.mag_raw)}', 0,
+                                lambda: noise_display_points(ws))
 
         if data_key == "pcmra_volume":
             if ws.pcmra_array is None:
@@ -1634,16 +1663,8 @@ class SceneController:
 
         if data_key in {"phase_wrap_mask", "phase_wrap_count"}:
             result = getattr(ws, "phase_unwrap_result", {}) or {}
-            field = result.get("wrap_mask" if data_key == "phase_wrap_mask" else "wrap_count")
-            if field is None:
-                return None
-            arr = np.asarray(field)
-            if arr.ndim == 5:
-                arr = arr[:, :, :, min(max(0, int(t)), arr.shape[3] - 1), :]
-            if arr.ndim == 4:
-                arr = np.any(arr, axis=-1) if data_key == "phase_wrap_mask" else arr[..., 0]
-            mesh = create_uniform_grid(np.asarray(arr), sp, org, name="wrap_mask" if data_key == "phase_wrap_mask" else "wrap_count")
-            return mesh
+            return self._cached(f'{data_key}_{id(result)}', int(t), lambda: active_wrap_mesh(
+                result, t, sp, org, counts=data_key == 'phase_wrap_count'))
 
         if isinstance(data_key, str) and data_key.startswith("segmask_group_"):
             group_name = str(data_key[len("segmask_group_"):])
@@ -1748,32 +1769,7 @@ class SceneController:
             return ws.derived.wss_surfaces[min(max(0, t), len(ws.derived.wss_surfaces) - 1)]
 
         if data_key == "tke_volume":
-            if ws.derived.tke_array is not None:
-                def _build_tke_t():
-                    arr = np.asarray(ws.derived.tke_array, dtype=np.float32)
-                    if arr.ndim == 4:
-                        vol_t = arr[..., min(max(0, int(t)), arr.shape[3] - 1)]
-                    else:
-                        vol_t = arr
-                    if ws.segmask_binary is not None:
-                        if ws.segmask_binary.ndim == 4:
-                            mask_t = ws.segmask_binary[..., min(max(0, int(t)), ws.segmask_binary.shape[3] - 1)]
-                        else:
-                            mask_t = ws.segmask_binary
-                    elif ws.segmask_3d is not None:
-                        mask_t = ws.segmask_3d
-                    else:
-                        mask_t = np.ones(vol_t.shape, dtype=bool)
-                    vol_t = vol_t * np.asarray(mask_t, dtype=np.float32)
-
-                    tke_grid = create_uniform_grid(vol_t, sp, origin=org, name="TKE")
-                    mask_grid = create_uniform_grid(np.asarray(mask_t, dtype=np.float32), sp, origin=org, name="mask")
-                    mask_mesh = mask_grid.threshold(0.1, scalars="mask")
-                    if mask_mesh is None or mask_mesh.n_cells == 0:
-                        return None
-                    return mask_mesh.sample(tke_grid)
-                return self._cached(data_key, t, _build_tke_t)
-            return ws.derived.tke_volume
+            return self._cached(data_key, t, lambda: tke_display_mesh(ws, t))
 
         vortex_fields = {
             "vorticity_magnitude_volume": ("vorticity_magnitude", "Vorticity Magnitude"),
@@ -1799,8 +1795,8 @@ class SceneController:
                 vol_t = np.where(support_t, vol_t, np.float32(0.0)).astype(np.float32, copy=False)
                 return self._sample_supported_surface(
                     vol_t,
-                    support_t,
-                    0,
+                    support_source,
+                    tidx,
                     sp,
                     org,
                     name=scalar_name,
@@ -1949,8 +1945,8 @@ class SceneController:
             return pv.Plane(
                 center=np.asarray(p.center) + np.asarray(org),
                 direction=np.asarray(p.normal),
-                i_size=25,
-                j_size=25,
+                i_size=self.plane_display_size(),
+                j_size=self.plane_display_size(),
                 i_resolution=1,
                 j_resolution=1,
             )
@@ -1993,12 +1989,12 @@ class SceneController:
         surface = self._cached(
             f"{str(cache_key or name)}_support_surface_{id(support_4d_or_3d)}",
             rep_t,
-            lambda: build_cell_mask_surface(
+            lambda: display_support_surface(
                 support_t, spacing, origin=origin, smooth_iter=80
             ),
         )
-        return sample_volume_on_existing_surface(
-            volume_t, surface, spacing, origin=origin, name=name
+        return sample_display_field(
+            volume_t, support_t, surface, spacing, origin=origin, name=name
         )
 
     def _get_streamline_mesh(self, t):
@@ -2193,7 +2189,7 @@ class SceneController:
         best_uid, best_idx, best_dist = None, None, float("inf")
         org = np.asarray(ws.origin, dtype=float).reshape(3)
         for uid, obj in ws.scene_objects.items():
-            if obj.kind != ObjectKind.PLANE:
+            if obj.kind != ObjectKind.PLANE or not self._object_visible_in_view(obj):
                 continue
             pidx = _parse_indexed_data_key(obj.data_key, "plane")
             if pidx is None:
@@ -2204,7 +2200,7 @@ class SceneController:
             d = float(np.linalg.norm(picked - center))
             if d < best_dist:
                 best_uid, best_idx, best_dist = uid, pidx, d
-        return (best_uid, best_idx) if best_dist <= 30.0 else (None, None)
+        return (best_uid, best_idx) if best_dist <= self.plane_display_size() else (None, None)
 
     def _plane_uid_at_display_position(self, x, y):
         renderer = self.plotter.renderer
@@ -2233,7 +2229,7 @@ class SceneController:
             axis_u /= np.linalg.norm(axis_u) + 1e-12
             axis_v = np.cross(normal, axis_u)
             axis_v /= np.linalg.norm(axis_v) + 1e-12
-            half_size = 12.5
+            half_size = self.plane_display_size() * 0.5
             corners = [
                 center - half_size * axis_u - half_size * axis_v,
                 center + half_size * axis_u - half_size * axis_v,

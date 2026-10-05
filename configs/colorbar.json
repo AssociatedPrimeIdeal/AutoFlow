@@ -1,11 +1,18 @@
 {
   "show": true,
   "bar_cfg": {
-    "position_x": 0.87,
+    "vertical": true,
+    "position_x": 0.82,
     "position_y": 0.15,
     "height": 0.65,
-    "width": 0.08,
+    "width": 0.045,
     "title_font_size": 14,
-    "label_font_size": 11
+    "label_font_size": 11,
+    "n_labels": 5,
+    "fmt": "%.3g",
+    "font_family": "arial",
+    "bold": false,
+    "italic": false,
+    "shadow": false
   }
 }

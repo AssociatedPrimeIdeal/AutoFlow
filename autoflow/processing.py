@@ -363,6 +363,7 @@ def process_single(
     noise_magnitude_fraction=0.05,
     noise_velocity_std_max=0.80,
     generate_pcmra=False,
+    render_background_color=None,
 ):
     loader = getattr(workspace, "loader_params", None)
     case = resolve_input_case(input_source, getattr(loader, "dicom_backend", "dicom2h5"), getattr(loader, "dicom_h5_dir", ""))
@@ -394,6 +395,17 @@ def process_single(
 
     os.makedirs(out_dir, exist_ok=True)
     ws = copy.deepcopy(workspace) if workspace is not None else Workspace()
+    # Keep offline and interactive rendering on the same resolved settings.
+    from .config import BACKGROUND_COLOR
+    ws.render_settings.update({
+        "render_background_color": render_background_color or ws.render_settings.get("render_background_color", BACKGROUND_COLOR),
+        "shared_colorbar_show": bool(shared_colorbar_show),
+        "wss_clim": wss_clim, "tke_clim": tke_clim,
+        "pressure_gradient_clim": pressure_gradient_clim,
+        "relative_pressure_clim": relative_pressure_clim, "streamline_clim": streamline_clim,
+    })
+    if shared_colorbar_bar_cfg is not None:
+        ws.render_settings["shared_colorbar_bar_cfg"] = dict(shared_colorbar_bar_cfg)
     ws.paths.segmask_path = case.input_path
     ws.paths.flow_path = case.input_path
     ws.paths.output_dir = out_dir

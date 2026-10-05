@@ -115,7 +115,7 @@ Put keys inside `phase_unwrapping.backend_params.pudip` or `.gust`. AutoFlow pas
 | `plane_color` | colour string | yellow | same | Plane marker colour | same |
 | `plane_opacity` | float | 0.75 | same | Plane marker opacity, 0–1 | same |
 
-Metric `render.bar_cfg` and shared `colorbar.bar_cfg` accept `position_x`, `position_y`, `width`, `height` as normalized viewport fractions, plus `title_font_size` / `label_font_size` as font sizes. Every default and field is expanded in [the module tables](parameters.md#colorbar). Per-metric bar_cfg governs offline defaults; the GUI uses the shared colourbar slot.
+Metric `render.bar_cfg` and shared `colorbar.bar_cfg` accept `position_x`, `position_y`, `width`, `height` as normalized viewport fractions, plus `title_font_size` / `label_font_size` as font sizes. Every default and field is expanded in [the module tables](parameters.md#colorbar). GUI and movies use the shared colourbar slot. Per-metric `bar_cfg` provides fallback fields; `colorbar.bar_cfg` overrides matching fields in both entry points. Text contrast follows `ui.background_color`, and `colorbar.show` is the master visibility switch for both.
 
 ## Optional overrides and compatibility
 
@@ -132,3 +132,39 @@ These accepted controls may be absent from shipped JSON.
 | `planes.use_center_plane` | bool/null | null | configs/planes.json / API | Legacy centre-plane override; prefer fixed_step placement controls for new workflows | `autoflow/algorithms/planes.py` |
 
 New configurations should use named metric modules rather than `derived.json`. Its historical `wss_*`, `pressure_gradient_*`, `pressure_method`, `vortex_*` and `tke_rho` fields are fallback aliases resolved by `autoflow/config.py:_build_derived_metrics_config`; an explicit modern field takes precedence.
+
+## Rendering groups
+
+Common materials live in `render_style.json`, colourbar layout in `colorbar.json`, and each metric has a `render` object in its own JSON. For example, edit `wss.json` to change both GUI and movie colours:
+
+```json
+{"render": {"cmap": "viridis", "opacity": 0.8, "clim": [0, 5], "show_scalar_bar": true}}
+```
+
+Relative pressure is nested under `pressure_gradient.json -> render.relative_pressure`. Vortex uses three independent groups under `vortex.json -> render`: `vorticity_magnitude`, `q_criterion`, and `swirling_strength`. The full default/type/effect/owner tables are in [Configuration parameters](parameters.md).
+
+TKE has a `render.volume` object. Its `opacity_points` is a list of `[fraction, opacity]` pairs over the current colour range:
+
+```json
+{"render": {"volume": {"opacity_points": [[0, 0], [0.2, 0.015], [0.7, 0.25], [1, 0.65]]}}}
+```
+
+Fractions and opacity values must be between zero and one. Start at `[0,0]`, end at fraction `1`, and increase fractions strictly. Intermediate values are interpolated; the layer opacity multiplies the curve. `interpolation` chooses linear/nearest sampling, `blending` selects composite/maximum/minimum/average/additive, and `opacity_unit_distance_scale` is positive. These settings affect the display only. A zero-energy voxel remains transparent even if the colour limits omit zero.
+
+
+## Live plane display
+
+`planes.json` accepts `render.plane_size_mm` as a finite number from 1 to 200 mm and `render.selected_only` as a boolean. These settings change outlines and picking, not metric support. For example:
+
+```json
+{
+  "render": {
+    "plane_size_mm": 8.0,
+    "selected_only": false,
+    "default": {"plane_color": "yellow", "plane_opacity": 0.75},
+    "groups": {}
+  }
+}
+```
+
+The workspace records live GUI changes in `render_settings.plane_render_cfg`. A null video `plane_size` inherits this value. The selected-plane filter is limited to the GUI.

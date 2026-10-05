@@ -19,7 +19,21 @@ AutoFlow keeps defaults in per-module JSON files. The complete key/type/default/
 
 Metric-specific JSON density/viscosity keys can override shared `fluid.json` values. Otherwise WSS and pressure use shared viscosity, and pressure/TKE use shared density. `derived.json` is a compatibility placeholder; use the named metric modules for new settings.
 
-GUI metric layers share the live `colorbar.json` layout. Metric `render.bar_cfg` controls offline video defaults; GUI runtime colourbar edits can also be copied into video settings for that session.
+## Rendering configuration layout
+
+| File | Ownership |
+| --- | --- |
+| `ui.json` | Shared GUI/video background |
+| `render_style.json` | Anti-aliasing, anatomical context, text contrast and surface materials |
+| `colorbar.json` | One shared colourbar layout and master visibility switch |
+| `wss.json`, `tke.json`, `streamlines.json` | Metric `render.cmap`, `render.opacity`, `render.clim`, `render.show_scalar_bar`; streamline line width and TKE volume controls |
+| `pressure_gradient.json` | Pressure-gradient `render` settings and a nested `render.relative_pressure` group |
+| `vortex.json` | `render.vorticity_magnitude`, `render.q_criterion`, `render.swirling_strength` |
+| `labels.json`, `planes.json`, `video_exporting.json` | Anatomical-group colours, live plane appearance, and movie/camera controls |
+
+Edit the selected JSON directory and restart the GUI or start a fresh CLI/API run to apply it. Use the current nested pressure schema rather than the former top-level display opacity keys or flat relative-pressure render keys. Shipped metric files do not repeat colourbar layout fields.
+
+`autoflow/config.py` defines fallback defaults, validates display controls and merges the selected files. It stores a resolved `render_style_cfg` in `workspace.render_settings`. Public API overrides and interactive scene-object edits retain precedence. Isolated video jobs carry this resolved style snapshot, so they do not reread a different JSON directory while rendering. `autoflow/rendering/style.py` applies it to VTK; `autoflow/rendering/datasets.py` owns display geometry. Direct video renderers resolve colour limits as explicit argument, scene object, workspace setting, then automatic fallback. TKE volume opacity never fades its quantitative colourbar, and zero energy remains transparent.
 
 ## Updating parameters
 

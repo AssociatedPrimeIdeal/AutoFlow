@@ -313,7 +313,7 @@ def apply_background_phase_correction_to_complex(
         corr_xyzt3 = np.transpose(corr_nvtzyx, (4, 3, 2, 1, 0))
         report["stationary_voxels"] = int(np.sum(stationary_mask))
     else:
-        _emit_progress(progress_callback, "background_phase_start", message="Reusing cached background phase correction")
+        _emit_progress(progress_callback, "background_phase_cache_apply", message="Applying saved corr (background phase correction)")
 
     corrected = np.asarray(arr, dtype=np.complex64).copy()
     corrected[..., 1:4] *= np.exp(-1j * np.asarray(corr_xyzt3, dtype=np.float32))
@@ -325,7 +325,7 @@ def apply_background_phase_correction_to_complex(
     _emit_progress(
         progress_callback,
         "background_phase_done",
-        message="Background phase correction reused from cache" if report.get("cache_hit", False) else "Background phase correction applied",
+        message="Saved corr applied (background phase correction)" if report.get("cache_hit", False) else "Background phase correction applied",
     )
     return corrected, (stationary_mask.astype(bool) if stationary_mask is not None else None), report
 

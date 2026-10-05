@@ -4,18 +4,12 @@
   "parabolic_fitting": true,
   "no_slip_condition": true,
   "render": {
+    "cmap": "turbo",
+    "opacity": 1.0,
     "clim": [
       0.0,
       5.0
     ],
-    "show_scalar_bar": true,
-    "bar_cfg": {
-      "position_x": 0.75,
-      "position_y": 0.2,
-      "height": 0.22,
-      "width": 0.05,
-      "title_font_size": 40,
-      "label_font_size": 32
-    }
+    "show_scalar_bar": true
   }
 }

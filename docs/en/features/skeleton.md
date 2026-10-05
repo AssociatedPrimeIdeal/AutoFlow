@@ -52,6 +52,8 @@ this cleanup. This filters graph edges and derived paths while leaving the
 original skeleton mask and points available for inspection.
 
 ## When to use it
+
+Regenerating the skeleton clears the previous graph, paths, planes, plane measurements, PWV, and plane pathlines from the workspace. Generate the graph and planes again before measuring them. This applies to GUI, CLI pipeline orchestration, and Python API step calls.
 - use it after segmentation is available
 - use it before graph and plane generation
 - use it when you want grouped vessel trees instead of one merged binary tree

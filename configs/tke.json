@@ -1,17 +1,43 @@
 {
   "render": {
+    "cmap": "inferno",
+    "opacity": 1.0,
     "clim": [
       0.0,
       100.0
     ],
     "show_scalar_bar": true,
-    "bar_cfg": {
-      "position_x": 0.75,
-      "position_y": 0.2,
-      "height": 0.22,
-      "width": 0.05,
-      "title_font_size": 40,
-      "label_font_size": 32
+    "volume": {
+      "opacity_points": [
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.05,
+          0.0
+        ],
+        [
+          0.2,
+          0.015
+        ],
+        [
+          0.45,
+          0.08
+        ],
+        [
+          0.7,
+          0.25
+        ],
+        [
+          1.0,
+          0.65
+        ]
+      ],
+      "shade": false,
+      "blending": "composite",
+      "interpolation": "linear",
+      "opacity_unit_distance_scale": 1.0
     }
   }
 }

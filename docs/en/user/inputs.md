@@ -61,26 +61,34 @@ Legacy complex data must be channels-last `XYZT4` (single VENC) or `XYZT7` (dual
 
 ## H5 Background Correction Cache
 
-The GUI/CLI/API pipeline separates acquisition loading from the explicit correction action. Low-level `load_h5_data` / `load_input_data` callers may still request correction during a direct load. Noise removal changes only the PC-MRA display region, while background correction and phase unwrapping update working velocity without overwriting source velocity datasets.
+GUI loading applies existing H5 correction fields without computing missing ones. GUI Background Correction always recomputes from the original acquisition and replaces the previous result. CLI/API correction remains opt-in and can reuse caches matching its configured method and parameters. Low-level `load_h5_data` / `load_input_data` callers may request normal correction during a direct load or set `reuse_existing_corr=True` to apply saved fields only. Noise removal changes only the PC-MRA display region, while background correction and phase unwrapping update working velocity without overwriting source velocity datasets.
 
-- after selecting an H5 case group, the GUI loads acquisition arrays with correction disabled; run Correction explicitly to apply or reuse a compatible cache
-- loading does not prompt for correction; choose its method and run it in the Correction stage
+- after selecting an H5 case group, the GUI applies existing `corr`, or `corr_low` / `corr_high` for dual VENC; it validates shape, finite values and source-group ownership without requiring saved fitting parameters to match the current UI
+- loading does not prompt for correction and never computes a missing or invalid correction cache; the progress dialog shows loading and applying saved corr, with separate low/high VENC messages
+- clicking GUI **Background Correction** or Correction **Run All** ignores old caches and rereads untouched source arrays before fitting; working velocity, wrapped-phase baseline and displayed correction fields are replaced, and the saved H5 correction fields are replaced when cache writing is enabled
 - after loading, an embedded `segmask`, `segmentation`, or `seg` is activated without another prompt; when no segmentation is available, the GUI leaves the case unloaded from segmentation work and directs the user to the `Segmentation` stage's explicit `Run Automatic Segmentation` command
 - embedded segmentation remains available for review; changing correction does not automatically regenerate it
 - when background phase correction is disabled, the correction stage preserves the same normalized output values while bypassing its extra full-volume copy and synthetic complex conversion
-- when background phase correction is enabled for an H5 input, AutoFlow first looks for a reusable `corr` dataset in the selected H5 data group, then at the file root
+- for CLI/API or normal low-level loads with background phase correction enabled, AutoFlow first looks for a reusable `corr` dataset in the selected H5 data group, then at the file root
 - if no compatible cache is found, AutoFlow runs the configured background-correction method and writes the resulting correction field back to the original H5 as `corr` when the file is writable
 - WRLS + ARTO is the default method in Correction; MSAC is also available
 - WRLS+ARTO automatically runs its dominant ARTO GMM stage on CUDA when PyTorch and a usable CUDA device are available, with automatic CPU fallback and no device setting
-- the GUI shows its standard progress dialog for enabled H5 background correction, including method-specific fitting and the H5 cache-write stage; closing the dialog only hides progress
+- the GUI shows its standard progress dialog for enabled H5 background correction, including method-specific fitting and the H5 cache-write stage; closing the dialog requests cancellation
 - legacy dual-venc H5 stores separate correction caches as `corr_low` and `corr_high`
 - after a dual-venc correction is applied or reused, the GUI Content selector exposes both normalized low- and high-venc correction components (`Corr Low LR/AP/FH` and `Corr High LR/AP/FH`)
 - when both dual-venc correction fields must be computed, the low- and high-venc correction passes run concurrently; H5 cache writes remain serialized
 - a time-invariant correction cache may use shape `XYZ13`; AutoFlow broadcasts its singleton time dimension across every input time frame
-- cached corrections are reused only when their shape, method, algorithm version, fit order, and method-specific parameters match the current load configuration
+- normal CLI/API and low-level correction runs reuse caches only when shape, method, algorithm version, fit order and method-specific parameters match; GUI opening applies structurally valid saved results regardless of the parameters chosen for the next computation
 - cold MSAC correction caches the full-volume polynomial design matrix across its fixed random trials; the random seed, sampled indices, threshold, fit order, correction values, and cache format remain unchanged
 - for multi-group H5 files, untagged root-level `corr` caches are not reused across different data-group paths
 - if the H5 file cannot be opened for writing, loading still succeeds; AutoFlow simply skips writing the cache
+
+Low-level loader controls:
+
+| Parameter | Type | Default | Where configured | Effect | Code owner |
+| --- | --- | --- | --- | --- | --- |
+| `reuse_existing_corr` | bool | `False` | `load_h5_data`, `load_input_data`, `PipelineEngine.load_data`; GUI passes `True` | Apply existing correction fields read-only, without fitting missing caches or matching current fitting settings | `autoflow/algorithms/data/correction_cache.py`, `data/h5_loader.py`, `data/dual_venc.py`, `autoflow/core/pipeline.py` |
+| `force_recompute_corr` | bool | `False` | `PipelineEngine.run_step`; GUI Background Correction passes `True` | Reread the original acquisition and recompute correction, replacing the prior working result | `autoflow/core/pipeline.py`, `autoflow/ui/app.py` |
 
 ## H5 Orientation Normalization
 
@@ -175,4 +183,4 @@ AutoFlow normalizes loaders to `LoadedCase`.
 - pipeline load step: `autoflow/core/pipeline.py`
 - types: `autoflow/case_types.py`
 
-Loading does not compute PC-MRA, even when correction or segmentation caches exist. Generate it explicitly as the final Correction step. Raw magnitude/velocity remain available in the right Content menu immediately after loading; derived entries appear only after their data exists.
+Loading does not compute PC-MRA, even when correction or segmentation caches exist. Generate it explicitly as the final Correction step. Acquired magnitude and working velocity (with saved corr applied when available in GUI) are available in the right Content menu immediately after loading; derived entries appear only after their data exists.

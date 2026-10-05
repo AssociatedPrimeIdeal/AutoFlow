@@ -18,9 +18,14 @@ from ..algorithms import (
     create_uniform_grid,
     generate_seed_points,
     generate_streamlines_at_t,
-    sample_volume_on_existing_surface,
 )
-from ..config import DEFAULT_PLANE_VIDEO_CFG
+from ..config import DEFAULT_PLANE_VIDEO_CFG, BACKGROUND_COLOR, CONTEXT_COLOR
+from .style import (
+    configure_plotter, foreground_color, plane_display_size,
+    metric_style, scalar_bar_args, scene_object, surface_style, configured_metric_style, render_style_settings,
+    wss_display_surface, wss_scalar_range, metric_volume_kwargs, apply_metric_volume_opacity, metric_clim,
+)
+from .datasets import tke_display_mesh, display_support_surface, sample_display_field
 
 WINDOW_SIZE = (1600, 1200)
 _OFFSCREEN_BOOTSTRAPPED = False
@@ -96,21 +101,11 @@ def _plane_mesh(center_world, normal, size):
 
 
 def _scalar_bar_args(title, bar_cfg=None):
-    cfg = {
-        "title": title,
-        "vertical": True,
-        "position_x": 0.86,
-        "position_y": 0.1,
-        "height": 0.8,
-        "width": 0.08,
-        "title_font_size": 18,
-        "label_font_size": 14,
-        "n_labels": 5,
-        "fmt": "%.3g",
-    }
-    if bar_cfg:
-        cfg.update({k: v for k, v in bar_cfg.items() if k != "stack_gap"})
-    return cfg
+    return scalar_bar_args(title, feature_cfg=bar_cfg)
+
+
+def _video_background(ws):
+    return (getattr(ws, "render_settings", {}) or {}).get("render_background_color") or BACKGROUND_COLOR
 
 
 def _ensure_offscreen():
@@ -128,10 +123,10 @@ def _ensure_offscreen():
             pass
 
 
-def _make_plotter(window_size=WINDOW_SIZE):
+def _make_plotter(window_size=WINDOW_SIZE, background=BACKGROUND_COLOR, workspace=None):
     _ensure_offscreen()
     plotter = pv.Plotter(off_screen=True, window_size=window_size)
-    plotter.set_background("white")
+    configure_plotter(plotter, background, workspace=workspace)
     return plotter
 
 
@@ -144,11 +139,28 @@ def _resolve_window_size(window_size=None):
         return WINDOW_SIZE
 
 
-def _scalar_bar_mesh_kwargs(show_scalar_bar, title, bar_cfg=None):
-    kwargs = {"show_scalar_bar": bool(show_scalar_bar)}
+def _scalar_bar_mesh_kwargs(show_scalar_bar, title, bar_cfg=None, ws=None):
+    settings = getattr(ws, "render_settings", {}) or {}
+    kwargs = {"show_scalar_bar": bool(show_scalar_bar) and bool(settings.get("shared_colorbar_show", True))}
     if kwargs["show_scalar_bar"]:
-        kwargs["scalar_bar_args"] = _scalar_bar_args(title, bar_cfg)
+        kwargs["scalar_bar_args"] = scalar_bar_args(
+            title, bar_cfg, settings.get("shared_colorbar_bar_cfg"), _video_background(ws), workspace=ws,
+        )
     return kwargs
+
+
+def _add_context_surfaces(plotter, ws, union_surface, smoothing_iteration):
+    groups = _build_group_surfaces(ws, smoothing_iteration=smoothing_iteration)
+    context = render_style_settings(ws)["context"]
+    if groups:
+        for name, surface, color in groups:
+            obj = scene_object(ws, f"segmask_group_{name}")
+            plotter.add_mesh(surface, color=obj.color if obj is not None else color,
+                             opacity=obj.opacity if obj is not None else context["opacity"],
+                             show_scalar_bar=False, **surface_style(workspace=ws))
+    else:
+        plotter.add_mesh(union_surface, color=context["color"], opacity=context["opacity"],
+                         show_scalar_bar=False, **surface_style(workspace=ws))
 
 
 def _write_video(frames, out_path, fps=24):
@@ -305,6 +317,48 @@ def _build_union_surface(ws, smoothing_iteration=200):
     return result
 
 
+def _build_group_surfaces(ws, smoothing_iteration=200):
+    """Build GUI-style per-label surfaces for grouped plane exports."""
+    group_order = tuple(str(name) for name in (getattr(ws, "group_order", []) or []))
+    if not group_order:
+        return []
+    cache_key = (
+        id(getattr(ws, "segmask_3d", None)),
+        group_order,
+        int(smoothing_iteration),
+        tuple(np.asarray(ws.resolution, dtype=float).reshape(3)),
+        tuple(np.asarray(ws.origin, dtype=float).reshape(3)),
+    )
+    cache = getattr(ws, "_video_group_surface_cache", {})
+    if cache_key in cache:
+        return cache[cache_key]
+
+    entries = []
+    groups = getattr(ws, "multilabel_groups", {}) or {}
+    for group_name in group_order:
+        state = groups.get(group_name, {}) or {}
+        mask = state.get("segmask_3d")
+        if mask is None or not np.any(mask):
+            continue
+        surface = build_cell_mask_surface(
+            np.asarray(mask, dtype=bool),
+            ws.resolution,
+            origin=ws.origin,
+            smooth_iter=smoothing_iteration,
+        )
+        if surface is None or surface.n_points == 0:
+            continue
+        try:
+            color = ws.skeleton_params.scene_color_for_group(group_name, "scene")
+        except Exception:
+            color = state.get("scene_color") or state.get("browser_color") or "lightgray"
+        entries.append((group_name, surface, str(color or "lightgray")))
+
+    cache[cache_key] = entries
+    ws._video_group_surface_cache = cache
+    return entries
+
+
 def _pressure_support_surface(ws, support_source, t, smooth_iter=80):
     support_key = (
         id(support_source),
@@ -336,21 +390,13 @@ def _pressure_support_surface(ws, support_source, t, smooth_iter=80):
     surfaces = entry["surfaces"]
     if rep_t not in surfaces:
         support_t = support[..., rep_t] if support.ndim == 4 else support
-        surfaces[rep_t] = build_cell_mask_surface(
+        surfaces[rep_t] = display_support_surface(
             support_t,
             ws.resolution,
             origin=ws.origin,
             smooth_iter=smooth_iter,
         )
     return surfaces[rep_t]
-
-
-def _plane_size_from_surface(surf):
-    if surf is None or surf.n_points == 0:
-        return 25.0
-    bounds = np.array(surf.bounds, dtype=float).reshape(3, 2)
-    extent = bounds[:, 1] - bounds[:, 0]
-    return float(max(12.0, 0.12 * np.max(extent)))
 
 
 def _path_group_name(ws, path_idx):
@@ -509,11 +555,11 @@ def render_plane_rotation_video(
 
     label_style = _plane_label_style(base_cfg)
 
-    default_plane_size = _plane_size_from_surface(surf)
+    default_plane_size = plane_display_size(ws)
     origin = np.asarray(ws.origin, dtype=float).reshape(3)
-    plotter = _make_plotter(window_size=_resolve_window_size(window_size))
+    plotter = _make_plotter(window_size=_resolve_window_size(window_size), background=_video_background(ws), workspace=ws)
     try:
-        plotter.add_mesh(surf, opacity=0.18, color="white")
+        _add_context_surfaces(plotter, ws, surf, smoothing_iteration)
 
         if bool(base_cfg.get("show_skeleton", True)):
             if list(getattr(ws, "group_order", []) or []):
@@ -561,9 +607,8 @@ def render_plane_rotation_video(
                 plane_mesh,
                 color=style["plane_color"],
                 opacity=style["plane_opacity"],
-                show_edges=True,
-                edge_color="black",
-                line_width=2,
+                style="wireframe", lighting=False,
+                line_width=4,
             )
             centers.append(center_world)
             plane_labels.append(f'{label_style["prefix"]}{i}')
@@ -629,7 +674,7 @@ def render_plane_rotation_video(
                 f"Rotating {frame_idx + 1}/{int(max(n_frames, 1))}",
                 position="upper_left",
                 font_size=14,
-                color="black",
+                color=foreground_color(_video_background(ws), ws),
                 name="frame_text",
             )
             plotter.render()
@@ -669,14 +714,7 @@ def render_wss_video(
     if context_surf is None or context_surf.n_points == 0:
         return None
 
-    wss_max = 0.0
-    for surf in ws.derived.wss_surfaces:
-        if surf is not None and surf.n_points > 0 and "wss" in surf.point_data:
-            vals = np.asarray(surf.point_data["wss"], dtype=float)
-            if vals.size:
-                wss_max = max(wss_max, float(np.nanmax(vals)))
-    wss_max = max(wss_max, 1e-6)
-    clim = wss_clim if wss_clim is not None else (0.0, wss_max)
+    clim = metric_clim(ws, "wss_surface_live", wss_clim, wss_scalar_range(ws.derived.wss_surfaces))
 
     _, default_elevation_deg = _resolve_view(view)
     if elevation_deg is None:
@@ -692,9 +730,12 @@ def render_wss_video(
     else:
         total_frames = n_time * int(max(time_repeat, 1))
 
-    plotter = _make_plotter(window_size=_resolve_window_size(window_size))
+    plotter = _make_plotter(window_size=_resolve_window_size(window_size), background=_video_background(ws), workspace=ws)
     try:
-
+        wss_display_cache = {}
+        wss_actor = None
+        text_actor = plotter.add_text("", position="upper_left", font_size=14,
+                                     color=foreground_color(_video_background(ws), ws))
         for frame_idx in range(total_frames):
             check_cancelled()
             if rotate:
@@ -709,26 +750,30 @@ def render_wss_video(
                 t = min(frame_idx, n_time - 1)
                 camera_position = _camera_from_view(context_surf, view, distance_scale)
 
-            plotter.clear()
-            plotter.set_background("white")
-            plotter.add_mesh(context_surf, opacity=0.08, color="white")
-
-            surf = ws.derived.wss_surfaces[min(max(0, t), len(ws.derived.wss_surfaces) - 1)]
-            if surf is not None and surf.n_points > 0 and "wss" in surf.point_data:
-                plotter.add_mesh(
-                    surf,
-                    scalars="wss",
-                    cmap="jet",
-                    clim=clim,
-                    **_scalar_bar_mesh_kwargs(show_scalar_bar, "WSS (Pa)", wss_bar_cfg),
-                )
+            phase = min(max(0, t), len(ws.derived.wss_surfaces) - 1)
+            if phase not in wss_display_cache:
+                wss_display_cache[phase] = wss_display_surface(ws.derived.wss_surfaces[phase])
+            surface = wss_display_cache[phase]
+            if surface is not None and surface.n_points > 0 and "wss" in surface.point_data:
+                if wss_actor is None:
+                    wss_actor = plotter.add_mesh(
+                        surface, scalars="wss", clim=clim,
+                        **metric_style(ws, "wss_surface_live"),
+                        **_scalar_bar_mesh_kwargs(show_scalar_bar, "WSS (Pa)", wss_bar_cfg, ws=ws),
+                    )
+                else:
+                    wss_actor.SetVisibility(1)
+                    wss_actor.GetMapper().dataset = surface
+                    wss_actor.GetMapper().Update()
+            elif wss_actor is not None:
+                wss_actor.SetVisibility(0)
 
             if rotate:
                 txt = f"t={t} | rot {frame_idx + 1}/{total_frames}"
             else:
                 txt = f"t={t}"
 
-            plotter.add_text(txt, position="upper_left", font_size=14, color="black")
+            text_actor.SetText(2, txt)
             plotter.camera_position = camera_position
             plotter.render()
             check_cancelled()
@@ -792,7 +837,7 @@ def render_streamlines_video(
     )
 
     v_max = _streamline_speed_max(ws)
-    clim = streamline_clim if streamline_clim is not None else (0.0, v_max)
+    clim = metric_clim(ws, "streamlines_live", streamline_clim, (0.0, v_max))
 
     _, default_elevation_deg = _resolve_view(view)
     if elevation_deg is None:
@@ -836,28 +881,11 @@ def render_streamlines_video(
     else:
         streamline_cache = dict(_build_streamline(tidx) for tidx in range(n_time))
 
-    tube_radius = float(ws.streamline_params.tube_radius)
-    if tube_radius > 0.0:
-        def _build_tube(item):
-            tidx, streamline = item
-            if streamline is None or streamline.n_points == 0 or not hasattr(streamline, "tube"):
-                return tidx, None
-            return tidx, streamline.tube(radius=tube_radius)
-
-        if worker_count > 1:
-            with ThreadPoolExecutor(max_workers=worker_count) as pool:
-                tube_cache = dict(pool.map(_build_tube, streamline_cache.items()))
-        else:
-            tube_cache = dict(_build_tube(item) for item in streamline_cache.items())
-    else:
-        tube_cache = {}
-
-    plotter = _make_plotter(window_size=_resolve_window_size(window_size))
+    plotter = _make_plotter(window_size=_resolve_window_size(window_size), background=_video_background(ws), workspace=ws)
     try:
-        plotter.set_background("white")
-        plotter.add_mesh(surf, opacity=0.18, color="lightgray")
+        _add_context_surfaces(plotter, ws, surf, smoothing_iteration)
         streamline_actor = None
-        text_actor = plotter.add_text("", position="upper_left", font_size=14, color="black")
+        text_actor = plotter.add_text("", position="upper_left", font_size=14, color=foreground_color(_video_background(ws), ws))
 
         for frame_idx in range(total_frames):
             check_cancelled()
@@ -876,18 +904,17 @@ def render_streamlines_video(
             sl = streamline_cache[t]
 
             if sl is not None and sl.n_points > 0:
-                sl_show = tube_cache.get(t) if tube_radius > 0.0 else sl
+                sl_show = sl
                 if sl_show is not None:
                     if streamline_actor is None:
                         streamline_actor = plotter.add_mesh(
                             sl_show,
                             scalars="Velocity",
-                            cmap="turbo",
                             clim=clim,
-                            render_lines_as_tubes=tube_radius <= 0.0,
-                            line_width=3,
-                            lighting=False,
-                            **_scalar_bar_mesh_kwargs(show_scalar_bar, "Velocity (m/s)", streamline_bar_cfg),
+                            render_lines_as_tubes=True,
+                            line_width=getattr(scene_object(ws, "streamlines_live"), "line_width", configured_metric_style(ws, "streamlines_live")["line_width"]),
+                            **metric_style(ws, "streamlines_live"),
+                            **_scalar_bar_mesh_kwargs(show_scalar_bar, "Velocity (m/s)", streamline_bar_cfg, ws=ws),
                         )
                     else:
                         streamline_actor.SetVisibility(1)
@@ -958,7 +985,7 @@ def render_tke_video(
         return None
 
     tke_max = _tke_max(ws)
-    clim = tke_clim if tke_clim is not None else (0.0, tke_max)
+    clim = metric_clim(ws, "tke_volume", tke_clim, (0.0, tke_max))
 
     _, default_elevation_deg = _resolve_view(view)
     if elevation_deg is None:
@@ -974,16 +1001,12 @@ def render_tke_video(
     else:
         total_frames = n_time * int(max(time_repeat, 1))
 
-    plotter = _make_plotter(window_size=_resolve_window_size(window_size))
+    plotter = _make_plotter(window_size=_resolve_window_size(window_size), background=_video_background(ws), workspace=ws)
     try:
         tke_mesh_cache = {}
-        mesh_union = None
-        if ws.derived.tke_array is not None:
-            mesh_union = create_uniform_grid(
-                np.max(ws.segmask_binary > 0, axis=-1),
-                ws.resolution,
-                origin=ws.origin,
-            ).threshold(0.1)
+        tke_actor = None
+        text_actor = plotter.add_text("", position="upper_left", font_size=14,
+                                     color=foreground_color(_video_background(ws), ws))
 
         for frame_idx in range(total_frames):
             check_cancelled()
@@ -999,40 +1022,31 @@ def render_tke_video(
                 t = min(frame_idx, n_time - 1)
                 camera_position = _camera_from_view(surf, view, distance_scale)
 
-            plotter.clear()
-            plotter.set_background("white")
-            plotter.add_mesh(surf, opacity=0.08, color="white")
-
-            if ws.derived.tke_array is not None:
-                arr = np.asarray(ws.derived.tke_array, dtype=np.float32)
-                tidx = min(max(0, t), arr.shape[3] - 1) if arr.ndim == 4 else 0
-                if tidx not in tke_mesh_cache:
-                    vol_t = arr[..., tidx] if arr.ndim == 4 else arr
-                    tke_grid = create_uniform_grid(vol_t, ws.resolution, origin=ws.origin, name="TKE")
-                    tke_mesh_cache[tidx] = mesh_union.sample(tke_grid)
-                tke_mesh = tke_mesh_cache[tidx]
-                plotter.add_mesh(
-                    tke_mesh,
-                    scalars="TKE",
-                    cmap="hot",
-                    clim=clim,
-                    **_scalar_bar_mesh_kwargs(show_scalar_bar, "TKE (J/m³)", tke_bar_cfg),
-                )
-            else:
-                plotter.add_mesh(
-                    ws.derived.tke_volume,
-                    scalars="TKE",
-                    cmap="hot",
-                    clim=clim,
-                    **_scalar_bar_mesh_kwargs(show_scalar_bar, "TKE (J/m³)", tke_bar_cfg),
-                )
+            if t not in tke_mesh_cache:
+                tke_mesh_cache[t] = tke_display_mesh(ws, t)
+            tke_mesh = tke_mesh_cache[t]
+            if tke_mesh is not None and tke_mesh.n_points > 0:
+                if tke_actor is None:
+                    tke_actor = plotter.add_volume(
+                        tke_mesh, scalars="TKE",
+                        **metric_volume_kwargs(ws, "tke_volume", clim),
+                        mapper='fixed_point' if plotter.render_window.GetClassName() == 'vtkOSOpenGLRenderWindow' else 'smart',
+                        **_scalar_bar_mesh_kwargs(show_scalar_bar, "TKE (J/m³)", tke_bar_cfg, ws=ws),
+                    )
+                else:
+                    tke_actor.SetVisibility(1)
+                    tke_actor.GetMapper().dataset = tke_mesh
+                    tke_actor.GetMapper().Update()
+                apply_metric_volume_opacity(tke_actor, clim, metric_style(ws, 'tke_volume')['opacity'], ws.resolution, workspace=ws)
+            elif tke_actor is not None:
+                tke_actor.SetVisibility(0)
 
             if rotate:
                 txt = f"t={t} | rot {frame_idx + 1}/{total_frames}"
             else:
                 txt = f"t={t}"
 
-            plotter.add_text(txt, position="upper_left", font_size=14, color="black")
+            text_actor.SetText(2, txt)
             plotter.camera_position = camera_position
             plotter.render()
             check_cancelled()
@@ -1099,9 +1113,8 @@ def render_pressure_gradient_video(
         return None
 
     pg_max = _pressure_gradient_max(ws)
-    if pressure_gradient_clim is None:
-        pressure_gradient_clim = tuple(ws.derived.pressure_gradient_display_clim) if ws.derived.pressure_gradient_display_clim is not None else (0.0, pg_max)
-    clim = pressure_gradient_clim
+    fallback = tuple(ws.derived.pressure_gradient_display_clim) if ws.derived.pressure_gradient_display_clim is not None else (0.0, pg_max)
+    clim = metric_clim(ws, "pressure_gradient_volume", pressure_gradient_clim, fallback)
 
     _, default_elevation_deg = _resolve_view(view)
     if elevation_deg is None:
@@ -1118,13 +1131,11 @@ def render_pressure_gradient_video(
     if support_source is None:
         support_source = ws.segmask_3d if ws.segmask_3d is not None else np.max(ws.segmask_binary > 0, axis=-1)
     support_arr = np.asarray(support_source, dtype=bool)
-    plotter = _make_plotter(window_size=_resolve_window_size(window_size))
+    plotter = _make_plotter(window_size=_resolve_window_size(window_size), background=_video_background(ws), workspace=ws)
     try:
         pg_mesh_cache = {}
-        plotter.set_background("white")
-        plotter.add_mesh(surf, opacity=0.08, color="white")
         pg_actor = None
-        text_actor = plotter.add_text("", position="upper_left", font_size=14, color="black")
+        text_actor = plotter.add_text("", position="upper_left", font_size=14, color=foreground_color(_video_background(ws), ws))
 
         for frame_idx in range(total_frames):
             check_cancelled()
@@ -1146,8 +1157,8 @@ def render_pressure_gradient_video(
                 support_t = support_arr if support_arr.ndim == 3 else support_arr[..., tidx]
                 vol_t = np.where(support_t, vol_t, 0.0)
                 support_surface = _pressure_support_surface(ws, support_source, tidx, smooth_iter=80)
-                pg_mesh_cache[tidx] = sample_volume_on_existing_surface(
-                    vol_t, support_surface, ws.resolution, origin=ws.origin,
+                pg_mesh_cache[tidx] = sample_display_field(
+                    vol_t, support_t, support_surface, ws.resolution, origin=ws.origin,
                     name="PressureGradient",
                 )
             pg_mesh = pg_mesh_cache[tidx]
@@ -1156,14 +1167,14 @@ def render_pressure_gradient_video(
                     pg_actor = plotter.add_mesh(
                         pg_mesh,
                         scalars="PressureGradient",
-                        cmap="magma",
                         clim=clim,
-                        **_scalar_bar_mesh_kwargs(show_scalar_bar, "|Pressure Grad| (Pa/m)", pressure_gradient_bar_cfg),
+                        **metric_style(ws, "pressure_gradient_volume"),
+                        **_scalar_bar_mesh_kwargs(show_scalar_bar, "|Pressure Grad| (Pa/m)", pressure_gradient_bar_cfg, ws=ws),
                     )
                 else:
                     pg_actor.SetVisibility(1)
                     mapper = pg_actor.GetMapper()
-                    mapper.SetInputData(pg_mesh)
+                    mapper.dataset = pg_mesh
                     mapper.Update()
             elif pg_actor is not None:
                 pg_actor.SetVisibility(0)
@@ -1216,9 +1227,8 @@ def render_relative_pressure_video(
         return None
 
     rp_max = _relative_pressure_max(ws)
-    if relative_pressure_clim is None:
-        relative_pressure_clim = tuple(ws.derived.relative_pressure_display_clim) if ws.derived.relative_pressure_display_clim is not None else (-rp_max, rp_max)
-    clim = relative_pressure_clim
+    fallback = tuple(ws.derived.relative_pressure_display_clim) if ws.derived.relative_pressure_display_clim is not None else (-rp_max, rp_max)
+    clim = metric_clim(ws, "relative_pressure_volume", relative_pressure_clim, fallback)
 
     _, default_elevation_deg = _resolve_view(view)
     if elevation_deg is None:
@@ -1235,13 +1245,11 @@ def render_relative_pressure_video(
     if support_source is None:
         support_source = ws.segmask_3d if ws.segmask_3d is not None else np.max(ws.segmask_binary > 0, axis=-1)
     support_arr = np.asarray(support_source, dtype=bool)
-    plotter = _make_plotter(window_size=_resolve_window_size(window_size))
+    plotter = _make_plotter(window_size=_resolve_window_size(window_size), background=_video_background(ws), workspace=ws)
     try:
         rp_mesh_cache = {}
-        plotter.set_background("white")
-        plotter.add_mesh(surf, opacity=0.08, color="white")
         rp_actor = None
-        text_actor = plotter.add_text("", position="upper_left", font_size=14, color="black")
+        text_actor = plotter.add_text("", position="upper_left", font_size=14, color=foreground_color(_video_background(ws), ws))
 
         for frame_idx in range(total_frames):
             check_cancelled()
@@ -1263,8 +1271,8 @@ def render_relative_pressure_video(
                 support_t = support_arr if support_arr.ndim == 3 else support_arr[..., tidx]
                 vol_t = np.where(support_t, vol_t, 0.0)
                 support_surface = _pressure_support_surface(ws, support_source, tidx, smooth_iter=80)
-                rp_mesh_cache[tidx] = sample_volume_on_existing_surface(
-                    vol_t, support_surface, ws.resolution, origin=ws.origin,
+                rp_mesh_cache[tidx] = sample_display_field(
+                    vol_t, support_t, support_surface, ws.resolution, origin=ws.origin,
                     name="RelativePressure",
                 )
             rp_mesh = rp_mesh_cache[tidx]
@@ -1273,14 +1281,14 @@ def render_relative_pressure_video(
                     rp_actor = plotter.add_mesh(
                         rp_mesh,
                         scalars="RelativePressure",
-                        cmap="RdBu_r",
                         clim=clim,
-                        **_scalar_bar_mesh_kwargs(show_scalar_bar, "Relative Pressure (Pa)", relative_pressure_bar_cfg),
+                        **metric_style(ws, "relative_pressure_volume"),
+                        **_scalar_bar_mesh_kwargs(show_scalar_bar, "Relative Pressure (Pa)", relative_pressure_bar_cfg, ws=ws),
                     )
                 else:
                     rp_actor.SetVisibility(1)
                     mapper = rp_actor.GetMapper()
-                    mapper.SetInputData(rp_mesh)
+                    mapper.dataset = rp_mesh
                     mapper.Update()
             elif rp_actor is not None:
                 rp_actor.SetVisibility(0)

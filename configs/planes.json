@@ -14,6 +14,8 @@
   "smoothing_polyorder": 2,
   "inter_time": 10,
   "render": {
+    "plane_size_mm": 10.0,
+    "selected_only": false,
     "default": {
       "plane_color": "yellow",
       "plane_opacity": 0.75

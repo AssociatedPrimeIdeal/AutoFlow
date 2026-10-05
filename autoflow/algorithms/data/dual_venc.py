@@ -10,7 +10,8 @@ from ..phase_correction import apply_background_phase_correction_to_complex, bac
 
 from .correction_cache import (
     _progress_prefix,
-    _read_background_phase_corr_cache_from_scopes,
+    _prepare_background_phase_corr_cache,
+    _merge_background_phase_cache_report,
     _write_background_phase_corr_cache,
 )
 from .normalization import normalize_loaded_case
@@ -40,6 +41,7 @@ def _load_legacy_dual_venc_h5(
     source_group=None,
     allow_untagged_root=True,
     dual_venc_mode="dv",
+    reuse_existing_corr=False,
 ):
     if img_complex.ndim != 5 or img_complex.shape[-1] != 7:
         raise ValueError(f"legacy dual-venc H5 expects XYZT7 complex data, got {img_complex.shape}")
@@ -52,34 +54,18 @@ def _load_legacy_dual_venc_h5(
     lv_complex = np.concatenate([img_complex[..., :1], encoded_groups[lv_group_index]], axis=-1)
     hv_complex = np.concatenate([img_complex[..., :1], encoded_groups[hv_group_index]], axis=-1)
     cache_scopes = list(h5_scopes or ([h5_group] if h5_group is not None else []))
-    # A disabled correction cannot consume a cache.  Avoid reading compressed
-    # cache datasets in that case; the arrays are otherwise identical.
-    if bool(cfg.enabled):
-        lv_cached_corr, lv_cache_report = _read_background_phase_corr_cache_from_scopes(
-            cache_scopes,
-            "corr_low",
-            tuple(lv_complex.shape[:-1]) + (3,),
-            cfg,
-            expected_source_group=source_group,
-            allow_untagged_root=allow_untagged_root,
-        )
-        hv_cached_corr, hv_cache_report = _read_background_phase_corr_cache_from_scopes(
-            cache_scopes,
-            "corr_high",
-            tuple(hv_complex.shape[:-1]) + (3,),
-            cfg,
-            expected_source_group=source_group,
-            allow_untagged_root=allow_untagged_root,
-        )
-    else:
-        lv_cached_corr = hv_cached_corr = None
-        lv_cache_report = hv_cache_report = {
-            "cache_hit": False,
-            # Keep the historical metadata value while avoiding the cache
-            # read; correction is disabled, so the cache is never consumed.
-            "cache_reason": "hit",
-            "cache_name": "corr_low/high",
-        }
+    lv_cfg, lv_cached_corr, lv_cache_report = _prepare_background_phase_corr_cache(
+        cache_scopes, "corr_low", tuple(lv_complex.shape[:-1]) + (3,), cfg,
+        expected_source_group=source_group, allow_untagged_root=allow_untagged_root,
+        reuse_existing_corr=reuse_existing_corr,
+        progress_callback=_progress_prefix(progress_callback, "h5_dual_lv_"),
+    )
+    hv_cfg, hv_cached_corr, hv_cache_report = _prepare_background_phase_corr_cache(
+        cache_scopes, "corr_high", tuple(hv_complex.shape[:-1]) + (3,), cfg,
+        expected_source_group=source_group, allow_untagged_root=allow_untagged_root,
+        reuse_existing_corr=reuse_existing_corr,
+        progress_callback=_progress_prefix(progress_callback, "h5_dual_hv_"),
+    )
 
     # Worker threads enqueue progress; callbacks (including Qt widgets) run
     # on the calling thread while it waits for the two correction jobs.
@@ -97,18 +83,18 @@ def _load_legacy_dual_venc_h5(
             return apply_background_phase_correction_to_complex(complex_data, **kwargs)
 
     lv_kwargs = {
-        "config": cfg,
+        "config": lv_cfg,
         "progress_callback": _progress_prefix(callback, "h5_dual_lv_"),
         "source_mode": "legacy_dual_venc_h5_low",
         "cached_corr": lv_cached_corr,
     }
     hv_kwargs = {
-        "config": cfg,
+        "config": hv_cfg,
         "progress_callback": _progress_prefix(callback, "h5_dual_hv_"),
         "source_mode": "legacy_dual_venc_h5_high",
         "cached_corr": hv_cached_corr,
     }
-    if bool(cfg.enabled):
+    if bool(lv_cfg.enabled) or bool(hv_cfg.enabled):
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="autoflow-bgc") as executor:
             lv_future = executor.submit(
                 correct_encoding,
@@ -137,12 +123,9 @@ def _load_legacy_dual_venc_h5(
         )
 
     lv_report["cache_name"] = "corr_low"
-    if not bool(lv_report.get("cache_hit", False)):
-        lv_report["cache_reason"] = lv_cache_report.get("cache_reason", "missing")
-    if "stationary_voxels" in lv_cache_report and bool(lv_report.get("cache_hit", False)):
-        lv_report["stationary_voxels"] = int(lv_cache_report["stationary_voxels"])
+    _merge_background_phase_cache_report(lv_report, lv_cache_report, reuse_existing_corr)
     if (
-        bool(cfg.write_cache)
+        bool(lv_cfg.write_cache)
         and bool(lv_report.get("applied", False))
         and not bool(lv_report.get("cache_hit", False))
         and h5_group is not None
@@ -156,12 +139,9 @@ def _load_legacy_dual_venc_h5(
         ))
 
     hv_report["cache_name"] = "corr_high"
-    if not bool(hv_report.get("cache_hit", False)):
-        hv_report["cache_reason"] = hv_cache_report.get("cache_reason", "missing")
-    if "stationary_voxels" in hv_cache_report and bool(hv_report.get("cache_hit", False)):
-        hv_report["stationary_voxels"] = int(hv_cache_report["stationary_voxels"])
+    _merge_background_phase_cache_report(hv_report, hv_cache_report, reuse_existing_corr)
     if (
-        bool(cfg.write_cache)
+        bool(hv_cfg.write_cache)
         and bool(hv_report.get("applied", False))
         and not bool(hv_report.get("cache_hit", False))
         and h5_group is not None

@@ -1,3 +1,4 @@
+from ..config import BACKGROUND_COLOR
 import hashlib
 import json
 import copy
@@ -71,6 +72,7 @@ from ..rendering import (
     render_tke_video,
     render_wss_video,
 )
+from ..rendering.style import plane_display_size
 from .viewer import SceneController
 from .labeler_exchange import export_labeler_exchange
 
@@ -458,10 +460,12 @@ class _PipelineTaskWorker(_TaskWorker):
                     data["total"] = len(self._steps)
                     self.progress.emit(data)
                 candidate = self._workspace.copy_for_task()
+                step_kwargs = {"force_recompute_corr": True} if step == StepId.BACKGROUND_CORRECTION else {}
                 with task_scope(self.cancel_token, _step_progress):
                     result = self._engine.run_step(
                         candidate, step, lambda _message: None,
                         progress_callback=_step_progress,
+                        **step_kwargs,
                     )
                 check_cancelled()
                 elapsed = time.perf_counter() - step_started
@@ -911,14 +915,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_all_planes_visible = QtWidgets.QCheckBox("Planes")
         self.chk_all_planes_visible.setTristate(True)
         self.chk_all_planes_visible.setToolTip("Show or hide all plane objects")
-        self.chk_all_planes_visible.stateChanged.connect(
-            lambda state: self._set_render_category_visibility("planes", state != QtCore.Qt.Unchecked)
+        self.chk_all_planes_visible.clicked.connect(
+            lambda checked: self._set_render_category_visibility("planes", checked)
         )
         self.chk_all_pathlines_visible = QtWidgets.QCheckBox("Pathlines")
         self.chk_all_pathlines_visible.setTristate(True)
         self.chk_all_pathlines_visible.setToolTip("Show or hide all pathline objects")
-        self.chk_all_pathlines_visible.stateChanged.connect(
-            lambda state: self._set_render_category_visibility("pathlines", state != QtCore.Qt.Unchecked)
+        self.chk_all_pathlines_visible.clicked.connect(
+            lambda checked: self._set_render_category_visibility("pathlines", checked)
         )
         visibility_row.addWidget(self.chk_all_planes_visible)
         visibility_row.addWidget(self.chk_all_pathlines_visible)
@@ -935,6 +939,7 @@ class MainWindow(QtWidgets.QMainWindow):
         opacity_row.addWidget(self.label_browser_opacity)
         opacity_row.addWidget(self.slider_browser_opacity, 1)
         lay.addLayout(opacity_row)
+        self._build_plane_display_controls(lay)
         row = QtWidgets.QHBoxLayout()
         self.btn_delete_obj = QtWidgets.QPushButton("Delete Selected")
         self.btn_delete_obj.setIcon(standard_icon(self, "SP_TrashIcon"))
@@ -1045,7 +1050,7 @@ class MainWindow(QtWidgets.QMainWindow):
         grp = QtWidgets.QGroupBox("Background Correction")
         fl = QtWidgets.QFormLayout(grp)
         # Kept internally for older UI/workspace parameter bindings. Explicit
-        # correction actions always enable correction; loading never applies it.
+        # correction actions always recompute; loading only applies saved caches.
         self.chk_bpc_enabled = QtWidgets.QCheckBox()
         self.chk_bpc_enabled.setChecked(True)
         self.combo_bpc_method = QtWidgets.QComboBox()
@@ -2067,6 +2072,72 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addWidget(box_path, 1)
         parent.addLayout(lay)
 
+    def _build_plane_display_controls(self, parent):
+        plane_display_row = QtWidgets.QHBoxLayout()
+        plane_display_row.addWidget(QtWidgets.QLabel("Display size"))
+        self.slider_plane_size = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_plane_size.setRange(10, 2000)
+        self.slider_plane_size.setToolTip("Resize every plane outline immediately; metric regions stay unchanged")
+        self.spin_plane_size = QtWidgets.QDoubleSpinBox()
+        self.spin_plane_size.setRange(1.0, 200.0)
+        self.spin_plane_size.setDecimals(1)
+        self.spin_plane_size.setSingleStep(1.0)
+        self.spin_plane_size.setSuffix(" mm")
+        plane_display_row.addWidget(self.slider_plane_size, 1)
+        plane_display_row.addWidget(self.spin_plane_size)
+        parent.addLayout(plane_display_row)
+        self.chk_plane_selected_only = QtWidgets.QCheckBox("Only selected plane")
+        self.chk_plane_selected_only.setToolTip("Select a plane in the Browser to show its outline; other outlines stay hidden")
+        parent.addWidget(self.chk_plane_selected_only)
+        self.slider_plane_size.valueChanged.connect(lambda value: self._on_plane_display_size_changed(value / 10.0))
+        self.spin_plane_size.valueChanged.connect(self._on_plane_display_size_changed)
+        self.chk_plane_selected_only.toggled.connect(self._on_plane_selected_only_changed)
+        self._sync_plane_display_controls()
+
+    def _sync_plane_display_controls(self):
+        if not hasattr(self, "spin_plane_size"):
+            return
+        cfg = self.workspace.render_settings.get("plane_render_cfg", {}) or {}
+        size = plane_display_size(self.workspace)
+        values = ((self.spin_plane_size, size), (self.slider_plane_size, round(size * 10)),
+                  (self.chk_plane_selected_only, bool(cfg.get("selected_only", False))))
+        for widget, value in values:
+            previous = widget.blockSignals(True)
+            try:
+                if widget is self.chk_plane_selected_only:
+                    widget.setChecked(value)
+                else:
+                    widget.setValue(value)
+            finally:
+                widget.blockSignals(previous)
+
+    def _on_plane_display_size_changed(self, size_mm):
+        if self.scene is None:
+            self.workspace.render_settings.setdefault("plane_render_cfg", {})["plane_size_mm"] = float(size_mm)
+        else:
+            self.scene.set_plane_display_settings(size_mm=float(size_mm), render=False)
+        self._sync_plane_display_controls()
+        if self._plane_edit_enabled and 0 <= int(self._selected_plane_index) < len(self.workspace.planes):
+            plane = self.workspace.planes[int(self._selected_plane_index)]
+            center = self.scene.world_to_display_point(np.asarray(plane.center) + self.workspace.origin)
+            distance = self._plane_widget_distance()
+            self._plane_widget_initializing = True
+            try:
+                for widget, axis in ((self._plane_axis_u_widget, self._plane_axis_u),
+                                     (self._plane_axis_v_widget, self._plane_axis_v)):
+                    if widget is not None and axis is not None:
+                        widget.SetCenter(*(center + self.scene.world_to_display_vector(axis) * distance).tolist())
+            finally:
+                self._plane_widget_initializing = False
+        if self.scene is not None:
+            self.plotter.render()
+
+    def _on_plane_selected_only_changed(self, enabled):
+        if self.scene is None:
+            self.workspace.render_settings.setdefault("plane_render_cfg", {})["selected_only"] = bool(enabled)
+        else:
+            self.scene.set_plane_display_settings(selected_only=enabled)
+
     def _build_log(self, parent):
         self.console = QtWidgets.QTextEdit()
         self.console.setReadOnly(True)
@@ -2222,8 +2293,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combo_centerline_pressure_path.clear()
         for idx, item in enumerate(profiles):
             path_index = int(item.get("path_index", idx))
-            peak = float(item.get("pressure_drop_peak_Pa", 0.0) or 0.0)
-            self.combo_centerline_pressure_path.addItem(f"Path {path_index} ({peak:.3g} Pa)", path_index)
+            peak = item.get("pressure_drop_peak_Pa")
+            peak_text = f'{float(peak):.3g} Pa' if peak is not None and np.isfinite(peak) else 'drop unavailable'
+            self.combo_centerline_pressure_path.addItem(f"Path {path_index} ({peak_text})", path_index)
         self.combo_centerline_pressure_path.setEnabled(bool(profiles))
         if profiles:
             target = 0
@@ -2285,9 +2357,12 @@ class MainWindow(QtWidgets.QMainWindow):
             ax_drop.set_yticks([])
         self.fig_pwv.tight_layout()
         self.canvas_pwv.draw_idle()
+        def pressure_text(value):
+            return f'{float(value):.4g} Pa' if value is not None and np.isfinite(value) else 'Unavailable'
+        current_drop = drop_t[min(current_t, drop_t.size - 1)] if drop_t.size else None
         lines = [
             f"Path {int(profile.get('path_index', -1))}   Current phase: {current_t}",
-            f"Current drop: {float(drop_t[min(current_t, drop_t.size - 1)]) if drop_t.size else 0.0:.4g} Pa   Mean drop: {float(profile.get('pressure_drop_mean_Pa', 0.0)):.4g} Pa   Peak |drop|: {float(profile.get('pressure_drop_peak_Pa', 0.0)):.4g} Pa",
+            f"Current drop: {pressure_text(current_drop)}   Mean drop: {pressure_text(profile.get('pressure_drop_mean_Pa'))}   Peak |drop|: {pressure_text(profile.get('pressure_drop_peak_Pa'))}",
         ]
         self.label_pwv_status.setText("\n".join(lines))
 
@@ -2439,8 +2514,8 @@ class MainWindow(QtWidgets.QMainWindow):
         label_map = {key: label for key, label in _PLANE_CURVE_SERIES_OPTIONS}
         series_label = label_map.get(str(series_key), str(series_key or "Metric"))
         values = np.asarray(metric.get(series_key, []), dtype=float).reshape(-1)
-        if values.size == 0:
-            self.label_pwv_status.setText(f"Plane {int(plane_idx)} has no samples for {series_label}.")
+        if values.size == 0 or not np.any(np.isfinite(values)):
+            self.label_pwv_status.setText(f"Plane {int(plane_idx)} has no valid samples for {series_label}.")
             self._clear_pwv_axes("Selected metric is not available for this plane.", title="Plane Curve")
             return
         self.fig_pwv.clear()
@@ -2623,8 +2698,8 @@ class MainWindow(QtWidgets.QMainWindow):
         mb = self.menuBar()
         mf = mb.addMenu("File")
         for label, slot in [
-            ("Open H5", self._on_open_h5),
-            ("Import DICOM Directory", self._on_import_dicom_directory),
+            ("Load H5", self._on_load_h5),
+            ("Load DICOM", self._on_load_dicom),
             ("Clear Workspace", self._on_close_workspace),
             ("Exit", self.close),
         ]:
@@ -2653,7 +2728,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ms.addAction(a)
         mv = mb.addMenu("View")
         for label, slot in [("Reset Camera", lambda: self.scene.reset_camera()), ("Toggle Axes", lambda: self.scene.toggle_axes()),
-            ("White BG", lambda: self.scene.set_background("white")), ("Dark BG", lambda: self.scene.set_background("#202124"))]:
+            ("White BG", lambda: self.scene.set_background("white")), ("Dark BG", lambda: self.scene.set_background(BACKGROUND_COLOR))]:
             a = QtGui.QAction(label, self)
             a.triggered.connect(slot)
             mv.addAction(a)
@@ -2702,7 +2777,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             current = QtGui.QColor(str(self.scene.plotter.background_color.hex_rgb))
         except Exception:
-            current = QtGui.QColor("#000000")
+            current = QtGui.QColor(BACKGROUND_COLOR)
         color = QtWidgets.QColorDialog.getColor(current, self, "3D Background Color")
         if color.isValid():
             value = color.name()
@@ -3064,7 +3139,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _bind_scene(self):
         self.scene = SceneController(self.plotter, self.workspace, self.log)
-        background = str(self._config_bundle.get("ui", {}).get("background_color", "#000000") or "#000000")
+        background = str(self._config_bundle.get("ui", {}).get("background_color") or BACKGROUND_COLOR)
         self.scene.set_background(background)
         self.scene.initialize()
         self.scene.enable_plane_picking(self._on_3d_plane_picked)
@@ -4520,8 +4595,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return [leaf.data(0, QtCore.Qt.UserRole) for leaf in self._iter_browser_leaf_items(item) if leaf.data(0, QtCore.Qt.UserRole) is not None]
 
     def _plane_widget_distance(self):
-        spacing = self._get_spacing_xyz_from_resolution()
-        return max(5.0, float(np.mean(spacing)) * 8.0)
+        return max(2.0, plane_display_size(self.workspace) * 0.45)
 
     def _refresh_plane_edit_controls(self):
         selected = 0 <= int(self._selected_plane_index) < len(self.workspace.planes)
@@ -5603,8 +5677,8 @@ class MainWindow(QtWidgets.QMainWindow):
         ws.derived_params.pressure_method = pressure_method
         ws.derived_params.pressure_gradient_smoothing_sigma = max(self._float_from_text(self.edit_dm_pg_smoothing_sigma.text(), 0.0), 0.0)
         ws.derived_params.pressure_gradient_support_erosion_iters = max(self._int_from_text(self.edit_dm_pg_support_erosion.text(), 1), 0)
-        ws.derived_params.pressure_gradient_layer_opacity = min(max(self._float_from_text(self.edit_dm_pg_opacity.text(), 0.6), 0.0), 1.0)
-        ws.derived_params.relative_pressure_layer_opacity = min(max(self._float_from_text(self.edit_dm_rp_opacity.text(), 0.6), 0.0), 1.0)
+        ws.derived_params.pressure_gradient_layer_opacity = min(max(self._float_from_text(self.edit_dm_pg_opacity.text(), 1.0), 0.0), 1.0)
+        ws.derived_params.relative_pressure_layer_opacity = min(max(self._float_from_text(self.edit_dm_rp_opacity.text(), 1.0), 0.0), 1.0)
         ws.derived_params.vortex_smoothing_sigma = max(self._float_from_text(self.edit_dm_vortex_smoothing_sigma.text(), 0.0), 0.0)
         ws.derived_params.vortex_support_erosion_iters = max(self._int_from_text(self.edit_dm_vortex_support_erosion.text(), 1), 0)
         ws.derived_params.use_multithread = self.chk_dm_multithread.isChecked()
@@ -5716,6 +5790,7 @@ class MainWindow(QtWidgets.QMainWindow):
         mode = str(getattr(ws.plane_gen_params, "plane_mode", "fixed_step") or "fixed_step")
         idx = max(self.combo_plane_mode.findData(mode), 0)
         self.combo_plane_mode.setCurrentIndex(idx)
+        self._sync_plane_display_controls()
         self.edit_plane_count.setText(str(getattr(ws.plane_gen_params, "plane_count", 3)))
         self.edit_plane_dist.setText(str(ws.plane_gen_params.cross_section_distance))
         self.edit_plane_start.setText(str(ws.plane_gen_params.start_distance))
@@ -6037,11 +6112,24 @@ class MainWindow(QtWidgets.QMainWindow):
         if not objects:
             self._sync_render_category_visibility_controls()
             return
-        for obj in objects:
-            obj.visible = bool(visible)
-            self.scene.apply_object_properties(obj, render=False, refresh_scalar_bar=False)
+        previous = self.tree_objects.blockSignals(True)
+        try:
+            # Update checks in place so visibility changes preserve the current
+            # selection, expansion, and selected-plane display filter.
+            for obj in objects:
+                obj.visible = bool(visible)
+                self.scene.apply_object_properties(obj, render=False, refresh_scalar_bar=False)
+                item = self._find_browser_item_by_uid(obj.uid)
+                if item is not None:
+                    item.setCheckState(0, QtCore.Qt.Checked if visible else QtCore.Qt.Unchecked)
+            for obj in objects:
+                item = self._find_browser_item_by_uid(obj.uid)
+                if item is not None:
+                    self._sync_browser_parent_states(item)
+        finally:
+            self.tree_objects.blockSignals(previous)
         self._sync_render_category_visibility_controls()
-        self._refresh_browser()
+        self._refresh_browser_opacity_control()
         self._refresh_scene()
 
     def _selected_uid(self):
@@ -6866,7 +6954,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 pending.paths.output_dir = os.path.join(configured_out, resolved.output_name or Path(resolved.input_path).stem)
 
             def load(progress, log):
-                self.pipeline.load_data(pending, log, input_source=resolved, progress_callback=progress)
+                self.pipeline.load_data(pending, log, input_source=resolved, progress_callback=progress,
+                                        reuse_existing_corr=True)
                 return pending
 
             self._run_modal_task("Load Input", f"Loading {resolved.display_name or resolved.input_path}…", load)
@@ -6886,7 +6975,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.scene.reset_display_reference()
             self.scene.reset_scene()
             self._refresh_all()
-            self.log(f"Loaded input: {resolved.display_name or resolved.input_path}. Run Correction explicitly to update working velocity.")
+            self.log(f"Loaded input: {resolved.display_name or resolved.input_path}. Saved corr applied when available; Background Correction recomputes from source.")
             self._input_signature = self._current_input_signature()
         except TaskCancelled:
             self.log("Input loading cancelled; the previous workspace is retained.")
@@ -6957,10 +7046,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log("Input parameters changed; reloading input and invalidating downstream results.")
         self._load_selected_input_case(self._active_input_case)
 
-    def _on_open_h5(self):
+    def _on_load_h5(self):
         if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
             return
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open H5", "", "H5 (*.h5 *.hdf5);;All (*)")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load H5", "", "H5 (*.h5 *.hdf5);;All (*)")
         if not path:
             return
         cases = discover_h5_input_cases(path)
@@ -6981,10 +7070,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._load_selected_input_case(resolved)
 
-    def _on_import_dicom_directory(self):
+    def _on_load_dicom(self):
         if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
             return
-        root = QtWidgets.QFileDialog.getExistingDirectory(self, "Import DICOM Directory", "")
+        root = QtWidgets.QFileDialog.getExistingDirectory(self, "Load DICOM", "")
         if not root:
             return
         target, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -6997,10 +7086,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not target.lower().endswith((".h5", ".hdf5")):
             target += ".h5"
         if os.path.exists(target):
-            self.log(f"DICOM CONVERSION ERROR: destination exists: {target}. Choose a new filename or Open H5.")
+            self.log(f"DICOM CONVERSION ERROR: destination exists: {target}. Choose a new filename or use File > Load H5.")
             return
         self._dicom_conversion_progress = self._create_progress_dialog(
-            "Dicom2H5", "Converting DICOM and validating H5..."
+            "Load DICOM", "Converting DICOM and validating H5..."
         )
         self._dicom_conversion_progress.setRange(0, 0)
         self._dicom_conversion_thread = QtCore.QThread(self)
@@ -7052,7 +7141,17 @@ class MainWindow(QtWidgets.QMainWindow):
         rendering_cfg = bundle_to_autoflow_kwargs(self._config_bundle)
         runtime_cfg = dict(getattr(self.workspace, "render_settings", {}) or {})
         rendering_cfg.update(copy.deepcopy(runtime_cfg))
+        # Export the current layer ranges and visibility of its scalar bar.
+        for obj in self.workspace.scene_objects.values():
+            prefix = {"wss_surface_live": "wss", "tke_volume": "tke",
+                      "pressure_gradient_volume": "pressure_gradient",
+                      "relative_pressure_volume": "relative_pressure",
+                      "streamlines_live": "streamline"}.get(obj.data_key)
+            if prefix:
+                rendering_cfg[f"{prefix}_clim"] = obj.clim
+                rendering_cfg[f"{prefix}_show_scalar_bar"] = obj.show_scalar_bar
         return {
+            "render_background_color": str(rendering_cfg.get("render_background_color") or BACKGROUND_COLOR),
             "fps": int(rendering_cfg.get("fps", 12)),
             "plane_rotation_frames": int(rendering_cfg.get("plane_rotation_frames", 180)),
             "camera_view": str(rendering_cfg.get("camera_view", "right")),
@@ -7064,13 +7163,15 @@ class MainWindow(QtWidgets.QMainWindow):
             "add_plane_idx": bool(rendering_cfg.get("add_plane_idx", True)),
             "add_path_idx": bool(rendering_cfg.get("add_path_idx", False)),
             "plane_video_cfg": dict(rendering_cfg.get("plane_video_cfg", {})),
+            "plane_render_cfg": copy.deepcopy(rendering_cfg.get("plane_render_cfg", {})),
             "window_size": tuple(rendering_cfg.get("window_size", (1600, 1200))),
+            "render_style_cfg": copy.deepcopy(rendering_cfg.get("render_style_cfg", {})),
             "shared_colorbar_show": bool(rendering_cfg.get("shared_colorbar_show", True)),
             "shared_colorbar_bar_cfg": dict(rendering_cfg.get("shared_colorbar_bar_cfg", {})),
-            "wss_clim": tuple(rendering_cfg.get("wss_clim", (0.0, 10.0))),
+            "wss_clim": None if rendering_cfg.get("wss_clim") is None else tuple(rendering_cfg["wss_clim"]),
             "wss_show_scalar_bar": bool(rendering_cfg.get("wss_show_scalar_bar", True)),
             "wss_bar_cfg": dict(rendering_cfg.get("wss_bar_cfg", {})),
-            "tke_clim": tuple(rendering_cfg.get("tke_clim", (0.0, 100.0))),
+            "tke_clim": None if rendering_cfg.get("tke_clim") is None else tuple(rendering_cfg["tke_clim"]),
             "tke_show_scalar_bar": bool(rendering_cfg.get("tke_show_scalar_bar", True)),
             "tke_bar_cfg": dict(rendering_cfg.get("tke_bar_cfg", {})),
             "pressure_gradient_clim": None if rendering_cfg.get("pressure_gradient_clim", None) is None else tuple(rendering_cfg.get("pressure_gradient_clim", (-1.0, 1.0))),
@@ -7196,7 +7297,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._pipeline_running_guard("exporting videos") or self._autoseg_running_guard("exporting videos"):
             return
         if not self.workspace.data_loaded:
-            self.log("No data loaded. Use File > Open H5 or Import DICOM Directory.")
+            self.log("No data loaded. Use File > Load H5 or File > Load DICOM.")
             return
         options = self._prompt_video_export_options()
         if options is None:
@@ -7349,6 +7450,11 @@ class MainWindow(QtWidgets.QMainWindow):
         ):
             rebuild_prefixes.append("segmask_group_")
         rebuild_prefixes = tuple(dict.fromkeys(rebuild_prefixes))
+        if steps & {StepId.GENERATE_SKELETON, StepId.GENERATE_GRAPH, StepId.GENERATE_PLANES}:
+            self._clear_plane_drag_widgets()
+            self._selected_plane_index = -1
+            self._pathline_selected_plane_idx = None
+            self.ortho_viewer.set_selected_plane(None)
         for prefix in rebuild_prefixes:
             self.scene.invalidate_cache(prefix)
         self._sync_segmentation_scene_object()
@@ -7440,7 +7546,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._pipeline_running_guard("running another pipeline step"):
             return
         if not self.workspace.data_loaded:
-            self.log("No data loaded. Use File > Open H5 or Import DICOM Directory.")
+            self.log("No data loaded. Use File > Load H5 or File > Load DICOM.")
             return
         if self._edit_mode is not None:
             if step == StepId.EDIT_SKELETON and self._edit_mode == "skeleton":
@@ -7492,7 +7598,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._pipeline_running_guard("running the full pipeline"):
             return
         if not self.workspace.data_loaded:
-            self.log("No data loaded. Use File > Open H5 or Import DICOM Directory.")
+            self.log("No data loaded. Use File > Load H5 or File > Load DICOM.")
             return
         if self._edit_mode is not None:
             self.log("Finish current interactive edit first.")

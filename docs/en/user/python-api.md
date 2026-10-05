@@ -91,7 +91,8 @@ For the other derived metrics, `AutoFlowConfig.from_config_dir()` now reads:
 - `configs/pressure_gradient.json` for pressure-gradient estimation, relative-pressure reconstruction, and centerline-pressure outputs
 - `configs/vortex.json` for vorticity, Q-criterion, and swirling-strength smoothing and support erosion
 - `configs/planes.json` for GUI plane styling, plus `configs/video_exporting.json` for plane-video styling
-- `configs/wss.json`, `configs/tke.json`, `configs/pressure_gradient.json`, and `configs/streamlines.json` for metric-specific render ranges and optional colorbars
+- `configs/render_style.json` for shared materials, anti-aliasing and text; `configs/colorbar.json` for shared colourbar layout
+- Metric JSON `render` groups for colormap, opacity, scalar range and colourbar visibility; TKE also has `render.volume` controls
 - `configs/pathlines.json` for GUI pathline launch, color, tube, and temporal-cache defaults
 - `configs/video_exporting.json` for shared video controls such as `window_size`, camera behavior, and rotation
 

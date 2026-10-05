@@ -25,7 +25,29 @@ Code owner: `autoflow/ui/app.py`.
 
 | Parameter | Type | Effective default | Where configured | Effect and units | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `background_color` | string | `"#000000"` | `configs/ui.json` | Background colour of the 3D scene, as a VTK colour name or hexadecimal RGB. Changes display only. | `autoflow/ui/app.py` |
+| `background_color` | string | `"#101820"` | `configs/ui.json` | Shared 3D viewport and offline-video background, as a VTK colour name or hexadecimal RGB. Text contrast follows the background; changes display only. | `autoflow/config.py; autoflow/ui/app.py; autoflow/rendering/videos.py` |
+
+## render_style
+
+Shared surface material, edge smoothing and text defaults. Per-metric colours and opacity stay in each metric JSON; shared colourbar layout stays in colorbar.json.
+
+| Parameter | Type | Effective default | Where configured | Effect and units | Code owner |
+| --- | --- | --- | --- | --- | --- |
+| `anti_aliasing` | string | `"auto"` | `configs/render_style.json` | Edge smoothing mode: auto chooses SSAA on EGL/OSMesa and FXAA elsewhere; none disables it. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `context.color` | string | `"#8296a8"` | `configs/render_style.json` | Colour for an ungrouped anatomical context surface. Label-group colours remain in labels.json. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `context.opacity` | float | `0.15` | `configs/render_style.json` | Default opacity for anatomical context and newly created segmentation-group surfaces; Browser edits override it. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `text.dark` | string | `"#17212b"` | `configs/render_style.json` | Text and colourbar-label colour on a light background. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `text.light` | string | `"#edf2f7"` | `configs/render_style.json` | Text and colourbar-label colour on a dark background. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `surfaces.anatomical.smooth_shading` | bool | `true` | `configs/render_style.json` | Interpolate anatomical surface normals for a smooth appearance. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `surfaces.anatomical.lighting` | bool | `true` | `configs/render_style.json` | Enable VTK surface lighting; quantitative meshes default to false to preserve mapped colours. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `surfaces.anatomical.ambient` | float | `0.4` | `configs/render_style.json` | Ambient lighting coefficient between zero and one. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `surfaces.anatomical.diffuse` | float | `0.6` | `configs/render_style.json` | Diffuse lighting coefficient between zero and one. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `surfaces.anatomical.specular` | float | `0.08` | `configs/render_style.json` | Specular lighting coefficient between zero and one. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `surfaces.anatomical.specular_power` | float | `16.0` | `configs/render_style.json` | Specular highlight exponent, nonnegative. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `surfaces.quantitative.lighting` | bool | `false` | `configs/render_style.json` | Enable VTK surface lighting; quantitative meshes default to false to preserve mapped colours. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `surfaces.quantitative.nan_color` | string | `"#8296a8"` | `configs/render_style.json` | Fallback colour for invalid scalar values; nan_opacity=0 hides them. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `surfaces.quantitative.nan_opacity` | float | `0.0` | `configs/render_style.json` | Opacity for invalid scalar values, between zero and one; does not replace numerical NaNs. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `surfaces.quantitative.interpolate_before_map` | bool | `true` | `configs/render_style.json` | Interpolate scalar values before applying the colormap. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
 
 ## loader
 
@@ -138,6 +160,8 @@ Code owner: `autoflow/algorithms/planes.py`.
 | `smoothing_window` | int | `15` | `configs/planes.json` | Savitzky-Golay window length for centreline smoothing; must admit the selected polynomial order. | `autoflow/algorithms/planes.py` |
 | `smoothing_polyorder` | int | `2` | `configs/planes.json` | Polynomial degree of centreline Savitzky-Golay smoothing. | `autoflow/algorithms/planes.py` |
 | `inter_time` | int | `10` | `configs/planes.json` | Centreline interpolation density multiplier; increases resampled path points before plane generation. | `autoflow/algorithms/planes.py` |
+| `render.plane_size_mm` | float | `10.0` | `configs/planes.json`; live GUI `Browser > Display size` | Physical side length of plane outlines, 1–200 mm; affects GUI picking and the default video display without changing metric ROI. | `autoflow/config.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.selected_only` | bool | `false` | `configs/planes.json`; live GUI `Only selected plane` | GUI-only filter that shows the selected plane outline and preserves Browser visibility flags; with no selection it shows no ordinary outlines. | `autoflow/config.py; autoflow/ui/viewer.py` |
 | `render.default.plane_color` | string | `"yellow"` | `configs/planes.json` | Plane display colour for the default or named anatomical group. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
 | `render.default.plane_opacity` | float | `0.75` | `configs/planes.json` | Plane display opacity between zero and one for the default or named anatomical group. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
 | `render.groups.aorta_systemic_branches.plane_color` | string | `"#ffd43b"` | `configs/planes.json` | Plane display colour for the default or named anatomical group. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
@@ -166,15 +190,12 @@ Code owner: `autoflow/algorithms/streamlines.py`.
 | `min_seeds` | int | `50` | `configs/streamlines.json` | Minimum desired seed count per valid plane, limited by available support. | `autoflow/algorithms/streamlines.py` |
 | `terminal_speed` | float | `0.01` | `configs/streamlines.json` | Velocity threshold in m/s for terminating streamline integration (input cm/s is converted to m/s). | `autoflow/algorithms/streamlines.py` |
 | `rng_seed` | int | `0` | `configs/streamlines.json` | Random seed for reproducible seed subsampling. | `autoflow/algorithms/streamlines.py` |
-| `tube_radius` | float | `0.05` | `configs/streamlines.json` | Rendered tube radius in physical mm; affects display geometry, not integration. | `autoflow/algorithms/streamlines.py` |
-| `render.clim` | optional / null | `null` | `configs/streamlines.json` | Displayed scalar limits [lower,upper] in the metric's units; null selects the automatic range. Changes colours only, never numerical results. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.show_scalar_bar` | bool | `true` | `configs/streamlines.json` | Show the metric scalar bar in the GUI/offline renderer. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.position_x` | float | `0.75` | `configs/streamlines.json` | Horizontal scalar-bar origin as a viewport fraction between zero and one. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.position_y` | float | `0.2` | `configs/streamlines.json` | Vertical scalar-bar origin as a viewport fraction between zero and one. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.height` | float | `0.22` | `configs/streamlines.json` | Scalar-bar height as a viewport fraction. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.width` | float | `0.05` | `configs/streamlines.json` | Scalar-bar width as a viewport fraction. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.title_font_size` | int | `40` | `configs/streamlines.json` | Scalar-bar title font size in points. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.label_font_size` | int | `32` | `configs/streamlines.json` | Scalar-bar tick-label font size in points. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `tube_radius` | float | `0.05` | `configs/streamlines.json` | Physical tube radius in mm for secondary / plane streamline objects; main live streamlines and movies use Browser line width in pixels. Does not affect integration. | `autoflow/algorithms/streamlines.py` |
+| `render.cmap` | string | `"turbo"` | `configs/streamlines.json` | Matplotlib colormap name used by the GUI and offline videos. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.opacity` | float | `1.0` | `configs/streamlines.json` | Layer opacity between zero and one; TKE multiplies this by its volume opacity curve. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.line_width` | float | `2.0` | `configs/streamlines.json` | Main streamline line width in screen pixels; affects rendering only. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.clim` | optional / null | `null` | `configs/streamlines.json` | Scalar limits [lower, upper] in the metric units; null selects the automatic range. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.show_scalar_bar` | bool | `true` | `configs/streamlines.json` | Show this layer colourbar when the shared master switch is enabled. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
 
 ## pathlines
 
@@ -215,18 +236,14 @@ Code owner: `autoflow/algorithms/metrics/wss.py`.
 
 | Parameter | Type | Effective default | Where configured | Effect and units | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `smoothing_iteration` | int | `200` | `configs/wss.json` | Taubin surface-smoothing iterations before normal sampling; zero retains the extracted voxel surface. | `autoflow/algorithms/metrics/wss.py` |
+| `smoothing_iteration` | int | `200` | `configs/wss.json` | Taubin iterations after closed signed-distance reconstruction and Gaussian smoothing at half the minimum voxel spacing; zero disables both smoothing steps. | `autoflow/algorithms/metrics/wss.py` |
 | `inward_distance` | string | `"auto"` | `configs/wss.json` | Wall-normal sampling step h in mm; auto uses the minimum voxel spacing. Parabolic fitting also probes 2h. | `autoflow/algorithms/metrics/wss.py` |
 | `parabolic_fitting` | bool | `true` | `configs/wss.json` | True computes the exact wall derivative of a three-point quadratic vector fit; false uses the first-segment linear slope. | `autoflow/algorithms/metrics/wss.py` |
 | `no_slip_condition` | bool | `true` | `configs/wss.json` | Set the wall velocity vector to zero by default. False samples the measured wall vector and increases sensitivity to partial volume and surface placement. | `autoflow/algorithms/metrics/wss.py` |
-| `render.clim` | list | `[0.0, 5.0]` | `configs/wss.json` | Displayed scalar limits [lower,upper] in the metric's units; null selects the automatic range. Changes colours only, never numerical results. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.show_scalar_bar` | bool | `true` | `configs/wss.json` | Show the metric scalar bar in the GUI/offline renderer. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.position_x` | float | `0.75` | `configs/wss.json` | Horizontal scalar-bar origin as a viewport fraction between zero and one. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.position_y` | float | `0.2` | `configs/wss.json` | Vertical scalar-bar origin as a viewport fraction between zero and one. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.height` | float | `0.22` | `configs/wss.json` | Scalar-bar height as a viewport fraction. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.width` | float | `0.05` | `configs/wss.json` | Scalar-bar width as a viewport fraction. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.title_font_size` | int | `40` | `configs/wss.json` | Scalar-bar title font size in points. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.label_font_size` | int | `32` | `configs/wss.json` | Scalar-bar tick-label font size in points. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.cmap` | string | `"turbo"` | `configs/wss.json` | Matplotlib colormap name used by the GUI and offline videos. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.opacity` | float | `1.0` | `configs/wss.json` | Layer opacity between zero and one; TKE multiplies this by its volume opacity curve. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.clim` | list | `[0.0, 5.0]` | `configs/wss.json` | Scalar limits [lower, upper] in the metric units; null selects the automatic range. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.show_scalar_bar` | bool | `true` | `configs/wss.json` | Show this layer colourbar when the shared master switch is enabled. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
 
 ## tke
 
@@ -234,14 +251,15 @@ Code owner: `autoflow/algorithms/data/h5_loader.py; autoflow/algorithms/metrics/
 
 | Parameter | Type | Effective default | Where configured | Effect and units | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `render.clim` | list | `[0.0, 100.0]` | `configs/tke.json` | Displayed scalar limits [lower,upper] in the metric's units; null selects the automatic range. Changes colours only, never numerical results. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.show_scalar_bar` | bool | `true` | `configs/tke.json` | Show the metric scalar bar in the GUI/offline renderer. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.position_x` | float | `0.75` | `configs/tke.json` | Horizontal scalar-bar origin as a viewport fraction between zero and one. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.position_y` | float | `0.2` | `configs/tke.json` | Vertical scalar-bar origin as a viewport fraction between zero and one. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.height` | float | `0.22` | `configs/tke.json` | Scalar-bar height as a viewport fraction. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.width` | float | `0.05` | `configs/tke.json` | Scalar-bar width as a viewport fraction. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.title_font_size` | int | `40` | `configs/tke.json` | Scalar-bar title font size in points. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.label_font_size` | int | `32` | `configs/tke.json` | Scalar-bar tick-label font size in points. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.cmap` | string | `"inferno"` | `configs/tke.json` | Matplotlib colormap name used by the GUI and offline videos. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.opacity` | float | `1.0` | `configs/tke.json` | Layer opacity between zero and one; TKE multiplies this by its volume opacity curve. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.volume.opacity_points` | list | `[[0.0, 0.0], [0.05, 0.0], [0.2, 0.015], [0.45, 0.08], [0.7, 0.25], [1.0, 0.65]]` | `configs/tke.json` | Piecewise-linear [range fraction, opacity] pairs; first [0,0], last fraction 1, strictly increasing fractions. Zero energy stays transparent. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.volume.shade` | bool | `false` | `configs/tke.json` | Enable volume lighting; false preserves quantitative colours. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.volume.blending` | string | `"composite"` | `configs/tke.json` | Volume blending: composite, maximum, minimum, average or additive. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.volume.interpolation` | string | `"linear"` | `configs/tke.json` | Volume sampling interpolation: linear or nearest. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.volume.opacity_unit_distance_scale` | float | `1.0` | `configs/tke.json` | Positive multiplier for max(mean voxel spacing, 0.1 mm) in the volume opacity transfer function. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.clim` | list | `[0.0, 100.0]` | `configs/tke.json` | Scalar limits [lower, upper] in the metric units; null selects the automatic range. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.show_scalar_bar` | bool | `true` | `configs/tke.json` | Show this layer colourbar when the shared master switch is enabled. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
 
 ## pressure_gradient
 
@@ -252,25 +270,15 @@ Code owner: `autoflow/algorithms/metrics/pressure.py`.
 | `method` | string | `"ppe"` | `configs/pressure_gradient.json` | `ppe` is the merged Cartesian pressure solver; `ste` is the staggered-grid Stokes estimator. Legacy `least_squares` is accepted as an alias for `ppe`. | `autoflow/algorithms/metrics/pressure.py` |
 | `smoothing_sigma` | float | `0.0` | `configs/pressure_gradient.json` | Spatial Gaussian smoothing width in voxels. Zero disables smoothing; valid-mask normalization prevents boundary attenuation. | `autoflow/algorithms/metrics/pressure.py` |
 | `support_erosion_iters` | int | `1` | `configs/pressure_gradient.json` | Additional conservative 26-neighbour erosion margin. Complete measured spatial and temporal derivative stencils are mandatory even at zero. | `autoflow/algorithms/metrics/pressure.py` |
-| `layer_opacity` | float | `0.6` | `configs/pressure_gradient.json` | PG layer opacity between zero (transparent) and one (opaque), affecting display only. | `autoflow/algorithms/metrics/pressure.py` |
-| `relative_pressure_opacity` | float | `0.6` | `configs/pressure_gradient.json` | Relative-pressure layer opacity between zero and one. | `autoflow/algorithms/metrics/pressure.py` |
 | `use_convective_acceleration` | bool | `true` | `configs/pressure_gradient.json` | Include (v dot grad)v in Navier-Stokes PG. Disabling omits real convective effects and is an explicit approximation. | `autoflow/algorithms/metrics/pressure.py` |
-| `render.clim` | optional / null | `null` | `configs/pressure_gradient.json` | Displayed scalar limits [lower,upper] in the metric's units; null selects the automatic range. Changes colours only, never numerical results. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.show_scalar_bar` | bool | `true` | `configs/pressure_gradient.json` | Show the metric scalar bar in the GUI/offline renderer. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.position_x` | float | `0.75` | `configs/pressure_gradient.json` | Horizontal scalar-bar origin as a viewport fraction between zero and one. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.position_y` | float | `0.2` | `configs/pressure_gradient.json` | Vertical scalar-bar origin as a viewport fraction between zero and one. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.height` | float | `0.22` | `configs/pressure_gradient.json` | Scalar-bar height as a viewport fraction. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.width` | float | `0.05` | `configs/pressure_gradient.json` | Scalar-bar width as a viewport fraction. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.title_font_size` | int | `40` | `configs/pressure_gradient.json` | Scalar-bar title font size in points. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.bar_cfg.label_font_size` | int | `32` | `configs/pressure_gradient.json` | Scalar-bar tick-label font size in points. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.relative_pressure_clim` | optional / null | `null` | `configs/pressure_gradient.json` | Displayed relative-pressure range [lower,upper] in Pa; null uses an automatic symmetric range. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.relative_pressure_show_scalar_bar` | bool | `true` | `configs/pressure_gradient.json` | Show the relative-pressure scalar bar. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.relative_pressure_bar_cfg.position_x` | float | `0.75` | `configs/pressure_gradient.json` | Horizontal scalar-bar origin as a viewport fraction between zero and one. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.relative_pressure_bar_cfg.position_y` | float | `0.2` | `configs/pressure_gradient.json` | Vertical scalar-bar origin as a viewport fraction between zero and one. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.relative_pressure_bar_cfg.height` | float | `0.22` | `configs/pressure_gradient.json` | Scalar-bar height as a viewport fraction. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.relative_pressure_bar_cfg.width` | float | `0.05` | `configs/pressure_gradient.json` | Scalar-bar width as a viewport fraction. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.relative_pressure_bar_cfg.title_font_size` | int | `40` | `configs/pressure_gradient.json` | Scalar-bar title font size in points. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `render.relative_pressure_bar_cfg.label_font_size` | int | `32` | `configs/pressure_gradient.json` | Scalar-bar tick-label font size in points. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.cmap` | string | `"magma"` | `configs/pressure_gradient.json` | Matplotlib colormap name used by the GUI and offline videos. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.opacity` | float | `1.0` | `configs/pressure_gradient.json` | Layer opacity between zero and one; TKE multiplies this by its volume opacity curve. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.relative_pressure.cmap` | string | `"RdBu_r"` | `configs/pressure_gradient.json` | Matplotlib colormap name used by the GUI and offline videos. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.relative_pressure.opacity` | float | `1.0` | `configs/pressure_gradient.json` | Layer opacity between zero and one; TKE multiplies this by its volume opacity curve. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.relative_pressure.clim` | optional / null | `null` | `configs/pressure_gradient.json` | Scalar limits [lower, upper] in the metric units; null selects the automatic range. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.relative_pressure.show_scalar_bar` | bool | `true` | `configs/pressure_gradient.json` | Show this layer colourbar when the shared master switch is enabled. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.clim` | optional / null | `null` | `configs/pressure_gradient.json` | Scalar limits [lower, upper] in the metric units; null selects the automatic range. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.show_scalar_bar` | bool | `true` | `configs/pressure_gradient.json` | Show this layer colourbar when the shared master switch is enabled. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
 
 ## vortex
 
@@ -280,6 +288,18 @@ Code owner: `autoflow/algorithms/metrics/vortex.py`.
 | --- | --- | --- | --- | --- | --- |
 | `smoothing_sigma` | float | `0.0` | `configs/vortex.json` | Spatial Gaussian velocity smoothing width in voxels before vortex derivatives; zero disables smoothing. | `autoflow/algorithms/metrics/vortex.py` |
 | `support_erosion_iters` | int | `1` | `configs/vortex.json` | Lumen-mask erosion iterations defining valid vortex derivative support. Zero disables the optional erosion. | `autoflow/algorithms/metrics/vortex.py` |
+| `render.vorticity_magnitude.cmap` | string | `"turbo"` | `configs/vortex.json` | Matplotlib colormap name used by the GUI and offline videos. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.vorticity_magnitude.opacity` | float | `1.0` | `configs/vortex.json` | Layer opacity between zero and one; TKE multiplies this by its volume opacity curve. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.vorticity_magnitude.clim` | optional / null | `null` | `configs/vortex.json` | Scalar limits [lower, upper] in the metric units; null selects the automatic range. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.vorticity_magnitude.show_scalar_bar` | bool | `true` | `configs/vortex.json` | Show this layer colourbar when the shared master switch is enabled. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.q_criterion.cmap` | string | `"RdBu_r"` | `configs/vortex.json` | Matplotlib colormap name used by the GUI and offline videos. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.q_criterion.opacity` | float | `1.0` | `configs/vortex.json` | Layer opacity between zero and one; TKE multiplies this by its volume opacity curve. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.q_criterion.clim` | optional / null | `null` | `configs/vortex.json` | Scalar limits [lower, upper] in the metric units; null selects the automatic range. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.q_criterion.show_scalar_bar` | bool | `true` | `configs/vortex.json` | Show this layer colourbar when the shared master switch is enabled. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.swirling_strength.cmap` | string | `"turbo"` | `configs/vortex.json` | Matplotlib colormap name used by the GUI and offline videos. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.swirling_strength.opacity` | float | `1.0` | `configs/vortex.json` | Layer opacity between zero and one; TKE multiplies this by its volume opacity curve. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.swirling_strength.clim` | optional / null | `null` | `configs/vortex.json` | Scalar limits [lower, upper] in the metric units; null selects the automatic range. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `render.swirling_strength.show_scalar_bar` | bool | `true` | `configs/vortex.json` | Show this layer colourbar when the shared master switch is enabled. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
 
 ## pwv
 
@@ -353,13 +373,20 @@ Code owner: `autoflow/ui/viewer.py; autoflow/rendering/videos.py`.
 
 | Parameter | Type | Effective default | Where configured | Effect and units | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `show` | bool | `true` | `configs/colorbar.json` | Default shared GUI scalar-bar visibility; metric visibility still follows its active layer. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `bar_cfg.position_x` | float | `0.87` | `configs/colorbar.json` | Horizontal scalar-bar origin as a viewport fraction between zero and one. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `bar_cfg.position_y` | float | `0.15` | `configs/colorbar.json` | Vertical scalar-bar origin as a viewport fraction between zero and one. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `bar_cfg.height` | float | `0.65` | `configs/colorbar.json` | Scalar-bar height as a viewport fraction. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `bar_cfg.width` | float | `0.08` | `configs/colorbar.json` | Scalar-bar width as a viewport fraction. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `bar_cfg.title_font_size` | int | `14` | `configs/colorbar.json` | Scalar-bar title font size in points. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
-| `bar_cfg.label_font_size` | int | `11` | `configs/colorbar.json` | Scalar-bar tick-label font size in points. | `autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `show` | bool | `true` | `configs/colorbar.json` | Master colourbar visibility switch for GUI and offline movies. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `bar_cfg.position_x` | float | `0.82` | `configs/colorbar.json` | Horizontal origin as a viewport fraction; clamped to fit inside the viewport. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `bar_cfg.position_y` | float | `0.15` | `configs/colorbar.json` | Vertical origin as a viewport fraction; clamped to fit inside the viewport. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `bar_cfg.height` | float | `0.65` | `configs/colorbar.json` | Colourbar height as a viewport fraction. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `bar_cfg.width` | float | `0.045` | `configs/colorbar.json` | Colourbar width as a viewport fraction. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `bar_cfg.title_font_size` | int | `14` | `configs/colorbar.json` | Title font size in points. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `bar_cfg.label_font_size` | int | `11` | `configs/colorbar.json` | Tick label font size in points. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `bar_cfg.vertical` | bool | `true` | `configs/colorbar.json` | Use a vertical colourbar. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `bar_cfg.n_labels` | int | `5` | `configs/colorbar.json` | Number of scalar tick labels. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `bar_cfg.fmt` | string | `"%.3g"` | `configs/colorbar.json` | Printf format for tick values. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `bar_cfg.font_family` | string | `"arial"` | `configs/colorbar.json` | VTK font family, for example arial. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `bar_cfg.bold` | bool | `false` | `configs/colorbar.json` | Use bold label and title text. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `bar_cfg.italic` | bool | `false` | `configs/colorbar.json` | Use italic label and title text. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
+| `bar_cfg.shadow` | bool | `false` | `configs/colorbar.json` | Draw text shadows. | `autoflow/config.py; autoflow/rendering/style.py; autoflow/ui/viewer.py; autoflow/rendering/videos.py` |
 
 ## video_exporting
 
@@ -391,7 +418,7 @@ Code owner: `autoflow/rendering/videos.py`.
 | `plane_video.label.shape_color` | string | `"yellow"` | `configs/video_exporting.json` | Background/outline colour of the plane-label shape. | `autoflow/rendering/videos.py` |
 | `plane_video.label.shape_opacity` | float | `0.3` | `configs/video_exporting.json` | Opacity of the plane-label shape between zero and one. | `autoflow/rendering/videos.py` |
 | `plane_video.default.skeleton_color` | string | `""` | `configs/video_exporting.json` | Skeleton-colour override for plane videos; empty uses the group/default scene colour. | `autoflow/rendering/videos.py` |
-| `plane_video.default.plane_size` | int | `10` | `configs/video_exporting.json` | Physical side length in mm of the displayed plane square. | `autoflow/rendering/videos.py` |
+| `plane_video.default.plane_size` | float or null | `null` | `configs/video_exporting.json` | Optional video-specific side length in mm; null follows `planes.render.plane_size_mm`. | `autoflow/rendering/videos.py` |
 | `plane_video.default.plane_color` | string | `"yellow"` | `configs/video_exporting.json` | Plane-video default colour; group settings can override it. | `autoflow/rendering/videos.py` |
 | `plane_video.default.plane_opacity` | float | `0.75` | `configs/video_exporting.json` | Default plane-video opacity between zero and one. | `autoflow/rendering/videos.py` |
 | `plane_video.groups` | object | `{}` | `configs/video_exporting.json` | Per-group plane-video overrides; each group may supply skeleton_color, plane_size, plane_color and plane_opacity. | `autoflow/rendering/videos.py` |

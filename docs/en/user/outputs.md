@@ -44,7 +44,7 @@
 
 ## Notes
 
-- `derived_metrics_pixelwise.npz` stores whole-volume derived arrays. WSS is in Pa; rasterized invalid wall samples are NaN and non-wall voxels are zero. Workspace WSS surfaces additionally carry signed `wss_vectors` in Pa and `wss_valid`.
+- `derived_metrics_pixelwise.npz` stores whole-volume derived arrays. WSS is in Pa; rasterized invalid wall samples are NaN and non-wall voxels are zero. Workspace WSS surfaces additionally carry signed `wss_vectors` in Pa, `wss_valid`, and `wss_normal_flipped` (uint8 local orientation corrections).
 - Pressure gradients are in Pa/m and relative pressure is in Pa. Use `pressure_gradient_support_mask` to identify evaluated voxels; values outside support are zero placeholders. Each disconnected support component has its own zero-pressure reference. Recompute exports from older pressure reconstruction versions rather than rescaling them.
 - When `vortex` is requested, `derived_metrics_pixelwise.npz` includes `vorticity`, `vorticity_magnitude`, `q_criterion`, `swirling_strength`, their phase-peak arrays, and `vortex_support_mask`.
 - `plane_metrics_pixelwise.h5` stores per-plane slice-cellwise samples
@@ -71,3 +71,11 @@ DICOM directory input through Dicom2H5 saves a new H5 before analysis, under `di
 `summary.json.noise_removal` records actual screening parameters, magnitude threshold/mode, `magnitude_reference_max`, `magnitude_statistic`, `temporal_std_threshold`, `temporal_std_reference_max`, `temporal_std_statistic`, temporal-screening status and retained fraction; `noise_removal_file` points to the NPZ. The SD threshold/reference are `null` when screening is bypassed. Default magnitude and temporal-speed SD fractions are `0.05` and `0.80` of their respective maxima, not P99 or VENC; see [Noise removal](../features/noise-removal.md). Phase records include `mask_source` and `diagnostic_scope`. `phase_unwrap.npz` velocity/phase include preserved values outside a masked rerun, while wrap-count diagnostics describe the latest requested mask. GUI workspaces preserve the display mask, correction fields and working velocity. Source H5 correction-cache writes remain controlled by `write_cache` / `--no-cache-write`; noise masking and unwrapping do not overwrite source magnitude/flow.
 
 `pcmra.npz` is created by CLI/API `--generate-pcmra` / `generate_pcmra=True` or the full Correction group. It contains unmasked `XYZT` `pcmra`, `resolution` and `origin`; the companion `pcmra_noise_mask.npz` defines the display region when requested. `summary.json.pcmra_file` points to it. Input loading alone creates neither PC-MRA arrays nor this file.
+
+WSS surfaces use the closed reconstructed numerical wall. Recompute old exports after the `wss-continuous-wall-v4` algorithm change; `wss_valid` still rejects unsupported probes, and increased coverage is not an accuracy or confidence measure.
+
+Centreline pressure profiles add `valid_sample_t` and `pressure_drop_valid_t`. Unsupported pressure samples/drops and unavailable mean/peak drops are JSON `null`; supported measured zero remains numeric zero. Pressure drops across disconnected component gauges are unavailable. Recompute pressure and vortex families after the support-validation change.
+
+## Pressure plane availability
+
+Pressure-gradient and relative-pressure plane summaries exclude cells outside the valid derivative support. Each unavailable phase and an unavailable cycle summary is JSON `null`, preserving genuine measured `0`. Cycle summaries average the available phases. `pressure_gradient_valid_cell_count_t` and `relative_pressure_valid_cell_count_t` give valid sample counts. In `plane_metrics_pixelwise.h5`, each timepoint has uint8 `pressure_gradient_valid` and `relative_pressure_valid` arrays; pressure samples outside them are NaN, while `lumen_mask` retains anatomical support. Recompute plane metrics to refresh earlier zero-filled pressure summaries.

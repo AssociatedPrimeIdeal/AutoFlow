@@ -494,8 +494,8 @@ class DerivedMetricsParams:
     pressure_gradient_viscosity: float = 4.0
     pressure_gradient_smoothing_sigma: float = 0.0
     pressure_gradient_support_erosion_iters: int = 1
-    pressure_gradient_layer_opacity: float = 0.6
-    relative_pressure_layer_opacity: float = 0.6
+    pressure_gradient_layer_opacity: float = 1.0
+    relative_pressure_layer_opacity: float = 1.0
     pressure_gradient_use_convective_acceleration: bool = True
     pressure_method: str = "ppe"
     vortex_smoothing_sigma: float = 0.0
@@ -556,8 +556,8 @@ class DerivedMetricsParams:
             pressure_gradient_viscosity=float(payload.get("pressure_gradient_viscosity", legacy_viscosity)),
             pressure_gradient_smoothing_sigma=float(payload.get("pressure_gradient_smoothing_sigma", 0.0)),
             pressure_gradient_support_erosion_iters=int(payload.get("pressure_gradient_support_erosion_iters", 1)),
-            pressure_gradient_layer_opacity=float(payload.get("pressure_gradient_layer_opacity", 0.6)),
-            relative_pressure_layer_opacity=float(payload.get("relative_pressure_layer_opacity", 0.6)),
+            pressure_gradient_layer_opacity=float(payload.get("pressure_gradient_layer_opacity", 1.0)),
+            relative_pressure_layer_opacity=float(payload.get("relative_pressure_layer_opacity", 1.0)),
             pressure_gradient_use_convective_acceleration=bool(payload.get("pressure_gradient_use_convective_acceleration", True)),
             pressure_method=pressure_method,
             vortex_smoothing_sigma=max(float(payload.get("vortex_smoothing_sigma", 0.0)), 0.0),

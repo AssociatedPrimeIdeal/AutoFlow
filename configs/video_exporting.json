@@ -30,7 +30,7 @@
     },
     "default": {
       "skeleton_color": "",
-      "plane_size": 10,
+      "plane_size": null,
       "plane_color": "yellow",
       "plane_opacity": 0.75
     },

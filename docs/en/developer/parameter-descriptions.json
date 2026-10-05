@@ -11,7 +11,7 @@
       "reuse_planes": "Path to a plane-position JSON or per-case directory to reuse. Empty string generates planes normally."
     },
     "ui": {
-      "background_color": "Background colour of the 3D scene, as a VTK colour name or hexadecimal RGB. Changes display only."
+      "background_color": "Shared GUI viewport and offline-video background, as a VTK colour name or hexadecimal RGB. Text contrast follows the background; changes display only."
     },
     "loader": {
       "background_phase_correction.enabled": "Enable an explicit background-correction stage after loading, before segmentation. Compatible H5 correction caches may be reused unless force_recompute is true.",
@@ -87,7 +87,9 @@
       "segmentation_filter": "Discard candidate planes whose centreline location lacks compatible segmentation support.",
       "smoothing_window": "Savitzky-Golay window length for centreline smoothing; must admit the selected polynomial order.",
       "smoothing_polyorder": "Polynomial degree of centreline Savitzky-Golay smoothing.",
-      "inter_time": "Centreline interpolation density multiplier; increases resampled path points before plane generation."
+      "inter_time": "Centreline interpolation density multiplier; increases resampled path points before plane generation.",
+      "render.plane_size_mm": "Physical plane-outline side length in mm, 1 to 200, changed live in the GUI without changing metric ROI; also the default plane-video size.",
+      "render.selected_only": "GUI-only display filter: only the selected ordinary plane is shown; scientific planes and Browser visibility flags are preserved."
     },
     "streamlines": {
       "seed_ratio": "Fraction of slice support locations sampled as streamline seeds; min_seeds sets a lower target when possible.",
@@ -95,7 +97,12 @@
       "min_seeds": "Minimum desired seed count per valid plane, limited by available support.",
       "terminal_speed": "Velocity threshold in m/s for terminating streamline integration (input cm/s is converted to m/s).",
       "rng_seed": "Random seed for reproducible seed subsampling.",
-      "tube_radius": "Rendered tube radius in physical mm; affects display geometry, not integration."
+      "tube_radius": "Physical tube radius in mm for secondary / plane streamline objects; main live streamlines and movies use Browser line width in pixels. Does not affect integration.",
+      "render.cmap": "Matplotlib colormap name used by the GUI and offline videos.",
+      "render.opacity": "Layer opacity between zero and one; TKE multiplies this by its volume opacity curve.",
+      "render.line_width": "Main streamline line width in screen pixels; affects rendering only.",
+      "render.clim": "Scalar limits [lower, upper] in the metric units; null selects the automatic range.",
+      "render.show_scalar_bar": "Show this layer colourbar when the shared master switch is enabled."
     },
     "pathlines": {
       "seed_ratio": "Support fraction used only by ratio seeding.",
@@ -115,13 +122,26 @@
       "viscosity": "Dynamic viscosity in mPa*s, shared by WSS and pressure unless their module overrides it."
     },
     "wss": {
-      "smoothing_iteration": "Taubin surface-smoothing iterations before normal sampling; zero retains the extracted voxel surface.",
+      "smoothing_iteration": "Taubin iterations after closed signed-distance reconstruction and Gaussian smoothing at half the minimum voxel spacing; zero disables both smoothing steps.",
       "inward_distance": "Wall-normal sampling step h in mm; auto uses the minimum voxel spacing. Parabolic fitting also probes 2h.",
       "parabolic_fitting": "True computes the exact wall derivative of a three-point quadratic vector fit; false uses the first-segment linear slope.",
-      "no_slip_condition": "Set the wall velocity vector to zero by default. False samples the measured wall vector and increases sensitivity to partial volume and surface placement."
+      "no_slip_condition": "Set the wall velocity vector to zero by default. False samples the measured wall vector and increases sensitivity to partial volume and surface placement.",
+      "render.cmap": "Matplotlib colormap name used by the GUI and offline videos.",
+      "render.opacity": "Layer opacity between zero and one; TKE multiplies this by its volume opacity curve.",
+      "render.clim": "Scalar limits [lower, upper] in the metric units; null selects the automatic range.",
+      "render.show_scalar_bar": "Show this layer colourbar when the shared master switch is enabled."
     },
     "tke": {
-      "rho": "Optional TKE density override in kg/m^3; absent uses fluid.rho."
+      "rho": "Optional TKE density override in kg/m^3; absent uses fluid.rho.",
+      "render.cmap": "Matplotlib colormap name used by the GUI and offline videos.",
+      "render.opacity": "Layer opacity between zero and one; TKE multiplies this by its volume opacity curve.",
+      "render.volume.opacity_points": "Piecewise-linear [range fraction, opacity] pairs; first [0,0], last fraction 1, strictly increasing fractions. Zero energy stays transparent.",
+      "render.volume.shade": "Enable volume lighting; false preserves quantitative colours.",
+      "render.volume.blending": "Volume blending: composite, maximum, minimum, average or additive.",
+      "render.volume.interpolation": "Volume sampling interpolation: linear or nearest.",
+      "render.volume.opacity_unit_distance_scale": "Positive multiplier for max(mean voxel spacing, 0.1 mm) in the volume opacity transfer function.",
+      "render.clim": "Scalar limits [lower, upper] in the metric units; null selects the automatic range.",
+      "render.show_scalar_bar": "Show this layer colourbar when the shared master switch is enabled."
     },
     "pressure_gradient": {
       "rho": "Optional pressure density override in kg/m^3; absent uses fluid.rho.",
@@ -129,13 +149,31 @@
       "method": "Relative-pressure reconstruction: ppe is the merged Cartesian solver; ste is the staggered-grid Stokes estimator; legacy least_squares is accepted as an alias for ppe.",
       "smoothing_sigma": "Spatial Gaussian smoothing width in voxels. Zero disables smoothing; valid-mask normalization prevents boundary attenuation.",
       "support_erosion_iters": "Additional conservative 26-neighbour erosion margin. Complete measured spatial and temporal derivative stencils are mandatory even at zero.",
-      "layer_opacity": "PG layer opacity between zero (transparent) and one (opaque), affecting display only.",
-      "relative_pressure_opacity": "Relative-pressure layer opacity between zero and one.",
-      "use_convective_acceleration": "Include (v dot grad)v in Navier-Stokes PG. Disabling omits real convective effects and is an explicit approximation."
+      "use_convective_acceleration": "Include (v dot grad)v in Navier-Stokes PG. Disabling omits real convective effects and is an explicit approximation.",
+      "render.cmap": "Matplotlib colormap name used by the GUI and offline videos.",
+      "render.opacity": "Layer opacity between zero and one; TKE multiplies this by its volume opacity curve.",
+      "render.relative_pressure.cmap": "Matplotlib colormap name used by the GUI and offline videos.",
+      "render.relative_pressure.opacity": "Layer opacity between zero and one; TKE multiplies this by its volume opacity curve.",
+      "render.relative_pressure.clim": "Scalar limits [lower, upper] in the metric units; null selects the automatic range.",
+      "render.relative_pressure.show_scalar_bar": "Show this layer colourbar when the shared master switch is enabled.",
+      "render.clim": "Scalar limits [lower, upper] in the metric units; null selects the automatic range.",
+      "render.show_scalar_bar": "Show this layer colourbar when the shared master switch is enabled."
     },
     "vortex": {
       "smoothing_sigma": "Spatial Gaussian velocity smoothing width in voxels before vortex derivatives; zero disables smoothing.",
-      "support_erosion_iters": "Lumen-mask erosion iterations defining valid vortex derivative support. Zero disables the optional erosion."
+      "support_erosion_iters": "Lumen-mask erosion iterations defining valid vortex derivative support. Zero disables the optional erosion.",
+      "render.vorticity_magnitude.cmap": "Matplotlib colormap name used by the GUI and offline videos.",
+      "render.vorticity_magnitude.opacity": "Layer opacity between zero and one; TKE multiplies this by its volume opacity curve.",
+      "render.vorticity_magnitude.clim": "Scalar limits [lower, upper] in the metric units; null selects the automatic range.",
+      "render.vorticity_magnitude.show_scalar_bar": "Show this layer colourbar when the shared master switch is enabled.",
+      "render.q_criterion.cmap": "Matplotlib colormap name used by the GUI and offline videos.",
+      "render.q_criterion.opacity": "Layer opacity between zero and one; TKE multiplies this by its volume opacity curve.",
+      "render.q_criterion.clim": "Scalar limits [lower, upper] in the metric units; null selects the automatic range.",
+      "render.q_criterion.show_scalar_bar": "Show this layer colourbar when the shared master switch is enabled.",
+      "render.swirling_strength.cmap": "Matplotlib colormap name used by the GUI and offline videos.",
+      "render.swirling_strength.opacity": "Layer opacity between zero and one; TKE multiplies this by its volume opacity curve.",
+      "render.swirling_strength.clim": "Scalar limits [lower, upper] in the metric units; null selects the automatic range.",
+      "render.swirling_strength.show_scalar_bar": "Show this layer colourbar when the shared master switch is enabled."
     },
     "pwv": {
       "enabled": "Enable the configured PWV workflow; CLI/API must still request pwv as an optional metric.",
@@ -194,7 +232,20 @@
       "write_auto_cache": "Permit segmentation-cache writes into supported source H5 files. Set false for read-only benchmarking."
     },
     "colorbar": {
-      "show": "Default shared GUI scalar-bar visibility; metric visibility still follows its active layer."
+      "show": "Master colourbar visibility switch for GUI and offline movies.",
+      "bar_cfg.position_x": "Horizontal origin as a viewport fraction; clamped to fit inside the viewport.",
+      "bar_cfg.position_y": "Vertical origin as a viewport fraction; clamped to fit inside the viewport.",
+      "bar_cfg.height": "Colourbar height as a viewport fraction.",
+      "bar_cfg.width": "Colourbar width as a viewport fraction.",
+      "bar_cfg.title_font_size": "Title font size in points.",
+      "bar_cfg.label_font_size": "Tick label font size in points.",
+      "bar_cfg.vertical": "Use a vertical colourbar.",
+      "bar_cfg.n_labels": "Number of scalar tick labels.",
+      "bar_cfg.fmt": "Printf format for tick values.",
+      "bar_cfg.font_family": "VTK font family, for example arial.",
+      "bar_cfg.bold": "Use bold label and title text.",
+      "bar_cfg.italic": "Use italic label and title text.",
+      "bar_cfg.shadow": "Draw text shadows."
     },
     "video_exporting": {
       "fps": "Output video frame rate in frames per second; sets playback speed independently of acquired RR.",
@@ -221,7 +272,7 @@
       "plane_video.label.shape_color": "Background/outline colour of the plane-label shape.",
       "plane_video.label.shape_opacity": "Opacity of the plane-label shape between zero and one.",
       "plane_video.default.skeleton_color": "Skeleton-colour override for plane videos; empty uses the group/default scene colour.",
-      "plane_video.default.plane_size": "Physical side length in mm of the displayed plane square.",
+      "plane_video.default.plane_size": "Optional video-specific plane-outline side length in mm. Null follows planes.render.plane_size_mm.",
       "plane_video.default.plane_color": "Plane-video default colour; group settings can override it.",
       "plane_video.default.plane_opacity": "Default plane-video opacity between zero and one.",
       "plane_video.groups": "Per-group plane-video overrides; each group may supply skeleton_color, plane_size, plane_color and plane_opacity."
@@ -231,6 +282,23 @@
       "method": "Choose magnitude_temporal screening or magnitude-only screening.",
       "magnitude_fraction": "Fraction of maximum temporal-mean magnitude; AutoFlow default 0.05. Lower values retain more voxels; zero keeps all positive finite magnitude.",
       "velocity_std_max": "Upper temporal speed SD as a fraction of maximum SD over finite velocity voxels; AutoFlow default 0.80. Higher values retain more voxels; zero disables temporal screening. Not VENC-normalized."
+    },
+    "render_style": {
+      "anti_aliasing": "Edge smoothing mode: auto chooses SSAA on EGL/OSMesa and FXAA elsewhere; none disables it.",
+      "context.color": "Colour for an ungrouped anatomical context surface. Label-group colours remain in labels.json.",
+      "context.opacity": "Default opacity for anatomical context and newly created segmentation-group surfaces; Browser edits override it.",
+      "text.dark": "Text and colourbar-label colour on a light background.",
+      "text.light": "Text and colourbar-label colour on a dark background.",
+      "surfaces.anatomical.smooth_shading": "Interpolate anatomical surface normals for a smooth appearance.",
+      "surfaces.anatomical.lighting": "Enable VTK surface lighting; quantitative meshes default to false to preserve mapped colours.",
+      "surfaces.anatomical.ambient": "Ambient lighting coefficient between zero and one.",
+      "surfaces.anatomical.diffuse": "Diffuse lighting coefficient between zero and one.",
+      "surfaces.anatomical.specular": "Specular lighting coefficient between zero and one.",
+      "surfaces.anatomical.specular_power": "Specular highlight exponent, nonnegative.",
+      "surfaces.quantitative.lighting": "Enable VTK surface lighting; quantitative meshes default to false to preserve mapped colours.",
+      "surfaces.quantitative.nan_color": "Fallback colour for invalid scalar values; nan_opacity=0 hides them.",
+      "surfaces.quantitative.nan_opacity": "Opacity for invalid scalar values, between zero and one; does not replace numerical NaNs.",
+      "surfaces.quantitative.interpolate_before_map": "Interpolate scalar values before applying the colormap."
     }
   },
   "render": {
@@ -686,7 +754,7 @@
     },
     "shared_colorbar_show": {
       "path": "colorbar.show",
-      "effect": "Default shared GUI scalar-bar visibility; metric visibility still follows its active layer."
+      "effect": "Shared GUI/video scalar-bar master visibility switch; per-metric visibility still applies."
     },
     "shared_colorbar_bar_cfg": {
       "path": "colorbar.bar_cfg",
@@ -785,6 +853,10 @@
     },
     "generate_pcmra": {
       "effect": "Generate PC-MRA after requested correction steps; loading leaves it uncomputed."
+    },
+    "render_background_color": {
+      "path": "ui.background_color",
+      "effect": "Shared GUI viewport and offline-video background, as a VTK colour name or hexadecimal RGB. Text contrast follows the background; changes display only."
     }
   }
 }

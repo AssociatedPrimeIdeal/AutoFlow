@@ -6,7 +6,7 @@ Supported in GUI. Partial in CLI and public Python API: offline streamline video
 
 ## What it does
 
-Integrates instantaneous velocity trajectories inside the vessel. Live trajectories use unlit velocity-coloured tubes; colour is the magnitude of the same interpolated vector used by the tracer. The GUI uses line-tube rendering and phase caches. Offline videos crop velocity grids to the vessel, prepare phases with up to eight workers, and retain meshes until encoding completes. Automatic colour limits use 0 to the finite vessel-velocity 99th percentile across phases.
+Integrates instantaneous velocity trajectories inside the vessel. Live trajectories use unlit velocity-coloured tubes; colour is the magnitude of the same interpolated vector used by the tracer. Both the GUI and offline movies use screen-space line-tube rendering and phase caches, with the same unlit `turbo` colours, layer opacity and Browser line width (2 px by default). The movie no longer expands a second thick tube mesh. Offline videos crop velocity grids to the vessel, prepare phases with up to eight workers, and retain meshes until encoding completes. Automatic colour limits use 0 to the finite vessel-velocity 99th percentile across phases.
 
 ## When to use it
 
@@ -36,7 +36,7 @@ Velocity `XYZT3` in cm/s, segmentation, spacing and origin. Tracer velocity is c
 
 ## Parameters
 
-[All streamline controls](../user/parameters.md#streamlines), [video settings](../user/parameters.md#video_exporting), and [colourbar layout](../user/parameters.md#colorbar). `terminal_speed` is m/s; tube radius is mm. Seed randomness is reproducible via `rng_seed`.
+[All streamline controls](../user/parameters.md#streamlines), [video settings](../user/parameters.md#video_exporting), and [colourbar layout](../user/parameters.md#colorbar). `terminal_speed` is m/s. `tube_radius` is retained for physical tube geometry on secondary / plane streamline objects; the main live layer and movies use screen-space line width. Seed randomness is reproducible via `rng_seed`.
 
 ## Outputs
 
@@ -61,4 +61,4 @@ PYVISTA_OFF_SCREEN=true python -m pytest tests/test_smoke_phantoms.py tests/test
 
 ## Common problems
 
-No trajectories: check segmentation and flow. Dark/subpixel tubes: use unlit rendering, a suitable tube radius and automatic limits; explicit broad colour limits can compress most velocities into dark colours. Phase changes should preserve active scalars and tube styling.
+No trajectories: check segmentation and flow. Dark/subpixel tubes: use unlit rendering, a suitable Browser line width and automatic limits; explicit broad colour limits can compress most velocities into dark colours. Phase changes should preserve active scalars and tube styling.

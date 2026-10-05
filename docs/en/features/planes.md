@@ -43,6 +43,12 @@ In grouped multi-label workflows, every plane keeps the group name of the path i
 When `Calculate && Save Metrics` runs in the GUI, its progress dialog advances
 after each plane completes and shows the current plane count.
 
+The Browser control area below its tree groups `Display size` and `Only selected plane` with `Visibility` and `Opacity`. The `Display size` slider and millimetre spin box resize every ordinary plane wireframe and the selected-plane highlight immediately, with no plane regeneration or metric calculation. The default is 10 mm, adjustable from 1 to 200 mm. Right-click selection follows the displayed size. `Only selected plane` hides other plane outlines while preserving their Browser visibility flags; select a plane in the Browser to inspect it, or turn the option off to restore the visible outlines. With no selected plane, this option shows no ordinary plane outlines. Editing handles move with the displayed size. `Visibility: Planes` hides or shows all planes, including the selected-plane highlight, while retaining the selection; the switch is disabled only when no plane objects exist.
+
+`configs/planes.json -> render.plane_size_mm` supplies the initial GUI size and the default CLI/GUI plane-video size. `render.selected_only` supplies the GUI filter default; video exports still include the full plane layout. The Python viewer API can change these display settings with `scene.set_plane_display_settings(size_mm=8.0, selected_only=True)` and select a plane with `scene.highlight_plane(uid)`. Video-specific `plane_video.default.plane_size` or group overrides take precedence when non-null. Display settings leave centres, normals, ROI contours, areas, flow, pressure, and saved scientific arrays unchanged.
+
+`Generate Planes` replaces the complete previous plane layout, including manually added or imported planes. Old plane measurements, PWV, pathlines, selection highlights, and edit handles are cleared. Plane wireframes use a foreground renderer that clears its depth each frame while retaining the vessel image; PC-MRA, noise, and segmentation visibility changes cannot occlude their edges. Removing a plane also removes its foreground actor. Previously exported files remain on disk until a later export replaces them.
+
 The Generate Planes panel exposes `Plane Mode`, `Plane Count`, `Anchor`,
 `Direction`, `Spacing Mode`, `Spacing Ratio`, and the enabled-by-default
 `Segmentation Filter` checkbox.

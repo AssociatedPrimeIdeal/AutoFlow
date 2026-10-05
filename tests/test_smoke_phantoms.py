@@ -642,7 +642,37 @@ def test_wss_interpolates_cell_velocity_continuously_and_retains_signed_componen
     np.testing.assert_allclose(result["wss_vectors"][:, 1], 0.4 * result.point_normals[:, 0], atol=1e-10)
 
 
+@pytest.mark.parametrize("support_kind", ["image", "unstructured"])
+def test_wss_resolves_supported_normal_direction(support_kind):
+    import pyvista as pv
+    from autoflow.algorithms.surfaces import create_uniform_grid
+
+    grid = pv.ImageData(dimensions=(41, 9, 9), spacing=(0.1, 0.5, 0.5), origin=(-2, -2, -2))
+    s = -grid.points[:, 0]
+    grid.point_data["u"] = np.zeros(len(s))
+    grid.point_data["v"] = 0.4 * s + 0.04 * s**2
+    grid.point_data["w"] = np.zeros(len(s))
+    mask = np.zeros((4, 4, 4), dtype=np.uint8)
+    mask[:2] = 1
+    support = create_uniform_grid(mask, (1, 1, 1), origin=(-2, -2, -2), name="wss_lumen")
+    if support_kind == "unstructured":
+        support = support.cast_to_unstructured_grid()
+    # The supplied point normal points outward; the lumen resolves its sign.
+    wall = pv.Plane(center=(0, 0, 0), direction=(1, 0, 0), i_size=1, j_size=1,
+                    i_resolution=2, j_resolution=2)
+    result = cal_wss_from_surf(wall, grid, inward_distance=0.5, viscosity=4.0,
+                               support_grid=support)
+    assert np.all(result["wss_valid"])
+    assert np.all(result["wss_normal_flipped"])
+    np.testing.assert_allclose(result.point_normals[:, 0], -1.0)
+    np.testing.assert_allclose(result["wss_vectors"], np.tile([0, 1.6, 0], (wall.n_points, 1)), atol=1e-10)
+    np.testing.assert_allclose(result.points[:, 0], 0.0, atol=1e-7)
+
+
 def test_wss_linear_mode_and_invalid_wall_normal_samples():
+    import pyvista as pv
+    from autoflow.rendering.style import wss_display_surface, wss_scalar_range
+
     np.testing.assert_allclose(calculate_gradient([0.0], [0.3], [0.4], 1.0, use_parabolic=False), [0.3])
     mask = np.zeros((8, 8, 8, 2), dtype=bool)
     mask[2:6, 2:6, 2:6] = True
@@ -652,7 +682,141 @@ def test_wss_linear_mode_and_invalid_wall_normal_samples():
         assert not np.any(wall["wss_valid"])
         assert np.isnan(wall["wss"]).all()
         assert np.isnan(wall["wss_vectors"]).all()
+        assert np.isnan(wss_display_surface(wall)["wss"]).all()
     assert np.isnan(result["wss_volume"]).any()
+    assert wss_scalar_range(result["wss_surfaces"]) == (0.0, 1.0)
+
+    # An invalid finite probe and infinity must remain unavailable in the
+    # view; a measured zero is still valid. Display preparation cannot alter
+    # the scientific arrays used for metrics and exports.
+    wall = pv.Plane(i_resolution=1, j_resolution=1)
+    wall["wss"] = [0.0, 1.0, np.inf, 2.0]
+    wall["wss_valid"] = [1, 0, 1, 1]
+    before = wall["wss"].copy()
+    display = wss_display_surface(wall)
+    np.testing.assert_array_equal(wall["wss"], before)
+    np.testing.assert_array_equal(wall["wss_valid"], [1, 0, 1, 1])
+    np.testing.assert_array_equal(display["wss"][[0, 3]], [0.0, 2.0])
+    assert np.isnan(display["wss"][[1, 2]]).all()
+    assert wss_scalar_range([wall]) == (0.0, 2.0)
+
+
+def test_metric_display_preserves_constant_values_at_supported_wall():
+    from autoflow.rendering.datasets import display_support_surface, sample_display_field, active_wrap_mesh
+
+    mask = np.zeros((9, 10, 11), dtype=bool)
+    mask[2:7, 2:8, 2:9] = True
+    spacing, origin = np.array([1.0, 2.0, 3.0]), np.array([-4.0, 7.0, 2.0])
+    field = np.where(mask, 12.0, np.nan).astype(np.float32)
+    wall = display_support_surface(mask, spacing, origin)
+    assert wall.n_open_edges == 0
+    display = sample_display_field(field, mask, wall, spacing, origin, 'metric')
+    np.testing.assert_allclose(display['metric'], 12.0, atol=1e-5)
+    assert np.isnan(field[~mask]).all()
+
+    counts = np.zeros(mask.shape + (2, 3), dtype=np.int16)
+    counts[3, 4, 5, 0, 1] = -2
+    counts[4, 4, 5, 0, 2] = 1
+    result = {'wrap_count': counts, 'wrap_mask': counts != 0}
+    wrap = active_wrap_mesh(result, 0, spacing, origin, counts=True)
+    assert set(np.unique(wrap['wrap_count'])) == {-2, 1}
+    assert not np.any(wrap['wrap_count'] == 0)
+    assert active_wrap_mesh(result, 1, spacing, origin, counts=True) is None
+
+
+def test_vortex_display_tracks_phase_specific_support_geometry():
+    from contextlib import closing
+    import pyvista as pv
+    from autoflow.ui.viewer import SceneController
+
+    ws = Workspace()
+    support = np.zeros((14, 8, 8, 3), dtype=np.uint8)
+    support[2:5, 2:6, 2:6, 0] = 1
+    support[7:10, 2:6, 2:6, 1] = 1
+    support[..., 2] = support[..., 0]
+    ws.derived.vortex_support_mask = support
+    ws.derived.vorticity_magnitude = support.astype(np.float32) * 20.0
+    with closing(pv.Plotter(off_screen=True)) as plotter:
+        scene = SceneController(plotter, ws, lambda _: None)
+        centers = []
+        for phase in range(3):
+            ws.current_t = phase
+            mesh = scene._build_dataset('vorticity_magnitude_volume')
+            centers.append(mesh.center)
+            np.testing.assert_allclose(mesh['Vorticity Magnitude'], 20.0, atol=1e-5)
+        np.testing.assert_allclose(np.subtract(centers[1], centers[0]), [5., 0., 0.], atol=1e-5)
+        np.testing.assert_allclose(centers[2], centers[0], atol=1e-5)
+
+
+def test_tke_volume_preserves_energy_and_keeps_colourbar_opaque():
+    from contextlib import closing
+    import pyvista as pv
+    from autoflow.core.models import ObjectKind
+    from autoflow.ui.viewer import SceneController
+
+    ws = Workspace()
+    mask = np.zeros((8, 8, 8, 2), dtype=bool)
+    mask[2:6, 2:6, 2:6] = True
+    ws.segmask_binary = mask
+    energy = np.full(mask.shape, np.nan, dtype=np.float32)
+    energy[mask] = 12.0
+    energy[..., 1][mask[..., 1]] = 0.0
+    ws.derived.tke_array = energy
+    uid = ws.add_object('TKE', ObjectKind.METRIC, 'tke_volume', visible=True,
+                        scalars='TKE', cmap='inferno', clim=(0, 20), opacity=1.0, dynamic=True)
+    errors = []
+    with closing(pv.Plotter(off_screen=True)) as plotter:
+        scene = SceneController(plotter, ws, errors.append)
+        obj = ws.scene_objects[uid]
+        scene._render_object(obj)
+        assert obj.actor is not None
+        volume = obj.actor.mapper.dataset
+        assert isinstance(volume, pv.ImageData)
+        values = volume['TKE'].reshape((10, 10, 10), order='F')[1:-1, 1:-1, 1:-1]
+        np.testing.assert_allclose(values[mask[..., 0]], 12.0)
+        assert not np.any(values[~mask[..., 0]])
+        assert np.all(obj.actor.mapper.lookup_table.values[:, 3] == 255)
+        assert obj.actor.GetProperty().GetScalarOpacity(0).GetValue(0.0) == 0.0
+        obj.opacity = 0.0
+        scene.apply_object_properties(obj)
+        assert obj.actor.GetProperty().GetScalarOpacity(0).GetValue(12.0) == 0.0
+        scene.update_time(1)
+        assert not np.any(obj.actor.mapper.dataset['TKE'])
+    assert np.isnan(energy[~mask]).all()
+    assert not errors
+
+
+def test_tke_sigma_units_and_masked_invalid_background():
+    from autoflow.algorithms.metrics.tke import compute_tke_metrics, compute_tke_array_from_sigma
+
+    sigma = np.full((5, 5, 5, 2, 3), 10.0)
+    np.testing.assert_allclose(compute_tke_array_from_sigma(sigma), 15.9, rtol=1e-6)
+    mask = np.zeros(sigma.shape[:4], dtype=bool)
+    mask[1:4, 1:4, 1:4] = True
+    sigma[~mask] = np.nan
+    result = compute_tke_metrics(mask, (1, 1, 1), sigma=sigma)
+    assert not np.any(result['tke_array'][~mask])
+    np.testing.assert_allclose(result['tke_array'][mask], 15.9, rtol=1e-6)
+    with pytest.raises(ValueError, match='density'):
+        compute_tke_array_from_sigma(sigma, rho=-1)
+
+
+def test_vortex_excludes_nonfinite_stencil_even_without_extra_erosion():
+    from autoflow.algorithms.metrics.vortex import compute_vortex_metrics
+
+    mask = np.ones((9, 9, 9, 1), dtype=bool)
+    xyz = np.indices(mask.shape[:3], dtype=float)
+    flow = np.zeros(mask.shape + (3,), dtype=float)
+    flow[..., 0] = (-xyz[1])[..., None]
+    flow[..., 1] = xyz[0][..., None]
+    flow[4, 4, 4, 0, 0] = np.nan
+    result = compute_vortex_metrics(mask, flow, (1, 1, 1), support_erosion_iters=0)
+    support = result['vortex_support_mask'].astype(bool)
+    assert not support[4, 4, 4, 0]
+    assert not support[3, 4, 4, 0]
+    assert support[2, 2, 2, 0]
+    np.testing.assert_allclose(result['vorticity_magnitude'][support], 20.0)
+    assert np.isfinite(result['swirling_strength_array']).all()
 
 
 def test_static_masks_reuse_plane_and_wss_geometry(monkeypatch):
@@ -680,14 +844,14 @@ def test_static_masks_reuse_plane_and_wss_geometry(monkeypatch):
     assert support_calls == 1
 
     surface_calls = 0
-    original_extract_surface = wss._extract_surface
+    original_extract_surface = wss._prepare_wss_wall
 
     def counting_surface(*args, **kwargs):
         nonlocal surface_calls
         surface_calls += 1
         return original_extract_surface(*args, **kwargs)
 
-    monkeypatch.setattr(wss, "_extract_surface", counting_surface)
+    monkeypatch.setattr(wss, "_prepare_wss_wall", counting_surface)
     result = compute_wss_metrics(
         mask, flow, (1.0, 1.0, 1.0), smoothing_iteration=0,
     )
@@ -696,6 +860,65 @@ def test_static_masks_reuse_plane_and_wss_geometry(monkeypatch):
     for wall in result["wss_surfaces"]:
         assert np.all(wall["wss_valid"])
         assert np.all(np.sum((wall.points - np.array([4, 4, 4])) * wall.point_normals, axis=1) < 0)
+
+
+def test_wss_closed_wall_preserves_cavity_and_separate_lumens():
+    from autoflow.algorithms.metrics.wss import _prepare_wss_wall
+
+    spacing = np.array([1.0, 1.0, 2.0])
+    origin = np.array([-5.0, 3.0, 9.0])
+    mask = np.zeros((24, 16, 16), dtype=bool)
+    mask[2:12, 2:14, 2:14] = True
+    mask[5:9, 5:11, 5:11] = False
+    mask[17:22, 4:12, 4:12] = True
+    wall, support = _prepare_wss_wall(mask, spacing, origin, 200)
+    assert wall.n_open_edges == 0
+    indices = np.array([[3, 7, 7], [6, 7, 7], [14, 7, 7], [19, 7, 7], [0, 0, 0]])
+    points = origin + (indices + 0.5) * spacing
+    np.testing.assert_array_equal(support.contains(points), [True, False, False, True, False])
+
+
+@pytest.mark.parametrize("spacing,direction", [((2.5, 2.5, 2.5), (0, 0, 1)),
+                                              ((1.0, 1.0, 2.5), (1, 1, 2))])
+def test_wss_poiseuille_curved_wall_phantom(spacing, direction):
+    spacing = np.asarray(spacing, dtype=float)
+    axis = np.asarray(direction, dtype=float)
+    axis /= np.linalg.norm(axis)
+    radius, length = 10.0, 40.0
+    extent = radius + np.abs(axis) * length / 2 + 4 * np.max(spacing)
+    shape = np.ceil(2 * extent / spacing).astype(int)
+    origin = -shape * spacing / 2
+    xyz = np.stack(np.meshgrid(*[origin[k] + (np.arange(size) + 0.5) * spacing[k]
+                                for k, size in enumerate(shape)], indexing="ij"), axis=-1)
+    axial = xyz @ axis
+    r2 = np.sum(xyz * xyz, axis=-1) - axial * axial
+    mask = (r2 < radius ** 2) & (np.abs(axial) < length / 2)
+    flow = 100 * np.maximum(0.5 * (1 - r2 / radius ** 2), 0)[..., None] * axis
+    wall = compute_wss_metrics(mask[..., None], flow[..., None, :], spacing,
+                               origin=origin)["wss_surfaces"][0]
+    side = np.abs(np.asarray(wall.points) @ axis) < length / 4
+    assert wall.n_open_edges == 0
+    assert np.all(wall["wss_valid"][side])
+    true_wss = 0.4
+    # This end-to-end bound includes reconstructed-wall and interpolation
+    # error, unlike a test of the derivative formula on exact point fields.
+    assert np.mean(np.abs(wall["wss"][side] - true_wss)) / true_wss < 0.15
+    vectors = np.asarray(wall["wss_vectors"])[side]
+    assert np.all(vectors @ axis > 0)
+
+
+def test_wss_thin_lumen_does_not_gain_unsupported_samples():
+    mask = np.zeros((12, 12, 12, 1), dtype=bool)
+    # Touching the acquisition boundary must still yield a closed wall, and
+    # its broad faces cannot support a two-voxel path across the thin axis.
+    mask[0:10, 5:6, 3:9] = True
+    flow = np.ones(mask.shape + (3,), dtype=float) * 10
+    wall = compute_wss_metrics(mask, flow, (1, 1, 1))["wss_surfaces"][0]
+    assert wall.n_open_edges == 0
+    thin_faces = np.abs(wall.point_normals[:, 1]) > 0.9
+    assert np.any(thin_faces)
+    assert not np.any(wall["wss_valid"][thin_faces])
+    assert np.isnan(wall["wss"][thin_faces]).all()
 
 
 def test_derived_cache_signature_invalidates_changed_wss_parameters(monkeypatch):
@@ -1424,6 +1647,135 @@ def test_disabled_background_correction_does_not_read_compressed_cache(monkeypat
     loaded = load_h5_data(str(path), correction_config={"enabled": False})
     assert np.array_equal(loaded.flow, flow)
     assert loaded.metadata["background_phase_correction"]["skipped_reason"] == "disabled"
+
+
+@pytest.mark.parametrize("layout", ["normalized", "complex", "dual", "real_phase"])
+def test_gui_load_saved_corr_and_recompute_from_source(monkeypatch, tmp_path, layout):
+    _smoke_qt_application(monkeypatch)
+    from autoflow.ui.app import _PipelineTaskWorker
+    import autoflow.algorithms.phase_correction as correction
+    shape = (3, 2, 4, 2)
+    phase = np.array([0.4, -0.3, 0.2], dtype=np.float32)
+    old_corr = np.full(shape[:3] + (1, 3), 0.05, dtype=np.float32)
+    path = tmp_path / f"saved_corr_{layout}.h5"
+    venc = np.full(6 if layout == "dual" else 3, 100.0, dtype=np.float32)
+    if layout == "dual":
+        venc[3:] = 200.0
+    with h5py.File(path, "w") as handle:
+        if layout == "normalized":
+            handle["mag"] = np.ones(shape, dtype=np.float32)
+            handle["flow"] = np.broadcast_to(phase * 100 / np.pi, shape + (3,))
+        elif layout == "real_phase":
+            img = np.ones(shape + (4,), dtype=np.float32)
+            # The loader recognizes combined real input near the full phase range.
+            phase = np.array([3.0, -3.0, 0.2], dtype=np.float32)
+            img[..., 1:4] = phase
+            handle["img"] = img
+        else:
+            img = np.ones(shape + (7 if layout == "dual" else 4,), dtype=np.complex64)
+            img[..., 1:4] = np.exp(1j * phase)
+            if layout == "dual":
+                img[..., 4:7] = np.exp(1j * phase / 2)
+            handle["img"] = img
+        handle["VENC"] = venc
+        handle["SpatialOrder"] = np.array(["LR", "AP", "FH"], dtype="S4")
+        handle["VENCOrder"] = np.array(["LR", "AP", "FH"], dtype="S4")
+        handle["seg"] = np.ones(shape, dtype=np.int16)
+        cache_names = ("corr_low", "corr_high") if layout == "dual" else ("corr",)
+        for name in cache_names:
+            # Untagged legacy MSAC caches must load even when the GUI selects WRLS.
+            handle[name] = old_corr
+    original = path.read_bytes()
+    calls = []
+    def fit(values, **kwargs):
+        calls.append(values.copy())
+        corr = np.full((3, 1) + values.shape[2:], 0.1, dtype=np.float32)
+        return corr, np.ones(values.shape[2:], dtype=bool), {"applied": True}
+    monkeypatch.setattr(correction, "execute_wrls_arto", fit)
+    monkeypatch.setattr(correction, "execute_msac", fit)
+    ws = Workspace()
+    ws.paths.flow_path = str(path)
+    ws.loader_params.background_phase_correction.method = "wrls_arto"
+    # Force-recompute settings apply to manual runs, not opening saved results.
+    ws.loader_params.background_phase_correction.force_recompute = True
+    events = []
+    engine = PipelineEngine()
+    engine.load_data(ws, lambda _: None, progress_callback=events.append, reuse_existing_corr=True)
+    assert calls == []
+    assert path.read_bytes() == original  # Opening applies a cache without writing H5.
+    expected = (phase - 0.05) * 100 / np.pi
+    np.testing.assert_allclose(ws.flow_raw, np.broadcast_to(expected, shape + (3,)), atol=2e-5)
+    assert ws.correction_raw is not None
+    if layout == "dual":
+        assert ws.correction_high_raw is not None
+    else:
+        meta = ws.input_state.metadata["background_phase_correction"]
+        assert meta["corr_algorithm"] == "msac" and meta["cache_only"]
+    messages = [e.get("message", "") for e in events]
+    assert any("Loading saved background correction" in text for text in messages)
+    assert any("Applying saved corr" in text for text in messages)
+    if layout == "dual":
+        assert any("Low VENC" in text and "Applying saved corr" in text for text in messages)
+        assert any("High VENC" in text and "Applying saved corr" in text for text in messages)
+    if layout != "dual":
+        np.testing.assert_allclose(ws.phase_wrapped, np.broadcast_to(phase - 0.05, shape + (3,)), atol=2e-6)
+    # The GUI worker must force recomputation even when force_recompute is off.
+    ws.loader_params.background_phase_correction.force_recompute = False
+    ws.loader_params.background_phase_correction.write_cache = True
+    expected_calls = 2 if layout == "dual" else 1
+    source_key = "flow" if layout == "normalized" else "img"
+    with h5py.File(path, "r") as handle:
+        source = handle[source_key][:]
+    for _ in range(2):
+        worker = _PipelineTaskWorker(engine, ws, [StepId.BACKGROUND_CORRECTION])
+        failures = []
+        worker.failed.connect(failures.append)
+        worker.run()
+        assert not failures
+        assert len(calls) == expected_calls
+        source_phases = [np.angle(values[1:4, 0, 0, 0, 0] * np.conj(values[0, 0, 0, 0, 0])) for values in calls]
+        source_phases.sort(key=lambda value: float(value[0]))
+        expected_phases = [phase / 2, phase] if layout == "dual" else [phase]
+        expected_phases.sort(key=lambda value: float(value[0]))
+        np.testing.assert_allclose(source_phases, expected_phases, atol=2e-6)
+        calls.clear()
+        expected = (phase - 0.1) * 100 / np.pi
+        np.testing.assert_allclose(ws.flow_raw, np.broadcast_to(expected, shape + (3,)), atol=2e-5)
+        with h5py.File(path, "r") as handle:
+            np.testing.assert_array_equal(handle[source_key][:], source)
+            for name in cache_names:
+                np.testing.assert_allclose(handle[name][:], 0.1)
+    reloaded = load_h5_data(str(path), reuse_existing_corr=True)
+    np.testing.assert_allclose(reloaded.flow, ws.flow_raw, atol=2e-5)
+
+
+@pytest.mark.parametrize("cache", ["missing", "shape", "nonfinite", "wrong_group"])
+def test_gui_load_invalid_corr_keeps_source_without_fitting(monkeypatch, tmp_path, cache):
+    shape = (3, 2, 4, 2)
+    path = tmp_path / "invalid_corr.h5"
+    with h5py.File(path, "w") as handle:
+        handle["mag"] = np.ones(shape, dtype=np.float32)
+        handle["flow"] = np.full(shape + (3,), 10.0, dtype=np.float32)
+        handle["SpatialOrder"] = np.array(["LR", "AP", "FH"], dtype="S4")
+        handle["VENCOrder"] = np.array(["LR", "AP", "FH"], dtype="S4")
+        if cache != "missing":
+            corr = np.full((1, 1, 1, 1, 3) if cache == "shape" else shape[:3] + (1, 3), 0.05)
+            if cache == "nonfinite":
+                corr[..., 0] = np.nan
+            ds = handle.create_dataset("corr", data=corr)
+            if cache == "wrong_group":
+                ds.attrs["corr_source_group"] = "AnotherCase"
+    calls = []
+    def fit(*args, **kwargs):
+        calls.append(True)
+        raise AssertionError("opening a case must never fit a missing or invalid corr")
+    monkeypatch.setattr("autoflow.algorithms.phase_correction.execute_msac", fit)
+    monkeypatch.setattr("autoflow.algorithms.phase_correction.execute_wrls_arto", fit)
+    loaded = load_h5_data(str(path), reuse_existing_corr=True)
+    assert calls == []
+    np.testing.assert_array_equal(loaded.flow, 10.0)
+    assert loaded.correction is None
+    assert not loaded.metadata["background_phase_correction"]["applied"]
 
 
 def test_msac_reports_trial_progress():
@@ -2519,7 +2871,7 @@ def test_plane_video_label_style_uses_plane_render_config(monkeypatch, tmp_path)
     )
 
     monkeypatch.setattr("autoflow.rendering.videos._build_union_surface", lambda ws, smoothing_iteration=200: (None, DummyPoly()))
-    monkeypatch.setattr("autoflow.rendering.videos._make_plotter", lambda window_size=None: plotter)
+    monkeypatch.setattr("autoflow.rendering.videos._make_plotter", lambda window_size=None, background=None, workspace=None: plotter)
     monkeypatch.setattr("autoflow.rendering.videos._plane_mesh", lambda center_world, normal, size: SimpleNamespace(n_points=4))
     monkeypatch.setattr("autoflow.rendering.videos._path_polydata", lambda path_world: SimpleNamespace(n_points=len(path_world)))
     monkeypatch.setattr("autoflow.rendering.videos._orbit_camera", lambda poly, azimuth_deg, elevation_deg=0.0, distance_scale=1.0: [tuple([0.0, 0.0, 0.0]), tuple([0.0, 0.0, 0.0]), (0.0, 0.0, 1.0)])
@@ -3630,7 +3982,7 @@ def test_generated_pcmra_is_explicit_and_noise_region_is_renderable():
         assert not noise.visible
         assert noise.color == "#ff0000"
         mesh = controller._build_dataset("noise_region")
-        assert isinstance(mesh, pv.ImageData)
+        assert isinstance(mesh, pv.PolyData)
         rejected = mesh.point_data["Noise mask"] > 0
         assert np.count_nonzero(rejected) == np.count_nonzero(~ws.pcmra_render_mask)
         noise_positions = mesh.points[rejected]
@@ -3754,46 +4106,41 @@ def test_noise_overlay_phantom_paints_over_segmentation_and_refreshes(monkeypatc
         application.processEvents()
 
 
-@pytest.mark.parametrize("mapper", ["smart", "fixed_point"])
-def test_noise_region_phantom_opacity_does_not_accumulate_with_depth(mapper):
+@pytest.mark.parametrize('depth', [2, 60])
+def test_noise_region_phantom_points_exclude_retained_voxels_and_zero_padding(depth):
     from contextlib import closing
     import pyvista as pv
     from autoflow.core.models import ObjectKind
     from autoflow.ui.viewer import SceneController
 
-    pixels = []
-    for depth in (2, 60):
-        ws = Workspace()
-        ws.pcmra_render_mask = np.zeros((5, depth, 5), dtype=bool)
-        uid = ws.add_object("Noise Region", ObjectKind.AUX, "noise_region", visible=True, color="#ff0000", opacity=0.15)
-        errors = []
-        with closing(pv.Plotter(off_screen=True, window_size=(128, 128))) as plotter:
-            plotter.set_background("black")
-            controller = SceneController(plotter, ws, errors.append)
-            controller._volume_mapper_name = lambda: mapper
-            controller.render_all()
-            obj = ws.scene_objects[uid]
-            assert obj.actor is not None
-            assert obj.actor.GetMapper().GetBlendMode() == 1
-            assert obj.actor.GetProperty().GetScalarOpacity(0).GetValue(0.0) == 0.0
-            assert obj.actor.GetProperty().GetScalarOpacity(0).GetValue(1.0) == 0.15
-            plotter.camera_position = [(2.5, -150.0, 2.5), (2.5, 2.5, 2.5), (0.0, 0.0, 1.0)]
-            plotter.enable_parallel_projection()
-            plotter.camera.parallel_scale = 4.0
-            image = plotter.screenshot()
-            pixels.append(image[64, 64])
-            assert 30 <= int(image[64, 64, 0]) <= 45
-            assert not image[64, 64, 1:].any()
-            obj.opacity = 0.05
-            controller.apply_object_properties(obj)
-            assert obj.actor.GetProperty().GetScalarOpacity(0).GetValue(1.0) == 0.05
-            image = plotter.screenshot()
-            assert 8 <= int(image[64, 64, 0]) <= 18
-            ws.pcmra_render_mask = np.ones_like(ws.pcmra_render_mask)
-            controller.readd_object(obj)
-            assert obj.actor is None
-        assert not errors
-    np.testing.assert_allclose(pixels[0], pixels[1], atol=1)
+    ws = Workspace()
+    ws.pcmra_render_mask = np.ones((5, depth, 5), dtype=bool)
+    ws.pcmra_render_mask[2, :, 2] = False
+    ws.pcmra_render_mask[0] = False
+    ws.mag_raw = np.ones((5, depth, 5, 1), dtype=np.float32)
+    ws.mag_raw[0] = 0.0
+    uid = ws.add_object('Noise Region', ObjectKind.AUX, 'noise_region', visible=True,
+                        color='#ff0000', opacity=0.15, point_size=2)
+    errors = []
+    with closing(pv.Plotter(off_screen=True, window_size=(128, 128))) as plotter:
+        controller = SceneController(plotter, ws, errors.append)
+        controller.render_all()
+        obj = ws.scene_objects[uid]
+        assert obj.actor is not None
+        cloud = obj.actor.mapper.dataset
+        assert cloud.n_points == depth
+        voxels = np.rint(cloud.points / ws.resolution - 0.5).astype(int)
+        assert not ws.pcmra_render_mask[tuple(voxels.T)].any()
+        assert np.all(ws.mag_raw[tuple(voxels.T) + (0,)] > 0)
+        np.testing.assert_array_equal(cloud['Noise RGBA'][:, :3], [[255, 0, 0]] * depth)
+        np.testing.assert_allclose(cloud['Noise RGBA'][:, 3] / 255, .15, atol=1/255)
+        obj.opacity = 0.05
+        controller.apply_object_properties(obj)
+        np.testing.assert_allclose(cloud['Noise RGBA'][:, 3] / 255, .05, atol=1/255)
+        ws.pcmra_render_mask = np.ones_like(ws.pcmra_render_mask)
+        controller.readd_object(obj)
+        assert obj.actor is None
+    assert not errors
 
 
 def test_correction_phantom_gui_refresh_enables_noise_overlay_and_pcmra_controls(monkeypatch):
@@ -4016,6 +4363,88 @@ def _smoke_qt_application(monkeypatch):
     return _qt_smoke_application
 
 
+def test_browser_plane_phantom_display_controls_and_visibility_clicks(monkeypatch, tmp_path):
+    app = _smoke_qt_application(monkeypatch)
+    monkeypatch.setenv("AUTOFLOW_SSH_RENDERING", "1")
+    from PySide6 import QtCore, QtTest
+    import pyvista as pv
+    import autoflow.ui.app as ui_app
+    from autoflow.ui.remote_plotter import RemotePlotter
+    from autoflow.core.models import ObjectKind
+    monkeypatch.setattr(ui_app, "RemotePlotter", RemotePlotter, raising=False)
+    window = ui_app.MainWindow()
+    try:
+        window.show()
+        app.processEvents()
+        assert not window.chk_all_planes_visible.isEnabled()
+        assert not window.chk_all_pathlines_visible.isEnabled()
+        browser = window.tree_objects.parentWidget()
+        assert window.slider_plane_size.parentWidget() is browser
+        assert window.spin_plane_size.parentWidget() is browser
+        assert window.chk_plane_selected_only.parentWidget() is browser
+        ws = window.workspace
+        ws.paths.output_dir = str(tmp_path)
+        ws.data_loaded = True
+        ws.flow_raw = np.zeros((7, 7, 7, 2, 3), dtype=np.float32)
+        ws.mag_raw = np.ones((7, 7, 7, 2), dtype=np.float32)
+        ws.segmask_3d = np.ones((7, 7, 7), dtype=bool)
+        ws.planes = [PlaneData(center=np.array([3., 3., float(z)]), normal=np.array([0., 0., 1.]))
+                     for z in (2, 4)]
+        planes = [ws.scene_objects[ws.add_object(f"Plane {i}", ObjectKind.PLANE, f"plane_{i}")]
+                  for i in range(2)]
+        ws.active_pathline_plane_indices = [0, 1]
+        for i in range(2):
+            ws.pathline_cache[i] = {0: pv.Line((2, 3, i + 2), (4, 3, i + 2))}
+        pathlines = [ws.scene_objects[ws.add_object(f"Pathline {i}", ObjectKind.FLOW, f"pathline_{i}")]
+                     for i in range(2)]
+        window.scene.sync_from_workspace()
+        window._refresh_browser()
+        item = window._find_browser_item_by_uid(planes[0].uid)
+        window.tree_objects.setCurrentItem(item)
+        window.chk_plane_selected_only.setChecked(True)
+        app.processEvents()
+        assert [obj.actor.GetVisibility() for obj in planes] == [1, 0]
+        highlight = window.scene._highlight_plane_actor
+        assert highlight.GetVisibility()
+
+        def click(checkbox):
+            QtTest.QTest.mouseClick(checkbox, QtCore.Qt.LeftButton,
+                                   pos=QtCore.QPoint(8, checkbox.height() // 2))
+            app.processEvents()
+
+        # Exercise Qt's actual signal type and mouse-click state transitions.
+        click(window.chk_all_planes_visible)
+        assert window.chk_all_planes_visible.checkState() == QtCore.Qt.Unchecked
+        assert not any(obj.visible or obj.actor.GetVisibility() for obj in planes)
+        assert not highlight.GetVisibility()
+        assert window.tree_objects.currentItem() is item and item.isSelected()
+        click(window.chk_all_planes_visible)
+        assert all(obj.visible for obj in planes)
+        assert [obj.actor.GetVisibility() for obj in planes] == [1, 0]
+        assert highlight.GetVisibility()
+        assert window.chk_plane_selected_only.isChecked()
+        window._find_browser_item_by_uid(planes[1].uid).setCheckState(0, QtCore.Qt.Unchecked)
+        assert window.chk_all_planes_visible.checkState() == QtCore.Qt.PartiallyChecked
+        click(window.chk_all_planes_visible)
+        assert all(obj.visible for obj in planes)
+        assert window.chk_all_planes_visible.checkState() == QtCore.Qt.Checked
+        assert window.chk_all_pathlines_visible.checkState() == QtCore.Qt.PartiallyChecked
+        click(window.chk_all_pathlines_visible)
+        assert all(obj.visible and obj.actor.GetVisibility() for obj in pathlines)
+        click(window.chk_all_pathlines_visible)
+        assert not any(obj.visible or obj.actor.GetVisibility() for obj in pathlines)
+        click(window.chk_all_pathlines_visible)
+        assert all(obj.visible and obj.actor.GetVisibility() for obj in pathlines)
+        window.spin_plane_size.setValue(6.0)
+        assert window.slider_plane_size.value() == 60
+        assert planes[0].actor.mapper.dataset.length == pytest.approx(6 * np.sqrt(2))
+        window.chk_plane_selected_only.setChecked(False)
+        assert all(obj.actor.GetVisibility() for obj in planes)
+    finally:
+        window.plotter.close()
+        window.hide()
+
+
 def test_progress_dialog_blocks_other_windows_and_keeps_activity_until_cancel_stops(monkeypatch):
     app = _smoke_qt_application(monkeypatch)
     from PySide6 import QtCore, QtGui, QtTest, QtWidgets
@@ -4100,3 +4529,157 @@ def test_cancelled_plane_h5_export_preserves_previous_complete_file(tmp_path):
         assert saved["completed"][0] == 123
         assert "planes" not in saved
     assert not list(tmp_path.glob(".autoflow_plane_*"))
+
+
+def test_plane_overlay_phantom_keeps_edges_visible_and_removes_stale_actors():
+    from contextlib import closing
+    import pyvista as pv
+    from autoflow.core.models import ObjectKind
+    from autoflow.ui.viewer import SceneController
+
+    ws = Workspace()
+    ws.planes = [PlaneData(center=np.zeros(3), normal=np.array([0., 0., 1.]))]
+    ws.render_settings["plane_render_cfg"] = {"plane_size_mm": 25.0}
+    uid = ws.add_object("Plane", ObjectKind.PLANE, "plane_0", color="yellow",
+                        visible=True, opacity=0.75, line_width=4)
+    errors = []
+    with closing(pv.Plotter(off_screen=True, window_size=(256, 256))) as plotter:
+        scene = SceneController(plotter, ws, errors.append)
+        scene.initialize()
+        scene._render_object(ws.scene_objects[uid])
+        overlay = scene._plane_overlay_renderer
+        # Do not let a spare orientation renderer accidentally clear depth
+        # before the plane layer and conceal this regression.
+        for renderer in plotter.render_window.GetRenderers():
+            if renderer.GetLayer() > 0 and renderer is not overlay:
+                renderer.SetDraw(False)
+        plotter.disable_anti_aliasing()
+        shell = plotter.add_mesh(pv.Sphere(radius=15), color="red", render=False,
+                                 reset_camera=False, opacity=1.0)
+        plotter.camera_position = [(0., 0., 40.), (0., 0., 0.), (0., 1., 0.)]
+        plotter.camera.parallel_projection = True
+        plotter.camera.parallel_scale = 18.0
+        plotter.show(auto_close=False, interactive=False)
+
+        def yellow_pixels():
+            frame = plotter.screenshot()
+            return ((frame[..., 0] > 150) & (frame[..., 1] > 150)
+                    & (frame[..., 2] < 80))
+
+        actor = ws.scene_objects[uid].actor
+        foreground = yellow_pixels()
+        shell.SetVisibility(False)
+        plotter.render()
+        np.testing.assert_array_equal(yellow_pixels(), foreground)
+        assert np.count_nonzero(foreground) > 500
+        shell.SetVisibility(True)
+        for _ in range(6):
+            ws.scene_objects[uid].visible = False
+            scene.apply_object_properties(ws.scene_objects[uid])
+            ws.scene_objects[uid].visible = True
+            scene.apply_object_properties(ws.scene_objects[uid])
+        np.testing.assert_array_equal(yellow_pixels(), foreground)
+        camera = list(plotter.camera_position)
+        scene.toggle_axes()
+        scene.toggle_axes()
+        assert ws.scene_objects[uid].actor is actor
+        np.testing.assert_allclose(list(plotter.camera_position), camera)
+        scene.highlight_plane(uid)
+        highlight = scene._highlight_plane_actor
+        assert highlight is not None
+        del ws.scene_objects[uid]
+        scene.sync_from_workspace(rebuild_prefixes=("pcmra_volume", "noise_region"))
+        assert not overlay.HasViewProp(actor)
+        assert not overlay.HasViewProp(highlight)
+        assert scene._highlight_plane_uid is None
+        assert overlay.GetViewProps().GetNumberOfItems() == 0
+    assert not errors
+
+
+def test_geometry_phantom_reruns_replace_old_planes_and_clear_measurements(tmp_path):
+    from contextlib import closing
+    import pyvista as pv
+    from autoflow.core.models import ObjectKind
+    from autoflow.ui.viewer import SceneController
+
+    x, y, z = np.indices((25, 25, 41))
+    mask = ((x - 12) ** 2 + (y - 12) ** 2 < 25) & (z >= 3) & (z <= 37)
+    ws = Workspace()
+    ws.data_loaded = True
+    ws.segmask_raw = np.repeat(mask[..., None].astype(np.int16), 2, axis=3)
+    ws.flow_raw = np.zeros(mask.shape + (2, 3), dtype=np.float32)
+    ws.flow_raw[..., 2] = ws.segmask_raw * 20.0
+    ws.paths.output_dir = str(tmp_path)
+    ws.plane_gen_params.plane_mode = "evenly_spaced"
+    ws.plane_gen_params.plane_count = 3
+    ws.plane_gen_params.start_distance = ws.plane_gen_params.end_distance = 0.0
+    ws.plane_gen_params.segmentation_filter = False
+    engine = PipelineEngine()
+    for step in (StepId.GENERATE_SKELETON, StepId.GENERATE_GRAPH, StepId.GENERATE_PLANES):
+        result = engine.run_step(ws, step, lambda _: None)
+        assert result.success and not result.skipped, result.message
+    assert len(ws.planes) == 3
+    errors = []
+    with closing(pv.Plotter(off_screen=True, window_size=(160, 160))) as plotter:
+        scene = SceneController(plotter, ws, errors.append)
+        scene.initialize()
+        scene.render_all()
+        plane_objects = [obj for obj in ws.scene_objects.values() if obj.kind == ObjectKind.PLANE]
+        old_actors = [obj.actor for obj in plane_objects]
+        measurements, _, _ = engine._compute_plane_metrics_internal(ws, save=False, include_derived=False)
+        centers = [plane.center.copy() for plane in ws.planes]
+        normals = [plane.normal.copy() for plane in ws.planes]
+        scene.set_plane_display_settings(size_mm=6.0)
+        for obj, old_actor in zip(plane_objects, old_actors):
+            assert obj.actor is old_actor
+            assert np.isclose(obj.actor.mapper.dataset.length, 6.0 * np.sqrt(2))
+        scene.highlight_plane(plane_objects[0].uid)
+        scene.set_plane_display_settings(selected_only=True)
+        assert [obj.actor.GetVisibility() for obj in plane_objects] == [1, 0, 0]
+        assert all(obj.visible for obj in plane_objects)
+        scene.highlight_plane(plane_objects[1].uid)
+        assert [obj.actor.GetVisibility() for obj in plane_objects] == [0, 1, 0]
+        scene.set_plane_display_settings(selected_only=False)
+        scene.highlight_plane(None)
+        assert all(obj.actor.GetVisibility() for obj in plane_objects)
+        recomputed, _, _ = engine._compute_plane_metrics_internal(ws, save=False, include_derived=False)
+        assert recomputed == measurements
+        for plane, center, normal in zip(ws.planes, centers, normals):
+            np.testing.assert_array_equal(plane.center, center)
+            np.testing.assert_array_equal(plane.normal, normal)
+        ws.derived.plane_metrics = [{"old_measurement": 1.0}] * len(ws.planes)
+        ws.derived.plane_pixelwise_file = "previous-plane-metrics.h5"
+        ws.pathline_cache[0] = "old-pathline"
+        ws.pathline_seed_cache[0] = "old-seed"
+        ws.active_pathline_plane_indices = [0]
+        ws.add_object("Old pathline", ObjectKind.FLOW, "pathline_0", visible=False)
+        ws.pipeline.mark_done(StepId.COMPUTE_PLANE_METRICS)
+        ws.plane_gen_params.plane_count = 1
+        assert engine.run_step(ws, StepId.GENERATE_PLANES, lambda _: None).success
+        scene.sync_from_workspace(rebuild_prefixes=("plane_", "smooth_path_", "pathline_"))
+        assert len(ws.planes) == 1
+        assert not any(scene._plane_overlay_renderer.HasViewProp(actor) for actor in old_actors)
+        assert scene._plane_overlay_renderer.GetViewProps().GetNumberOfItems() == 1
+        assert ws.derived.plane_metrics == []
+        assert not ws.derived.plane_pixelwise_file
+        assert not ws.pathline_cache and not ws.pathline_seed_cache
+        assert not ws.active_pathline_plane_indices
+        assert not ws.pipeline.is_done(StepId.COMPUTE_PLANE_METRICS)
+
+        assert engine.run_step(ws, StepId.GENERATE_GRAPH, lambda _: None).success
+        scene.sync_from_workspace(rebuild_prefixes=("graph_", "path_"))
+        assert not ws.planes
+        assert scene._plane_overlay_renderer.GetViewProps().GetNumberOfItems() == 0
+        assert not ws.pipeline.is_done(StepId.GENERATE_PLANES)
+        assert engine.run_step(ws, StepId.GENERATE_PLANES, lambda _: None).success
+        scene.sync_from_workspace()
+        assert len(ws.planes) == 1
+        assert engine.run_step(ws, StepId.GENERATE_SKELETON, lambda _: None).success
+        scene.sync_from_workspace(rebuild_prefixes=("skeleton_",))
+        assert not ws.planes and not ws.centerline_paths
+        assert ws.graph.points.size == 0 and ws.branch_labels is None
+        assert scene._plane_overlay_renderer.GetViewProps().GetNumberOfItems() == 0
+        assert not ws.pipeline.is_done(StepId.GENERATE_GRAPH)
+        assert not ws.pipeline.is_done(StepId.GENERATE_PLANES)
+        assert not any(obj.kind == ObjectKind.PLANE for obj in ws.scene_objects.values())
+    assert not errors

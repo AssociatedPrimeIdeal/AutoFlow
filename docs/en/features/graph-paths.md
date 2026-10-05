@@ -18,6 +18,8 @@ graph, paths, planes, and metrics; graph edits clear paths, planes, and metrics.
 Run the next centerline action after finishing an edit.
 
 ## When To Use It
+
+Regenerating the graph clears the previous plane layout, smoothed display paths, plane measurements, PWV, and plane pathlines. Generate planes again against the new graph.
 - use it after a valid skeleton exists
 - use it before plane generation
 - use GUI editing when automatic graph structure needs correction

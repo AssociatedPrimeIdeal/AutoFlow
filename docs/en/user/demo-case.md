@@ -11,7 +11,7 @@ On Windows the same file is available as:
 
 The screenshots in this page are unedited captures from autoflow-gui running on a private server display. Every operation is also shown as a CLI command. The exact counts below are from the run captured on 2026-10-02; counts can change after mask edits or configuration changes.
 
-The screenshots show the earlier workflow captured on 2026-10-02. Current navigation is **Input & QC → Correction → Segmentation**; background correction now runs explicitly in Correction, and optional unwrapping is in that same stage. Historical screenshots/counts are retained as review examples.
+The screenshots show the earlier workflow captured on 2026-10-02. Current navigation is **Input & QC → Correction → Segmentation**; existing H5 correction fields are applied during load, while Background Correction explicitly recomputes from the original source in Correction, and optional unwrapping is in that same stage. Historical screenshots/counts are retained as review examples.
 
 ## Before you start
 
@@ -24,11 +24,11 @@ The case is a legacy complex dual-VENC H5. It has 20 cardiac phases, low VENC 50
 
 ## 1. Inspect the H5 keys before loading
 
-**GUI.** Start autoflow-gui, choose **File > Open H5**, and select the case. The dual-VENC dialog appears before loading. Choose **DV (combine low and high VENC)**.
+**GUI.** Start autoflow-gui, choose **File > Load H5**, and select the case. The dual-VENC dialog appears before loading. Choose **DV (combine low and high VENC)**.
 
 ![Initial AutoFlow GUI](../../assets/images/dv-gui/00-start.png)
 
-![Open H5 dialog](../../assets/images/dv-gui/01-open-h5.png)
+![H5 file selection dialog](../../assets/images/dv-gui/01-open-h5.png)
 
 ![Dual-VENC source selection](../../assets/images/dv-gui/02-dual-venc-source.png)
 
@@ -252,7 +252,7 @@ The same workflow accepts DICOM directories through the [4DFlow_Dicom2H5 convert
       --dicom-backend dicom2h5 --dicom-h5-dir "$OUT/converted-h5" \
       --bgc --autoseg --with wss,pg --no-cache-write
 
-In the GUI use **File > Import DICOM Directory** to create a new H5 through Dicom2H5 and then load it. Conversion never overwrites an existing destination. Converted magnitude plus velocity inputs support skeletons, graphs, planes, metrics, WSS, pressure and streamlines; TKE remains optional.
+In the GUI use **File > Load DICOM** to create a new H5 through Dicom2H5 and then load it. Conversion never overwrites an existing destination. Converted magnitude plus velocity inputs support skeletons, graphs, planes, metrics, WSS, pressure and streamlines; TKE remains optional.
 
 ## Output checklist
 

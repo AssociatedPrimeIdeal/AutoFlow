@@ -20,7 +20,7 @@ Use to study spatial pressure variation and pressure drops after reviewing segme
 
 ## Quick use
 
-GUI: select pressure reconstruction in **WSS / TKE / Pressure / Vortex**; inspect support, PG and relative pressure, and centreline profiles. The 3D pressure layer colours the smoothed valid support surface.
+GUI: select pressure reconstruction in **WSS / TKE / Pressure / Vortex**; inspect support, PG and relative pressure, and centreline profiles. The 3-D layer colours a closed Taubin-smoothed valid support surface. Display interpolation is normalized by finite support weights, avoiding dilution by the zero-filled background. The default layer opacity is 1.0 for clear colour reading; GUI and videos use the same geometry and sampling.
 
 CLI:
 
@@ -42,11 +42,29 @@ Calibrated velocity, segmentation, spacing/origin and RR. Phase timing assumes a
 
 ## Parameters
 
+GUI and videos read shared materials from `configs/render_style.json`, shared colourbar layout from `configs/colorbar.json`, and layer styles from the metric JSON `render` groups. See [Rendering configuration layout](../developer/config-system.md#rendering-configuration-layout) and the complete [parameter tables](../user/parameters.md). Restart the GUI or start a new run after editing the selected JSON files.
+
+
 [All pressure parameters](../user/parameters.md#pressure_gradient) and [shared fluid properties](../user/parameters.md#fluid). Methods are `ppe` and `ste`; `least_squares` remains an input compatibility alias for `ppe`. Default extra erosion is one iteration. `support_erosion_iters=0` disables only the additional margin. Display ranges/opacity do not change numerical results.
+
+Low-level `compute_centerline_pressure_profiles` additionally accepts:
+
+| Parameter | Type | Default | Where configured | Effect | Code owner |
+| --- | --- | --- | --- | --- | --- |
+| `support_mask` | bool XYZT array or None | `None` | Python keyword; pipeline supplies its valid PG support automatically | Reject unsupported samples and drops across disconnected gauges; without a mask, finite volume samples define support | `autoflow/algorithms/metrics/pressure.py` |
+
+`summarize_plane_derived_metrics` and `augment_plane_metrics_with_derived` accept:
+
+| Parameter | Type | Default | Where configured | Effect | Code owner |
+| --- | --- | --- | --- | --- | --- |
+| `pressure_gradient_support_mask` | bool XYZ/XYZT array or None | `None` | Python keyword; pipeline supplies valid PG support | Exclude unavailable pressure cells from plane summaries; without a mask, finite samples define support | `autoflow/algorithms/metrics/plane_derived.py` |
 
 ## Outputs
 
-Volume PG vector/magnitude, valid support, relative-pressure arrays, centreline profiles and drops; `derived_metrics_pixelwise.npz` and augmented plane JSON/H5. `summary.json` records `pressure_gradient_dt_s` and `pressure_gradient_temporal_scheme=periodic_central_difference`. See [Outputs](../user/outputs.md) for keys and units.
+Plane pressure statistics use the valid pressure-derivative support, excluding zero padding outside it. Unavailable phases are JSON `null`; valid measured zero remains `0`. Cycle summaries average available phases, and `pressure_gradient_valid_cell_count_t` / `relative_pressure_valid_cell_count_t` expose per-phase sample counts. Plane pixelwise H5 adds `pressure_gradient_valid` and `relative_pressure_valid` flags; invalid pressure samples are NaN.
+
+
+Volume PG vector/magnitude, valid support, relative-pressure arrays, centreline profiles and drops; centreline `valid_sample_t` and `pressure_drop_valid_t` record availability. Unsupported profile samples and endpoint drops are JSON `null`, as are unavailable mean/peak drops. A drop requires both original endpoints to be supported in the same connected pressure component; endpoints are not silently moved.  `derived_metrics_pixelwise.npz` and augmented plane JSON/H5. `summary.json` records `pressure_gradient_dt_s` and `pressure_gradient_temporal_scheme=periodic_central_difference`. See [Outputs](../user/outputs.md) for keys and units.
 
 ## Limitations
 
@@ -58,7 +76,7 @@ Each disconnected support component has its own gauge; pressure levels across di
 
 ## Tests
 
-Pressure phantoms in `tests/test_pressure_gradient_phantom.py` cover analytic constant/quadratic pressure at isotropic/anisotropic spacing, disconnected gauges, periodic acceleration and valid boundary/smoothing support.
+Pressure phantoms in `tests/test_pressure_gradient_phantom.py` cover unsupported centreline endpoints, disconnected gauges, analytic constant/quadratic pressure at isotropic/anisotropic spacing, disconnected gauges, periodic acceleration and valid boundary/smoothing support.
 
 ```bash
 conda activate autoflow311
@@ -67,4 +85,4 @@ PYVISTA_OFF_SCREEN=true python -m pytest tests/test_smoke_phantoms.py tests/test
 
 ## Common problems
 
-Trimmed edges: inspect the support mask; excluded boundary stencils are expected. STE is more sensitive to thin or disconnected supports because it needs interior face unknowns and imposes zero auxiliary velocity at the support boundary. Large historical pressure differences: regenerate the case with the corrected algorithm. Unrealistic gradients: check RR, spacing, component orientation, phase order and velocity calibration.
+Unavailable centreline drop: inspect `pressure_drop_valid_t`, support and endpoint locations; unsupported endpoints are not measured zeros. Trimmed edges: inspect the support mask; excluded boundary stencils are expected. STE is more sensitive to thin or disconnected supports because it needs interior face unknowns and imposes zero auxiliary velocity at the support boundary. Large historical pressure differences: regenerate the case with the corrected algorithm. Unrealistic gradients: check RR, spacing, component orientation, phase order and velocity calibration.

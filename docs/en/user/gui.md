@@ -85,7 +85,12 @@ individual `Opacity` with the slider below the tree; the context menu also has
 `Set Opacity…` and `Reset Opacity (100%)`. Selecting a group applies the slider
 to all of its descendants. The `Visibility: Planes` and `Visibility: Pathlines`
 switches below the tree toggle every object of the selected type at once and
-show a mixed state when only some are visible. The right-hand ortho viewer has a separate
+show a mixed state when only some are visible. Clicking a mixed switch shows
+all objects; clicking a checked switch hides them. A switch is disabled only
+when its category has no objects. Visibility changes preserve the Browser
+selection and expansion, and hiding a selected plane also hides its highlight.
+`Display size` and `Only selected plane` sit directly below `Opacity` in the same
+Browser control area. The right-hand ortho viewer has a separate
 `Overlay` slider for the 2-D segmentation overlay; it does not change the
 underlying scalar window/level.
 
@@ -116,14 +121,14 @@ press `Ctrl+C` to end the process.
 
 The workflow navigation filters actions and parameters to the active task. Everyday controls remain visible; advanced skeleton, WSS, and pressure parameters are hidden until `Advanced` is enabled, while vortex controls remain visible in Hemodynamics. In `Hemodynamics`, plane metrics, derived metrics, live streamlines, and pathlines form a 2x2 action grid; `Run All` and `Compute PWV` are full-width rows below it. The segmentation dock appears only in the Segmentation stage, and the Analysis dock appears in Hemodynamics and Review. The status beside the navigation reports `Ready`, `Needs review`, `Incomplete`, or `Not ready` from current workspace prerequisites.
 
-Input also provides `Reload Input with Current Parameters`. An unchanged input signature is skipped; changed geometry, VENC, dual-VENC ratios reload the source and invalidate downstream artifacts. Correction settings live in **Correction** and run through explicit actions. Background correction and unwrapping update working velocity while retaining existing downstream artifacts until manually rerun. Corr content becomes available only after correction is applied or reused.
+Input also provides `Reload Input with Current Parameters`. An unchanged input signature is skipped; changed geometry, VENC, dual-VENC ratios reload the source and invalidate downstream artifacts. Opening or reloading H5 applies its existing `corr` (or dual-VENC `corr_low` / `corr_high`) when valid for the selected case, without fitting a missing cache. Correction settings live in **Correction**; clicking **Background Correction** or **Run All** always recomputes from the original acquisition and replaces the previous correction. Background correction and unwrapping update working velocity while retaining existing downstream artifacts until manually rerun. Corr content becomes available only after correction is applied or reused.
 
 ## File Menu
 
 | Menu item | What it does | Main code |
 | --- | --- | --- |
-| `Open H5` | open an H5 or HDF5 case; prompts for a data-group path when one file contains multiple supported cases, asks for `LV`, `HV`, or `DV` for legacy dual-VENC data, then loads acquisition data and any embedded segmentation; correction runs explicitly in Correction | `autoflow/ui/app.py`, `autoflow/ui/input_dialogs.py` |
-| `Import DICOM Directory` | convert through Dicom2H5 to a new reusable H5 in a background worker, validate it, select a group if needed, and load it | `autoflow/ui/app.py`, `autoflow/algorithms/dicom_conversion.py`, `autoflow/ui/input_dialogs.py` |
+| `Load H5` | open an H5 or HDF5 case; prompts for a data-group path when one file contains multiple supported cases, asks for `LV`, `HV`, or `DV` for legacy dual-VENC data, then loads acquisition data, any embedded segmentation and existing correction fields; manual Correction actions recompute from the original source | `autoflow/ui/app.py`, `autoflow/ui/input_dialogs.py` |
+| `Load DICOM` | the single DICOM loading action, directly below `Load H5`; convert to a new reusable H5 in a background worker, validate it, select a group if needed, and load it | `autoflow/ui/app.py`, `autoflow/algorithms/dicom_conversion.py`, `autoflow/ui/input_dialogs.py` |
 | `Clear Workspace` | clear loaded data and restore config defaults in the UI | `autoflow/ui/app.py` |
 | `Exit` | close the GUI | `autoflow/ui/app.py` |
 
@@ -135,21 +140,23 @@ Input also provides `Reload Input with Current Parameters`. An unchanged input s
 | `Export Plane Coordinates...` | export selected Browser planes, or all planes when none are selected | `autoflow/ui/app.py`, `autoflow/plane_io.py` |
 | `Export QC Report...` | write the current staged automated quality report | `autoflow/ui/app.py`, `autoflow/quality.py` |
 
+The 3-D viewer and exported movies share matte vessel lighting, antialiased edges and unlit metric colours. WSS uses `turbo`, TKE `inferno`, velocity `turbo`, pressure gradient `magma` and relative pressure `RdBu_r`. Missing WSS samples appear as transparent gaps instead of gray patches or artificial zero values. Video export uses current metric colormap, opacity, colour limits and shared colourbar layout. CLI movies have the same default style when using the same JSON bundle.
+
 ## Settings Menu
 
 | Menu item | What it does | Main code |
 | --- | --- | --- |
 | `3D Axis Orientation...` | choose the displayed positive direction for each 3D axis; the scene mirrors around its center while internal data remains unchanged | `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
-| `3D Background Color...` | choose the 3-D viewport background color; the choice applies to surfaces and PC-MRA volume rendering and starts from the `ui.background_color` config value | `autoflow/config.py`, `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
+| `3D Background Color...` | choose the 3-D viewport background color; the choice applies to surfaces and PC-MRA volume rendering and starts from `ui.background_color` (`#101820` by default); the current session background is also used by video exports | `autoflow/config.py`, `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
 | `Ortho Viewer Display...` | set the initial three-view zoom and plane-contour smoothing | `autoflow/ui/ortho_viewer.py`, `autoflow/ui/slice_view.py` |
 
 ## Standard Workflow
 
 1. start the GUI
-2. load through `Open H5` or `Import DICOM Directory`; select `LV`, `HV` or `DV` for legacy dual-VENC H5
-3. inspect inputs in `Input & QC`; H5 loads embedded segmentation when available and leaves correction for the explicit Correction stage
+2. load through `File > Load H5` or `File > Load DICOM`; select `LV`, `HV` or `DV` for legacy dual-VENC H5
+3. inspect inputs in `Input & QC`; H5 loads embedded segmentation and applies existing correction fields when available; the load progress dialog shows loading and applying saved corr, separately for low/high VENC
 4. for DICOM, choose a new H5 destination and review the converted acquisition calibration
-5. open `Correction`, configure background correction and noise masking, then click `Run All` for Background Correction → Noise Removal → Unwrap Phase → Generate PC-MRA (default `lap4D`, mask `none`)
+5. to recompute correction, open `Correction`, configure background correction and noise masking, then click `Run All` for Background Correction → Noise Removal → Unwrap Phase → Generate PC-MRA (default `lap4D`, mask `none`)
 6. in the `Segmentation` workflow stage, configure nnUNet if needed and click `Run Automatic Segmentation` explicitly
 7. after segmentation, optionally return to `Correction > Phase Unwrapping`, choose a method and `segmask` for masked refinement, and click `Unwrap Phase`; existing downstream results stay available until manually rerun
 8. if phase unwrapping ran, inspect `Estimated Wrap Locations`, `Phase Wrap Count`, and the `Unwrapped − Wrapped` views to see where wraps were detected
@@ -230,7 +237,7 @@ Important behavior:
 
 - `Run All` does not auto-start segmentation
 - segmentation must already exist when segmentation-dependent steps run
-- opening H5 loads the selected acquisition group and any embedded `segmask`, `segmentation` or `seg`; correction remains an explicit action
+- opening H5 loads the selected acquisition group and any embedded `segmask`, `segmentation` or `seg`, and applies existing correction fields; it never fits a missing correction cache
 - background correction settings are in Correction; there are no correction configuration prompts during input loading
 - input loading never starts or asks to start automatic segmentation
 - the top menu bar has no separate `Segmentation` menu; generation settings and commands are in the `Segmentation` workflow parameter panel, while source review and editing remain in the right-side `Segmentation` dock
@@ -286,6 +293,10 @@ Use `Export > Export Videos...` for interactive offline export.
 `Run All` does not export videos automatically. Video export is a separate top-level menu action.
 
 ## Selection, Browser, And Timeline
+
+Below the Browser tree, beside the `Visibility` and `Opacity` controls, use the live `Display size` slider and mm input (1–200 mm, initially 10 mm) plus `Only selected plane`. Reduce the size for densely spaced branches, or enable the filter and select planes in the Browser one at a time. These controls affect outlines, highlights, and their picking region without regenerating planes or recalculating metrics. The bottom `Plane` information box contains selection details and `Add Plane` / `Edit Plane` actions.
+
+Regenerating a skeleton clears the old graph and plane layout; regenerating a graph clears the old planes; generating planes replaces the full old layout. Their plane measurements, PWV, pathlines, selection highlights, and edit handles are cleared. The 3D view removes actors from both the main scene and the plane foreground layer. `View > Toggle Axes` changes the corner orientation marker without recreating models or moving the camera.
 
 - the browser creates one top-level row per segmentation group and one `Global` row for non-grouped scene objects
 - generated planes are grouped by their `path_index` under `Paths`; each path contains its path geometry, planes sorted by path distance, and any generated pathline below its plane
@@ -436,7 +447,7 @@ The GUI uses `batch.output_dir` from the selected config directory as its output
 
 ## Generated displays and Content choices
 
-Input loading computes no PC-MRA and creates no PC-MRA Browser layer. Correction has four buttons in a 2×2 grid: **Background Correction**, **Noise Removal**, **Unwrap Phase**, **Generate PC-MRA**, followed by **Run All**. The fourth action materializes `magnitude × speed` from current working flow and adds its time-resolved render layer. Run All always generates it last. After a later velocity correction, rerun Generate PC-MRA to update that stored display.
+Input loading computes no PC-MRA and creates no PC-MRA Browser layer. The progress dialog reports **Loading saved background correction: corr** followed by **Applying saved corr (background phase correction)**; dual-VENC messages identify **Low VENC** and **High VENC**. A missing or invalid cache is reported as unavailable and leaves that encoding uncorrected. Saved fields are applied independently of the method/parameters selected for the next manual run. Clicking Background Correction always fits the untouched source data again, replaces working velocity and correction arrays, and replaces H5 correction caches when cache writing is enabled. Repeated clicks do not add correction to already corrected velocity. Correction has four buttons in a 2×2 grid: **Background Correction**, **Noise Removal**, **Unwrap Phase**, **Generate PC-MRA**, followed by **Run All**. The fourth action materializes `magnitude × speed` from current working flow and adds its time-resolved render layer. Run All always generates it last. After a later velocity correction, rerun Generate PC-MRA to update that stored display.
 
 Noise Removal adds **Global → Noise → Noise Region** to the left Browser. The
 3-D surface is hidden by default and marks voxels excluded by the display mask;
@@ -463,3 +474,5 @@ The right **Content** menu contains only available data/results. Before PC-MRA g
 Task progress locks all other GUI operations until completion. Use × to request cancellation; Escape cannot dismiss the lock. Animated dots, elapsed time, time since the last changed progress payload, and stage/phase/plane/frame counts show activity. The lock stays visible until the worker or task-owned process exits. Completed pipeline steps remain; an incomplete step does not publish workspace results. Failed/cancelled background loads retain the previous case.
 
 ![Task progress](images/task-progress.png)
+
+The 3-D Noise Region now uses sparse rejected-voxel points, omits zero-signal padding and dims weak magnitude background; the complete 2-D rejection overlay is unchanged. The 3-D unwrap layers show only nonzero corrected voxels in any velocity component. TKE uses transparent-background volume rendering so interior high energy is visible. PG/vortex surfaces use closed display geometry and support-normalized colours. New pressure layers default to opacity 1.0; saved workspace styles remain configurable. Centreline pressure endpoints outside valid support show Unavailable instead of an artificial zero drop.

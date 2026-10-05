@@ -1,3 +1,4 @@
+from .config import BACKGROUND_COLOR
 from .case_types import normalize_dicom_backend
 import copy
 from dataclasses import dataclass, field
@@ -156,6 +157,7 @@ class AutoFlowConfig:
     add_path_idx: bool = False
     plane_video_cfg: Dict[str, Any] = field(default_factory=lambda: copy.deepcopy(DEFAULT_PLANE_VIDEO_CFG))
     window_size: Tuple[int, int] = (1600, 1200)
+    render_background_color: str = BACKGROUND_COLOR
     shared_colorbar_show: bool = True
     shared_colorbar_bar_cfg: Dict[str, Any] = field(default_factory=lambda: copy.deepcopy(DEFAULT_SHARED_COLORBAR_CFG["bar_cfg"]))
 
@@ -195,6 +197,7 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
     cfg = config or AutoFlowConfig.from_config_dir()
     ws = Workspace()
     apply_config_bundle_to_workspace(ws, load_config_bundle(cfg.config_dir))
+    ws.render_settings["render_background_color"] = cfg.render_background_color
     ws.loader_params.background_phase_correction.enabled = bool(cfg.background_phase_correction)
     ws.loader_params.background_phase_correction.method = str(cfg.background_phase_method)
     ws.loader_params.background_phase_correction.corr_fit_order = int(cfg.background_phase_corr_fit_order)
@@ -373,6 +376,7 @@ def run_case(
         add_path_idx=cfg.add_path_idx,
         plane_video_cfg=copy.deepcopy(cfg.plane_video_cfg),
         window_size=cfg.window_size,
+        render_background_color=cfg.render_background_color,
         shared_colorbar_show=cfg.shared_colorbar_show,
         shared_colorbar_bar_cfg=copy.deepcopy(cfg.shared_colorbar_bar_cfg),
         wss_clim=cfg.wss_clim,
@@ -546,6 +550,7 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 add_path_idx=config.add_path_idx,
                 plane_video_cfg=copy.deepcopy(config.plane_video_cfg),
                 window_size=config.window_size,
+                render_background_color=config.render_background_color,
                 shared_colorbar_show=config.shared_colorbar_show,
                 shared_colorbar_bar_cfg=copy.deepcopy(config.shared_colorbar_bar_cfg),
                 wss_clim=config.wss_clim,

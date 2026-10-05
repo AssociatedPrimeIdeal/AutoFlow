@@ -552,12 +552,19 @@ def _sample_volume_at_points(volume_xyz, points_xyz, spacing, origin, coordinate
     return out
 
 
-def compute_centerline_pressure_profiles(relative_pressure_array, centerline_paths, spacing, origin):
+def compute_centerline_pressure_profiles(relative_pressure_array, centerline_paths, spacing, origin, *, support_mask=None):
     pressure = np.asarray(relative_pressure_array, dtype=np.float32)
     if pressure.ndim != 4:
         raise ValueError(f"relative_pressure_array must be XYZT, got {pressure.shape}")
     spacing = np.asarray(spacing, dtype=float).reshape(3)
     origin = np.asarray(origin, dtype=float).reshape(3)
+    if support_mask is None:
+        support = np.isfinite(pressure)
+    else:
+        support = np.asarray(support_mask, dtype=bool)
+        if support.shape != pressure.shape:
+            raise ValueError('Centerline pressure support must match the pressure array')
+        support = support & np.isfinite(pressure)
     profiles = []
     nt = pressure.shape[3]
     for path_idx, path in enumerate(list(centerline_paths or [])):
@@ -568,8 +575,10 @@ def compute_centerline_pressure_profiles(relative_pressure_array, centerline_pat
                 "distances_mm": [],
                 "relative_pressure_Pa_t": [],
                 "pressure_drop_Pa_t": [],
-                "pressure_drop_mean_Pa": 0.0,
-                "pressure_drop_peak_Pa": 0.0,
+                "pressure_drop_mean_Pa": None,
+                "pressure_drop_peak_Pa": None,
+                "valid_sample_t": [],
+                "pressure_drop_valid_t": [],
             })
             continue
         # Centerline paths are stored in local physical millimetres.  Convert
@@ -586,19 +595,37 @@ def compute_centerline_pressure_profiles(relative_pressure_array, centerline_pat
         sample_pts = pts_vox
         samples_t = []
         drop_t = []
+        valid_sample_t = []
+        drop_valid_t = []
+        in_grid = np.all(np.isfinite(sample_pts) & (sample_pts >= 0)
+                         & (sample_pts <= np.array(pressure.shape[:3]) - 1), axis=1)
         for tidx in range(nt):
             vals = _sample_volume_at_points(
                 pressure[..., tidx], sample_pts, spacing, origin, coordinate_space="voxel"
             )
-            samples_t.append(vals.astype(np.float32).tolist())
-            drop_t.append(float(vals[0] - vals[-1]) if len(vals) else 0.0)
+            weights = _sample_volume_at_points(
+                support[..., tidx].astype(np.float32), sample_pts, spacing, origin, coordinate_space='voxel')
+            valid = in_grid & (weights >= 1.0 - 1e-6) & np.isfinite(vals)
+            components, _ = label(support[..., tidx], structure=generate_binary_structure(3, 1))
+            rounded = np.clip(np.rint(np.nan_to_num(sample_pts, nan=0.0, posinf=0.0, neginf=0.0)).astype(int), 0, np.array(pressure.shape[:3]) - 1)
+            ids = components[tuple(rounded.T)]
+            # Gauges differ between disconnected components. A zero-filled
+            # unsupported endpoint is not a measured zero-pressure sample.
+            drop_valid = bool(len(vals) > 1 and valid[0] and valid[-1]
+                              and ids[0] > 0 and ids[0] == ids[-1])
+            samples_t.append([float(v) if ok else None for v, ok in zip(vals, valid)])
+            valid_sample_t.append(valid.tolist())
+            drop_valid_t.append(drop_valid)
+            drop_t.append(float(vals[0] - vals[-1]) if drop_valid else None)
         profiles.append({
             "path_index": int(path_idx),
             "distances_mm": dist.astype(np.float32).tolist(),
             "relative_pressure_Pa_t": samples_t,
-            "pressure_drop_Pa_t": [float(x) for x in drop_t],
-            "pressure_drop_mean_Pa": float(np.mean(drop_t)) if drop_t else 0.0,
-            "pressure_drop_peak_Pa": float(np.max(np.abs(drop_t))) if drop_t else 0.0,
+            "pressure_drop_Pa_t": drop_t,
+            "pressure_drop_mean_Pa": float(np.mean([v for v in drop_t if v is not None])) if any(drop_valid_t) else None,
+            "pressure_drop_peak_Pa": float(np.max(np.abs([v for v in drop_t if v is not None]))) if any(drop_valid_t) else None,
+            "valid_sample_t": valid_sample_t,
+            "pressure_drop_valid_t": drop_valid_t,
         })
     return profiles
 
@@ -753,6 +780,7 @@ def compute_pressure_gradient_metrics(mask4d, flow, spacing, rr, rho=1060.0, vis
         centerline_paths or [],
         spacing_mm,
         origin,
+        support_mask=support_mask,
     )
 
     return {

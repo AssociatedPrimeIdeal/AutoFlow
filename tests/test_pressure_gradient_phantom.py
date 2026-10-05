@@ -145,6 +145,28 @@ def test_centerline_pressure_sampling_uses_local_coordinates_with_nonzero_origin
     assert shifted[0]["relative_pressure_Pa_t"][0] == pytest.approx([0.0, 4.0])
 
 
+def test_centerline_pressure_rejects_unsupported_endpoints_and_disconnected_gauges():
+    pressure = np.zeros((9, 3, 3, 2), dtype=np.float32)
+    pressure[:] = np.arange(9, dtype=float).reshape(9, 1, 1, 1)
+    support = np.zeros(pressure.shape, dtype=bool)
+    support[1:4] = True
+    support[5:8] = True
+    paths = [np.array([[0., 1., 1.], [3., 1., 1.]]),
+             np.array([[1., 1., 1.], [3., 1., 1.]]),
+             np.array([[1., 1., 1.], [6., 1., 1.]])]
+    profiles = compute_centerline_pressure_profiles(
+        pressure, paths, (1, 1, 1), (50, 60, 70), support_mask=support)
+    assert profiles[0]['relative_pressure_Pa_t'][0] == [None, 3.0]
+    assert profiles[0]['pressure_drop_Pa_t'] == [None, None]
+    assert profiles[0]['pressure_drop_mean_Pa'] is None
+    assert profiles[1]['pressure_drop_Pa_t'] == pytest.approx([-2., -2.])
+    assert all(profiles[1]['pressure_drop_valid_t'])
+    assert profiles[2]['pressure_drop_Pa_t'] == [None, None]
+    assert profiles[2]['pressure_drop_peak_Pa'] is None
+    # The new unavailable samples remain valid JSON, with null rather than NaN.
+    json.dumps(profiles, allow_nan=False)
+
+
 def _relative_error(measured: float, truth: float) -> float:
     denom = max(abs(float(truth)), 1e-12)
     return abs(float(measured) - float(truth)) / denom
@@ -302,3 +324,34 @@ def test_phantom_p_plane_metrics_include_mean_velocity_error_and_valid_distance_
         assert "pressure_gradient_mag_mean_Pa_m" in metric
         assert metric["pressure_gradient_mag_mean_Pa_m"] > 0.0
         assert metric["pressure_gradient_mag_peak_Pa_m"] >= metric["pressure_gradient_mag_mean_Pa_m"]
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_plane_pressure_support_excludes_padding_and_preserves_true_zero(workers):
+    from types import SimpleNamespace
+    from autoflow.algorithms.metrics.plane_derived import augment_plane_metrics_with_derived
+    mask = np.zeros((9, 9, 9, 3), dtype=bool)
+    mask[1:8, 1:8, 1:8] = True
+    support = np.zeros_like(mask)
+    support[1:5, 1:8, 1:8, 0] = True
+    support[..., 2] = mask[..., 2]
+    gradient = np.zeros(mask.shape + (3,), dtype=np.float32)
+    gradient[support[..., 0], 0, 2] = 3.0
+    pressure = np.zeros(mask.shape, dtype=np.float32)
+    pressure[..., 0][support[..., 0]] = 5.0
+    plane = SimpleNamespace(center=np.array([4.5, 4.5, 4.5]), normal=np.array([0., 0., 1.]),
+                            label=0, path_index=0, roi_edit_operations={})
+    metrics, samples = augment_plane_metrics_with_derived(
+        [{}, {}], [plane, plane], mask, (1, 1, 1), (0, 0, 0),
+        pressure_gradient_array=gradient, relative_pressure_array=pressure,
+        pressure_gradient_support_mask=support, max_workers=workers, use_multithread=workers > 1)
+    for metric, payload in zip(metrics, samples):
+        assert metric['pressure_gradient_mag_mean_Pa_m_t'] == [3.0, None, 0.0]
+        assert metric['relative_pressure_mean_Pa_t'] == [5.0, None, 0.0]
+        assert metric['pressure_gradient_mag_mean_Pa_m'] == pytest.approx(1.5)
+        assert metric['relative_pressure_mean_Pa'] == pytest.approx(2.5)
+        assert metric['pressure_gradient_valid_cell_count_t'][1] == 0
+        assert not np.any(payload['timepoints'][1]['pressure_gradient_valid'])
+        assert np.all(np.isnan(payload['timepoints'][1]['pressure_gradient_vec_Pa_m']))
+        assert np.all(np.isfinite(payload['timepoints'][2]['pressure_gradient_vec_Pa_m']))
+        json.dumps(metric, allow_nan=False)

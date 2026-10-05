@@ -31,6 +31,8 @@ Use it to inspect rotational flow structures after a segmentation is available. 
 3. Click `WSS / TKE / Pressure / Vortex` in the Hemodynamics workflow.
 4. In the left `Global` browser group, toggle `Vorticity Magnitude`, `Q-Criterion`, or `Swirling Strength` for the 3D scene; the ortho viewer `Content` menu provides the same three maps.
 
+The 3D legends use reciprocal units (`1/s` and `1/s²`) so missing superscript-minus glyphs cannot make inverse seconds appear as seconds.
+
 ### CLI
 
 ```bash
@@ -58,6 +60,9 @@ summary = run_case("case.h5", config=config)
 
 ## Parameters
 
+GUI and videos read shared materials from `configs/render_style.json`, shared colourbar layout from `configs/colorbar.json`, and layer styles from the metric JSON `render` groups. See [Rendering configuration layout](../developer/config-system.md#rendering-configuration-layout) and the complete [parameter tables](../user/parameters.md). Restart the GUI or start a new run after editing the selected JSON files.
+
+
 See [vortex parameters](../user/parameters.md#vortex), [CLI flags](../user/cli-parameters.md), and [API fields](../user/api-parameters.md) for complete type/default/unit/effect/owner tables. Dictionary controls are expanded in [Structured parameters](../user/parameter-schemas.md).
 
 ## Outputs
@@ -73,6 +78,8 @@ See [vortex parameters](../user/parameters.md#vortex), [CLI flags](../user/cli-p
 | `vortex_support_mask` | XYZT | valid derivative support (`uint8`) |
 
 `summary.json -> requested_metrics.vortex` records whether the batch run requested this family.
+
+Finite velocity and all six spatial neighbours inside segmentation are mandatory, including when extra erosion is set to zero. Nonfinite samples are excluded before smoothing and eigensolving. The GUI uses closed Taubin-smoothed support geometry and finite-mask-normalized display sampling; valid zero values are retained. Phase-specific support geometry uses a stable mask/phase cache; repeated masks share the same surface without reusing another phase's geometry. Default metric opacity is 1.0, and raw volume descriptors are unchanged by display smoothing.
 
 ## Limitations
 

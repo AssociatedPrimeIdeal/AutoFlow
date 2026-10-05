@@ -1,3 +1,5 @@
+from ..config import METRIC_CMAPS, METRIC_DATA_KEYS
+from ..rendering.style import configured_metric_style
 import copy
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -1210,6 +1212,10 @@ class OrthoViewer(QtWidgets.QWidget):
         return np.array([1.0, 1.0, 1.0])
 
     def _scene_style(self, data_key, default_cmap, default_clim=None):
+        if data_key in METRIC_DATA_KEYS:
+            style = configured_metric_style(self.workspace, data_key)
+            default_cmap = style["cmap"]
+            default_clim = style.get("clim") or default_clim
         for obj in self.workspace.scene_objects.values():
             if obj.data_key == data_key:
                 return obj.cmap or default_cmap, obj.clim if obj.clim else default_clim
@@ -1218,18 +1224,18 @@ class OrthoViewer(QtWidgets.QWidget):
     def _get_wss_volume(self, t):
         ws = self.workspace
         if ws.derived.wss_volume is not None:
-            cmap, clim = self._scene_style("wss_surface_live", "jet", None)
+            cmap, clim = self._scene_style("wss_surface_live", METRIC_CMAPS["wss_surface_live"], None)
             tidx = min(max(0, int(t)), ws.derived.wss_volume.shape[3] - 1)
             return np.asarray(ws.derived.wss_volume[..., tidx], dtype=np.float32), "WSS (Pa)", {"cmap": cmap, "clim": clim}
         if not ws.derived.wss_surfaces:
-            return None, "WSS (no data)", {"cmap": "jet", "clim": None}
+            return None, "WSS (no data)", {"cmap": METRIC_CMAPS["wss_surface_live"], "clim": None}
         tidx = min(max(0, t), len(ws.derived.wss_surfaces) - 1)
         surf = ws.derived.wss_surfaces[tidx]
         if surf is None or "wss" not in surf.point_data:
-            return None, "WSS (no data)", {"cmap": "jet", "clim": None}
+            return None, "WSS (no data)", {"cmap": METRIC_CMAPS["wss_surface_live"], "clim": None}
         shape = self._get_volume_shape()
         if shape is None:
-            return None, "WSS (no data)", {"cmap": "jet", "clim": None}
+            return None, "WSS (no data)", {"cmap": METRIC_CMAPS["wss_surface_live"], "clim": None}
         res = self._get_resolution()
         key = (
             id(surf),
@@ -1248,7 +1254,7 @@ class OrthoViewer(QtWidgets.QWidget):
             np.maximum.at(tgt, flat, vals)
             return vol
         vol = self._cached("wss_volume", key, _build)
-        cmap, clim = self._scene_style("wss_surface_live", "jet", None)
+        cmap, clim = self._scene_style("wss_surface_live", METRIC_CMAPS["wss_surface_live"], None)
         return vol, "WSS (Pa)", {"cmap": cmap, "clim": clim}
 
     def _get_tke_volume(self, t):
@@ -1271,16 +1277,16 @@ class OrthoViewer(QtWidgets.QWidget):
                     vol = np.asarray(vol, dtype=np.float32) * np.asarray(mask_t, dtype=np.float32)
                 return np.asarray(vol, dtype=np.float32)
             vol = self._cached("tke_volume", key, _build)
-            cmap, clim = self._scene_style("tke_volume", "hot", None)
+            cmap, clim = self._scene_style("tke_volume", METRIC_CMAPS["tke_volume"], None)
             return vol, "TKE (J/m³)", {"cmap": cmap, "clim": clim}
         if ws.derived.tke_volume is None:
-            return None, "TKE (no data)", {"cmap": "hot", "clim": None}
+            return None, "TKE (no data)", {"cmap": METRIC_CMAPS["tke_volume"], "clim": None}
         shape = self._get_volume_shape()
         if shape is None:
-            return None, "TKE (no data)", {"cmap": "hot", "clim": None}
+            return None, "TKE (no data)", {"cmap": METRIC_CMAPS["tke_volume"], "clim": None}
         tke_mesh = ws.derived.tke_volume
         if "TKE" not in tke_mesh.point_data and "TKE" not in tke_mesh.cell_data:
-            return None, "TKE (no data)", {"cmap": "hot", "clim": None}
+            return None, "TKE (no data)", {"cmap": METRIC_CMAPS["tke_volume"], "clim": None}
         res = self._get_resolution()
         key = (
             id(tke_mesh),
@@ -1303,7 +1309,7 @@ class OrthoViewer(QtWidgets.QWidget):
             np.maximum.at(tgt, flat, vals)
             return vol
         vol = self._cached("tke_mesh_volume", key, _build)
-        cmap, clim = self._scene_style("tke_volume", "hot", None)
+        cmap, clim = self._scene_style("tke_volume", METRIC_CMAPS["tke_volume"], None)
         return vol, "TKE (J/m³)", {"cmap": cmap, "clim": clim}
     def _get_relative_pressure_volume(self, t):
         ws = self.workspace

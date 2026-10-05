@@ -2,29 +2,17 @@
   "method": "ppe",
   "smoothing_sigma": 0.0,
   "support_erosion_iters": 1,
-  "layer_opacity": 0.6,
-  "relative_pressure_opacity": 0.6,
   "use_convective_acceleration": true,
   "render": {
+    "cmap": "magma",
+    "opacity": 1.0,
     "clim": null,
     "show_scalar_bar": true,
-    "relative_pressure_clim": null,
-    "relative_pressure_show_scalar_bar": true,
-    "bar_cfg": {
-      "position_x": 0.75,
-      "position_y": 0.2,
-      "height": 0.22,
-      "width": 0.05,
-      "title_font_size": 40,
-      "label_font_size": 32
-    },
-    "relative_pressure_bar_cfg": {
-      "position_x": 0.75,
-      "position_y": 0.2,
-      "height": 0.22,
-      "width": 0.05,
-      "title_font_size": 40,
-      "label_font_size": 32
+    "relative_pressure": {
+      "cmap": "RdBu_r",
+      "opacity": 1.0,
+      "clim": null,
+      "show_scalar_bar": true
     }
   }
 }

@@ -5,6 +5,7 @@ import hashlib
 import numpy as np
 
 from .models import StepId, ObjectKind, GraphData, DerivedResults
+from ..rendering.style import wss_scalar_range, configured_metric_style, render_style_settings
 from ..algorithms import (
     load_input_data,
     filter_segmask_labels, binarize_segmask, merge_segmask_to_3d,
@@ -32,10 +33,10 @@ from ..plane_io import build_plane_records, save_planes_h5, save_planes_json, sa
 
 
 _DERIVED_ALGORITHM_VERSIONS = {
-    "wss": "wss-vector-derivative-v2",
-    "tke": "tke-v1",
-    "pressure": "pressure-stencil-flux-v2",
-    "vortex": "vortex-kinematics-v1",
+    "wss": "wss-continuous-wall-v4",
+    "tke": "tke-masked-v2",
+    "pressure": "pressure-profile-support-v3",
+    "vortex": "vortex-finite-stencil-v2",
 }
 
 
@@ -191,6 +192,54 @@ class PipelineEngine:
         ws.derived.pwv_h5_file = ""
         ws.remove_object_by_data_key("pwv_planes")
 
+
+    def _clear_plane_state(self, ws):
+        """Discard measurements and scene objects tied to the old plane layout."""
+        self._clear_pwv_state(ws)
+        ws.planes = []
+        ws.centerline_paths_smooth = []
+        ws.clear_pathlines()
+        ws.pathline_colors = {}
+        ws.derived.plane_metrics = []
+        ws.derived.plane_qc = {}
+        ws.derived.plane_pixelwise_file = ""
+        for prefix in ("plane_", "smooth_path_", "path_arrow_"):
+            ws.remove_objects_by_prefix(prefix)
+        for group_state in ws.multilabel_groups.values():
+            group_state["planes"] = []
+            group_state["centerline_paths_smooth"] = []
+            group_state["plane_index_offset"] = 0
+        for step in (StepId.GENERATE_PLANES, StepId.EDIT_PLANES,
+                     StepId.COMPUTE_PLANE_METRICS, StepId.COMPUTE_PWV,
+                     StepId.COMPUTE_DERIVED_METRICS, StepId.PLANE_STREAMLINES):
+            ws.pipeline.completed.pop(step.value, None)
+            ws.pipeline.skipped.pop(step.value, None)
+
+    def _clear_graph_state(self, ws):
+        """Discard the topology and plane layout derived from the old skeleton."""
+        self._clear_plane_state(ws)
+        ws.graph = GraphData()
+        ws.branch_labels = None
+        ws.centerline_paths = []
+        ws.centerline_node_paths = []
+        ws.path_info = []
+        ws.forks = []
+        ws.selected_path_index = -1
+        ws.derived.centerline_pressure_profiles = []
+        for key in ("graph_lines", "fork_markers", "branch_surface", "willis_ring_graph"):
+            ws.remove_object_by_data_key(key)
+        for prefix in ("graph_", "forks_", "path_"):
+            ws.remove_objects_by_prefix(prefix)
+        for group_state in ws.multilabel_groups.values():
+            group_state["graph"] = GraphData()
+            group_state["branch_labels"] = None
+            for key in ("centerline_paths", "centerline_node_paths", "path_info", "forks"):
+                group_state[key] = []
+            group_state["path_index_offset"] = 0
+        for step in (StepId.GENERATE_GRAPH, StepId.EDIT_GRAPH):
+            ws.pipeline.completed.pop(step.value, None)
+            ws.pipeline.skipped.pop(step.value, None)
+
     def _register_pwv_scene_object(self, ws):
         ws.remove_object_by_data_key("pwv_planes")
         if not list(ws.derived.pwv_planes or []):
@@ -311,9 +360,10 @@ class PipelineEngine:
         ]:
             ws.remove_object_by_data_key(dk)
         render_cfg = dict(getattr(ws, "render_settings", {}) or {})
-        wss_max = float(np.nanmax(ws.derived.wss_volume)) if ws.derived.wss_volume is not None and np.size(ws.derived.wss_volume) else 0.0
+        styles = {key: configured_metric_style(ws, key) for key in (
+            "wss_surface_live", "tke_volume", "pressure_gradient_volume", "relative_pressure_volume")}
         tke_max = float(np.nanmax(ws.derived.tke_array)) if ws.derived.tke_array is not None and np.size(ws.derived.tke_array) else 0.0
-        wss_clim = render_cfg.get("wss_clim") or (0.0, wss_max if wss_max > 0 else 1.0)
+        wss_clim = render_cfg.get("wss_clim") or wss_scalar_range(ws.derived.wss_surfaces)
         tke_clim = render_cfg.get("tke_clim") or (0.0, tke_max if tke_max > 0 else 1.0)
         pressure_gradient_clim = render_cfg.get("pressure_gradient_clim")
         if pressure_gradient_clim is None:
@@ -322,33 +372,33 @@ class PipelineEngine:
         if relative_pressure_clim is None:
             relative_pressure_clim = tuple(ws.derived.relative_pressure_display_clim) if ws.derived.relative_pressure_display_clim is not None else (-1.0, 1.0)
         ws.add_object(name="wss_surface", kind=ObjectKind.METRIC,
-                      data_key="wss_surface_live", visible=False, opacity=1.0,
-                      scalars="wss", cmap="jet", clim=tuple(wss_clim), dynamic=True,
+                      data_key="wss_surface_live", visible=False, opacity=styles["wss_surface_live"]["opacity"],
+                      scalars="wss", cmap=styles["wss_surface_live"]["cmap"], clim=tuple(wss_clim), dynamic=True,
                       show_scalar_bar=bool(render_cfg.get("wss_show_scalar_bar", True)), scalar_bar_title="WSS (Pa)",
                       scalar_bar_cfg=dict(render_cfg.get("wss_bar_cfg", {}) or {}))
         has_tke_local = ws.derived.tke_array is not None or ws.derived.tke_volume is not None
         if has_tke_local:
             ws.add_object(name="tke_volume", kind=ObjectKind.METRIC,
-                          data_key="tke_volume", visible=False, opacity=0.5,
-                          scalars="TKE", cmap="hot", clim=tuple(tke_clim), dynamic=True,
+                          data_key="tke_volume", visible=False, opacity=styles["tke_volume"]["opacity"],
+                          scalars="TKE", cmap=styles["tke_volume"]["cmap"], clim=tuple(tke_clim), dynamic=True,
                           show_scalar_bar=bool(render_cfg.get("tke_show_scalar_bar", True)), scalar_bar_title="TKE (J/m³)",
                           scalar_bar_cfg=dict(render_cfg.get("tke_bar_cfg", {}) or {}))
         if ws.derived.pressure_gradient_magnitude is not None:
             ws.add_object(name="pressure_gradient_volume", kind=ObjectKind.METRIC,
                           data_key="pressure_gradient_volume", visible=False, opacity=float(np.clip(ws.derived_params.pressure_gradient_layer_opacity, 0.0, 1.0)),
-                          scalars="PressureGradient", cmap="magma", clim=pressure_gradient_clim, dynamic=True,
+                          scalars="PressureGradient", cmap=styles["pressure_gradient_volume"]["cmap"], clim=pressure_gradient_clim, dynamic=True,
                           show_scalar_bar=bool(render_cfg.get("pressure_gradient_show_scalar_bar", True)), scalar_bar_title="|Pressure Grad| (Pa/m)",
                           scalar_bar_cfg=dict(render_cfg.get("pressure_gradient_bar_cfg", {}) or {}))
         if ws.derived.relative_pressure_array is not None:
             ws.add_object(name="relative_pressure_volume", kind=ObjectKind.METRIC,
                           data_key="relative_pressure_volume", visible=False, opacity=float(np.clip(ws.derived_params.relative_pressure_layer_opacity, 0.0, 1.0)),
-                          scalars="RelativePressure", cmap="RdBu_r", clim=relative_pressure_clim, dynamic=True,
+                          scalars="RelativePressure", cmap=styles["relative_pressure_volume"]["cmap"], clim=relative_pressure_clim, dynamic=True,
                           show_scalar_bar=bool(render_cfg.get("relative_pressure_show_scalar_bar", render_cfg.get("pressure_gradient_show_scalar_bar", True))), scalar_bar_title="Relative Pressure (Pa)",
                           scalar_bar_cfg=dict(render_cfg.get("relative_pressure_bar_cfg", render_cfg.get("pressure_gradient_bar_cfg", {}) or {}) or {}))
 
         vortex_specs = (
-            ("vorticity_magnitude_volume", "Vorticity Magnitude", "vorticity_magnitude", "Vorticity Magnitude (s^-1)", "turbo", False),
-            ("q_criterion_volume", "Q-Criterion", "q_criterion_array", "Q-Criterion (s^-2)", "RdBu_r", True),
+            ("vorticity_magnitude_volume", "Vorticity Magnitude", "vorticity_magnitude", "Vorticity Magnitude (s⁻¹)", "turbo", False),
+            ("q_criterion_volume", "Q-Criterion", "q_criterion_array", "Q-Criterion (s⁻²)", "RdBu_r", True),
             ("swirling_strength_volume", "Swirling Strength", "swirling_strength_array", "Swirling Strength λci (s⁻¹)", "turbo", False),
         )
         vortex_support = ws.derived.vortex_support_mask
@@ -361,18 +411,19 @@ class PipelineEngine:
             finite = values[support & np.isfinite(values)] if support.shape == values.shape else values[np.isfinite(values)]
             upper = float(np.percentile(np.abs(finite), 99.0)) if finite.size else 1.0
             upper = max(upper, 1e-6)
-            clim = (-upper, upper) if signed else (0.0, upper)
+            style = configured_metric_style(ws, data_key)
+            clim = style.get("clim") or ((-upper, upper) if signed else (0.0, upper))
             ws.add_object(
                 name=name,
                 kind=ObjectKind.METRIC,
                 data_key=data_key,
                 visible=False,
-                opacity=0.5,
+                opacity=style["opacity"],
                 scalars=name,
-                cmap=cmap,
+                cmap=style["cmap"],
                 clim=clim,
                 dynamic=True,
-                show_scalar_bar=True,
+                show_scalar_bar=bool(style.get("show_scalar_bar", True)),
                 scalar_bar_title=scalar_bar_title,
                 scalar_bar_cfg=dict(render_cfg.get("shared_colorbar_bar_cfg", {}) or {}),
             )
@@ -407,13 +458,14 @@ class PipelineEngine:
             return [self._json_safe(v) for v in obj]
         return obj
 
-    def load_data(self, ws, log, input_source=None, progress_callback=None):
+    def load_data(self, ws, log, input_source=None, progress_callback=None, reuse_existing_corr=False):
         path = ws.paths.segmask_path or ws.paths.flow_path
         if input_source is None and not path:
             raise ValueError("data path is empty")
         load_target = path if input_source is None else input_source
         load_kwargs = {
             "correction_config": dict(ws.loader_params.background_phase_correction.to_dict(), enabled=False),
+            "reuse_existing_corr": bool(reuse_existing_corr),
             "force_recompute_seg": bool(getattr(ws.segmentation, "force_recompute_auto_cache", False)),
             "ignore_embedded_segmentation": bool(
                 getattr(ws.loader_params, "ignore_embedded_segmentation", False)
@@ -739,7 +791,7 @@ class PipelineEngine:
                 group_name=group_name,
                 browser_color=str(group_state.get("browser_color", "") or ""),
                 visible=True,
-                opacity=0.15,
+                opacity=render_style_settings(ws)["context"]["opacity"],
                 color=ws.skeleton_params.scene_color_for_group(group_name, "scene"),
             )
         check_cancelled()
@@ -790,9 +842,10 @@ class PipelineEngine:
                 ws.scene_objects.pop(key)
         return "geometry"
 
-    def run_step(self, ws, step, log, progress_callback=None):
+    def run_step(self, ws, step, log, progress_callback=None, force_recompute_corr=False):
         dispatch = {
-            StepId.BACKGROUND_CORRECTION: lambda workspace: self._step_background_correction(workspace, progress_callback=progress_callback),
+            StepId.BACKGROUND_CORRECTION: lambda workspace: self._step_background_correction(
+                workspace, progress_callback=progress_callback, force_recompute=force_recompute_corr),
             StepId.REMOVE_NOISE: self._step_remove_noise,
             StepId.GENERATE_PCMRA: self._step_generate_pcmra,
             StepId.UNWRAP_PHASE: self._step_unwrap_phase,
@@ -810,7 +863,7 @@ class PipelineEngine:
         }
         return dispatch[step](ws)
 
-    def _step_background_correction(self, ws, progress_callback=None):
+    def _step_background_correction(self, ws, progress_callback=None, force_recompute=False):
         """Correct source encoding, retaining all manually generated downstream artifacts."""
         if not ws.data_loaded or ws.flow_raw is None:
             return StepResult(StepId.BACKGROUND_CORRECTION, False, False, "Load data before background correction")
@@ -823,10 +876,12 @@ class PipelineEngine:
                                source_group=ws.input_state.source_group, metadata=dict(ws.input_state.metadata))
         cfg = copy.deepcopy(ws.loader_params.background_phase_correction)
         cfg.enabled = True
+        cfg.force_recompute = bool(force_recompute or cfg.force_recompute)
         kwargs = dict(getattr(ws, "_loaded_input_kwargs", {}) or {})
         kwargs.pop("progress_callback", None)
         kwargs.pop("parameter_overrides", None)
         kwargs.pop("dicom_read_workers", None)
+        kwargs.pop("reuse_existing_corr", None)
         if progress_callback is not None:
             kwargs["progress_callback"] = progress_callback
         kwargs.update(correction_config=cfg, ignore_embedded_segmentation=True, force_recompute_seg=False)
@@ -890,7 +945,7 @@ class PipelineEngine:
         ws.noise_removal_result = report
         ws.remove_object_by_data_key("noise_region")
         ws.add_object(name="Noise Region", kind=ObjectKind.AUX, data_key="noise_region",
-                      group_name="Global", visible=False, opacity=0.15, color="#ff0000", dynamic=False)
+                      group_name="Global", visible=False, opacity=0.3, point_size=2.0, color="#ff0000", dynamic=False)
         ws.pipeline.mark_done(StepId.REMOVE_NOISE)
         return StepResult(StepId.REMOVE_NOISE, True, False,
                           f"PC-MRA rendering region retained {report['retained_fraction']:.1%}; magnitude and flow unchanged")
@@ -1111,6 +1166,7 @@ class PipelineEngine:
         ws.skeleton_points = np.vstack(points_all) if points_all else np.empty((0, 3), dtype=float)
         ws.skeleton_mask = np.asarray(skeleton_mask, dtype=bool)
         check_cancelled()
+        self._clear_graph_state(ws)
         ws.pipeline.mark_done(StepId.GENERATE_SKELETON)
         return StepResult(StepId.GENERATE_SKELETON, True, False, f"Skeleton: {len(ws.skeleton_points)} points groups={len(ws.group_order)}")
 
@@ -1129,6 +1185,9 @@ class PipelineEngine:
             skel_result = self._step_generate_skeleton(ws)
             if skel_result.skipped or not skel_result.success:
                 return StepResult(StepId.GENERATE_GRAPH, skel_result.success, True, skel_result.message)
+        self._clear_plane_state(ws)
+        ws.selected_path_index = -1
+        ws.derived.centerline_pressure_profiles = []
         graph_points = []
         graph_edges = []
         branch_labels = np.zeros(ws.segmask_3d.shape, dtype=np.int16)
@@ -1564,6 +1623,9 @@ class PipelineEngine:
                 relative_pressure_array=(
                     ws.derived.relative_pressure_array if derived_validity["pressure"] else None
                 ),
+                pressure_gradient_support_mask=(
+                    ws.derived.pressure_gradient_support_mask if derived_validity["pressure"] else None
+                ),
                 wss_surfaces=ws.derived.wss_surfaces if derived_validity["wss"] else None,
                 use_multithread=use_multithread, progress_callback=progress_callback,
             )
@@ -1635,10 +1697,8 @@ class PipelineEngine:
             if graph_result.skipped or not graph_result.success:
                 return StepResult(StepId.GENERATE_PLANES, graph_result.success, True, graph_result.message)
 
-        ws.remove_objects_by_prefix("smooth_path_")
-        ws.remove_objects_by_prefix("path_arrow_")
+        self._clear_plane_state(ws)
         pgp = ws.plane_gen_params
-        ws.remove_objects_by_prefix("plane_")
         planes = []
         smooth_paths = []
         plane_layout_qc = {
@@ -1647,8 +1707,6 @@ class PipelineEngine:
             "requested_plane_count": int(pgp.plane_count),
         }
         branch_support_cache = {}
-        ws.clear_pathlines()
-        ws.pathline_colors = {}
         for group_index, group_name in enumerate(ws.group_order):
             report_progress({"stage": "planes_group", "current": group_index, "total": len(ws.group_order),
                              "message": f"Processing {group_name} ({group_index + 1}/{len(ws.group_order)})"})
@@ -1843,12 +1901,13 @@ class PipelineEngine:
         )
         ws.streamline_cache.clear()
         ws.streamline_active = True
+        style = configured_metric_style(ws, "streamlines_live")
         ws.remove_object_by_data_key("streamlines_live")
         render_cfg = dict(getattr(ws, "render_settings", {}) or {})
         ws.add_object(
             name="streamlines", kind=ObjectKind.FLOW,
-            data_key="streamlines_live", visible=True, opacity=1.0,
-            scalars="Velocity", cmap="turbo", clim=render_cfg.get("streamline_clim"), dynamic=True,
+            data_key="streamlines_live", visible=True, opacity=style["opacity"], line_width=style["line_width"],
+            scalars="Velocity", cmap=style["cmap"], clim=render_cfg.get("streamline_clim"), dynamic=True,
             show_scalar_bar=bool(render_cfg.get("streamline_show_scalar_bar", True)), scalar_bar_title="Velocity (m/s)",
             scalar_bar_cfg=dict(render_cfg.get("streamline_bar_cfg", {}) or {}),
             tube_radius=ws.streamline_params.tube_radius)
@@ -1957,6 +2016,7 @@ class PipelineEngine:
                 tke_array=ws.derived.tke_array,
                 pressure_gradient_array=ws.derived.pressure_gradient_array,
                 relative_pressure_array=ws.derived.relative_pressure_array,
+                pressure_gradient_support_mask=ws.derived.pressure_gradient_support_mask,
                 wss_surfaces=ws.derived.wss_surfaces,
             )
             ws.derived.plane_metrics = metrics

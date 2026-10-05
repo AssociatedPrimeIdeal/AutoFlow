@@ -4,7 +4,7 @@
 
 | Entry point | Status | Notes |
 | --- | --- | --- |
-| GUI | Supported | `File > Import DICOM Directory`; requires the converter dependency |
+| GUI | Supported | `File > Load DICOM`; requires the converter dependency |
 | CLI | Supported | DICOM directories convert before analysis; all H5 groups are processed |
 | Python API | Supported | `run_case()`, `run_batch()`, `load_input_data()` or explicit conversion |
 
@@ -33,13 +33,13 @@ Alternatively install the submodule directly with `pip install -e third_party/4D
 
 ### GUI
 
-1. Choose `File > Import DICOM Directory`.
+1. Choose `File > Load DICOM`, the single DICOM entry directly below `Load H5`.
 2. Select the acquisition directory and a new H5 destination.
 3. Wait for conversion and validation in the background worker.
 4. Select an H5 group if several acquisitions were converted.
 5. Load and review the case, then run Correction, segmentation and analysis as needed.
 
-Cancelling group selection retains the converted H5. Reopen it through `File > Open H5`. The native scan/metadata-override dialog has been removed.
+Cancelling group selection retains the converted H5. Reopen it through `File > Load H5`. The native scan/metadata-override dialog has been removed.
 
 ### CLI
 

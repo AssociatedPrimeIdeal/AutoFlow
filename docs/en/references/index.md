@@ -7,7 +7,7 @@ This page collects the literature behind AutoFlow's calculations and identifies 
 | Feature | References | Relationship to AutoFlow | Main code |
 | --- | --- | --- | --- |
 | PG and relative pressure | [PG-1 to PG-5](#pressure-gradient-and-relative-pressure) | Navier–Stokes gradients, pressure Poisson and Stokes estimators; Cartesian adaptations | `autoflow/algorithms/metrics/pressure.py` |
-| WSS | [WSS-1 and WSS-2](#wall-shear-stress) | Tangential velocity derivatives and surface smoothing; not the original B-spline estimator | `autoflow/algorithms/metrics/wss.py` |
+| WSS | [WSS-1 to WSS-3](#wall-shear-stress) | Tangential velocity derivatives and surface smoothing; not the original B-spline estimator | `autoflow/algorithms/metrics/wss.py` |
 | Centerline and paths | [CL-1 and CL-2](#centerline-skeleton-and-paths) | Lee 3-D thinning and Savitzky–Golay smoothing; graph cleanup/grouping are AutoFlow logic | `autoflow/algorithms/skeleton.py`, `autoflow/algorithms/graph.py`, `autoflow/algorithms/paths.py` |
 | Noise mask and PC-MRA | [PC-1 and PC-2](#noise-masking-and-pc-mra) | Magnitude/temporal-SD screening and magnitude-weighted speed; thresholds are project settings | `autoflow/algorithms/noise_removal.py`, `autoflow/core/pipeline.py` |
 | Background phase correction | [BGC-1](#background-phase-correction) | Weighted regularized least squares with automatic rejection of temporally invariant outliers | `autoflow/algorithms/phase_correction.py` |
@@ -36,7 +36,10 @@ Centerline pressure drops sample the reconstructed pressure field. They are not 
 - **WSS-1.** Stalder AF, Russe MF, Frydrychowicz A, Bock J, Hennig J, Markl M. *Quantitative 2D and 3D phase contrast MRI: optimized analysis of blood flow and vessel wall parameters.* Magnetic Resonance in Medicine. 2008;60(5). [DOI: 10.1002/mrm.21778](https://doi.org/10.1002/mrm.21778). Foundational MRI vector-WSS work; also discusses flow quantification and resolution-driven WSS underestimation.
 - **WSS-2.** Taubin G. *A signal processing approach to fair surface design.* Proceedings of SIGGRAPH '95. 1995:351–358. [DOI: 10.1145/218380.218473](https://doi.org/10.1145/218380.218473). Basis for the non-shrinking surface-smoothing family used by WSS geometry preparation.
 
-AutoFlow estimates `tau_wall = mu * d(v_tangential)/dn` with inward-normal samples at `0`, `h` and `2h`, a linear/quadratic derivative, and optional no-slip. It uses VTK-interpolated probes, not Stalder's B-spline/Green's-theorem method. Taubin iterations, probe distance, segmentation-derived normals and invalid-probe handling are implementation settings, not recommendations from WSS-1. See [WSS](../features/wss.md).
+
+- **WSS-3.** Edward Ferdian. [wss_mri_calculator, commit 5819969](https://github.com/EdwardFerdian/wss_mri_calculator/tree/5819969357d45c317ac7e6b88e27daf0016b06f5). Software comparator for inward probing and scalar polynomial fitting. Its README names Petersson, Dyverfeldt and Ebbers, *Assessment of the accuracy of MRI wall shear stress estimation using numerical simulations*, JMRI 2012;36(1):128-138, [DOI: 10.1002/jmri.23610](https://doi.org/10.1002/jmri.23610). Comparing source code does not establish that either implementation reproduces all methods or validation from that paper.
+
+AutoFlow estimates `tau_wall = mu * d(v_tangential)/dn` with inward-normal samples at `0`, `h` and `2h`, a linear/quadratic derivative, and optional no-slip. It reconstructs a closed signed-distance wall, tests support against that wall, and interpolates velocity at original voxel centres, not Stalder's B-spline/Green's-theorem method. Taubin iterations, probe distance, segmentation-derived normals, local direction checks and invalid-probe handling are implementation settings, not recommendations from WSS-1. Unlike WSS-3, AutoFlow computes signed shear-vector derivatives and explicitly rejects unsupported paths; its finite valid fraction is not an accuracy estimate. See [WSS](../features/wss.md).
 
 ## Centerline, skeleton and paths
 
