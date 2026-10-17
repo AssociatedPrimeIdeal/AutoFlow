@@ -340,13 +340,13 @@ def compute_plane_metrics_multithread(flow_xyzt3, segmask_binary_4d, spacing, or
         import os as _os
         # Separate processes avoid concurrent access to shared VTK datasets.
         # Temporal workloads can be expensive even below 128 planes: the
-        # controlled 96-plane/20-phase case benefits from four workers.
+        # controlled 26-plane/20-phase case benefits from isolated workers.
         # Keep short/small jobs serial to avoid startup and memmap overhead.
         plane_phase_work = len(planes) * int(flow.shape[3])
-        if len(planes) < 128 and plane_phase_work < 1920:
+        if len(planes) < 128 and plane_phase_work < 512:
             max_workers = 1
         else:
-            worker_limit = 4 if len(planes) < 128 else 8
+            worker_limit = 8
             max_workers = min(len(planes), worker_limit, max(1, _os.cpu_count() or 4))
     if int(max_workers) <= 1:
         result = compute_plane_metrics(

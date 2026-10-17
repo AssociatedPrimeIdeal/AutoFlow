@@ -66,17 +66,20 @@ def trace_planar_streamlines(vectors, spacing, *, mask=None, offset=(0.0, 0.0),
         alive = np.ones(len(seeds), dtype=bool)
         history = [points.copy()]
         for index in range(limit):
-            unit, valid = direction(points)
-            midpoint = points + sign * 0.5 * step * unit
+            active = np.flatnonzero(alive)
+            selected = points[active]
+            unit, valid = direction(selected)
+            midpoint = selected + sign * 0.5 * step * unit
             middle_unit, middle_valid = direction(midpoint)
-            following = points + sign * step * middle_unit
+            following = selected + sign * step * middle_unit
             _, end_valid = direction(following)
-            alive &= valid & middle_valid & end_valid
+            survived = valid & middle_valid & end_valid
             if index > 8:
-                alive &= np.linalg.norm(following - seeds, axis=1) > 0.75 * step
+                survived &= np.linalg.norm(following - seeds[active], axis=1) > 0.75 * step
+            alive[active] = survived
             if not np.any(alive):
                 break
-            points = np.where(alive[:, None], following, points)
+            points[active[survived]] = following[survived]
             history.append(np.where(alive[:, None], points, np.nan))
         return np.asarray(history)
 

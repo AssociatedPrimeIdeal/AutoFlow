@@ -515,40 +515,38 @@ def _points_as_voxels(points_xyz, spacing, origin, shape, coordinate_space="worl
     return vox, False
 
 
-def _sample_volume_at_points(volume_xyz, points_xyz, spacing, origin, coordinate_space="world"):
+def _sample_volume_at_points(volume_xyz, points_xyz, spacing, origin, coordinate_space='world'):
+    """Keep current trilinear arithmetic ordering and float32 output."""
     vol = np.asarray(volume_xyz, dtype=np.float32)
     pts = np.asarray(points_xyz, dtype=float).reshape(-1, 3)
     if vol.ndim != 3 or len(pts) == 0:
         return np.zeros(len(pts), dtype=np.float32)
-    spacing = np.asarray(spacing, dtype=float).reshape(3)
-    origin = np.asarray(origin, dtype=float).reshape(3)
-    shape = np.array(vol.shape, dtype=int)
+    shape = np.asarray(vol.shape, dtype=int)
     vox, _ = _points_as_voxels(pts, spacing, origin, shape, coordinate_space=coordinate_space)
+    valid = np.all((vox >= 0) & (vox <= shape - 1), axis=1)
+    coord = vox[valid]
     out = np.zeros(len(pts), dtype=np.float32)
-    for idx, coord in enumerate(vox):
-        if np.any(coord < 0.0) or np.any(coord > (shape - 1)):
-            continue
-        base = np.floor(coord).astype(int)
-        frac = coord - base
-        upper = np.minimum(base + 1, shape - 1)
-        x0, y0, z0 = base.tolist()
-        x1, y1, z1 = upper.tolist()
-        c000 = float(vol[x0, y0, z0])
-        c100 = float(vol[x1, y0, z0])
-        c010 = float(vol[x0, y1, z0])
-        c110 = float(vol[x1, y1, z0])
-        c001 = float(vol[x0, y0, z1])
-        c101 = float(vol[x1, y0, z1])
-        c011 = float(vol[x0, y1, z1])
-        c111 = float(vol[x1, y1, z1])
-        xd, yd, zd = frac.tolist()
-        c00 = c000 * (1.0 - xd) + c100 * xd
-        c10 = c010 * (1.0 - xd) + c110 * xd
-        c01 = c001 * (1.0 - xd) + c101 * xd
-        c11 = c011 * (1.0 - xd) + c111 * xd
-        c0 = c00 * (1.0 - yd) + c10 * yd
-        c1 = c01 * (1.0 - yd) + c11 * yd
-        out[idx] = c0 * (1.0 - zd) + c1 * zd
+    base = np.floor(coord).astype(int)
+    frac = coord - base
+    upper = np.minimum(base + 1, shape - 1)
+    x0, y0, z0 = base.T
+    x1, y1, z1 = upper.T
+    xd, yd, zd = frac.T
+    c000 = vol[x0, y0, z0].astype(np.float64)
+    c100 = vol[x1, y0, z0].astype(np.float64)
+    c010 = vol[x0, y1, z0].astype(np.float64)
+    c110 = vol[x1, y1, z0].astype(np.float64)
+    c001 = vol[x0, y0, z1].astype(np.float64)
+    c101 = vol[x1, y0, z1].astype(np.float64)
+    c011 = vol[x0, y1, z1].astype(np.float64)
+    c111 = vol[x1, y1, z1].astype(np.float64)
+    c00 = c000 * (1.0 - xd) + c100 * xd
+    c10 = c010 * (1.0 - xd) + c110 * xd
+    c01 = c001 * (1.0 - xd) + c101 * xd
+    c11 = c011 * (1.0 - xd) + c111 * xd
+    c0 = c00 * (1.0 - yd) + c10 * yd
+    c1 = c01 * (1.0 - yd) + c11 * yd
+    out[valid] = c0 * (1.0 - zd) + c1 * zd
     return out
 
 
@@ -567,6 +565,8 @@ def compute_centerline_pressure_profiles(relative_pressure_array, centerline_pat
         support = support & np.isfinite(pressure)
     profiles = []
     nt = pressure.shape[3]
+    components_by_phase = {}
+    structure = generate_binary_structure(3, 1)
     for path_idx, path in enumerate(list(centerline_paths or [])):
         pts = np.asarray(path, dtype=float).reshape(-1, 3)
         if len(pts) == 0:
@@ -606,7 +606,9 @@ def compute_centerline_pressure_profiles(relative_pressure_array, centerline_pat
             weights = _sample_volume_at_points(
                 support[..., tidx].astype(np.float32), sample_pts, spacing, origin, coordinate_space='voxel')
             valid = in_grid & (weights >= 1.0 - 1e-6) & np.isfinite(vals)
-            components, _ = label(support[..., tidx], structure=generate_binary_structure(3, 1))
+            if tidx not in components_by_phase:
+                components_by_phase[tidx], _ = label(support[..., tidx], structure=structure)
+            components = components_by_phase[tidx]
             rounded = np.clip(np.rint(np.nan_to_num(sample_pts, nan=0.0, posinf=0.0, neginf=0.0)).astype(int), 0, np.array(pressure.shape[:3]) - 1)
             ids = components[tuple(rounded.T)]
             # Gauges differ between disconnected components. A zero-filled
@@ -688,49 +690,6 @@ def compute_pressure_gradient_metrics(mask4d, flow, spacing, rr, rho=1060.0, vis
             velocity[..., comp] = np.divide(
                 numerator, denominator, out=np.zeros_like(numerator), where=denominator > 1e-12)
 
-    dx, dy, dz = [float(max(s, 1e-12)) for s in spacing_m]
-    vc = velocity[1:-1, 1:-1, 1:-1, :, :]
-    du_dt = _periodic_central_difference(velocity, dt_s)[1:-1, 1:-1, 1:-1, :, :]
-
-    conv = np.zeros_like(vc, dtype=np.float32)
-    lap = np.zeros_like(vc, dtype=np.float32)
-    for comp in range(3):
-        du_dx = (
-            velocity[2:, 1:-1, 1:-1, :, comp]
-            - velocity[:-2, 1:-1, 1:-1, :, comp]
-        ) / (2.0 * dx)
-        du_dy = (
-            velocity[1:-1, 2:, 1:-1, :, comp]
-            - velocity[1:-1, :-2, 1:-1, :, comp]
-        ) / (2.0 * dy)
-        du_dz = (
-            velocity[1:-1, 1:-1, 2:, :, comp]
-            - velocity[1:-1, 1:-1, :-2, :, comp]
-        ) / (2.0 * dz)
-        d2u_dx2 = (
-            velocity[2:, 1:-1, 1:-1, :, comp]
-            - 2.0 * velocity[1:-1, 1:-1, 1:-1, :, comp]
-            + velocity[:-2, 1:-1, 1:-1, :, comp]
-        ) / (dx * dx)
-        d2u_dy2 = (
-            velocity[1:-1, 2:, 1:-1, :, comp]
-            - 2.0 * velocity[1:-1, 1:-1, 1:-1, :, comp]
-            + velocity[1:-1, :-2, 1:-1, :, comp]
-        ) / (dy * dy)
-        d2u_dz2 = (
-            velocity[1:-1, 1:-1, 2:, :, comp]
-            - 2.0 * velocity[1:-1, 1:-1, 1:-1, :, comp]
-            + velocity[1:-1, 1:-1, :-2, :, comp]
-        ) / (dz * dz)
-        if use_convective_acceleration:
-            conv[..., comp] = vc[..., 0] * du_dx + vc[..., 1] * du_dy + vc[..., 2] * du_dz
-        lap[..., comp] = d2u_dx2 + d2u_dy2 + d2u_dz2
-
-    grad_inner = -rho * (du_dt + conv) + mu_pa_s * lap
-    # Always require the actual six-neighbour spatial derivative stencil to be
-    # measured inside the lumen, even when optional extra erosion is disabled.
-    # Also require both temporal neighbours; segmentation flicker must not be
-    # interpreted as acceleration from setting a phase's velocity to zero.
     support_work = np.zeros(work_mask.shape, dtype=bool)
     stencil = generate_binary_structure(3, 1)
     for tidx in range(work_mask.shape[3]):
@@ -747,9 +706,37 @@ def compute_pressure_gradient_metrics(mask4d, flow, spacing, rr, rho=1060.0, vis
                 iterations=erosion_iters,
                 border_value=0,
             )
+    # Gather only supported stencil centres; preserve all difference formulas,
+    # temporal neighbours, solver settings and full-size public output arrays.
+    dx, dy, dz = [float(max(s, 1e-12)) for s in spacing_m]
+    inner_indices = np.nonzero(support_work[1:-1, 1:-1, 1:-1, :])
+    centers = tuple(index + 1 for index in inner_indices[:3]) + (inner_indices[3],)
+    vc = velocity[centers]
+    du_dt = _periodic_central_difference(velocity, dt_s)[1:-1, 1:-1, 1:-1, :, :][inner_indices]
+    conv = np.zeros_like(vc, dtype=np.float32)
+    lap = np.zeros_like(vc, dtype=np.float32)
+    axis_indices = []
+    for axis in range(3):
+        before, after = list(centers), list(centers)
+        before[axis] = before[axis] - 1
+        after[axis] = after[axis] + 1
+        axis_indices.append((tuple(before), tuple(after)))
+    for comp in range(3):
+        before_x, after_x = axis_indices[0]
+        before_y, after_y = axis_indices[1]
+        before_z, after_z = axis_indices[2]
+        du_dx = (velocity[after_x + (comp,)] - velocity[before_x + (comp,)]) / (2.0 * dx)
+        du_dy = (velocity[after_y + (comp,)] - velocity[before_y + (comp,)]) / (2.0 * dy)
+        du_dz = (velocity[after_z + (comp,)] - velocity[before_z + (comp,)]) / (2.0 * dz)
+        d2u_dx2 = (velocity[after_x + (comp,)] - 2.0 * vc[..., comp] + velocity[before_x + (comp,)]) / (dx * dx)
+        d2u_dy2 = (velocity[after_y + (comp,)] - 2.0 * vc[..., comp] + velocity[before_y + (comp,)]) / (dy * dy)
+        d2u_dz2 = (velocity[after_z + (comp,)] - 2.0 * vc[..., comp] + velocity[before_z + (comp,)]) / (dz * dz)
+        if use_convective_acceleration:
+            conv[..., comp] = vc[..., 0] * du_dx + vc[..., 1] * du_dy + vc[..., 2] * du_dz
+        lap[..., comp] = d2u_dx2 + d2u_dy2 + d2u_dz2
+    grad_inner = -rho * (du_dt + conv) + mu_pa_s * lap
     grad_work = np.zeros(work_flow.shape, dtype=np.float32)
-    grad_work[1:-1, 1:-1, 1:-1, :, :] = grad_inner.astype(np.float32)
-    grad_work *= support_work.astype(np.float32)[..., None]
+    grad_work[centers] = grad_inner.astype(np.float32)
     grad_mag_work = np.sqrt(np.sum(np.square(grad_work, dtype=np.float32), axis=-1)).astype(np.float32)
 
     display_upper = _finite_percentile_abs(grad_mag_work[support_work], 99.0, default=1.0)

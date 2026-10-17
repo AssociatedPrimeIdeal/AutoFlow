@@ -86,6 +86,20 @@ automatic in defaults. Browser render objects have their own saved settings.
 **Restore defaults** resets the dock's display settings. No extra image, video,
 NPZ, H5 or JSON export is created by changing the display.
 
+The selected-plane image and label-overlay caches retain a full cardiac cycle
+and evict the oldest entry individually. Label/noise contents participate in
+overlay keys so in-place edits invalidate samples. Planar/projected streamline
+geometry retains up to a full cycle for all three views and both overlay types.
+Label boundary curves are reused when only colour, width or opacity changes;
+changed labels, sample spacing or image origin rebuild the geometry.
+
+Live 3D streamline cache misses compute in a background numerical worker.
+Scene actors and slice overlays update on the Qt thread after completion.
+Playback keeps one running request and the newest pending phase; returning to
+a cached phase is immediate. Results from a replaced input, mask, seed set or
+parameter context are discarded. Workspace serialization and Labeler files do
+not contain worker objects.
+
 ## Limitations
 
 Rendering settings do not recompute derived metrics. A 3D display fraction can

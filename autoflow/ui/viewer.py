@@ -789,6 +789,9 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         self._display_transform_cache.clear()
 
     def invalidate_cache(self, prefix=None):
+        manager = getattr(self, "_streamline_requests", None)
+        if manager is not None and (prefix is None or str(prefix).startswith("streamlines")):
+            manager.invalidate()
         self._content_source._cache.clear()
         self._phase_lookup_cache.clear()
         self._automatic_clim_cache.clear()
@@ -2110,26 +2113,26 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         )
 
     def _get_streamline_mesh(self, t):
+        from .streamline_jobs import streamline_requests
         ws = self.workspace
-        if not ws.streamline_active:
-            return None
-        if t in ws.streamline_cache:
-            return ws.streamline_cache[t]
-        if ws.flow_raw is None or ws.segmask_binary is None:
-            return None
-        p = ws.streamline_params
-        mask_t = ws.segmask_binary[..., min(max(0, int(t)), ws.segmask_binary.shape[3] - 1)]
-        sl = generate_streamlines_at_t(
-            ws.flow_raw, t, ws.streamline_seeds, ws.resolution, ws.origin,
-            mask_3d=mask_t,
-            max_steps=p.max_steps,
-            terminal_speed=p.terminal_speed,
-            seed_ratio=p.seed_ratio,
-            min_seeds=p.min_seeds,
-            rng_seed=p.rng_seed,
-        )
-        ws.streamline_cache[t] = sl
-        return sl
+        manager = streamline_requests(ws)
+        previous = getattr(self, "_streamline_requests", None)
+        if previous is not manager:
+            if previous is not None:
+                try:
+                    previous.ready.disconnect(self._streamline_mesh_ready)
+                    previous.failed.disconnect(self.logger)
+                except (RuntimeError, TypeError):
+                    pass
+            manager.ready.connect(self._streamline_mesh_ready)
+            manager.failed.connect(self.logger)
+            self._streamline_requests = manager
+        return manager.request(t)
+
+    def _streamline_mesh_ready(self, phase):
+        if (self.workspace.streamline_active and int(self.workspace.current_t) == phase
+                and self.workspace.streamline_cache.get(phase) is not None):
+            self.sync_from_workspace(rebuild_prefixes=("streamlines_live",))
 
     def _get_pathline_mesh(self, plane_idx, t):
         ws = self.workspace

@@ -28,6 +28,16 @@ def export_videos_in_process(workspace, out_dir, config, requested, progress_cal
     for key in list(vars(snapshot)):
         if key.endswith("_surface_cache"):
             delattr(snapshot, key)
+    if requested.get("plane") and not any(value for name, value in requested.items() if name != "plane"):
+        for name in ("mag_raw", "flow_raw", "flow_input", "phase_wrapped", "phase_wrapped_high",
+                     "correction_raw", "correction_high_raw", "pcmra_array", "pcmra_render_mask",
+                     "phase_unwrap_result"):
+            if hasattr(snapshot, name):
+                setattr(snapshot, name, None)
+        snapshot.derived = type(workspace.derived)()
+        for name in ("streamline_cache", "pathline_cache", "pathline_seed_cache"):
+            if hasattr(snapshot, name):
+                setattr(snapshot, name, {})
     with tempfile.TemporaryDirectory(prefix=".autoflow_export_", dir=out_dir) as directory:
         directory = Path(directory)
         request = directory / "request.joblib"

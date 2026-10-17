@@ -90,6 +90,13 @@ The `dynamic_time_repeat` value holds **each** cardiac phase for that many conse
 | `tke_video.mp4` or `tke_rotate.mp4` | `tke` video requested and TKE exists | TKE movie |
 | `summary.json` updates | GUI export runs in an output directory that already has results | refreshed `videos`, refreshed `video_times_sec`, and a `gui_video_export` record |
 
+A GUI export requesting only the plane video serializes a smaller private
+workspace snapshot: unrelated raw magnitude/velocity, phase-correction data,
+derived volumes and tracing caches are omitted. Plane geometry, segmentation,
+styles and framing remain available. Other video combinations retain the full
+numerical snapshot. The live workspace, saved Labeler exchange files and manual
+segmentation edits are preserved.
+
 ## Limitations
 - videos only render successfully if upstream data exists
 - offline export writes MP4 only through ImageIO FFmpeg; no GIF fallback is generated when MP4 encoding fails

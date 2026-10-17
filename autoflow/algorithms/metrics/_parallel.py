@@ -48,7 +48,8 @@ def _wait_plane_processes(calculate, progress_path, total, progress_callback, *,
             completed += 1
             if progress_callback is not None:
                 progress_callback({"stage": stage, "current": completed, "total": total,
-                                   "message": f"{'Sampled derived' if stage == 'plane_derived' else 'Calculated'} plane metrics ({completed}/{total})"})
+                                   "message": (f"Computed WSS phase {completed}/{total}" if stage == "wss" else
+                                               f"{'Sampled derived' if stage == 'plane_derived' else 'Calculated'} plane metrics ({completed}/{total})")})
     try:
         while runner.is_alive():
             check_cancelled()

@@ -224,6 +224,17 @@ AutoFlow normalizes loaders to `LoadedCase`.
 - each group can override preprocessing through `configs/labels.json -> label_groups.<group>.preprocess`, including Gaussian smoothing, dilation, erosion, opening, and closing
 - when only one foreground label exists, AutoFlow falls back to one group so single-label segmentations still work with the same pipeline
 
+## Large compressed H5 reads
+
+Legacy complex datasets of at least 32 MiB with gzip/shuffle filters decode in
+up to eight CPU threads. HDF5 I/O remains on the caller and the compressed-chunk
+queue is bounded. Unallocated chunks retain their fill value; unsupported
+layouts or filters use the normal HDF5 reader. This changes neither source
+files nor normalized arrays, correction/segmentation cache precedence or TKE
+availability. Source-file speed depends on NAS and operating-system caches.
+
+The bounded gzip/shuffle reader is owned by `autoflow/algorithms/data/h5_chunks.py` and called by `h5_loader.py`.
+
 ## Code References
 
 - H5 loading: `autoflow/algorithms/data/h5_loader.py`; cases/metadata: `data/discovery.py`, `data/h5_metadata.py`

@@ -151,6 +151,33 @@ Selected-plane display controls:
 
 Changing the active segmentation compares the processed masks and skeleton/group configuration. Identical processed 4D labels retain geometry and numerical results. Changed temporal labels with identical voted 3D labels and per-group topology retain centerlines and planes, while clearing all segmentation-dependent metrics, PWV and trajectories for explicit recomputation. Changed 3D topology or preprocessing/group configuration clears downstream geometry. No phase-local pressure or PWV shortcut is applied.
 
+Grouped CLI/Python 4D inference writes uncompressed source NIfTI files only
+inside its temporary directory. After the existing common crop, normalization
+and resampling, it uploads unique float32 feature maps once when CUDA memory
+permits, then selects each phase's original channels on the GPU. The guard
+reserves two channel tensors plus 16 GiB for inference; insufficient memory or
+allocation failure retains CPU assembly. Checkpoint, folds, interpolation,
+softmax, precision, sliding windows and phase ordering are unchanged.
+
+| Parameter | Type | Default | Where configured | Effect | Code owner |
+| --- | --- | --- | --- | --- | --- |
+| `num_processes_segmentation_export` | int or None | `None` | segmentation function keyword | Grouped 4D: four export workers; standard/3D: one process. Explicit positive counts override the default | `autoflow/algorithms/segmentation/nnunet_grouped.py`, `nnunet_static.py`, `nnunet_temporal.py` |
+
+Grouped CUDA export uses threads to avoid sending large logits through a process
+pipe. Its default is four export workers; an explicit
+`num_processes_segmentation_export` value is honored. `None` selects this grouped
+default and one process for the standard/3D path. CPU inference and unrecognized
+upstream iterator implementations retain nnUNet's process-based exporter.
+Torch's CPU thread limit is held at up to eight during the grouped call and
+restored after all workers finish. Runtime changes are confined to this predictor
+and private function namespaces, without editing installed nnUNet code.
+
+The GUI continues to use the standard isolated predictor. Grouped inference
+does not delete CPU magnitude, velocity or labels, persistent segmentation
+artifacts, or the Labeler exchange directory. Opening Labeler creates missing
+exchange images on demand, reuses unchanged files, and preserves a saved manual
+mask when regenerating images.
+
 ## Limitations
 - automatic backends are `nnUNet` (3D/static) and `nnUNet4D` (Dataset7020 temporal-channel model)
 - the `nnUNet` backend predicts one 3D label volume from Dataset7010's 12 summary channels and broadcasts that unchanged volume across the input time count
@@ -191,7 +218,7 @@ Changing the active segmentation compares the processed masks and skeleton/group
 | add a new segmentation source | `autoflow/core/models.py`, `autoflow/ui/app.py` | `autoflow/ui/segmentation.py`, `autoflow/algorithms/segmentation/io.py` | `tests/test_smoke_phantoms.py` |
 | change threshold behavior | `autoflow/algorithms/segmentation/threshold.py`, `autoflow/ui/app.py` | `autoflow/core/models.py` | `tests/test_smoke_phantoms.py` |
 | change static nnUNet inference | `autoflow/algorithms/segmentation/nnunet_static.py`, `autoflow/nnunet_runtime.py` | `autoflow/processing.py`, `autoflow/ui/app.py` | manual verification plus smoke and phantom regression only |
-| change temporal/grouped nnUNet inference | `autoflow/algorithms/segmentation/nnunet_temporal.py`, `autoflow/algorithms/segmentation/nnunet_grouped.py` | `autoflow/algorithms/segmentation/channels.py` | smoke/phantom coverage and manual inference checks |
+| change temporal/grouped nnUNet inference | `autoflow/algorithms/segmentation/nnunet_temporal.py`, `autoflow/algorithms/segmentation/nnunet_grouped.py`, `autoflow/algorithms/segmentation/grouped_runtime.py` | `autoflow/algorithms/segmentation/channels.py` | smoke/phantom coverage and manual inference checks |
 | change models, channels or subprocess behavior | `autoflow/algorithms/segmentation/models.py`, `autoflow/algorithms/segmentation/channels.py`, `autoflow/algorithms/segmentation/runtime.py` | static and temporal inference modules | `tests/test_smoke_phantoms.py` |
 | change segmentation import/export | `autoflow/algorithms/segmentation/io.py`, `autoflow/algorithms/segmentation/_common.py` | `autoflow/ui/labeler_exchange.py` | `tests/test_smoke_phantoms.py` |
 | change segmentation dock behavior | `autoflow/ui/segmentation.py`, `autoflow/ui/app.py` | `autoflow/core/models.py` | `tests/test_smoke_phantoms.py` |

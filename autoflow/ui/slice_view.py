@@ -538,21 +538,29 @@ class SliceView(QtWidgets.QFrame):
 
     def set_segmentation_boundaries(self, labels, colors, width=1.5, opacity=0.35):
         from skimage.measure import find_contours
-        for item in self.segmentation_boundaries:
-            self.view_box.removeItem(item)
-        self.segmentation_boundaries.clear()
-        if labels is None:
-            return
-        for value in np.unique(labels):
-            if value <= 0:
-                continue
-            for contour in find_contours(np.pad(labels == value, 1), 0.5):
-                points = (contour - 1) * self._spacing + self._sample_origin
-                item = pg.PlotCurveItem(points[:, 0], points[:, 1], pen=pg.mkPen(colors[int(value)], width=width))
-                item.setZValue(12)
-                item.setOpacity(float(opacity))
-                self.view_box.addItem(item)
-                self.segmentation_boundaries.append(item)
+        key = None if labels is None else (
+            labels.shape, labels.dtype.str, labels.tobytes(),
+            tuple(self._spacing), tuple(self._sample_origin))
+        if getattr(self, "_segmentation_boundary_key", object()) != key:
+            for item in self.segmentation_boundaries:
+                self.view_box.removeItem(item)
+            self.segmentation_boundaries.clear()
+            self._segmentation_boundary_labels = []
+            if labels is not None:
+                for value in np.unique(labels):
+                    if value <= 0:
+                        continue
+                    for contour in find_contours(np.pad(labels == value, 1), 0.5):
+                        points = (contour - 1) * self._spacing + self._sample_origin
+                        item = pg.PlotCurveItem(points[:, 0], points[:, 1])
+                        item.setZValue(12)
+                        self.view_box.addItem(item)
+                        self.segmentation_boundaries.append(item)
+                        self._segmentation_boundary_labels.append(int(value))
+            self._segmentation_boundary_key = key
+        for item, value in zip(self.segmentation_boundaries, self._segmentation_boundary_labels):
+            item.setPen(pg.mkPen(colors[value], width=width))
+            item.setOpacity(float(opacity))
 
     def set_contours(self, contours):
         self.clear_contours()

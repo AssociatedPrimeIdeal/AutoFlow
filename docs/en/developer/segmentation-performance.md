@@ -6,6 +6,28 @@ files. This measures automatic segmentation followed by manual label revision,
 not nnUNet training. The CLI's grouped preprocessing is a different path and
 was not replaced or benchmarked as the GUI baseline.
 
+## Grouped implementation update on 2026-10-18
+
+The grouped CLI/API path now owns its transfer/export adapter in
+`autoflow/algorithms/segmentation/grouped_runtime.py`. It retains the existing
+external runner's crop and normalization helpers, writes temporary source maps
+as `.nii`, optionally keeps their resampled float32 pool on CUDA, and runs the
+upstream exporter in threads with a scoped Torch thread count. The GUI's
+isolated standard path and Labeler exchange lifecycle remain separate.
+
+The preceding external fixed-checkpoint experiment measured grouped segmentation
+75.11 -> 33.61 seconds and complete API time 144.38 -> 77.68 seconds on the RTX
+PRO 6000. These are experiment measurements, not a guaranteed runtime for every
+case. The full run recomputed correction/segmentation with source writes off;
+OS caches were not flushed. The 30-second target was not reached. Integration
+validation is recorded in [Current pipeline performance](performance.md).
+
+Keep CPU `mag_raw`, `flow_raw` and active labels alive for Labeler. Only grouped
+temporary inputs and unused CUDA allocator blocks are disposable. Never clean
+the persistent exchange directory as part of inference cleanup. Validation
+uses the two existing smoke/phantom files plus a real Labeler open/save/import
+check; no new targeted test files are required.
+
 ## Input and controls
 
 The local validation input was

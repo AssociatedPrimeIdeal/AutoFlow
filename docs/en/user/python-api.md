@@ -165,4 +165,4 @@ DICOM directories always use Dicom2H5 before H5 loading. Set `dicom_h5_dir` to c
 
 ## Low-level plane sampling
 
-`autoflow.algorithms.augment_plane_metrics_with_derived()` accepts optional `use_multithread=False`, `max_workers=None` and `progress_callback=None` keywords. Automatic process sampling starts at 1920 plane-phases, uses up to four workers, and preserves per-frame contour edits and output order. See [Metrics](../features/metrics.md) for the parameter table. The standard pipeline selects this through its existing parallel-computation setting.
+`autoflow.algorithms.augment_plane_metrics_with_derived()` accepts optional `use_multithread=False`, `max_workers=None` and `progress_callback=None` keywords. Automatic process sampling starts at 512 plane-phases, uses up to eight workers, and preserves per-frame contour edits and output order. See [Metrics](../features/metrics.md) for the parameter table. The standard pipeline selects this through its existing parallel-computation setting.

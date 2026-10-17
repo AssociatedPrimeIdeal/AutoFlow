@@ -1,5 +1,6 @@
 from ..rendering.content import ScalarContentSource
 import copy
+import hashlib
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
@@ -159,12 +160,14 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         self._sync_display_legacy_controls()
 
     def _cached(self, group, key, builder, max_items=24):
+        if group in {"plane_slices", "plane_overlays"}:
+            max_items = max(max_items, int(self.workspace.time_count()))
         bucket = self._cache.setdefault(group, {})
         if key in bucket:
             return bucket[key]
         value = builder()
         if len(bucket) >= max_items:
-            bucket.clear()
+            bucket.pop(next(iter(bucket)))
         bucket[key] = value
         return value
 
@@ -776,24 +779,36 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             return images
 
         images = self._cached("plane_slices", key, _build, max_items=8)
-        out = []
-        for image, title, axis_u, axis_v in images:
-            overlay = None
-            if labels is not None:
-                sampled, _ = self._resample_basis(
-                    labels, center, axis_u, axis_v, fov_mm, spacing_mm,
-                    order=0, cell_centered=True,
-                )
-                overlay = np.rint(sampled).astype(np.int16)
-            noise_overlay = None
-            if noise_region is not None:
-                sampled_noise, _ = self._resample_basis(
-                    noise_region, center, axis_u, axis_v, fov_mm, spacing_mm,
-                    order=0, cell_centered=True,
-                )
-                noise_overlay = sampled_noise >= 0.5
-            out.append((image, overlay, noise_overlay, title))
-        return out
+        def content_token(value):
+            if value is None:
+                return None
+            array = np.ascontiguousarray(value)
+            return (array.shape, array.dtype.str,
+                    hashlib.blake2b(array.view(np.uint8), digest_size=16).digest())
+        # A content token also invalidates nearest-neighbour overlays after an
+        # in-place label edit, without retaining a second copy of the volume.
+        overlay_key = (key[1:7], content_token(labels), content_token(noise_region))
+
+        def build_overlays():
+            overlays = []
+            for image, title, axis_u, axis_v in images:
+                overlay = noise_overlay = None
+                if labels is not None:
+                    sampled, _ = self._resample_basis(
+                        labels, center, axis_u, axis_v, fov_mm, spacing_mm,
+                        order=0, cell_centered=True)
+                    overlay = np.rint(sampled).astype(np.int16)
+                if noise_region is not None:
+                    sampled_noise, _ = self._resample_basis(
+                        noise_region, center, axis_u, axis_v, fov_mm, spacing_mm,
+                        order=0, cell_centered=True)
+                    noise_overlay = sampled_noise >= 0.5
+                overlays.append((overlay, noise_overlay))
+            return overlays
+
+        overlays = self._cached("plane_overlays", overlay_key, build_overlays)
+        return [(image, overlay, noise, title)
+                for (image, title, _, _), (overlay, noise) in zip(images, overlays)]
 
     def update_slider_ranges(self):
         self._refresh_content_choices()
@@ -1214,28 +1229,22 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         self.label_streamline_status.setText(text)
 
     def _projection_streamline_mesh(self, t):
-        ws = self.workspace
-        if not ws.streamline_active or ws.flow_raw is None:
-            return None
-        if t in ws.streamline_cache:
-            return ws.streamline_cache[t]
-        mask = None
-        if ws.segmask_binary is not None:
-            binary = np.asarray(ws.segmask_binary)
-            mask = binary[..., min(t, binary.shape[3] - 1)] if binary.ndim == 4 else binary
-        if mask is None:
-            mask = self._get_mask_3d()
-        if mask is None:
-            return None
-        params = ws.streamline_params
-        mesh = generate_streamlines_at_t(
-            ws.flow_raw, t, ws.streamline_seeds, ws.resolution, ws.origin,
-            mask_3d=np.asarray(mask, dtype=bool), max_steps=params.max_steps,
-            terminal_speed=params.terminal_speed, seed_ratio=params.seed_ratio,
-            min_seeds=params.min_seeds, rng_seed=params.rng_seed,
-        )
-        ws.streamline_cache[t] = mesh
-        return mesh
+        from .streamline_jobs import streamline_requests
+        manager = streamline_requests(self.workspace)
+        previous = getattr(self, "_streamline_requests", None)
+        if previous is not manager:
+            if previous is not None:
+                try:
+                    previous.ready.disconnect(self._projection_mesh_ready)
+                except (RuntimeError, TypeError):
+                    pass
+            manager.ready.connect(self._projection_mesh_ready)
+            self._streamline_requests = manager
+        return manager.request(t)
+
+    def _projection_mesh_ready(self, phase):
+        if self.workspace.streamline_active and int(self.workspace.current_t) == phase:
+            self.refresh(update_plane=False)
 
     def _update_slice_streamlines(self, name, t, labels, selected_plane, center, fov_mm):
         view = self.slice_views[name]
@@ -1297,7 +1306,7 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
                 )
                 if planar_cfg["max_length"] > 0:
                     curves = [limit_polyline_length(curve, planar_cfg["max_length"]) for curve in curves]
-                if len(self._streamline_cache) >= 24:
+                if len(self._streamline_cache) >= max(24, 6 * int(ws.time_count())):
                     self._streamline_cache.pop(next(iter(self._streamline_cache)))
                 self._streamline_cache[key] = curves
             curves = self._streamline_cache[key]
@@ -1307,6 +1316,9 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             view.set_streamlines("planar", curves, planar_cfg["opacity"], values=values, style=planar_cfg, clim=clim)
         if projection:
             mesh = self._projection_streamline_mesh(frame)
+            if mesh is None:
+                view.set_streamlines("projection", None)
+                return
             key = ("projection", id(mesh), frame, geometry_key, projection_cfg["slab"], projection_cfg["fraction"], projection_cfg["quantity"])
             cached = self._streamline_cache.get(key)
             # Retain the mesh with the cache entry so a replaced VTK object's
@@ -1318,7 +1330,7 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
                 )
                 basis = np.column_stack((horizontal, vertical))
                 values = [np.linalg.norm(v @ basis if projection_cfg["quantity"] == "in_plane" else v, axis=-1) * 100.0 for v in vectors]
-                if len(self._streamline_cache) >= 24:
+                if len(self._streamline_cache) >= max(24, 6 * int(ws.time_count())):
                     self._streamline_cache.pop(next(iter(self._streamline_cache)))
                 cached = self._streamline_cache[key] = (mesh, curves, values)
             clim = self._streamline_clim(projection_cfg, horizontal, vertical)

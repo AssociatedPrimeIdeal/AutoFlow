@@ -90,7 +90,7 @@ Low-level Python users can call `augment_plane_metrics_with_derived(...)` with:
 
 | Parameter | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `use_multithread` | bool | `False` | function keyword; pipeline uses its plane-computation setting | Automatically use up to four isolated processes at 1920 plane-phases or more | `autoflow/algorithms/metrics/plane_derived.py` |
+| `use_multithread` | bool | `False` | function keyword; pipeline uses its plane-computation setting | Automatically use up to eight isolated processes at 512 plane-phases or more | `autoflow/algorithms/metrics/plane_derived.py` |
 | `max_workers` | int or None | `None` | function keyword | Override derived-sampling process count; one selects serial | same |
 | `progress_callback` | callable or None | `None` | function keyword | Receive completed-plane dictionaries on the calling thread | same |
 
@@ -103,6 +103,12 @@ Low-level Python callers of `augment_plane_metrics_with_derived()` or
 | --- | --- | --- | --- | --- | --- |
 | `segmentation_labels_3d` | Integer XYZ array or `None` | `None` | Python sampling call | Static label support when 4D labels are absent | `algorithms/metrics/sampling.py` |
 | `segmentation_labels_4d` | Integer XYZT array or `None` | `None` | Python sampling call | Phase-specific label support; preferred over 3D labels | `algorithms/metrics/sampling.py` |
+
+WSS worker selection is available to low-level Python callers:
+
+| Parameter | Type | Default | Where configured | Effect | Code owner |
+| --- | --- | --- | --- | --- | --- |
+| WSS `max_workers` | int or None | `None` | `compute_wss_metrics()` keyword | Auto: up to eight processes for at least two million mask samples and distinct mask groups; `1` selects serial; identical masks share wall preparation | `autoflow/algorithms/metrics/wss.py` |
 
 ## Outputs
 
@@ -151,11 +157,25 @@ Basic metrics include `roi_source_frame_t` (zero-based source phase or JSON `nul
 - fields ending in `_mean`, `_peak`, or `_p95` are scalar summaries over the sampled plane data
 - `forward` and `reverse` use the resolved local forward direction; `signed` keeps that sign convention in one curve
 
-Process parallelism now accounts for temporal workload: below 128 planes, 1920 or more plane-phase evaluations use up to four processes; smaller workloads remain serial. At least 128 planes retain up to eight processes. Shared input memmaps avoid copying full arrays into each worker. The controlled 96-plane/20-phase comparison preserved metric and QC results; see [Performance](../developer/performance.md).
+Process parallelism accounts for temporal workload: 512 or more plane-phase evaluations use up to eight processes; smaller workloads remain serial unless there are at least 128 planes. Explicit worker counts retain their existing precedence. Shared input memmaps avoid copying full arrays into each worker. The controlled 96-plane/20-phase comparison preserved metric and QC results; see [Performance](../developer/performance.md).
 
 Plane progress callbacks report every completed plane on the calling thread, including when several worker markers are collected in one poll.
 
 Plane pixelwise H5 output is written privately and replaces the previous file only after a complete write. Cancelling or failing that export retains the previous complete file; its schema is unchanged.
+
+WSS builds signed-distance walls only over the occupied spatial bounds plus
+the full smoothing stencil halo. Large dynamic masks use up to eight isolated
+processes; phases with identical masks stay together to reuse wall geometry.
+Small/static workloads remain serial. Results are restored to original phase
+order; progress and cancellation remain on the calling thread. No-slip fitting
+omits the unused wall-velocity probe, and linear fitting omits the unused second
+inward probe. These do not change the fitted values or validity rules.
+
+Pressure spatial differences evaluate only the existing valid stencil centres;
+the temporal difference, erosion, physical constants, reconstruction solver,
+gauge and tolerances are unchanged. Centreline sampling batches the same eight
+trilinear terms in float64 before float32 assignment. Connected components are
+computed once per phase per call and reused across paths.
 
 ## Limitations
 - segmentation is required

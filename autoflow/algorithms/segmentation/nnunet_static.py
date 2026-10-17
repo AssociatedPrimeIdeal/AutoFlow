@@ -63,7 +63,7 @@ def generate_nnunet_auto_segmentation(
     step_size=0.5,
     disable_tta=True,
     num_processes_preprocessing=0,
-    num_processes_segmentation_export=1,
+    num_processes_segmentation_export=None,
     artifact_prefix="",
     runner=None,
     progress_callback=None,
@@ -90,6 +90,8 @@ def generate_nnunet_auto_segmentation(
                 grouped_preprocessing=grouped_preprocessing,
             )
         raise ValueError(f"unsupported auto segmentation backend: {backend}")
+
+    num_processes_segmentation_export = max(1, int(num_processes_segmentation_export or 1))
 
     t_total_start = time.perf_counter()
     total_stages = 5

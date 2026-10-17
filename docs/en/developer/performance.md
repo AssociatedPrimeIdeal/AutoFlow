@@ -2,6 +2,60 @@
 
 The [2026-10-07 cross-anatomy pipeline and interaction audit](pipeline-audit-2026-10-07.md) covers five input categories, optional metrics and videos, GUI state, failure semantics and remaining optimization opportunities.
 
+## Validated changes on 2026-10-18
+
+The grouped CLI/Python pipeline now includes bounded gzip/shuffle H5 decoding,
+shared float32 CUDA feature maps, GPU-first padding, uncompressed temporary
+source NIfTI files, and threaded CPU prediction export. WSS uses isolated phase
+groups and a conservative spatial crop; repeated masks keep wall reuse. Pressure
+stencils and centreline interpolation avoid repeated work. The plane worker
+threshold is 512 plane-phases, with up to eight isolated processes.
+
+The baseline is the current worktree captured immediately before integration,
+including its existing graph and plane-plan changes: **44 paths and 29 planes**.
+This differs from the older external experiment's geometry. Both versions use
+the same frozen Dataset7020 checkpoint, NumPy/Torch seeds, deterministic CUDA
+settings, input, correction, fresh 4D segmentation and WSS/pressure requests.
+Embedded correction/segmentation are bypassed and source writes are disabled.
+OS caches were not flushed. Videos, optional phase unwrapping, PWV, TKE and
+vortex analysis are excluded from the pipeline timer.
+
+| Stage | Current baseline | Integrated implementation |
+| --- | ---: | ---: |
+| Complete API call | 151.42 s | 77.72 s |
+| Load and correction | 22.78 s | 19.32 s |
+| Fresh grouped segmentation | 75.81 s | 33.92 s |
+| Metrics and their exports | 44.12 s | 13.18 s |
+
+The observed complete-API speedup is **1.95x**;
+the 30-second target is **not reached**. NAS/cache conditions affect load time;
+the table is a controlled-case observation, not a universal runtime guarantee.
+The CUDA feature pool contains 112 maps (6,822,816,000 bytes) and the exporter
+uses four threads. The process Torch thread count is restored after inference.
+
+All 382 compared arrays and
+297,035 scalar fields are exactly equal, including
+NaN placement. Export checks also match all 10,340 H5
+datasets, 9 NPZ arrays and one segmentation NIfTI plus
+its affine. The existing smoke/phantom suite passes 369 checks.
+
+GUI checks compare exact selected-plane pixels and boundary screenshots,
+including in-place label invalidation. A three-frame plane video exported
+through the actual child process has identical decoded pixels. A real 3D
+streamline cache miss returns the same mesh in a background worker while Qt
+timer events continue. Pending requests coalesce and obsolete results are
+discarded. Worker objects are kept outside the serializable workspace.
+
+The GUI's standard isolated segmentation path is retained; the grouped inference
+numbers above apply to CLI/Python calls. Labeler checks use its real offscreen
+window, five 4D images and one mask: initial generation, zero-rewrite reuse,
+save/edit/import, missing-image regeneration and preservation of saved edits
+all pass. Raw magnitude/velocity/labels and persistent exchange files remain
+available. Plane-only video export trims only its private subprocess snapshot.
+
+The [machine-readable validation record](performance-validation-2026-10-18.json)
+contains the controls and numerical, GUI, video and Labeler results.
+
 ## Validated changes on 2026-10-04
 
 The current comparison uses the registered DV H5, 20 phases, **39 paths and 113 planes**, with a frozen `fold_all/checkpoint_best.pth`. Its SHA-256 is `a3b253f440bb9b1935c6457faf9eb6790a82af098e9ccc8fbce6645ad459987c`. The baseline is a Python-source snapshot taken before these changes. Raw timings, hashes, numerical comparisons and GUI checks are in the [validation record](performance-validation-2026-10-04.json).

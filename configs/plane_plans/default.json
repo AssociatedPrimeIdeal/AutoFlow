@@ -744,11 +744,11 @@
           "anchor": "label_connections",
           "position": "near",
           "fallback": {
-            "anchor": "label_longest",
-            "position": "fractions",
-            "fractions": [
-              0.5
-            ]
+            "anchor": "label_level",
+            "level": 1,
+            "path_selection": "longest",
+            "position": "near",
+            "offset_mm": 15.0
           },
           "offset_mm": 15.0
         }
@@ -776,11 +776,11 @@
           "anchor": "label_connections",
           "position": "near",
           "fallback": {
-            "anchor": "label_longest",
-            "position": "fractions",
-            "fractions": [
-              0.5
-            ]
+            "anchor": "label_level",
+            "level": 1,
+            "path_selection": "longest",
+            "position": "near",
+            "offset_mm": 15.0
           },
           "offset_mm": 15.0
         }
@@ -808,11 +808,11 @@
           "anchor": "label_connections",
           "position": "near",
           "fallback": {
-            "anchor": "label_longest",
-            "position": "fractions",
-            "fractions": [
-              0.5
-            ]
+            "anchor": "label_level",
+            "level": 1,
+            "path_selection": "longest",
+            "position": "near",
+            "offset_mm": 15.0
           },
           "offset_mm": 15.0
         }
@@ -840,11 +840,11 @@
           "anchor": "label_connections",
           "position": "near",
           "fallback": {
-            "anchor": "label_longest",
-            "position": "fractions",
-            "fractions": [
-              0.5
-            ]
+            "anchor": "label_level",
+            "level": 1,
+            "path_selection": "longest",
+            "position": "near",
+            "offset_mm": 15.0
           },
           "offset_mm": 15.0
         }

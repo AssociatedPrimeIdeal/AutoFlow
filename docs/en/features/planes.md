@@ -21,7 +21,8 @@ The default `plane_mode=by_label` detects observed cross-label connections once 
 | MPA, RBCT, CCA, LBCT | midpoint of each selected connected interval | longest L1 interval midpoint |
 | RPA, LPA | midpoint of each selected connected interval | longest continuous own-label interval midpoint |
 | ARCH, HA, SMA | disabled; their labels and paths remain available to connection detection | disabled |
-| PV, SMV, SV, StrS, LTS, RTS, SSS | 15 mm from the connection-side label boundary into the label | longest continuous own-label interval midpoint |
+| PV, SMV, SV | 15 mm from the connection-side label boundary into the label | longest continuous own-label interval midpoint |
+| StrS, LTS, RTS, SSS | 15 mm from the connection-side label boundary into the label | longest L1 interval, 15 mm from its flow-oriented start; midpoint below 30 mm; missing L1 is omitted |
 | BA | longest L2 interval midpoint if BA actually connects to both LVA and RVA in this component; otherwise longest L1 midpoint | same conditional level rule |
 | LIJV, RIJV | always longest L1 interval at 1/3 and 2/3, including when connections exist; no radius weighting | same L1 rule |
 | LICA, RICA, LVA, RVA | 5 mm inside each connected interval | longest L1 interval at 33% and 66% |

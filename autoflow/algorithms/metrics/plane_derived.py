@@ -396,7 +396,7 @@ def augment_plane_metrics_with_derived(plane_metrics, planes, mask4d, spacing, o
         tke_array = _prepare_tke_array(mask4d, tke_array=tke_array)
     count = min(len(plane_metrics), len(planes))
     if max_workers is None:
-        max_workers = min(4, count, max(1, os.cpu_count() or 1)) if use_multithread and count * mask4d.shape[3] >= 1920 else 1
+        max_workers = min(8, count, max(1, os.cpu_count() or 1)) if use_multithread and count * mask4d.shape[3] >= 512 else 1
     if int(max_workers) <= 1 or count != len(plane_metrics):
         return _augment_plane_metrics_serial(
             plane_metrics, planes, mask4d, spacing, origin, branch_labels_3d,

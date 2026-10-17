@@ -50,7 +50,10 @@ def default_label_placements(name, profile="default"):
         return connected(fractions=[.5], fallback=level([.5]))
     if name in {"RPA", "LPA"}:
         return connected(fractions=[.5])
-    if name in {"PV", "SMV", "SV", "StrS", "LTS", "RTS", "SSS"}:
+    if name in {"StrS", "LTS", "RTS", "SSS"}:
+        return connected(offset=15., fallback={"anchor": "label_level", "level": 1,
+                         "path_selection": "longest", "position": "near", "offset_mm": 15.})
+    if name in {"PV", "SMV", "SV"}:
         return connected(offset=15.)
     if name == "BA":
         return [level([.5], 2, when_connected_to=["LVA","RVA"], otherwise_level=1)]

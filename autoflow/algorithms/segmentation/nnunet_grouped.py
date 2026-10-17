@@ -12,6 +12,7 @@ from tempfile import TemporaryDirectory
 import numpy as np
 
 from ._common import segmentation_timestamp
+from .grouped_runtime import iter_grouped_temporal_samples, predict_grouped_iterator
 from .channels import (
     _apply_label_map,
     _nnunet_channel_volumes,
@@ -183,7 +184,7 @@ def _generate_nnunet_4d_grouped(
             index, (source_key, volume) = item
             kind, feature_index, frame = source_key
             frame_token = "global" if kind == "global" else f"t{int(frame):03d}"
-            path = input_dir / f"source_{kind}_{int(feature_index):02d}_{frame_token}_{index:03d}.nii.gz"
+            path = input_dir / f"source_{kind}_{int(feature_index):02d}_{frame_token}_{index:03d}.nii"
             _write_nifti_volume(volume, affine, path)
             return source_key, path
 
@@ -260,8 +261,8 @@ def _generate_nnunet_4d_grouped(
             temporal_radius=radius,
             unique_source_maps=len(source_paths),
         )
-        raw_iterator = pipeline.iter_grouped_temporal_preprocessed_samples_from_source_paths(
-            samples,
+        raw_iterator = iter_grouped_temporal_samples(
+            pipeline, torch_device, samples,
             source_paths,
             predictor.plans_manager,
             predictor.configuration_manager,
@@ -275,15 +276,15 @@ def _generate_nnunet_4d_grouped(
                 if segmentation is not None:
                     raise RuntimeError(f"{sample['sample_id']}: prediction input unexpectedly has a segmentation")
                 yield {
-                    "data": torch.from_numpy(np.ascontiguousarray(data, dtype=np.float32)),
+                    "data": data if torch.is_tensor(data) else torch.from_numpy(np.ascontiguousarray(data, dtype=np.float32)),
                     "data_properties": properties,
                     "ofile": str(output_dir / str(sample["sample_id"])),
                 }
 
-        predictor.predict_from_data_iterator(
-            _predictor_iterator(),
-            save_probabilities=False,
-            num_processes_segmentation_export=max(1, int(num_processes_segmentation_export or 1)),
+        predict_grouped_iterator(
+            predictor, _predictor_iterator(),
+            export_workers=(4 if num_processes_segmentation_export is None
+                            else max(1, int(num_processes_segmentation_export))),
         )
 
         _emit_progress(

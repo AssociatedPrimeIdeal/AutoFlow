@@ -62,7 +62,7 @@ def generate_nnunet_4d_auto_segmentation(
     auto_label_map="",
     case_id="autoflow_case",
     num_processes_preprocessing=0,
-    num_processes_segmentation_export=1,
+    num_processes_segmentation_export=None,
     artifact_prefix="",
     runner=None,
     progress_callback=None,
@@ -176,6 +176,7 @@ def generate_nnunet_4d_auto_segmentation(
                 fallback_reason=grouped_fallback_reason,
             )
 
+    num_processes_segmentation_export = max(1, int(num_processes_segmentation_export or 1))
     with TemporaryDirectory(prefix="autoflow_nnunet4d_") as tmp_root:
         tmp_root = Path(tmp_root)
         input_dir = tmp_root / "input"

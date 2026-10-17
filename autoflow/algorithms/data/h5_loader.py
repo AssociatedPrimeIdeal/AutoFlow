@@ -2,6 +2,7 @@
 
 import h5py
 import numpy as np
+from .h5_chunks import read_compressed_dataset
 from ...case_types import LoaderCapabilities
 from ..phase_correction import apply_background_phase_correction_to_complex, apply_background_phase_correction_to_mag_flow, background_phase_report_for_metadata
 
@@ -131,7 +132,7 @@ def load_h5_data(
         }
 
         if img_complex_ds is not None:
-            img_complex = np.asarray(img_complex_ds[:])
+            img_complex = read_compressed_dataset(img_complex_ds)
             if img_complex.ndim != 5 or int(img_complex.shape[-1]) not in (4, 7):
                 raise ValueError(
                     f"legacy complex H5 expects XYZT4 or XYZT7 complex data (channels last), got {img_complex.shape}"

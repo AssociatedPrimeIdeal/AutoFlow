@@ -96,6 +96,14 @@ public configuration fields. See [Viewer display settings](viewer-display.md).
 Cached GUI streamline polylines/display meshes and requested offline videos. See [Outputs](../user/outputs.md) for video names.
 Slice-overlay geometry is cached for display only; it creates no extra output files.
 
+Interactive live 3D streamlines and their slice projections share a background
+mesh request manager. Missing phases appear after computation finishes; playback
+coalesces pending requests and ignores results for obsolete inputs or parameters.
+The numerical integration, seeds and output geometry are unchanged. The 2D
+integrator evaluates only surviving seeds at each existing RK2 step, preserving
+trajectory order and stopping rules. CLI/offline export keeps its existing
+synchronous numerical contract.
+
 ## Limitations
 
 Instantaneous streamlines do not track particles through changing phases. Offline phase meshes consume memory. Geometry and colour remain qualitative unless reviewed against calibrated measurements.
@@ -112,6 +120,8 @@ display of an uncached 3D phase still requires its normal 3D integration.
 Planar integration and slab clipping: `autoflow/algorithms/slice_streamlines.py`;
 controls, sampling and phase caches: `autoflow/ui/ortho_viewer.py`; persistent
 overlay curves/arrows: `autoflow/ui/slice_view.py`.
+
+Live GUI mesh scheduling and obsolete-result rejection live in `autoflow/ui/streamline_jobs.py`; scene/slice consumers are `autoflow/ui/viewer.py` and `autoflow/ui/ortho_viewer.py`.
 
 ## Tests
 

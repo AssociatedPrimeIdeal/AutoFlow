@@ -1199,6 +1199,39 @@ def test_connection_default_phantom_offsets_stay_inside_short_label(name, length
     assert planes[0].center[0] == pytest.approx(5 + length - min(15., length / 2))
 
 
+@pytest.mark.parametrize("name", ["StrS", "LTS", "RTS", "SSS"])
+@pytest.mark.parametrize("length,flow_sign", [(12, 1), (40, 1), (40, -1)])
+def test_connection_sinus_phantom_unconnected_fallback_is_longest_l1_offset(name, length, flow_sign):
+    from autoflow.algorithms.label_planes import generate_label_planes
+    from autoflow.plane_rules import default_label_plane_rules
+    # A longer L2 branch must not replace the requested L1 interval.
+    x = 5. + length
+    paths = [np.column_stack((np.arange(5., x + 1), np.full(length + 1, 20.), np.full(length + 1, 10.))),
+             np.column_stack((np.full(45, x), np.arange(20., 65.), np.full(45, 10.))),
+             np.column_stack((np.full(16, x), np.arange(20., 4., -1), np.full(16, 10.)))]
+    hierarchy = [{"label_local_levels": {"23": level}, "flow_sign": flow_sign} for level in (0, 1, 1)]
+    volume, infos = _landmark_phantom(paths, [np.full(len(p), 23) for p in paths],
+                                    [(0, 1), (1, 2), (1, 3)], {name: 23}, hierarchy)
+    rule = default_label_plane_rules()[name]
+    planes, _, _, qc = generate_label_planes(paths, volume, {name: 23}, {name: rule},
+        path_info=infos, smoothing_window=1, inter_time=1)
+    assert len(planes) == 1 and planes[0].path_index == 0
+    placement = planes[0].placement
+    assert placement["connection_fallback"] and placement["anchor"] == "label_level"
+    assert placement["label_level"] == 1 and placement["path_selection"] == "longest"
+    distance = min(15., length / 2)
+    assert placement["nominal_distance_in_interval_mm"] == pytest.approx(distance)
+    assert placement["short_interval_midpoint"] == (length < 30)
+    assert planes[0].center[0] == pytest.approx(5. + (distance if flow_sign == 1 else length - distance))
+    assert planes[0].normal == pytest.approx([flow_sign, 0., 0.])
+    assert not qc[0]["selection_warnings"]
+    # Without L1, report the unavailable level rather than choosing L2.
+    infos[0]["hierarchy"]["label_local_levels"]["23"] = 1
+    omitted, _, _, qc = generate_label_planes(paths, volume, {name: 23}, {name: rule},
+        path_info=infos, smoothing_window=1, inter_time=1)
+    assert not omitted and qc[0]["selection_warnings"] == ["label_level_unavailable"]
+
+
 def test_connection_phantom_background_gap_uses_only_declared_fallback():
     from autoflow.algorithms.label_planes import generate_label_planes
     from autoflow.plane_rules import default_label_plane_rules
@@ -1248,7 +1281,7 @@ def test_connection_default_gui_phantom_preserves_fallback_and_conditional_level
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     rules = default_label_plane_rules()
     edited = {}
-    for name in ("LICA", "BA", "RIJV"):
+    for name in ("LICA", "BA", "RIJV", "StrS", "LTS", "RTS", "SSS"):
         dialog = LandmarkPlanDialog(name, rules[name])
         try:
             dialog.accept()
@@ -7817,3 +7850,55 @@ def test_docs_action_smoke_uses_local_pages_or_online_fallback(monkeypatch, tmp_
             assert Path(opened[0].toLocalFile()) == expected
     finally:
         window.close()
+
+
+
+def test_streamline_phantom_background_keeps_geometry_and_rejects_obsolete_input(monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtCore, QtWidgets
+    from autoflow.algorithms.streamlines import generate_seed_points
+    from autoflow.ui.streamline_jobs import streamline_requests
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    ws = Workspace()
+    ws.flow_raw = np.zeros((12, 12, 12, 2, 3), dtype=np.float32)
+    ws.flow_raw[..., 0] = 30.0
+    ws.segmask_binary = np.ones((12, 12, 12, 2), dtype=bool)
+    ws.segmask_3d = ws.segmask_binary[..., 0]
+    p = ws.streamline_params
+    p.max_steps, p.min_seeds, p.seed_ratio = 100, 4, 0.005
+    ws.streamline_seeds = generate_seed_points(
+        ws.segmask_3d, ws.resolution, ws.origin, ratio=p.seed_ratio,
+        rng_seed=p.rng_seed, min_seeds=p.min_seeds)
+    ws.streamline_active = True
+    manager = streamline_requests(ws)
+    assert manager.request(0) is None
+    # Replace the input while the first result is still waiting for Qt delivery.
+    ws.flow_raw = ws.flow_raw.copy() * 2
+    expected = generate_streamlines_at_t(
+        ws.flow_raw, 1, ws.streamline_seeds, ws.resolution, ws.origin,
+        mask_3d=ws.segmask_binary[..., 1], max_steps=p.max_steps,
+        terminal_speed=p.terminal_speed, seed_ratio=p.seed_ratio,
+        min_seeds=p.min_seeds, rng_seed=p.rng_seed)
+    assert manager.request(1) is None
+    loop = QtCore.QEventLoop()
+    delivered = []
+    def ready(phase):
+        delivered.append((phase, QtCore.QThread.currentThread() is app.thread()))
+        loop.quit()
+    manager.ready.connect(ready)
+    timeout = QtCore.QTimer()
+    timeout.setSingleShot(True)
+    timeout.timeout.connect(loop.quit)
+    timeout.start(5000)
+    loop.exec()
+    timeout.stop()
+    manager.ready.disconnect(ready)
+    assert delivered == [(1, True)]
+    assert 0 not in ws.streamline_cache
+    actual = manager.request(1)
+    np.testing.assert_array_equal(actual.points, expected.points)
+    np.testing.assert_array_equal(actual.lines, expected.lines)
+    assert set(actual.point_data) == set(expected.point_data)
+    for name in expected.point_data:
+        np.testing.assert_array_equal(actual.point_data[name], expected.point_data[name])
