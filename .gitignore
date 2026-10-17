@@ -12,6 +12,9 @@ __pycache__/
 /111/
 /results/
 /dicom/
+/paper/
+/pics/
+/outputs/
 /@eaDir/
 Thumbs.db
 .DS_Store
@@ -35,3 +38,7 @@ data/phantom_*.h5
 # Local-only archive and experimental reconstruction work
 /autoflow-gui-source-final-model.zip
 /ztemp/
+
+# Windows portable build artifacts and local build environments
+/release/
+/.venv-windows/

@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
+from ..plane_rules import default_label_plane_rules, normalize_label_plane_rules
 
 from ..case_types import BackgroundPhaseCorrectionConfig, PhaseUnwrappingConfig, NoiseRemovalConfig, InputState, LoadedCase, LoaderCapabilities, normalize_dicom_backend
 
@@ -114,9 +115,15 @@ class PreprocessParams:
         return PreprocessParams()
 
 
+def validate_graph_connectivity(value):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value not in (6, 26):
+        raise ValueError("graph_connectivity must be 6 or 26")
+    return int(value)
+
+
 @dataclass
 class SkeletonParams:
-    remove_small_cc: bool = False
+    remove_small_cc: bool = True
     # How a configured special-label group is prepared before skeletonization.
     # ``three_pass_merge`` is the default experiment requested for the aortic
     # branches; ``contact_surface`` retains the previous contact-cutting path.
@@ -126,11 +133,12 @@ class SkeletonParams:
     special_contact_labels: List[str] = field(default_factory=lambda: ["RBCT", "CCA", "LBCT"])
     min_cc_volume_mm3: float = 50.0
     cc_filter_mode: str = "hybrid"
-    cc_rel_min_ratio: float = 0.01
+    cc_rel_min_ratio: float = 0.10
     # Minimum number of graph edge segments retained in a terminal branch.
     # Short endpoint-to-junction spurs are removed during graph generation.
-    min_edge_points: int = 3
-    do_closing: bool = True
+    min_edge_points: int = 5
+    graph_connectivity: int = 26
+    do_closing: bool = False
     do_opening: bool = False
     gaussian_sigma: float = 0.5
     gaussian_enabled: bool = True
@@ -155,6 +163,7 @@ class SkeletonParams:
             "cc_filter_mode": str(self.cc_filter_mode),
             "cc_rel_min_ratio": float(self.cc_rel_min_ratio),
             "min_edge_points": int(self.min_edge_points),
+            "graph_connectivity": validate_graph_connectivity(self.graph_connectivity),
             "do_closing": self.do_closing,
             "do_opening": self.do_opening,
             "gaussian_sigma": self.gaussian_sigma,
@@ -225,16 +234,17 @@ class SkeletonParams:
                 f"got {raw_special_handling!r}"
             )
         return SkeletonParams(
-            remove_small_cc=bool(payload.get("remove_small_cc", False)),
+            remove_small_cc=bool(payload.get("remove_small_cc", True)),
             special_handling=special_handling,
             special_merge_radius_mm=max(0.0, float(payload.get("special_merge_radius_mm", 1.5))),
             separate_special_label_contacts=bool(separate_special),
             special_contact_labels=special_labels,
             min_cc_volume_mm3=float(payload.get("min_cc_volume_mm3", 50.0)),
             cc_filter_mode=str(payload.get("cc_filter_mode", "hybrid") or "hybrid"),
-            cc_rel_min_ratio=float(payload.get("cc_rel_min_ratio", 0.01)),
-            min_edge_points=max(0, int(payload.get("min_edge_points", payload.get("min_edge_count", 3)) or 0)),
-            do_closing=bool(payload.get("do_closing", True)),
+            cc_rel_min_ratio=float(payload.get("cc_rel_min_ratio", 0.10)),
+            min_edge_points=max(0, int(payload.get("min_edge_points", payload.get("min_edge_count", 5)) or 0)),
+            graph_connectivity=validate_graph_connectivity(payload.get("graph_connectivity", 26)),
+            do_closing=bool(payload.get("do_closing", False)),
             do_opening=bool(payload.get("do_opening", False)),
             gaussian_sigma=float(payload.get("gaussian_sigma", 0.5)),
             gaussian_enabled=bool(payload.get("gaussian_enabled", True)),
@@ -284,6 +294,7 @@ class SkeletonParams:
             "separate_special_label_contacts",
             "special_contact_labels",
             "min_edge_points",
+            "graph_connectivity",
         ):
             if key in cfg and key not in overrides:
                 overrides[key] = cfg[key]
@@ -297,6 +308,7 @@ class SkeletonParams:
             cc_filter_mode=self.cc_filter_mode,
             cc_rel_min_ratio=self.cc_rel_min_ratio,
             min_edge_points=self.min_edge_points,
+            graph_connectivity=self.graph_connectivity,
             do_closing=self.do_closing,
             do_opening=self.do_opening,
             gaussian_sigma=self.gaussian_sigma,
@@ -316,6 +328,7 @@ class SkeletonParams:
             "cc_filter_mode",
             "cc_rel_min_ratio",
             "min_edge_points",
+            "graph_connectivity",
             "do_closing",
             "do_opening",
             "gaussian_sigma",
@@ -339,6 +352,7 @@ class SkeletonParams:
             )
         params.special_merge_radius_mm = max(0.0, float(params.special_merge_radius_mm))
         params.min_edge_points = max(0, int(params.min_edge_points))
+        params.graph_connectivity = validate_graph_connectivity(params.graph_connectivity)
         # Group-level configs written before the rename remain readable.
         if "separate_special_label_contacts" not in overrides and "separate_label_contacts" in overrides:
             params.separate_special_label_contacts = bool(overrides.get("separate_label_contacts"))
@@ -347,7 +361,9 @@ class SkeletonParams:
 
 @dataclass
 class PlaneGenerationParams:
-    plane_mode: str = "fixed_step"
+    plane_mode: str = "by_label"
+    label_rules: Dict[str, Dict[str, Any]] = field(default_factory=default_label_plane_rules)
+    label_rules_file: str = ""
     plane_count: int = 3
     cross_section_distance: float = 5.0
     start_distance: float = 0.0
@@ -358,6 +374,8 @@ class PlaneGenerationParams:
     spacing_mode: str = "fraction"
     spacing_ratio: float = 0.25
     segmentation_filter: bool = True
+    fov_boundary_filter: bool = True
+    fov_boundary_max_fraction: float = 0.25
     smoothing_window: int = 15
     smoothing_polyorder: int = 2
     inter_time: int = 10
@@ -365,6 +383,8 @@ class PlaneGenerationParams:
     def to_dict(self):
         return {
             "plane_mode": str(self.plane_mode or "fixed_step"),
+            "label_rules": copy.deepcopy(self.label_rules),
+            "label_rules_file": str(self.label_rules_file or ""),
             "plane_count": int(self.plane_count),
             "cross_section_distance": float(self.cross_section_distance),
             "start_distance": float(self.start_distance),
@@ -375,6 +395,8 @@ class PlaneGenerationParams:
             "spacing_mode": str(self.spacing_mode or "fraction"),
             "spacing_ratio": float(self.spacing_ratio),
             "segmentation_filter": bool(self.segmentation_filter),
+            "fov_boundary_filter": bool(self.fov_boundary_filter),
+            "fov_boundary_max_fraction": float(self.fov_boundary_max_fraction),
             "smoothing_window": int(self.smoothing_window),
             "smoothing_polyorder": int(self.smoothing_polyorder),
             "inter_time": int(self.inter_time),
@@ -383,8 +405,10 @@ class PlaneGenerationParams:
     @staticmethod
     def from_dict(d):
         payload = dict(d or {})
-        plane_mode = str(payload.get("plane_mode", "") or "").strip().lower()
-        if plane_mode not in {"count", "distance", "anchored_offset", "uniform", "fixed_step"}:
+        plane_mode = str(payload.get("plane_mode", "by_label") or "by_label").strip().lower()
+        if "plane_mode" not in payload and payload.get("use_center_plane") is not None:
+            plane_mode = "count" if payload["use_center_plane"] else "distance"
+        if plane_mode not in {"by_label", "count", "distance", "anchored_offset", "uniform", "fixed_step"}:
             use_center_plane = payload.get("use_center_plane", None)
             plane_mode = "count" if bool(True if use_center_plane is None else use_center_plane) else "distance"
         plane_count = int(payload.get("plane_count", 3) or 3)
@@ -399,8 +423,13 @@ class PlaneGenerationParams:
         spacing_mode = str(payload.get("spacing_mode", "fraction") or "fraction").strip().lower()
         if spacing_mode not in {"distance", "fraction"}:
             spacing_mode = "fraction"
+        fov_fraction = float(payload.get("fov_boundary_max_fraction", 0.25))
+        if not np.isfinite(fov_fraction) or not 0 <= fov_fraction <= 1:
+            raise ValueError("fov_boundary_max_fraction must be finite and between 0 and 1")
         return PlaneGenerationParams(
             plane_mode=plane_mode,
+            label_rules=normalize_label_plane_rules(payload.get("label_rules", default_label_plane_rules())),
+            label_rules_file=str(payload.get("label_rules_file", "") or ""),
             plane_count=plane_count,
             cross_section_distance=float(payload.get("cross_section_distance", 5.0)),
             start_distance=float(payload.get("start_distance", 5.0)),
@@ -411,6 +440,8 @@ class PlaneGenerationParams:
             spacing_mode=spacing_mode,
             spacing_ratio=float(payload.get("spacing_ratio", 0.25)),
             segmentation_filter=bool(payload.get("segmentation_filter", True)),
+            fov_boundary_filter=bool(payload.get("fov_boundary_filter", True)),
+            fov_boundary_max_fraction=fov_fraction,
             smoothing_window=int(payload.get("smoothing_window", 15)),
             smoothing_polyorder=int(payload.get("smoothing_polyorder", 2)),
             inter_time=int(payload.get("inter_time", 10)),
@@ -922,6 +953,7 @@ class PlaneData:
     group_name: str = ""
     roi_polygon_uv_mm: List[List[float]] = field(default_factory=list)
     roi_edit_operations: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    placement: Dict[str, Any] = field(default_factory=dict)
     metrics: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -1175,6 +1207,7 @@ class Workspace:
     segmask_labels_3d: Optional[np.ndarray] = None
     segmask_binary: Optional[np.ndarray] = None
     segmask_3d: Optional[np.ndarray] = None
+    segmentation_preprocess_qc: Dict[str, Any] = field(default_factory=dict)
     group_order: List[str] = field(default_factory=list)
     multilabel_groups: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # Optional runtime topology overlay. It overlaps source labels and is
@@ -1192,6 +1225,7 @@ class Workspace:
     skeleton_mask: Optional[np.ndarray] = None
 
     graph: GraphData = field(default_factory=GraphData)
+    graph_hierarchy: Dict[str, Any] = field(default_factory=dict)
     branch_labels: Optional[np.ndarray] = None
     centerline_paths: List[np.ndarray] = field(default_factory=list)
     centerline_node_paths: List[List[int]] = field(default_factory=list)
@@ -1423,6 +1457,7 @@ class Workspace:
 
     def reset_segmentation_results(self):
         self._preprocess_signature = None
+        self.segmentation_preprocess_qc = {}
         for attr in [
             "segmask_labels",
             "segmask_labels_3d",
@@ -1438,6 +1473,7 @@ class Workspace:
         self.willis_ring_status = {}
         self.willis_ring_graph = GraphData()
         self.graph = GraphData()
+        self.graph_hierarchy = {}
         self.centerline_paths = []
         self.centerline_node_paths = []
         self.centerline_paths_smooth = []
@@ -1461,6 +1497,7 @@ class Workspace:
         self.remove_objects_by_prefix("segmask_group_")
         self.remove_objects_by_prefix("skeleton_")
         self.remove_objects_by_prefix("graph_")
+        self.remove_objects_by_prefix("hierarchy_path_")
         self.remove_objects_by_prefix("forks_")
         self.remove_object_by_data_key("wss_surface_live")
         self.remove_object_by_data_key("tke_volume")
@@ -1491,6 +1528,7 @@ class Workspace:
         ]:
             setattr(self, attr, default)
         self.resolution = np.array([1., 1., 1.])
+        self.segmentation_preprocess_qc = {}
         self.origin = np.array([0., 0., 0.])
         self.venc = np.array([1., 1., 1.])
         self.rr = 1000.0
@@ -1504,6 +1542,7 @@ class Workspace:
         self.willis_ring_status = {}
         self.willis_ring_graph = GraphData()
         self.graph = GraphData()
+        self.graph_hierarchy = {}
         self.centerline_paths = []
         self.centerline_node_paths = []
         self.centerline_paths_smooth = []
@@ -1561,6 +1600,7 @@ class Workspace:
                             "path_index": int(p.path_index), "distance": float(p.distance), "group_name": str(p.group_name),
                             "roi_polygon_uv_mm": copy.deepcopy(getattr(p, "roi_polygon_uv_mm", []) or []),
                             "roi_edit_operations": copy.deepcopy(getattr(p, "roi_edit_operations", {}) or {}),
+                            "placement": copy.deepcopy(getattr(p, "placement", {}) or {}),
                             "metrics": copy.deepcopy(p.metrics)} for p in state.get("planes", [])],
                 "path_index_offset": int(state.get("path_index_offset", 0)),
                 "plane_index_offset": int(state.get("plane_index_offset", 0)),
@@ -1594,6 +1634,8 @@ class Workspace:
             "segmask_labels": arr(self.segmask_labels),
             "segmask_binary": arr(self.segmask_binary),
             "segmask_3d": arr(self.segmask_3d),
+            "segmask_labels_3d": arr(self.segmask_labels_3d),
+            "segmentation_preprocess_qc": copy.deepcopy(self.segmentation_preprocess_qc),
             "group_order": [str(x) for x in self.group_order],
             "multilabel_groups": group_payload,
             "willis_ring_status": copy.deepcopy(self.willis_ring_status),
@@ -1611,12 +1653,14 @@ class Workspace:
             "centerline_node_paths": [list(map(int, x)) for x in self.centerline_node_paths],
             "centerline_paths_smooth": [arr(x) for x in self.centerline_paths_smooth],
             "path_info": copy.deepcopy(self.path_info),
+            "graph_hierarchy": copy.deepcopy(self.graph_hierarchy),
             "forks": copy.deepcopy(self.forks),
             "planes": [{"center": arr(p.center), "normal": arr(p.normal), "label": int(p.label),
                         "segmentation_label": int(getattr(p, "segmentation_label", 0) or 0),
                         "path_index": int(p.path_index), "distance": float(p.distance),
                         "group_name": str(p.group_name),
                         "roi_polygon_uv_mm": copy.deepcopy(getattr(p, "roi_polygon_uv_mm", []) or []),
+                        "placement": copy.deepcopy(getattr(p, "placement", {}) or {}),
                         "metrics": copy.deepcopy(p.metrics)} for p in self.planes],
             "flow_raw": arr(self.flow_raw),
             "flow_input": arr(self.flow_input),
@@ -1695,6 +1739,8 @@ class Workspace:
         self.segmask_labels = nparr("segmask_labels", np.int16)
         self.segmask_binary = None if d.get("segmask_binary") is None else np.asarray(d["segmask_binary"], dtype=bool)
         self.segmask_3d = None if d.get("segmask_3d") is None else np.asarray(d["segmask_3d"], dtype=bool)
+        self.segmask_labels_3d = nparr("segmask_labels_3d", np.int16)
+        self.segmentation_preprocess_qc = copy.deepcopy(d.get("segmentation_preprocess_qc", {}))
         self.group_order = [str(x) for x in d.get("group_order", [])]
         self.willis_ring_status = copy.deepcopy(d.get("willis_ring_status", {}))
         wr = d.get("willis_ring_graph", {}) or {}
@@ -1717,6 +1763,7 @@ class Workspace:
                     group_name=str(p.get("group_name", group_name) or group_name),
                     roi_polygon_uv_mm=copy.deepcopy(p.get("roi_polygon_uv_mm", []) or []),
                     roi_edit_operations=copy.deepcopy(p.get("roi_edit_operations", {}) or {}),
+                    placement=copy.deepcopy(p.get("placement", {}) or {}),
                     metrics=copy.deepcopy(p.get("metrics", {})),
                 ))
             self.multilabel_groups[str(group_name)] = {
@@ -1762,6 +1809,7 @@ class Workspace:
         self.centerline_node_paths = [list(map(int, x)) for x in d.get("centerline_node_paths", [])]
         self.centerline_paths_smooth = [np.asarray(x, dtype=float) for x in d.get("centerline_paths_smooth", [])]
         self.path_info = copy.deepcopy(d.get("path_info", []))
+        self.graph_hierarchy = copy.deepcopy(d.get("graph_hierarchy", {}))
         self.forks = copy.deepcopy(d.get("forks", []))
         self.planes = []
         for p in d.get("planes", []):
@@ -1770,6 +1818,7 @@ class Workspace:
                 label=int(p.get("label", 1)), segmentation_label=int(p.get("segmentation_label", 0) or 0), path_index=int(p.get("path_index", 0)),
                 distance=float(p.get("distance", 0.0)), group_name=str(p.get("group_name", "") or ""),
                 roi_polygon_uv_mm=copy.deepcopy(p.get("roi_polygon_uv_mm", []) or []),
+                placement=copy.deepcopy(p.get("placement", {}) or {}),
                 metrics=copy.deepcopy(p.get("metrics", {}))))
         self.flow_raw = nparr("flow_raw")
         self.flow_input = nparr("flow_input")

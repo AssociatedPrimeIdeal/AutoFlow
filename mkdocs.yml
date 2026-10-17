@@ -84,6 +84,7 @@ nav:
   - Home: index.md
   - Start:
       - Quickstart: en/user/quickstart.md
+      - Windows portable application: en/user/windows-portable.md
       - Worked example: en/user/demo-case.md
       - GUI workflow: en/user/gui.md
       - CLI workflow: en/user/cli.md
@@ -111,9 +112,10 @@ nav:
           - Pulse wave velocity: en/features/pwv.md
           - Vortex kinematics: en/features/vortex-kinematics.md
       - Visualization and delivery:
+          - Viewer display settings: en/features/viewer-display.md
           - Streamlines: en/features/streamlines.md
           - Pathlines: en/features/pathlines.md
-          - PC-MRA: en/features/pcmra-volume-rendering.md
+          - Content volumes and PC-MRA: en/features/pcmra-volume-rendering.md
           - Quality control: en/features/quality-control.md
           - Videos: en/features/videos.md
   - References:
@@ -125,11 +127,13 @@ nav:
       - Python API fields: en/user/api-parameters.md
   - Development:
       - Architecture: en/developer/architecture.md
+      - Windows builds and releases: en/developer/windows-packaging.md
       - Modules and code owners: en/developer/feature-to-code-map.md
       - Configuration system: en/developer/config-system.md
       - Change recipes: en/developer/change-recipes.md
       - Testing and documentation checks: en/developer/testing.md
       - Current pipeline performance: en/developer/performance.md
+      - Pipeline audit (2026-10-07): en/developer/pipeline-audit-2026-10-07.md
       - Segmentation performance history: en/developer/segmentation-performance.md
 
 plugins:

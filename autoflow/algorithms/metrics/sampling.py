@@ -4,6 +4,7 @@ import numpy as np
 from ..surfaces import _build_branch_grid, _select_connected_region, create_uniform_field_grid
 
 from ._common import _ensure_mask4d
+from .fov import measure_fov_boundary_contact
 
 # Replacement contours usually stay within the same local voxel box across
 # successive edits. Cache those small support meshes so each edit does not
@@ -117,13 +118,15 @@ def filter_planes_by_branch_support(
     *,
     branch_label_offset=0,
     support_cache=None,
+    check_branch_support=True,
+    fov_boundary_max_fraction=None,
 ):
-    """Drop generated planes whose requested branch has no slice support.
+    """Drop branch-unsupported planes and, when requested, FOV-truncated ROIs.
 
     A zero numerical flow value is not sufficient evidence that a plane is
     invalid: a real vessel can have low or cancelling flow.  This helper only
-    rejects a plane when its branch-filtered cross-section has no cells in any
-    representative mask phase.  The returned QC keeps the original local
+    rejects an unsupported plane from geometric cells, with an independent
+    optional FOV contact-length threshold on the temporal-union ROI. QC keeps the original local
     plane index so callers can report stable diagnostics without renumbering
     graph paths.
     """
@@ -131,31 +134,26 @@ def filter_planes_by_branch_support(
     mask = _ensure_mask4d(mask4d)
     if not planes:
         return [], []
-    # Without a branch volume there is no safe way to decide ownership.  Keep
-    # all planes and make the reason explicit for callers that want to expose
-    # QC details.
+    if fov_boundary_max_fraction is not None:
+        fov_boundary_max_fraction = float(fov_boundary_max_fraction)
+        if not np.isfinite(fov_boundary_max_fraction) or not 0 <= fov_boundary_max_fraction <= 1:
+            raise ValueError("FOV boundary fraction must be finite and between 0 and 1")
     branch_array = None if branch_labels_3d is None else np.asarray(branch_labels_3d)
-    if branch_array is None or branch_array.shape != mask.shape[:3] or not np.any(branch_array > 0):
-        reason = "branch_labels_unavailable" if branch_array is None else "branch_labels_empty_or_mismatched"
-        return list(planes), [
-            {
-                "plane_index": int(i),
-                "path_index": int(getattr(plane, "path_index", -1)),
-                "valid": True,
-                "reason": reason,
-                "supported_phase_count": 0,
-                "max_cell_count": 0,
-            }
-            for i, plane in enumerate(planes)
-        ]
+    branch_available = (bool(check_branch_support) and branch_array is not None
+                        and branch_array.shape == mask.shape[:3] and np.any(branch_array > 0))
+    unavailable_reason = ("segmentation_filter_disabled" if not check_branch_support else
+                          "branch_labels_unavailable" if branch_array is None else
+                          "branch_labels_empty_or_mismatched")
 
     cache = support_cache if isinstance(support_cache, dict) else {}
     branch_grid = cache.get("branch_grid")
     phase_lookup = cache.get("phase_lookup")
     support_mesh_cache = cache.get("support_mesh_cache")
-    if branch_grid is None:
+    if branch_grid is None and branch_available:
         branch_grid = _build_branch_grid(branch_array, spacing, origin)
         cache["branch_grid"] = branch_grid
+    if not branch_available:
+        branch_grid = None
     if phase_lookup is None:
         phase_lookup = _build_mask_phase_lookup(mask)
         cache["phase_lookup"] = phase_lookup
@@ -201,27 +199,36 @@ def filter_planes_by_branch_support(
             support_mesh = segmentation_mesh_cache.get(mesh_key)
         else:
             support_mesh = probe_mesh
-        spec = _build_plane_slice_spec(
+        region = _build_plane_slice_region(
             mask_t,
             plane,
             spacing,
             origin,
             branch_grid=branch_grid,
-            target_label=target_label,
+            target_label=target_label if branch_available else None,
             select_connected=True,
             support_mesh=support_mesh,
         )
-        cell_count = int(len(spec.get("cell_ids", []))) if spec is not None else 0
+        cell_count = int(region.n_cells) if region is not None else 0
         max_cell_count = cell_count
         supported_phase_count = 1 if cell_count > 0 else 0
-        valid = supported_phase_count > 0
+        valid = supported_phase_count > 0 if branch_available else True
+        reason = "" if branch_available and valid else "no_branch_support" if branch_available else unavailable_reason
+        fov = measure_fov_boundary_contact(region, plane, mask.shape[:3], spacing, origin, fov_boundary_max_fraction)
+        if valid and fov["status"] == "excluded":
+            valid, reason = False, "fov_boundary_contact"
         record = {
             "plane_index": int(plane_index),
             "path_index": int(path_index),
             "branch_label": int(target_label),
             "segmentation_label": int(plane_seg_label),
             "valid": bool(valid),
-            "reason": "" if valid else "no_branch_support",
+            "reason": reason,
+            "center_local_mm": np.asarray(plane.center, dtype=float).tolist(),
+            "normal": np.asarray(plane.normal, dtype=float).tolist(),
+            "distance_mm": float(getattr(plane, "distance", 0.0)),
+            "branch_support_checked": bool(branch_available),
+            "fov_boundary": fov,
             "supported_phase_count": int(supported_phase_count),
             "phase_count": int(len(set(phase_lookup))),
             "max_cell_count": int(max_cell_count),
@@ -245,8 +252,6 @@ def _build_plane_slice_region(
     frame_index=0,
 ):
     mask_xyz = np.asarray(mask_xyz, dtype=bool)
-    if support_mesh is None and not np.any(mask_xyz):
-        return None
     operations = list((getattr(plane, "roi_edit_operations", {}) or {}).get(str(int(frame_index)), []) or [])
     replacement_polygon = None
     for operation in operations:
@@ -255,6 +260,9 @@ def _build_plane_slice_region(
         candidate = np.asarray(operation.get("polygon", []), dtype=float)
         if candidate.ndim == 2 and candidate.shape[1] == 2 and len(candidate) >= 3:
             replacement_polygon = candidate
+
+    if replacement_polygon is None and support_mesh is None and not np.any(mask_xyz):
+        return None
 
     mesh = support_mesh
     if replacement_polygon is not None:
@@ -487,6 +495,113 @@ def _get_cached_plane_slice_spec(slice_cache, cache_key, mask_xyz, plane, spacin
             frame_index=frame_index,
         )
     return slice_cache[cache_key]
+
+
+
+def _resolve_plane_roi_frame(cache, plane, frame_index, build_frame):
+    """Carry only ROI geometry forward; explicit empty edits stop propagation.
+
+    The result is independent of playback/request order. Leading missing
+    frames stay empty and real geometry always takes precedence on return.
+    """
+    frames = cache.setdefault("_resolved_roi_frames", {})
+    t = int(frame_index)
+    pending, cursor = [], t
+    while cursor >= 0 and cursor not in frames:
+        region = build_frame(cursor)
+        if region is not None:
+            frames[cursor] = (region, cursor)
+            break
+        if (getattr(plane, "roi_edit_operations", {}) or {}).get(str(cursor)):
+            frames[cursor] = (None, None)
+            break
+        pending.append(cursor)
+        cursor -= 1
+    resolved = frames.get(cursor, (None, None))
+    for missing in pending:
+        frames[missing] = resolved
+    return frames.get(t, (None, None))
+
+
+def _get_plane_metric_slice_spec(slice_cache, mask4d, phase_lookup, support_cache,
+                                 plane, frame_index, spacing, origin, *,
+                                 branch_grid=None, target_label=None,
+                                 segmentation_labels_3d=None, segmentation_labels_4d=None):
+    """Use current fields with one shared, temporally resolved ROI contract."""
+    def build(t):
+        return _get_raw_plane_metric_slice_spec(
+            slice_cache, mask4d, phase_lookup, support_cache, plane, t, spacing, origin,
+            branch_grid=branch_grid, target_label=target_label,
+            segmentation_labels_3d=segmentation_labels_3d,
+            segmentation_labels_4d=segmentation_labels_4d,
+        )
+    spec, source = _resolve_plane_roi_frame(slice_cache, plane, frame_index, build)
+    if spec is None:
+        return None
+    return {**spec, "roi_source_frame": int(source), "roi_carried_forward": int(source) != int(frame_index)}
+
+
+def _get_raw_plane_metric_slice_spec(slice_cache, mask4d, phase_lookup, support_cache,
+                                    plane, frame_index, spacing, origin, *,
+                                    branch_grid=None, target_label=None,
+                                    segmentation_labels_3d=None, segmentation_labels_4d=None):
+    """Select the observed/edited ROI of exactly one frame without filling."""
+    t = int(frame_index)
+    rep_t = int(phase_lookup[t])
+    mask_t = np.asarray(mask4d[..., rep_t], dtype=bool)
+    label = int(getattr(plane, "segmentation_label", 0) or 0)
+    labels4d = None if segmentation_labels_4d is None else np.asarray(segmentation_labels_4d)
+    labels3d = None if segmentation_labels_3d is None else np.asarray(segmentation_labels_3d)
+    label_support = None
+    if label > 0 and support_cache is not None:
+        label_support = support_cache.get(
+            ("seg4d", t, label) if labels4d is not None else ("seg3d", rep_t, label)
+        )
+    if label > 0 and label_support is None:
+        labels_t = None
+        if labels4d is not None and labels4d.ndim == 4:
+            labels_t = labels4d[..., min(t, labels4d.shape[3] - 1)]
+        elif labels3d is not None:
+            labels_t = labels3d[..., 0] if labels3d.ndim == 4 else labels3d
+        if labels_t is not None and labels_t.shape == mask_t.shape:
+            mask_t = mask_t & (labels_t == label)
+    label_phase = support_cache.get(("seg_phase", t, label), t) if support_cache is not None else t
+    key = (rep_t, t) if getattr(plane, "roi_edit_operations", {}) else (
+        (rep_t, label_phase) if label > 0 and labels4d is not None else rep_t
+    )
+    support = label_support if label > 0 else (
+        support_cache.get(rep_t) if support_cache is not None else None
+    )
+    return _get_cached_plane_slice_spec(
+        slice_cache, key, mask_t, plane, spacing, origin,
+        branch_grid=branch_grid, target_label=target_label, select_connected=True,
+        support_mesh=support, frame_index=t,
+    )
+
+
+def _plane_slice_point_mask(points_world, slice_spec, mask_shape, spacing, origin):
+    """Keep wall samples in the selected cut cells, including cell boundaries."""
+    points = np.asarray(points_world, dtype=float).reshape(-1, 3)
+    keep = np.zeros(len(points), dtype=bool)
+    if slice_spec is None or not len(points):
+        return keep
+    coordinates = (points - np.asarray(origin)) / np.asarray(spacing)
+    base = np.floor(coordinates).astype(np.int64)
+    on_boundary = np.isclose(coordinates, np.rint(coordinates), atol=1e-5, rtol=0)
+    selected = np.asarray(slice_spec['cell_ids'], dtype=np.int64)
+    # A boundary point belongs to either adjacent cell; interior points only
+    # belong to their containing cell. Never bridge an unselected vessel.
+    import itertools
+    for offset in itertools.product((0, -1), repeat=3):
+        offset = np.asarray(offset)
+        indices = base + offset
+        valid = np.all((indices >= 0) & (indices < np.asarray(mask_shape)), axis=1)
+        valid &= np.all((offset == 0) | on_boundary, axis=1)
+        rows = np.flatnonzero(valid)
+        if len(rows):
+            cell_ids = np.ravel_multi_index(indices[rows].T, mask_shape, order='F')
+            keep[rows] |= np.isin(cell_ids, selected)
+    return keep
 
 
 def _sample_field_from_slice_spec(field_t, mask_shape, field_name, slice_spec):

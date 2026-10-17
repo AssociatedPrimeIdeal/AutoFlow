@@ -87,8 +87,56 @@ Low-level loader controls:
 
 | Parameter | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
+| `parameter_overrides` | dict or `None` | `None` | `load_h5_data`, `load_input_data`, `PipelineEngine.load_data`; GUI Reload Input | Override `resolution` and `venc` in normalized LR/AP/FH order and/or source `spatial_order` and `venc_order` before decoding. Retained for later correction; source acquisition metadata stays unchanged. Recalibrated correction results stay in the workspace. | `autoflow/algorithms/data/input_parameters.py`, `data/h5_loader.py`, `autoflow/core/pipeline.py` |
 | `reuse_existing_corr` | bool | `False` | `load_h5_data`, `load_input_data`, `PipelineEngine.load_data`; GUI passes `True` | Apply existing correction fields read-only, without fitting missing caches or matching current fitting settings | `autoflow/algorithms/data/correction_cache.py`, `data/h5_loader.py`, `data/dual_venc.py`, `autoflow/core/pipeline.py` |
 | `force_recompute_corr` | bool | `False` | `PipelineEngine.run_step`; GUI Background Correction passes `True` | Reread the original acquisition and recompute correction, replacing the prior working result | `autoflow/core/pipeline.py`, `autoflow/ui/app.py` |
+
+## Prepared Unwrapped H5
+
+For inputs prepared with phase unwrapping in advance, use normalized floating-point `mag` + `flow` H5; `flow` stores the recovered velocity in cm/s and may exceed the original acquisition VENC. Preserve `SpatialOrder`, `VENCOrder`, geometry, RR and optional segmentation. A complex exponential cannot retain the integer `2pi` correction. If background correction is already included in `flow`, do not also attach an active root `corr` cache. Preparation provenance does not trigger additional correction or unwrapping during loading; proceed directly to centerline and plane analysis. See [Preparing reusable unwrapped inputs](../features/phase-unwrapping.md#preparing-reusable-unwrapped-inputs).
+
+### Exporting prepared H5 as test DICOM
+
+Use [4DFlow_H52Dicom](https://github.com/AssociatedPrimeIdeal/4DFlow_H52Dicom)
+with native `mag` (`XYZT`) and physical `flow` (`XYZT3`, cm/s), plus `RR`,
+`Resolution`, `VENC`, `VENCOrder` and `SpatialOrder`. The library also accepts
+complex four-channel `img[XYZT4]`, which it first decodes to actual magnitude and
+cm/s velocity using reference-phase differences and acquisition VENC. Real-valued
+`img`, seven-channel inputs and the old `norm` / `corr` options are not supported.
+For an already corrected and lap4D-unwrapped H5, pass its native physical velocity
+directly; the writer does not apply another correction or unwrap:
+
+```bash
+h52dicom --file-path prepared.h5 --out-path dicoms --orientation Tra
+```
+
+PCMRA is enabled by default for both supported formats: normalized actual
+magnitude times physical velocity magnitude. Input `mag` is assumed to be actual
+magnitude, not an existing PCMRA. Use `--no-pcmra` / `pcmra=False` only when the
+output should retain actual magnitude instead.
+
+Tra is the converter's CLI/API default and the recommended CVI test direction.
+Its bundled shells are Tra; other orientations, including an explicit `auto`
+that selects Cor/Sag, may cause CVI to identify velocity directions incorrectly.
+The converter retains the shell's first image position, so this export does not
+preserve an H5 `Origin` as absolute scanner position. Check compatibility in CVI
+itself before relying on another orientation.
+
+The input H5 acquisition VENC remains unchanged and is still used per component
+when decoding complex input. All three DICOM velocity series share one export VENC:
+`max(ceil(max(acquisition VENC)), ceil(max(abs(velocity))) + 1)` across every
+component, voxel and phase. The common range calibrates both pixels and Siemens
+VENC labels, retaining unwrapped velocities above the acquisition VENC without
+rescaling their physical cm/s values. In the tested CVI setup, unequal directional
+VENC caused a direction error; the common-VENC comparison opened correctly.
+
+For an acquisition-range comparison, `--keep-venc` / `keep_venc=True` uses
+`max(original integer acquisition VENC)` for all three series. It does not keep
+three unequal output ranges. Values outside that common 12-bit range are saturated
+at pixel encoding time; input H5 velocity and PCMRA remain unchanged. Use the
+default expanded common range to retain recovered peaks. Raising the common VENC
+increases the quantization step to `VENC / 2048` cm/s (rounding error at most
+`VENC / 4096` cm/s).
 
 ## H5 Orientation Normalization
 
@@ -100,7 +148,8 @@ Low-level loader controls:
 - for real-valued `img[..., 1:4]`, AutoFlow treats values near the full `[-pi, pi]` phase range as phase radians and rescales them to physical velocity with `flow / pi * VENC` during load.
 - complex single-VENC H5 inputs retain canonical `phase_wrapped` for the optional phase-unwrapping stage; dual-VENC inputs retain low/high wrapped phases for audit, and only the `DV` selection skips unwrapping.
 - for real-valued H5 inputs, this normalization reorders spatial axes and flow components but does not rescale the stored magnitude values.
-- `LoadedCase.metadata["spatial_order_raw"]` and `LoadedCase.metadata["venc_order_raw"]` preserve the source labels read from the H5 file.
+- `LoadedCase.metadata["spatial_order_raw"]` and `LoadedCase.metadata["venc_order_raw"]` describe the effective source labels, including explicit session overrides. `input_parameter_overrides` records those overrides.
+- `parameter_overrides={"resolution": [2, 2, 3], "venc": [150, 150, 150], "spatial_order": ["FH", "AP", "LR"], "venc_order": ["LR", "AP", "FH"]}` applies calibration before normalization. Resolution/VENC are positive finite triplets in normalized LR/AP/FH order (a scalar repeats across all directions); direction orders describe the source arrays. Phase encodings use the overridden VENC for decoding; physical velocity datasets are not rescaled by this metadata override. Dual-VENC overrides scale both source triplets together, preserving their component-wise high/low ratios, with LV as the reference for LV selection and HV for HV/DV. Saved normalized correction fields are reoriented consistently with edited source orders.
 
 Segmentation imports also accept NIfTI (`.nii` and `.nii.gz`) 3D or 4D label volumes. NIfTI files exported by the GUI use the loaded voxel spacing and origin in the affine and can be round-tripped through external editors.
 
@@ -168,9 +217,10 @@ AutoFlow normalizes loaders to `LoadedCase`.
 
 - downstream vessel steps accept binary masks, 3D label masks, and 4D label masks
 - 4D label masks are reduced to a 3D label volume by majority vote along the time axis before skeleton, graph, plane, or pathline generation
-- connected-component cleanup runs per label value before groups are built
-- label values are merged into groups using `configs/labels.json -> label_map` and `label_groups`
-- each grouped vessel mask uses the skeleton connected-component cleanup rule instead of always collapsing to one largest component
+- label values are merged into groups using `configs/labels.json -> label_map` and `label_groups` before connected-component cleanup
+- the default `skeleton.cc_filter_mode=hybrid` filters merged groups after morphology and keeps every component at least `max(50 mm³, 10% of the largest)`; closing is off by default, and labels are not filtered individually first
+- for 4D segmentation, the same merged-group rule runs independently in each frame; the majority-voted 3D mask supplies stable topology, while each frame retains its lumen motion
+- disconnected vessels within one group are removed by the default rule; use `hybrid`, `absolute`, `relative`, or disable cleanup when they must remain
 - each group can override preprocessing through `configs/labels.json -> label_groups.<group>.preprocess`, including Gaussian smoothing, dilation, erosion, opening, and closing
 - when only one foreground label exists, AutoFlow falls back to one group so single-label segmentations still work with the same pipeline
 

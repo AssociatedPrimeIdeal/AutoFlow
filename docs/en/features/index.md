@@ -35,7 +35,8 @@ flowchart LR
 | Flow structure | [Vortex kinematics](vortex-kinematics.md): vorticity, Q and swirling strength | GUI / CLI / Python |
 | Instantaneous trajectories | [Streamlines](streamlines.md) | GUI; CLI/Python offline videos |
 | Temporal trajectories | [Pathlines](pathlines.md) | GUI only |
-| Anatomical backdrop | [PC-MRA](pcmra-volume-rendering.md): explicitly generated final Correction step | GUI rendering; CLI/API numerical NPZ |
+| Display | [Viewer display settings](viewer-display.md): scalar styles, overlays, legends and per-view controls | GUI only |
+| 3D scalar context | [Content volumes and PC-MRA](pcmra-volume-rendering.md): Browser volumes/MIP or draggable orthogonal cuts; generated PC-MRA is selected automatically | GUI rendering; CLI/API numerical PC-MRA NPZ |
 | Review | [Quality control](quality-control.md): input, geometry, planes and flow consistency | GUI / CLI / Python |
 | Delivery | [Videos](videos.md) and [output contracts](../user/outputs.md) | GUI / CLI / Python |
 

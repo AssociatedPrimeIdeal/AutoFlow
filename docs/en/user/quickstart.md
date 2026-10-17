@@ -3,6 +3,10 @@
 ## Goal
 Use this page when you want the shortest path to a successful AutoFlow run.
 
+## Windows portable application
+
+For Windows, the full portable release needs no Python or Conda installation. Extract the whole package to a short ASCII/English path such as `D:\AutoFlow` and double-click `AutoFlow.exe`. The separate `models/` directory contains the active 3D and 4D models. See [Windows portable usage](windows-portable.md) for complete download, CUDA, configuration, and diagnostic instructions.
+
 ## Install
 
 Full local install for GUI, automatic segmentation, and tests:
@@ -163,4 +167,4 @@ autoflow-run case.h5 --correction --autoseg --no-cache-write
 autoflow-run case.h5 --generate-pcmra
 ```
 
-The left Noise Region layer reviews excluded voxels and is hidden by default; its binary maximum-intensity rendering does not accumulate opacity with depth. Noise Removal, alone or in Correction Run All, automatically enables the ortho viewer's **Noise mask** overlay for review. Its checkbox and opacity slider show only excluded voxels in red; zero opacity disables it. Right-side Content lists acquired fields and computed results only.
+The left Noise Region layer reviews excluded voxels and is hidden by default; its binary maximum-intensity rendering does not accumulate opacity with depth. Noise Removal, alone or in Correction Run All, automatically enables the ortho viewer's **Noise mask** overlay for review. Its quick checkbox controls visibility; **Display → Overlays** controls opacity and color (red by default). Zero opacity is transparent. Right-side Content lists acquired fields and computed results only.

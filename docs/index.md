@@ -2,10 +2,13 @@
 
 AutoFlow processes 4D flow MRI from H5 or DICOM using a desktop GUI, batch CLI, or Python API.
 
+In the GUI, click **Docs** beside **File** or press **F1** to open the documentation. Windows portable releases include a searchable offline copy matching the application sources.
+
 Start with [Quickstart](en/user/quickstart.md), then follow the [functional workflow](en/features/index.md). Each feature page explains its purpose, entry points, inputs, outputs, limitations, parameters and implementation.
 
 | I want to… | Read |
 | --- | --- |
+| Use Windows without installing Python | [Windows portable application](en/user/windows-portable.md) |
 | Run a case or a batch | [Quickstart](en/user/quickstart.md), [CLI](en/user/cli.md), [GUI](en/user/gui.md), [Python API](en/user/python-api.md) |
 | Check data shape, coordinates and units | [Inputs](en/user/inputs.md) |
 | Correct phase offsets or aliasing | [Background correction](en/features/background-phase-correction.md), [Noise removal](en/features/noise-removal.md), [Unwrapping](en/features/phase-unwrapping.md) |

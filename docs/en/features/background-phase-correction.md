@@ -25,7 +25,7 @@ Do not assume the two methods are interchangeable. They can estimate materially 
 
 ### GUI
 
-Open the input in **Input & QC**, then choose **Correction > Background Correction**. Set `MSAC` or `WRLS + ARTO` and click **Background Correction**, or use **Run All** for background correction, noise masking, unwrapping and PC-MRA generation. Opening H5 does not prompt for or apply correction, including when a cache exists. Compatible correction caches are checked only when the action runs.
+Open the input in **Input & QC**, then right-click **Correction > Background Correction**. Set `MSAC` or `WRLS + ARTO` and choose Save and run, or Save then left-click **Background Correction**, or use **Run All** for background correction, noise masking, unwrapping and PC-MRA generation. Opening H5 applies structurally valid saved correction fields without fitting missing ones. The explicit Background Correction action always recomputes from the original acquisition, retaining any calibration applied with Reload Input.
 
 ### CLI
 
@@ -58,9 +58,13 @@ WRLS+ARTO requires at least two time frames because it estimates temporal standa
 
 See [loader parameters](../user/parameters.md#loader), [CLI flags](../user/cli-parameters.md), and [API fields](../user/api-parameters.md) for complete type/default/unit/effect/owner tables. Dictionary controls are expanded in [Structured parameters](../user/parameter-schemas.md).
 
+| Low-level parameter | Type | Default | Where configured | Effect | Code owner |
+| --- | --- | --- | --- | --- | --- |
+| `preserve_source_sigma` | Boolean | `False` | `load_input_data()` / `load_h5_data()`; fused case loading sets `True` | Derive legacy single-VENC complex sigma from source encodes, preserving the former pipeline TKE input | `algorithms/data/h5_loader.py` |
+
 ## Outputs
 
-The explicit Correction action updates working `flow_raw`, its pre-unwrapping `flow_input` baseline and stored wrapped phase. New segmentation uses this working velocity. Existing segmentation, geometry, metrics and trajectories are retained until manually rerun. The low-level loader still supports `correction_config` for direct callers; pipeline loading itself disables correction. Writable H5 sources also receive a reusable `corr` dataset, or `corr_low` and `corr_high` for dual-venc data. Cache attributes record the correction method, algorithm version, fit order, source group, and every method-specific parameter used to compute the field.
+The explicit Correction action updates working `flow_raw`, its pre-unwrapping `flow_input` baseline and stored wrapped phase. New segmentation uses this working velocity. Existing segmentation, geometry, metrics and trajectories are retained until manually rerun. The low-level loader supports `correction_config` for direct callers. CLI/API case runs that request correction apply it during their first decode, avoiding a second complete H5 read. Their combined stage is `load_and_background_correction`. Default GUI loading only applies saved correction fields; the explicit correction action reloads the preserved source so reruns start from source encoding with the current reloaded calibration. Writable H5 sources also receive a reusable `corr` dataset, or `corr_low` and `corr_high` for dual-venc data. Cache attributes record the correction method, algorithm version, fit order, source group, and every method-specific parameter used to compute the field. If session calibration overrides differ from the source H5 metadata, newly fitted correction fields remain in the workspace and do not replace the file's caches.
 
 The GUI retains correction fields as optional workspace arrays and exposes their LR/AP/FH components in the right-side Content selector (radians). The Corr entries remain disabled until a correction was applied or reused. Dual-venc data expose both normalized `Corr Low LR/AP/FH` and `Corr High LR/AP/FH` fields.
 
@@ -73,7 +77,7 @@ For the shipped WRLS fit orders, CUDA constructs the volume-scale normal equatio
 - WRLS+ARTO needs at least two time frames.
 - Automatic CUDA acceleration currently covers the dominant ARTO GMM stage; the small WRLS coefficient systems remain on CPU.
 - PyTorch is optional. Missing CUDA support or a CUDA execution failure causes a transparent CPU fallback.
-- A correction cache is reusable only when its shape and complete algorithm metadata match.
+- Normal CLI/API correction requires matching cache shape and complete algorithm metadata. GUI opening only checks structural validity and ownership; manual GUI correction always recomputes. Session calibration overrides do not update H5 acquisition metadata or publish recalibrated caches.
 - Without a ground-truth phase-offset field, method comparison relies on static-tissue residuals and downstream measurement review.
 
 ## Where to change code
@@ -82,7 +86,7 @@ For the shipped WRLS fit orders, CUDA constructs the volume-scale normal equatio
 - H5 cache validation, dual-venc concurrency, and cache writing: `autoflow/algorithms/data/h5_loader.py`, `autoflow/algorithms/data/correction_cache.py`, `autoflow/algorithms/data/dual_venc.py`
 - Public configuration types: `autoflow/case_types.py`, `autoflow/api.py`, and `autoflow/config.py`
 - CLI flags: `autoflow/cli.py`
-- Explicit pipeline action and original-source reloading: `autoflow/core/pipeline.py`
+- Fused batch load and explicit GUI correction action: `autoflow/core/pipeline.py`
 - GUI action and method controls: `autoflow/ui/app.py`
 
 ## Tests

@@ -1,5 +1,7 @@
 # DICOM loading through Dicom2H5
 
+The [full Windows portable distribution](../user/windows-portable.md) includes this feature and its optional runtime dependencies. GPU-only backends still require compatible NVIDIA hardware and drivers.
+
 ## Status
 
 | Entry point | Status | Notes |
@@ -8,7 +10,7 @@
 | CLI | Supported | DICOM directories convert before analysis; all H5 groups are processed |
 | Python API | Supported | `run_case()`, `run_batch()`, `load_input_data()` or explicit conversion |
 
-The [4DFlow_Dicom2H5 project](https://github.com/AssociatedPrimeIdeal/4DFlow_Dicom2H5) is an MIT-licensed submodule at `third_party/4DFlow_Dicom2H5`, pinned to commit `c6693c07f51255cd1004beb5bce9704a8f219e5c`. The `dicom` dependency extra uses the same revision. AutoFlow no longer implements a separate native DICOM decoder.
+The [4DFlow_Dicom2H5 project](https://github.com/AssociatedPrimeIdeal/4DFlow_Dicom2H5) is an MIT-licensed submodule at `third_party/4DFlow_Dicom2H5`, pinned to commit `d13d0a49e1debd08bb659d447de1a51c32cf6920` (2026-10-13). The `dicom` and `all` dependency extras use the same revision. This revision resolves Siemens single-frame velocity directions from the private encoding tag when available, retaining the sequence-name fallback. AutoFlow no longer implements a separate native DICOM decoder.
 
 ## What it does
 
@@ -34,12 +36,19 @@ Alternatively install the submodule directly with `pip install -e third_party/4D
 ### GUI
 
 1. Choose `File > Load DICOM`, the single DICOM entry directly below `Load H5`.
-2. Select the acquisition directory and a new H5 destination.
-3. Wait for conversion and validation in the background worker.
+2. Select the acquisition directory. **Save Converted H5** then asks for a new
+   H5 destination; conversion starts only after confirming that filename.
+3. Wait for conversion and calibration-validation messages in the background
+   progress dialog. It remains animated during conversion, without a per-file
+   percentage. The status bar identifies cancellation or failure.
 4. Select an H5 group if several acquisitions were converted.
 5. Load and review the case, then run Correction, segmentation and analysis as needed.
 
 Cancelling group selection retains the converted H5. Reopen it through `File > Load H5`. The native scan/metadata-override dialog has been removed.
+Directory and destination choosers use Qt dialogs, including SSH-forwarded
+sessions. Cancelling either chooser is reported in the status bar. An existing
+destination or conversion failure also opens an error message; details remain
+in Log.
 
 ### CLI
 
@@ -91,7 +100,7 @@ loaded = load_input_data(cases[0])
 | `DICOM2H5_MAX_WORKERS` | positive integer environment variable | 8 | Set before converter import / GUI launch | Bounds upstream conversion process pools | `third_party/4DFlow_Dicom2H5/src/dicom2h5/converter.py` |
 | `dicom_directory` | path | required | `convert_dicom_input()` | Source directory for upstream decoding | `autoflow/algorithms/dicom_conversion.py` |
 | `output_h5` | path | required | `convert_dicom_input()` | Publish a new validated H5 | same |
-| `progress_callback` | callable or None | None | `convert_dicom_input()` | Receives conversion start/completion dictionaries | same |
+| `progress_callback` | callable or None | None | `convert_dicom_input()` | Receives conversion, validation and completion dictionaries | same |
 
 `dicom_read_workers`, `--dicom-read-workers` and `dicom_parameter_overrides` belonged to the removed native loader. They are no longer supported controls; old saved loader dictionaries omit them when restored. Review or correct acquisition calibration before conversion rather than applying native-reader overrides.
 
@@ -115,6 +124,7 @@ Automatic filenames are `<directory-name>-<absolute-path-hash>.h5`. Temporary fi
 - The downstream geometry contract is axis aligned; storing an oblique rotation matrix does not add oblique resampling.
 - Converted magnitude and velocity lack the complex information needed to derive sigma. TKE stays optional and is skipped when unavailable.
 - Atomic publication requires hard-link support on the output filesystem.
+- [Conversion performance measurements and isolated optimization experiments](../developer/performance.md#dicom-converter-update-and-profiling-2026-10-16) distinguish warm NAS timings from a fresh full-pipeline run.
 
 ## Where to change code
 
@@ -138,6 +148,7 @@ Manual vendor validation should compare known component signs and calibration wi
 | --- | --- |
 | Converter unavailable | Initialize the submodule and install it, or install `.[dicom]` in the running environment |
 | Destination already exists | Reopen the saved H5 or choose a new destination |
+| Nothing loads after directory selection | Complete **Save Converted H5**; cancelling it starts no conversion. Check the status bar and Log for the current step or error. |
 | Multiple H5 groups | Select a group in the GUI or an `InputCase`, or use `run_batch()` |
 | Invalid calibration | Review DICOM metadata and upstream decoding before converting again |
 | No TKE | Continue supported velocity analysis; provide measured sigma/TKE if available |

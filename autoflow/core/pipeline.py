@@ -30,6 +30,8 @@ from ..algorithms.noise_removal import pcmra_render_mask
 from ..case_types import InputCase
 from ..task_control import TaskCancelled, check_cancelled, report_progress
 from ..plane_io import build_plane_records, save_planes_h5, save_planes_json, save_pwv_h5
+from ..algorithms.label_planes import generate_label_planes
+from ..algorithms.hierarchy import build_workspace_hierarchy
 
 
 _DERIVED_ALGORITHM_VERSIONS = {
@@ -135,6 +137,7 @@ class PipelineEngine:
             anterior_label_values=anterior_values,
             posterior_label_values=posterior_values,
             candidate_mask=candidate_mask,
+            connectivity=ws.skeleton_params.graph_connectivity,
         )
         ws.willis_ring_status = {
             str(key): value
@@ -219,6 +222,8 @@ class PipelineEngine:
         """Discard the topology and plane layout derived from the old skeleton."""
         self._clear_plane_state(ws)
         ws.graph = GraphData()
+        ws.graph_hierarchy = {}
+        ws.remove_objects_by_prefix("hierarchy_path_")
         ws.branch_labels = None
         ws.centerline_paths = []
         ws.centerline_node_paths = []
@@ -458,19 +463,24 @@ class PipelineEngine:
             return [self._json_safe(v) for v in obj]
         return obj
 
-    def load_data(self, ws, log, input_source=None, progress_callback=None, reuse_existing_corr=False):
+    def load_data(self, ws, log, input_source=None, progress_callback=None, reuse_existing_corr=False,
+                  apply_background_correction=False, parameter_overrides=None):
         path = ws.paths.segmask_path or ws.paths.flow_path
         if input_source is None and not path:
             raise ValueError("data path is empty")
         load_target = path if input_source is None else input_source
         load_kwargs = {
-            "correction_config": dict(ws.loader_params.background_phase_correction.to_dict(), enabled=False),
+            "correction_config": dict(ws.loader_params.background_phase_correction.to_dict(), enabled=bool(apply_background_correction)),
             "reuse_existing_corr": bool(reuse_existing_corr),
             "force_recompute_seg": bool(getattr(ws.segmentation, "force_recompute_auto_cache", False)),
             "ignore_embedded_segmentation": bool(
                 getattr(ws.loader_params, "ignore_embedded_segmentation", False)
             ),
         }
+        if apply_background_correction:
+            load_kwargs["preserve_source_sigma"] = True
+        if parameter_overrides:
+            load_kwargs["parameter_overrides"] = copy.deepcopy(parameter_overrides)
         load_kwargs["dicom_backend"] = getattr(ws.loader_params, "dicom_backend", "dicom2h5")
         load_kwargs["dicom_h5_dir"] = getattr(ws.loader_params, "dicom_h5_dir", "")
         source_metadata = getattr(load_target, "metadata", {}) if not isinstance(load_target, (str, bytes, os.PathLike)) else {}
@@ -481,7 +491,7 @@ class PipelineEngine:
         try:
             data = load_input_data(load_target, **load_kwargs)
         except TypeError as exc:
-            if "unexpected keyword argument" not in str(exc):
+            if parameter_overrides or "unexpected keyword argument" not in str(exc):
                 raise
             data = load_input_data(load_target)
         # Reruns and saved workspaces must reread the preserved H5, rather than
@@ -493,6 +503,12 @@ class PipelineEngine:
                 metadata=dict(data.metadata),
             )
             ws.paths.flow_path = ws.paths.segmask_path = str(converted_h5)
+        if apply_background_correction:
+            report = dict(data.metadata.get("background_phase_correction", {}) or {})
+            parts = [report.get("dual_venc_low", {}), report.get("dual_venc_high", {})] if "dual_venc_low" in report else [report]
+            if not all(part.get("applied", False) for part in parts):
+                reason = "; ".join(str(part.get("skipped_reason", "not applied")) for part in parts)
+                raise RuntimeError(f"Background correction not applied: {reason}")
         ws._loaded_input_source = copy.deepcopy(load_target)
         ws._loaded_input_kwargs = dict(load_kwargs)
         ws.pcmra_render_mask = None
@@ -629,6 +645,9 @@ class PipelineEngine:
         ws.derived.pwv_h5_file = ""
         ws.derived.artifact_signatures = {}
         ws.data_loaded = True
+        if apply_background_correction:
+            ws.loader_params.background_phase_correction.enabled = True
+            ws.pipeline.mark_done(StepId.BACKGROUND_CORRECTION)
         ws._preprocess_signature = None
 
         for data_key in [
@@ -671,7 +690,8 @@ class PipelineEngine:
     def preprocess(self, ws):
         if ws.segmask_raw is None:
             raise ValueError("segmask_raw is None")
-        from ..algorithms.preprocess import majority_vote_labels_3d, filter_connected_components, filter_labeled_components, filter_4d_labeled_components
+        from ..algorithms.preprocess import majority_vote_labels_3d, filter_connected_components, filter_4d_labeled_components
+        from ..algorithms.preprocess_qc import build_segmentation_preprocess_qc
 
         signature = (
             id(ws.segmask_raw),
@@ -702,15 +722,9 @@ class PipelineEngine:
                 min_volume_mm3=float(getattr(getattr(ws, "segmentation", None), "cleanup_4d_min_volume_mm3", 50.0)),
             )
         voted_labels_3d = majority_vote_labels_3d(ws.segmask_labels)
-        if ws.skeleton_params.remove_small_cc:
-            voted_labels_3d = filter_labeled_components(
-                voted_labels_3d,
-                ws.resolution,
-                mode=ws.skeleton_params.cc_filter_mode,
-                min_volume_mm3=ws.skeleton_params.min_cc_volume_mm3,
-                rel_min_ratio=ws.skeleton_params.cc_rel_min_ratio,
-            )
-        ws.segmask_labels_3d = np.asarray(voted_labels_3d, dtype=np.int16)
+        # Retain components after merging labels into their anatomical group.
+        # Small labels attached to the retained group must survive unchanged.
+        retained_labels_3d = np.zeros_like(voted_labels_3d, dtype=np.int16)
         specs = self._build_group_specs(ws, voted_labels_3d)
         ws.group_order = [str(spec["name"]) for spec in specs]
         ws.multilabel_groups = {}
@@ -718,6 +732,7 @@ class PipelineEngine:
         binary_shape = voted_labels_3d.shape + (time_count,)
         global_binary = np.zeros(binary_shape, dtype=bool)
         global_mask_3d = np.zeros(voted_labels_3d.shape, dtype=bool)
+        morphology_groups = {}
         for spec_index, spec in enumerate(specs):
             report_progress({"stage": "segmentation_preprocess", "current": spec_index, "total": len(specs),
                              "message": f"Preparing segmentation group {spec_index + 1}/{len(specs)}"})
@@ -725,35 +740,35 @@ class PipelineEngine:
             labels = [int(x) for x in spec["labels"]]
             group_mask_3d = np.isin(voted_labels_3d, labels)
             group_params = ws.skeleton_params.params_for_group(group_name)
-            if group_params.remove_small_cc:
-                group_mask_3d = filter_connected_components(
-                    group_mask_3d,
-                    ws.resolution,
-                    mode=group_params.cc_filter_mode,
-                    min_volume_mm3=group_params.min_cc_volume_mm3,
-                    rel_min_ratio=group_params.cc_rel_min_ratio,
-                )
+            protected_values = self._special_label_values(ws, group_params, labels)
+            special_handling = str(getattr(group_params, "special_handling", "three_pass_merge") or "three_pass_merge").strip().lower().replace("-", "_")
+            contact_cut = None
+            if special_handling == "contact_surface" and getattr(group_params, "separate_special_label_contacts", True) and len(protected_values) >= 2:
+                contact_cut = lambda mask: separate_special_label_contacts(
+                    mask, voted_labels_3d, protected_values, resolution=ws.resolution)
+            processed_mask_3d, preprocess_details = preprocess_mask_for_skeleton(
+                group_mask_3d, group_params, resolution=ws.resolution, return_details=True,
+                post_morphology=contact_cut)
+            morphology_groups[group_name] = preprocess_details["morphology_mask"]
+            group_mask_3d = preprocess_details["retained_source_mask"]
+            retained_labels_3d[group_mask_3d] = voted_labels_3d[group_mask_3d]
             # Keep the temporal prediction for phase-dependent metrics.  The
             # voted 3D mask above remains the stable topology input for
             # skeleton/graph generation, while WSS, pressure and plane flow
             # use the actual per-frame lumen where a 4D segmentation exists.
             if np.asarray(ws.segmask_labels).ndim == 4:
                 group_binary = np.isin(ws.segmask_labels, labels).astype(bool)
+                if group_params.remove_small_cc:
+                    # Filter merged labels per frame to preserve lumen motion.
+                    for frame in range(group_binary.shape[3]):
+                        group_binary[..., frame] = filter_connected_components(
+                            group_binary[..., frame], ws.resolution,
+                            mode=group_params.cc_filter_mode,
+                            min_volume_mm3=group_params.min_cc_volume_mm3,
+                            rel_min_ratio=group_params.cc_rel_min_ratio,
+                        )
             else:
                 group_binary = self._repeat_mask_to_time(group_mask_3d, time_count)
-            processed_mask_3d = preprocess_mask_for_skeleton(group_mask_3d, group_params, resolution=ws.resolution)
-            # Apply legacy contact cutting only when explicitly selected.  The
-            # three-pass mode keeps this display/metric mask intact and builds
-            # its separate skeleton passes during _step_generate_skeleton.
-            protected_values = self._special_label_values(ws, group_params, labels)
-            special_handling = str(getattr(group_params, "special_handling", "three_pass_merge") or "three_pass_merge").strip().lower().replace("-", "_")
-            if special_handling == "contact_surface" and getattr(group_params, "separate_special_label_contacts", True) and len(protected_values) >= 2:
-                processed_mask_3d = separate_special_label_contacts(
-                    processed_mask_3d,
-                    voted_labels_3d,
-                    protected_values,
-                    resolution=ws.resolution,
-                )
             previous_state = dict(previous_groups.get(group_name, {})) if isinstance(previous_groups.get(group_name, {}), dict) else {}
             global_binary |= np.asarray(group_binary, dtype=bool)
             global_mask_3d |= np.asarray(processed_mask_3d, dtype=bool)
@@ -777,8 +792,29 @@ class PipelineEngine:
                 "skeleton_points": previous_state.get("skeleton_points"),
                 "skeleton_mask": previous_state.get("skeleton_mask"),
             }
+        ws.segmask_labels_3d = retained_labels_3d
         ws.segmask_binary = np.asarray(global_binary, dtype=bool)
         ws.segmask_3d = np.asarray(global_mask_3d, dtype=bool)
+        ws.segmentation_preprocess_qc = build_segmentation_preprocess_qc(
+            ws.segmask_raw, ws.segmask_labels, voted_labels_3d, retained_labels_3d, global_mask_3d,
+            resolution=ws.resolution, label_map=ws.skeleton_params.label_map,
+            label_groups=ws.skeleton_params.label_groups, group_specs=specs,
+            processed_groups={name: state["segmask_3d"] for name, state in ws.multilabel_groups.items()},
+            temporal_group_mask=global_binary,
+            morphology_groups=morphology_groups,
+        )
+        ws.segmentation_preprocess_qc["preprocessing_order"] = [
+            "merge_group_labels", "morphology_and_gaussian", "optional_special_contact_separation",
+            "connected_component_filter", "skeleton", "graph"]
+        ws.segmentation_preprocess_qc["cleanup_4d"] = {
+            "enabled": bool(getattr(getattr(ws, "segmentation", None), "cleanup_4d_components", False)),
+            "mode": str(getattr(getattr(ws, "segmentation", None), "cleanup_4d_mode", "absolute")),
+            "min_volume_mm3": float(getattr(getattr(ws, "segmentation", None), "cleanup_4d_min_volume_mm3", 50.0)),
+        }
+        ws.segmentation_preprocess_qc["group_filters"] = [{
+            "group_name": name, "labels": list(ws.multilabel_groups[name]["labels"]),
+            "parameters": ws.skeleton_params.params_for_group(name).to_dict(),
+        } for name in ws.group_order]
         ws.set_object_visible_by_data_key("segmask_raw_surface", False)
         ws.remove_object_by_data_key("segmask_pre_surface")
         ws.remove_objects_by_prefix("segmask_group_")
@@ -879,13 +915,14 @@ class PipelineEngine:
         cfg.force_recompute = bool(force_recompute or cfg.force_recompute)
         kwargs = dict(getattr(ws, "_loaded_input_kwargs", {}) or {})
         kwargs.pop("progress_callback", None)
-        kwargs.pop("parameter_overrides", None)
         kwargs.pop("dicom_read_workers", None)
         kwargs.pop("reuse_existing_corr", None)
         if progress_callback is not None:
             kwargs["progress_callback"] = progress_callback
         kwargs.update(correction_config=cfg, ignore_embedded_segmentation=True, force_recompute_seg=False)
         if not getattr(ws, "_loaded_input_kwargs", None):
+            if ws.input_state.metadata.get("input_parameter_overrides"):
+                kwargs["parameter_overrides"] = copy.deepcopy(ws.input_state.metadata["input_parameter_overrides"])
             kwargs["dicom_backend"] = ws.loader_params.dicom_backend
             kwargs["dicom_h5_dir"] = ws.loader_params.dicom_h5_dir
             dual_info = ws.input_state.metadata.get("dual_venc", {})
@@ -970,9 +1007,13 @@ class PipelineEngine:
             pcmra[..., tidx] = np.nan_to_num(mag_t * speed, nan=0.0, posinf=0.0, neginf=0.0)
         check_cancelled()
         ws.pcmra_array = pcmra
-        ws.remove_object_by_data_key("pcmra_volume")
-        ws.add_object(name="PC-MRA (4D)", kind=ObjectKind.AUX, data_key="pcmra_volume", group_name="Global",
-                      visible=True, opacity=0.85, scalars="PC-MRA", cmap="gray", dynamic=True, show_scalar_bar=False)
+        obj = next((obj for obj in ws.scene_objects.values() if obj.data_key == "pcmra_volume"), None)
+        if obj is None:
+            ws.add_object(name="PC-MRA (4D)", kind=ObjectKind.AUX, data_key="pcmra_volume", group_name="Global",
+                          visible=True, opacity=0.85, scalars="PC-MRA", cmap="gray", dynamic=True, show_scalar_bar=False)
+        else:
+            obj.visible = True
+            obj.dynamic = True
         ws.pipeline.mark_done(StepId.GENERATE_PCMRA)
         return StepResult(StepId.GENERATE_PCMRA, True, False,
                           "Generated PC-MRA from current working velocity; noise mask applies to 3D rendering only")
@@ -1136,13 +1177,12 @@ class PipelineEngine:
             special_handling = str(getattr(group_params, "special_handling", "three_pass_merge") or "three_pass_merge").strip().lower().replace("-", "_")
             if special_handling == "three_pass_merge":
                 protected_values = self._special_label_values(ws, group_params, group_state.get("labels", []))
-                pts, mask = generate_three_pass_special_skeleton(
-                    np.asarray(ws.segmask_labels_3d),
-                    group_state.get("labels", []),
-                    protected_values,
-                    group_params,
-                    ws.resolution,
-                )
+                if len(protected_values) >= 2 and set(group_state.get("labels", [])) - set(protected_values):
+                    pts, mask = generate_three_pass_special_skeleton(
+                        np.asarray(ws.segmask_labels_3d), group_state.get("labels", []),
+                        protected_values, group_params, ws.resolution)
+                else:
+                    pts, mask = generate_skeleton_from_mask3d(group_state["segmask_3d"], ws.resolution)
             else:
                 processed = np.asarray(group_state.get("segmask_3d"), dtype=bool)
                 pts, mask = generate_skeleton_from_mask3d(processed, ws.resolution)
@@ -1188,6 +1228,8 @@ class PipelineEngine:
         self._clear_plane_state(ws)
         ws.selected_path_index = -1
         ws.derived.centerline_pressure_profiles = []
+        ws.graph_hierarchy = {}
+        ws.remove_objects_by_prefix("hierarchy_path_")
         graph_points = []
         graph_edges = []
         branch_labels = np.zeros(ws.segmask_3d.shape, dtype=np.int16)
@@ -1210,8 +1252,8 @@ class PipelineEngine:
             group_state = ws.multilabel_groups.get(group_name, {})
             group_params = ws.skeleton_params.params_for_group(group_name)
             local_points = np.asarray(group_state.get("skeleton_points"), dtype=float).reshape(-1, 3) if group_state.get("skeleton_points") is not None else np.empty((0, 3), dtype=float)
-            local_graph = build_graph_from_points(local_points, ws.resolution)
-            min_edge_points = max(0, int(getattr(group_params, "min_edge_points", 3)))
+            local_graph = build_graph_from_points(local_points, ws.resolution, connectivity=group_params.graph_connectivity)
+            min_edge_points = max(0, int(getattr(group_params, "min_edge_points", 5)))
             local_graph = remove_short_terminal_branches(local_graph, min_edge_points=min_edge_points)
             group_state["graph"] = local_graph
             local_binary = np.asarray(group_state.get("segmask_binary"), dtype=bool)
@@ -1307,6 +1349,22 @@ class PipelineEngine:
         ws.path_info = path_info
         ws.forks = forks
         ws.selected_path_index = -1
+        ws.graph_hierarchy = build_workspace_hierarchy(ws)
+        for info in ws.path_info:
+            group_name, index = info["group_name"], info["path_index"]
+            ws.add_object(name=f"path {index}", kind=ObjectKind.BRANCH,
+                data_key=self._group_data_key("smooth_path", group_name, index), group_name=group_name,
+                browser_color=ws.skeleton_params.browser_color_for_group(group_name), visible=True,
+                color=ws.skeleton_params.scene_color_for_group(group_name, "path"), line_width=3)
+        for report in ws.graph_hierarchy["joint_systems"]:
+            name = report["group_name"]
+            for record in report["paths"]:
+                index = record["path_index"]
+                ws.add_object(name=f"joint branch {index}", kind=ObjectKind.BRANCH,
+                    data_key=f"hierarchy_path_{name}_{index}", group_name=name,
+                    visible=False, color="#ff00ff", line_width=4)
+        with open(os.path.join(self._output_dir(ws), "graph_hierarchy.json"), "w", encoding="utf-8") as handle:
+            json.dump(ws.graph_hierarchy, handle, indent=2)
         self._update_willis_ring_overlay(ws)
 
         check_cancelled()
@@ -1616,6 +1674,8 @@ class PipelineEngine:
             metrics, plane_pixelwise = augment_plane_metrics_with_derived(
                 metrics, ws.planes, ws.segmask_binary, ws.resolution, ws.origin,
                 branch_labels_3d=ws.branch_labels,
+                segmentation_labels_3d=ws.segmask_labels_3d,
+                segmentation_labels_4d=ws.segmask_labels,
                 tke_array=ws.derived.tke_array if derived_validity["tke"] else None,
                 pressure_gradient_array=(
                     ws.derived.pressure_gradient_array if derived_validity["pressure"] else None
@@ -1654,6 +1714,10 @@ class PipelineEngine:
                 "segmentation_filter": bool(getattr(ws.plane_gen_params, "segmentation_filter", True)),
             }
             generated_layout = dict(ws.derived.plane_qc or {})
+            for key in ("labels", "plane_mode", "segmentation_filter", "fov_boundary_filter", "fov_boundary_max_fraction"):
+                if key in generated_layout:
+                    plane_layout[key] = generated_layout[key]
+            plane_layout["requested_plane_count"] = int(generated_layout.get("requested_plane_count", plane_layout["requested_plane_count"]))
             if isinstance(generated_layout.get("planes"), list):
                 plane_layout["planes"] = list(generated_layout.get("planes") or [])
             qc["plane_layout"] = plane_layout
@@ -1705,8 +1769,35 @@ class PipelineEngine:
             "paths": [],
             "planes": [],
             "requested_plane_count": int(pgp.plane_count),
+            "fov_boundary_filter": bool(pgp.fov_boundary_filter),
+            "fov_boundary_max_fraction": float(pgp.fov_boundary_max_fraction),
         }
+        by_label = str(pgp.plane_mode) == "by_label" and (
+            bool(ws.skeleton_params.label_map) or any(str(name).isdigit() for name in pgp.label_rules)
+        )
+        label_plan = None
+        if by_label:
+            label_plan = generate_label_planes(
+                ws.centerline_paths, ws.segmask_labels_3d, ws.skeleton_params.label_map, pgp.label_rules,
+                spacing=ws.resolution, path_info=ws.path_info,
+                branch_labels_3d=ws.branch_labels,
+                filter_defaults={"segmentation_filter": pgp.segmentation_filter,
+                                 "fov_boundary_filter": pgp.fov_boundary_filter,
+                                 "fov_boundary_max_fraction": pgp.fov_boundary_max_fraction},
+                flow_xyzt3=ws.flow_raw, segmask_binary_4d=ws.segmask_binary,
+                smoothing_window=pgp.smoothing_window * pgp.inter_time,
+                smoothing_polyorder=pgp.smoothing_polyorder, inter_time=pgp.inter_time,
+                fork_points=[fork["crosspoint"] for fork in ws.forks if fork.get("crosspoint") is not None],
+            )
+            plane_layout_qc["labels"] = label_plan[3]
+            plane_layout_qc["requested_plane_count"] = sum(
+                q["requested_plane_count"] for q in label_plan[3]
+                if q["status"] not in {"label_absent", "disabled"}
+            )
+        # Unmapped workspaces retain global per-path placement compatibility.
+        plane_layout_qc["plane_mode"] = "by_label" if by_label else ("fixed_step" if pgp.plane_mode == "by_label" else pgp.plane_mode)
         branch_support_cache = {}
+        candidate_plane_offset = 0
         for group_index, group_name in enumerate(ws.group_order):
             report_progress({"stage": "planes_group", "current": group_index, "total": len(ws.group_order),
                              "message": f"Processing {group_name} ({group_index + 1}/{len(ws.group_order)})"})
@@ -1716,50 +1807,77 @@ class PipelineEngine:
                 fork.get("crosspoint") for fork in list(group_state.get("forks", []))
                 if isinstance(fork, dict) and fork.get("crosspoint") is not None
             ]
-            local_planes, local_smooth_paths, local_filter_qc = generate_planes_from_paths(
-                local_paths,
-                cross_section_distance=pgp.cross_section_distance,
-                start_distance=pgp.start_distance,
-                end_distance=pgp.end_distance,
-                smoothing_window=pgp.smoothing_window * pgp.inter_time,
-                smoothing_polyorder=pgp.smoothing_polyorder,
-                inter_time=pgp.inter_time,
-                plane_mode=pgp.plane_mode,
-                plane_count=pgp.plane_count,
-                anchor=pgp.anchor,
-                anchor_offset_mm=pgp.anchor_offset_mm,
-                direction=getattr(pgp, "direction", "both"),
-                spacing_mode=getattr(pgp, "spacing_mode", "fraction"),
-                spacing_ratio=getattr(pgp, "spacing_ratio", 0.25),
-                segmentation_labels=ws.segmask_labels_3d,
-                segmentation_filter=bool(getattr(pgp, "segmentation_filter", True)),
-                path_info=group_state.get("path_info", []),
-                segmentation_spacing=ws.resolution,
-                segmentation_origin=ws.origin,
-                return_qc=True,
-                fork_points=fork_points,
-                forks=group_state.get("forks", []),
-            )
             path_offset = int(group_state.get("path_index_offset", 0))
+            if by_label:
+                path_end = path_offset + len(local_paths)
+                local_planes = [copy.deepcopy(plane) for plane in label_plan[0]
+                                if path_offset <= plane.path_index < path_end]
+                for plane in local_planes:
+                    plane.path_index -= path_offset
+                local_smooth_paths = label_plan[1][path_offset:path_end]
+                local_filter_qc = label_plan[2][path_offset:path_end]
+            else:
+                local_planes, local_smooth_paths, local_filter_qc = generate_planes_from_paths(
+                    local_paths,
+                    cross_section_distance=pgp.cross_section_distance,
+                    start_distance=pgp.start_distance,
+                    end_distance=pgp.end_distance,
+                    smoothing_window=pgp.smoothing_window * pgp.inter_time,
+                    smoothing_polyorder=pgp.smoothing_polyorder,
+                    inter_time=pgp.inter_time,
+                    plane_mode="fixed_step" if pgp.plane_mode == "by_label" else pgp.plane_mode,
+                    plane_count=pgp.plane_count,
+                    anchor=pgp.anchor,
+                    anchor_offset_mm=pgp.anchor_offset_mm,
+                    direction=getattr(pgp, "direction", "both"),
+                    spacing_mode=getattr(pgp, "spacing_mode", "fraction"),
+                    spacing_ratio=getattr(pgp, "spacing_ratio", 0.25),
+                    segmentation_labels=ws.segmask_labels_3d,
+                    segmentation_filter=bool(getattr(pgp, "segmentation_filter", True)),
+                    path_info=group_state.get("path_info", []),
+                    segmentation_spacing=ws.resolution,
+                    segmentation_origin=ws.origin,
+                    return_qc=True,
+                    fork_points=fork_points,
+                    forks=group_state.get("forks", []),
+                )
             # The branch volume uses globally offset path IDs, while the
             # freshly generated local planes still carry local path indices.
             # Remove only planes with no branch-supported cross-section; keep
             # the graph/path topology and all paths themselves intact.
             if (
-                bool(getattr(pgp, "segmentation_filter", True))
+                (by_label or bool(getattr(pgp, "segmentation_filter", True)) or pgp.fov_boundary_filter)
                 and ws.segmask_binary is not None
-                and ws.branch_labels is not None
             ):
-                local_planes, local_support_qc = filter_planes_by_branch_support(
-                    local_planes,
-                    ws.segmask_binary,
-                    ws.resolution,
-                    ws.origin,
-                    branch_labels_3d=ws.branch_labels,
-                    segmentation_labels_3d=ws.segmask_labels_3d,
-                    branch_label_offset=path_offset,
-                    support_cache=branch_support_cache,
-                )
+                batches = {}
+                for candidate_index, plane in enumerate(local_planes):
+                    rule = getattr(plane, "_label_plane_rule", {}) if by_label else {}
+                    check_support = rule.get("segmentation_filter")
+                    check_support = bool(pgp.segmentation_filter) if check_support is None else check_support
+                    fov_enabled = rule.get("fov_boundary_filter")
+                    fov_enabled = pgp.fov_boundary_filter if fov_enabled is None else fov_enabled
+                    fraction = rule.get("fov_boundary_max_fraction")
+                    fraction = pgp.fov_boundary_max_fraction if fraction is None else fraction
+                    batches.setdefault((check_support, float(fraction) if fov_enabled else None), []).append(candidate_index)
+                original_planes, kept_indices, support_records = local_planes, [], {}
+                for (check_support, fraction), indices in batches.items():
+                    _, records = filter_planes_by_branch_support(
+                        [original_planes[i] for i in indices], ws.segmask_binary, ws.resolution, ws.origin,
+                        branch_labels_3d=ws.branch_labels, segmentation_labels_3d=ws.segmask_labels_3d,
+                        branch_label_offset=path_offset, support_cache=branch_support_cache,
+                        check_branch_support=check_support, fov_boundary_max_fraction=fraction)
+                    for record in records:
+                        original_index = indices[record["plane_index"]]
+                        record["plane_index"] = original_index
+                        if by_label:
+                            source_plane = original_planes[original_index]
+                            record.update(main_path_index=source_plane._main_path_index,
+                                          main_path_fraction=source_plane._main_path_fraction)
+                        support_records[original_index] = record
+                        if record["valid"]:
+                            kept_indices.append(original_index)
+                local_planes = [original_planes[i] for i in sorted(kept_indices)]
+                local_support_qc = [support_records[i] for i in sorted(support_records)]
             else:
                 support_reason = (
                     "segmentation_filter_disabled"
@@ -1784,7 +1902,7 @@ class PipelineEngine:
             for local_path_idx, raw_q in enumerate(local_filter_qc):
                 q = dict(raw_q or {})
                 q["path_index"] = int(path_offset + local_path_idx)
-                q["requested_plane_count"] = int(pgp.plane_count)
+                q["requested_plane_count"] = int(q.get("requested_plane_count", pgp.plane_count))
                 q["actual_plane_count"] = int(sum(1 for p in local_planes if int(p.path_index) == int(local_path_idx)))
                 q["dropped_plane_count"] = int(sum(
                     1 for item in local_support_qc
@@ -1792,6 +1910,7 @@ class PipelineEngine:
                     and not bool(item.get("valid", False))
                 ))
                 q["path_status"] = (
+                    "not_selected" if by_label and not q["requested_plane_count"] else
                     "no_valid_planes" if int(q["actual_plane_count"]) == 0 else "ok"
                 )
                 plane_layout_qc["paths"].append(q)
@@ -1799,15 +1918,16 @@ class PipelineEngine:
                 support = dict(item)
                 support["path_index"] = int(path_offset + int(support.get("path_index", -1)))
                 support["plane_index_local"] = int(support.get("plane_index", -1))
-                source_plane_index = int(plane_offset + int(item.get("plane_index", -1)))
+                source_plane_index = int(candidate_plane_offset + int(item.get("plane_index", -1)))
                 output_plane_index = int(plane_offset + sum(
                     1 for prior in local_support_qc[:int(item.get("plane_index", 0))]
                     if bool(prior.get("valid", False))
-                )) if bool(item.get("valid", False)) else source_plane_index
+                )) if bool(item.get("valid", False)) else None
                 support["plane_index_source"] = source_plane_index
                 support["plane_index"] = output_plane_index
                 support["group_name"] = str(group_name)
                 plane_layout_qc["planes"].append(support)
+            candidate_plane_offset += len(local_support_qc)
             adjusted_smooth_paths = [np.asarray(path, dtype=float) for path in local_smooth_paths]
             adjusted_planes = []
             for local_idx, plane in enumerate(local_planes):
@@ -1849,10 +1969,36 @@ class PipelineEngine:
         ws.planes = planes
         ws.centerline_paths_smooth = smooth_paths
         plane_layout_qc["actual_plane_count"] = int(len(ws.planes))
-        plane_layout_qc["segmentation_filter"] = bool(getattr(pgp, "segmentation_filter", True))
+        plane_layout_qc["segmentation_filter"] = by_label or bool(getattr(pgp, "segmentation_filter", True))
+        preprocess_labels = {int(item["label"]): item for item in ws.segmentation_preprocess_qc.get("labels", [])}
+        for label_qc in plane_layout_qc.get("labels", []):
+            actual = sum(int(plane.segmentation_label) == int(label_qc["segmentation_label"]) for plane in ws.planes)
+            label_qc["actual_plane_count"] = int(actual)
+            for main_path in label_qc.get("selected_main_paths", []):
+                main_path["actual_plane_count"] = sum(
+                    int(plane.segmentation_label) == int(label_qc["segmentation_label"])
+                    and int(plane.path_index) == int(main_path["path_index"])
+                    and getattr(plane, "_main_path_index", -1) == main_path["main_path_index"]
+                    for plane in ws.planes)
+            if label_qc["status"] == "selected":
+                label_qc["status"] = "ok" if actual == label_qc["requested_plane_count"] else "incomplete"
+            if label_qc["status"] == "label_absent":
+                provenance = preprocess_labels.get(int(label_qc["segmentation_label"]))
+                label_qc["reason"] = provenance["status"] if provenance else "absent_from_input"
+            omitted = list(label_qc.get("omitted_positions", []))
+            omitted.extend(item for item in plane_layout_qc["planes"]
+                           if int(item.get("segmentation_label", 0)) == int(label_qc["segmentation_label"])
+                           and not item.get("valid", True))
+            reasons = {}
+            for item in omitted:
+                reason = str(item.get("reason", "unknown"))
+                reasons[reason] = reasons.get(reason, 0) + 1
+            label_qc["excluded_plane_counts"] = reasons
         ws.derived.plane_qc = plane_layout_qc
 
         planes_path = self._save_planes_json(ws)
+        with open(os.path.join(os.path.dirname(planes_path), "plane_qc.json"), "w", encoding="utf-8") as handle:
+            json.dump(plane_layout_qc, handle, indent=2)
         check_cancelled()
         ws.pipeline.mark_done(StepId.GENERATE_PLANES)
         dropped_planes = sum(
@@ -1863,6 +2009,9 @@ class PipelineEngine:
             f"Planes: {len(ws.planes)} paths={len(ws.centerline_paths_smooth)} "
             f"forks={len(ws.forks)} dropped={dropped_planes} saved={planes_path}"
         )
+        fallback = [q["label_name"] for q in plane_layout_qc.get("labels", []) if q.get("selection_warnings")]
+        if fallback:
+            msg += " | Geometry fallback (see QC): " + ", ".join(fallback)
         return StepResult(StepId.GENERATE_PLANES, True, False, msg)
 
     def _step_edit_planes(self, ws):
@@ -2013,6 +2162,8 @@ class PipelineEngine:
                 ws.resolution,
                 ws.origin,
                 branch_labels_3d=ws.branch_labels,
+                segmentation_labels_3d=ws.segmask_labels_3d,
+                segmentation_labels_4d=ws.segmask_labels,
                 tke_array=ws.derived.tke_array,
                 pressure_gradient_array=ws.derived.pressure_gradient_array,
                 relative_pressure_array=ws.derived.relative_pressure_array,

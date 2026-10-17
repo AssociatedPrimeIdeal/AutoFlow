@@ -86,6 +86,62 @@ def make_label_overlay(
     return rgba
 
 
+class SliceImageItem(pg.ImageItem):
+    smooth = False
+
+    def paint(self, painter, *args):
+        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, bool(self.smooth))
+        super().paint(painter, *args)
+
+
+class ColoredStreamlineItem(pg.GraphicsObject):
+    """One cached painter picture for many independently coloured segments."""
+
+    def __init__(self):
+        super().__init__()
+        self._picture = QtGui.QPicture()
+        self._bounds = QtCore.QRectF()
+        self._data = np.empty((0, 2))
+        self.segment_colors = np.empty((0, 4), dtype=np.uint8)
+
+    def set_segments(self, data, colors, width):
+        self.prepareGeometryChange()
+        self._data = np.asarray(data, dtype=float).reshape(-1, 2)
+        self.segment_colors = np.asarray(colors, dtype=np.uint8).reshape(-1, 4)
+        self._picture = QtGui.QPicture()
+        painter = QtGui.QPainter(self._picture)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        segments = self._data.reshape(-1, 2, 2)
+        for color in np.unique(self.segment_colors, axis=0):
+            selected = np.all(self.segment_colors == color, axis=1)
+            path = QtGui.QPainterPath()
+            for first, second in segments[selected]:
+                path.moveTo(float(first[0]), float(first[1]))
+                path.lineTo(float(second[0]), float(second[1]))
+            painter.setPen(pg.mkPen(QtGui.QColor(*map(int, color)), width=float(width), cosmetic=True))
+            painter.drawPath(path)
+        painter.end()
+        if len(self._data):
+            low, high = np.min(self._data, axis=0), np.max(self._data, axis=0)
+            self._bounds = QtCore.QRectF(float(low[0] - 1), float(low[1] - 1),
+                                        float(high[0] - low[0] + 2), float(high[1] - low[1] + 2))
+        else:
+            self._bounds = QtCore.QRectF()
+        self.update()
+
+    def getData(self):
+        return self._data[:, 0], self._data[:, 1]
+
+    def clear(self):
+        self.set_segments(np.empty((0, 2)), np.empty((0, 4)), 1.0)
+
+    def boundingRect(self):
+        return self._bounds
+
+    def paint(self, painter, option, widget=None):
+        painter.drawPicture(0, 0, self._picture)
+
+
 class SliceViewBox(pg.ViewBox):
     cursorRequested = QtCore.Signal(str, int, int)
     strokeStarted = QtCore.Signal(str, int, int, bool)
@@ -317,7 +373,7 @@ class SliceView(QtWidgets.QFrame):
         self.plot.setMouseTracking(True)
         layout.addWidget(self.plot, 1)
 
-        self.image_item = pg.ImageItem(axisOrder="row-major")
+        self.image_item = SliceImageItem(axisOrder="row-major")
         self.noise_overlay_item = pg.ImageItem(axisOrder="row-major")
         self.overlay_item = pg.ImageItem(axisOrder="row-major")
         self.image_item.setZValue(0)
@@ -326,6 +382,19 @@ class SliceView(QtWidgets.QFrame):
         self.view_box.addItem(self.image_item)
         self.view_box.addItem(self.noise_overlay_item)
         self.view_box.addItem(self.overlay_item)
+        self.streamline_items = {}
+        self._streamline_geometry = {}
+        self._streamline_style = {}
+        for name, color in (("planar", "#00e5ff"), ("projection", "#ffb347")):
+            line = ColoredStreamlineItem()
+            arrows = ColoredStreamlineItem()
+            for item in (line, arrows):
+                item.setZValue(20 if name == "planar" else 21)
+                item.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
+                item.hide()
+                self.view_box.addItem(item)
+            self.streamline_items[name] = (line, arrows)
+        self.segmentation_boundaries = []
         self.contour_items = []
         self.draft_stroke_item = pg.PlotCurveItem(pen=pg.mkPen("#ffd43b", width=2.0))
         self.preview_contour_item = pg.PlotCurveItem(pen=pg.mkPen("#7CFC00", width=2.0))
@@ -403,6 +472,88 @@ class SliceView(QtWidgets.QFrame):
         self.plane_line.setData(points[:, 0], points[:, 1])
         self.plane_line.show()
 
+    def set_streamlines(self, name, curves, opacity=0.85, *, values=None, style=None, clim=(0.0, 100.0)):
+        """Update persistent line/arrow items without changing image geometry."""
+        line, arrows = self.streamline_items[name]
+        if curves is None or not len(curves):
+            line.clear()
+            arrows.clear()
+            line.hide()
+            arrows.hide()
+            self._streamline_geometry.pop(name, None)
+            self._streamline_style.pop(name, None)
+            return
+        style = dict(style or {})
+        style_key = (tuple(sorted(style.items())), tuple(clim), id(values))
+        if self._streamline_geometry.get(name) is not curves or self._streamline_style.get(name) != style_key:
+            segments, heads, segment_values, head_values = [], [], [], []
+            size = float(style.get("arrow_size", min(1.5, max(0.25, float(min(self._spacing))))))
+            interval = max(float(style.get("arrow_spacing", 8.0 * size)), 1e-3)
+            for curve_index, raw in enumerate(curves):
+                points = np.asarray(raw, dtype=float).reshape(-1, 2)
+                if len(points) < 2:
+                    continue
+                lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+                total = float(np.sum(lengths))
+                if total < float(style.get("min_length", 0.0)):
+                    continue
+                speed = np.asarray(values[curve_index], dtype=float) if values is not None else np.zeros(len(points))
+                segments.append(np.stack((points[:-1], points[1:]), axis=1).reshape(-1, 2))
+                segment_values.extend(0.5 * (speed[:-1] + speed[1:]))
+                if total < 2.0 * size or not style.get("arrows", True):
+                    continue
+                cumulative = np.cumsum(lengths)
+                for distance in np.arange(min(total / 2.0, interval / 2.0), total, interval):
+                    index = min(int(np.searchsorted(cumulative, distance)), len(lengths) - 1)
+                    if lengths[index] <= 1e-10:
+                        continue
+                    unit = (points[index + 1] - points[index]) / lengths[index]
+                    previous = cumulative[index - 1] if index else 0.0
+                    tip = points[index] + (distance - previous) * unit
+                    side = np.array([-unit[1], unit[0]])
+                    tail = tip - size * unit
+                    heads.extend((tip, tail + 0.5 * size * side, tip, tail - 0.5 * size * side))
+                    arrow_speed = speed[index] + (distance - previous) / lengths[index] * (speed[index + 1] - speed[index])
+                    head_values.extend((arrow_speed, arrow_speed))
+            data = np.vstack(segments) if segments else np.empty((0, 2))
+            arrow_data = np.asarray(heads).reshape(-1, 2)
+            def colors(speeds):
+                if style.get("color_mode", "fixed") == "fixed":
+                    color = QtGui.QColor(style.get("color", "#00e5ff" if name == "planar" else "#ffb347"))
+                    return np.tile(color.getRgb(), (len(speeds), 1))
+                fractions = (np.asarray(speeds) - clim[0]) / max(clim[1] - clim[0], 1e-8)
+                bins = np.rint(np.clip(np.nan_to_num(fractions), 0, 1) * 31).astype(int)
+                lut = np.rint(colormaps.get_cmap(style.get("cmap", "turbo"))(np.linspace(0, 1, 32)) * 255).astype(np.uint8)
+                result = lut[bins].copy()
+                result[~np.isfinite(np.asarray(speeds)), 3] = 0
+                return result
+            line.set_segments(data, colors(segment_values), style.get("line_width", 1.5))
+            arrows.set_segments(arrow_data, colors(head_values), style.get("line_width", 1.5))
+            self._streamline_geometry[name] = curves
+            self._streamline_style[name] = style_key
+        for item in (line, arrows):
+            item.setOpacity(float(opacity))
+            item.show()
+        arrows.setVisible(bool(style.get("arrows", True)))
+
+    def set_segmentation_boundaries(self, labels, colors, width=1.5, opacity=0.35):
+        from skimage.measure import find_contours
+        for item in self.segmentation_boundaries:
+            self.view_box.removeItem(item)
+        self.segmentation_boundaries.clear()
+        if labels is None:
+            return
+        for value in np.unique(labels):
+            if value <= 0:
+                continue
+            for contour in find_contours(np.pad(labels == value, 1), 0.5):
+                points = (contour - 1) * self._spacing + self._sample_origin
+                item = pg.PlotCurveItem(points[:, 0], points[:, 1], pen=pg.mkPen(colors[int(value)], width=width))
+                item.setZValue(12)
+                item.setOpacity(float(opacity))
+                self.view_box.addItem(item)
+                self.segmentation_boundaries.append(item)
+
     def set_contours(self, contours):
         self.clear_contours()
         for points, color, width, dashed in contours or []:
@@ -416,6 +567,7 @@ class SliceView(QtWidgets.QFrame):
                 pen=pg.mkPen(str(color), width=float(width), style=style),
             )
             item.setZValue(36)
+            item._contour_role = "manual" if str(color).lower() == "#ffd43b" else "roi"
             self.view_box.addItem(item)
             self.contour_items.append(item)
 
@@ -681,6 +833,9 @@ class SliceView(QtWidgets.QFrame):
         self.noise_overlay_item.hide()
         self.overlay_item.clear()
         self.overlay_item.hide()
+        for name in self.streamline_items:
+            self.set_streamlines(name, None)
+        self.set_segmentation_boundaries(None, {})
         self.plane_line.hide()
         self.clear_contours()
         self.clear_contour_draft()

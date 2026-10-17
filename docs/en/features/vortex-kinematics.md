@@ -27,7 +27,7 @@ Use it to inspect rotational flow structures after a segmentation is available. 
 ### GUI
 
 1. Load or create a segmentation.
-2. In the visible `Vortex Kinematics Parameters` panel, choose `Gaussian Sigma (vox)` and `Support Erosion (vox)`.
+2. Right-click `WSS / TKE / Pressure / Vortex`, open Vortex, and choose `Gaussian Sigma (vox)` and `Support Erosion (vox)`.
 3. Click `WSS / TKE / Pressure / Vortex` in the Hemodynamics workflow.
 4. In the left `Global` browser group, toggle `Vorticity Magnitude`, `Q-Criterion`, or `Swirling Strength` for the 3D scene; the ortho viewer `Content` menu provides the same three maps.
 

@@ -1,3 +1,4 @@
+from .content_controls import ContentRenderControls
 from ..config import BACKGROUND_COLOR
 import hashlib
 import json
@@ -45,14 +46,14 @@ from ..algorithms import (
 )
 from ..algorithms.data import discover_h5_input_cases, inspect_h5_input_case
 from ..algorithms.dicom_conversion import convert_dicom_input
-from ..algorithms.phase_unwrapping import backend_available, mask_sources_for_method, resolve_mask_source
 from ..algorithms.segmentation import (
     resolve_nnunet_model_folder,
     resolve_nnunet_4d_model_folder,
 )
-from ..core.models import ObjectKind, PlaneData, PwvParams, StepId, Workspace
+from ..core.models import ObjectKind, PlaneData, StepId, Workspace
 from ..core.pipeline import PipelineEngine
 from ..task_control import CancellationToken, TaskCancelled, check_cancelled, task_scope
+from ..runtime_paths import DOCUMENTATION_URL, documentation_index
 from .progress import TaskProgressDialog
 from ..config import apply_config_bundle_to_workspace, bundle_to_autoflow_kwargs, load_config_bundle
 from ..plane_io import load_plane_position_payload, project_planes_to_workspace, save_plane_positions
@@ -61,6 +62,7 @@ from ..algorithms import compute_plane_metrics, apply_internal_consistency_to_me
 from ..algorithms.streamlines import _plane_seeds, create_pathline_temporal_source
 from .editors import PlaneEditor
 from .input_dialogs import DualVencSelectDialog, H5CaseSelectDialog
+from .action_settings import ActionSettingsMixin, action_sections
 from .ortho_viewer import OrthoViewer
 from .segmentation import SegmentationDock, SOURCE_LABELS
 from .theme import apply_application_theme, configure_high_dpi, standard_icon
@@ -172,14 +174,6 @@ _PLANE_CURVE_SERIES_OPTIONS = [
     ("wss_wall_p95_Pa_t", "WSS P95 (Pa)"),
 ]
 
-
-_RUNTIME_RENDER_METRICS = [
-    ("wss", "WSS"),
-    ("tke", "TKE"),
-    ("pressure_gradient", "Pressure Gradient"),
-    ("relative_pressure", "Relative Pressure"),
-    ("streamline", "Streamlines"),
-]
 
 _WORKFLOW_STAGES = [
     ("Input & QC", "input"),
@@ -401,6 +395,7 @@ class _AutoSegmentationWorker(_TaskWorker):
 
 
 class _DicomConversionWorker(_TaskWorker):
+    progress = QtCore.Signal(dict)
     finished = QtCore.Signal(object)
     failed = QtCore.Signal(str)
 
@@ -413,7 +408,7 @@ class _DicomConversionWorker(_TaskWorker):
     @_cancellable_worker
     def run(self):
         try:
-            result = convert_dicom_input(self.root, self.output_h5)
+            result = convert_dicom_input(self.root, self.output_h5, progress_callback=self.progress.emit)
             check_cancelled()
             self.finished.emit(result)
         except TaskCancelled:
@@ -607,7 +602,7 @@ class _PathlineTaskWorker(_TaskWorker):
             self.failed.emit(traceback.format_exc())
 
 
-class MainWindow(QtWidgets.QMainWindow):
+class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
     def __init__(self, config_dir=None):
         super().__init__()
         self.setWindowTitle("AutoFlow")
@@ -743,13 +738,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.workflow_status.setAlignment(QtCore.Qt.AlignCenter)
         self.workflow_status.setMinimumWidth(105)
         workflow_row.addWidget(self.workflow_status, 0)
-        self.btn_show_advanced = QtWidgets.QToolButton()
-        self.btn_show_advanced.setText("Advanced")
-        self.btn_show_advanced.setCheckable(True)
-        self.btn_show_advanced.setChecked(False)
-        self.btn_show_advanced.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
-        self.btn_show_advanced.setArrowType(QtCore.Qt.RightArrow)
-        workflow_row.addWidget(self.btn_show_advanced, 0)
         root.addLayout(workflow_row)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
@@ -816,48 +804,26 @@ class MainWindow(QtWidgets.QMainWindow):
         sp_lay.setContentsMargins(0, 0, 0, 0)
         sp_lay.setSpacing(4)
         self._build_step_buttons(sp_lay)
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        params_widget = QtWidgets.QWidget()
-        self.params_layout = QtWidgets.QVBoxLayout(params_widget)
-        self.params_layout.setContentsMargins(4, 4, 4, 4)
-        self._workflow_param_widgets = {stage_key: [] for _label, stage_key in _WORKFLOW_STAGES}
-
-        def _capture_params(stage_key, builder, advanced=False):
-            start = self.params_layout.count()
-            builder()
-            for index in range(start, self.params_layout.count()):
-                widget = self.params_layout.itemAt(index).widget()
-                if widget is not None:
-                    self._workflow_param_widgets[stage_key].append((widget, bool(advanced)))
-
-        _capture_params("input", self._build_preprocess_params)
-        _capture_params("correction", self._build_background_correction_params)
-        _capture_params("correction", self._build_noise_removal_params)
-        _capture_params("correction", self._build_phase_unwrap_params)
-        _capture_params("segmentation", self._build_segmentation_params)
-        _capture_params("centerline", self._build_skeleton_params, advanced=True)
-        _capture_params("centerline", self._build_plane_params)
-        _capture_params("hemodynamics", self._build_pwv_params)
-        _capture_params("hemodynamics", self._build_streamline_params)
-        _capture_params("hemodynamics", self._build_derived_params, advanced=True)
-        _capture_params("hemodynamics", self._build_vortex_params)
-        _capture_params("review", self._build_review_params)
+        self.review_panel = QtWidgets.QScrollArea()
+        self.review_panel.setWidgetResizable(True)
+        self.review_panel.setFrameShape(QtWidgets.QFrame.NoFrame)
+        review_widget = QtWidgets.QWidget()
+        self.params_layout = QtWidgets.QVBoxLayout(review_widget)
+        self._build_review_params()
         self.params_layout.addStretch()
-        scroll.setWidget(params_widget)
-        sp_lay.addWidget(scroll, 1)
+        self.review_panel.setWidget(review_widget)
+        sp_lay.addWidget(self.review_panel, 1)
         mid_splitter.addWidget(step_and_params)
-        mid_splitter.setStretchFactor(0, 4)
-        mid_splitter.setStretchFactor(1, 2)
-        mid_splitter.setSizes([480, 220])
+        mid_splitter.setStretchFactor(0, 1)
+        mid_splitter.setStretchFactor(1, 0)
+        mid_splitter.setSizes([640, 100])
         mid_lay.addWidget(mid_splitter, 1)
         right = QtWidgets.QWidget()
         right.setMinimumWidth(360)
         right_lay = QtWidgets.QVBoxLayout(right)
         right_lay.setContentsMargins(0, 0, 0, 0)
         self.ortho_viewer = OrthoViewer(self.workspace, self)
+        self.ortho_viewer.contentRenderRequested.connect(self._on_content_render_requested)
         right_lay.addWidget(self.ortho_viewer)
         splitter.addWidget(left)
         splitter.addWidget(mid)
@@ -890,7 +856,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_segmentation_dock()
         self._build_pwv_dock()
         self.workflow_tabs.currentChanged.connect(self._on_workflow_stage_changed)
-        self.btn_show_advanced.toggled.connect(self._on_advanced_toggled)
         self._on_workflow_stage_changed(self.workflow_tabs.currentIndex())
 
     def _build_browser(self, parent):
@@ -928,6 +893,11 @@ class MainWindow(QtWidgets.QMainWindow):
         visibility_row.addWidget(self.chk_all_pathlines_visible)
         visibility_row.addStretch()
         lay.addLayout(visibility_row)
+        self.chk_selection_on_top = QtWidgets.QCheckBox("Selection on top")
+        self.chk_selection_on_top.setChecked(True)
+        self.chk_selection_on_top.setToolTip("Draw selected Browser layers in front of other 3D layers")
+        self.chk_selection_on_top.toggled.connect(self._on_selection_on_top_changed)
+        lay.addWidget(self.chk_selection_on_top)
         opacity_row = QtWidgets.QHBoxLayout()
         self.label_browser_opacity = QtWidgets.QLabel("Opacity: —")
         self.slider_browser_opacity = QtWidgets.QSlider(QtCore.Qt.Horizontal)
@@ -939,6 +909,11 @@ class MainWindow(QtWidgets.QMainWindow):
         opacity_row.addWidget(self.label_browser_opacity)
         opacity_row.addWidget(self.slider_browser_opacity, 1)
         lay.addLayout(opacity_row)
+        self.content_render_controls = ContentRenderControls(self)
+        self.content_render_controls.settingsChanged.connect(self._on_content_render_settings)
+        self.content_render_controls.positionChanged.connect(self._on_content_render_position)
+        self.content_render_controls.interactionChanged.connect(lambda active: self.scene.set_interaction_preview(active))
+        lay.addWidget(self.content_render_controls)
         self._build_plane_display_controls(lay)
         row = QtWidgets.QHBoxLayout()
         self.btn_delete_obj = QtWidgets.QPushButton("Delete Selected")
@@ -978,6 +953,8 @@ class MainWindow(QtWidgets.QMainWindow):
             button = QtWidgets.QPushButton(label)
             button.setToolTip(step_tooltips.get(step, step.label))
             button.clicked.connect(partial(self._run_single_step, step))
+            if action_sections(step, self.workspace):
+                self._attach_action_settings(button, step, partial(self._run_single_step, step))
             self.step_buttons[step] = button
             row, column = divmod(index, 3)
             gl.addWidget(button, row, column)
@@ -991,9 +968,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_run_all.setProperty("role", "primary")
         self.btn_run_all.setMinimumHeight(34)
         self.btn_run_all.clicked.connect(self._run_all_pipeline)
+        self._attach_action_settings(self.btn_run_all, "run_all", self._run_all_pipeline)
         run_all_row = import_row + 1
         gl.addWidget(self.btn_run_all, run_all_row, 0, 1, 3)
         parent.addWidget(grp, 0)
+
+        self.btn_reload_input = QtWidgets.QPushButton("Reload Input")
+        self.btn_reload_input.setIcon(standard_icon(self, "SP_BrowserReload"))
+        self.btn_reload_input.clicked.connect(self._reload_input_case)
+        self._attach_action_settings(self.btn_reload_input, "input", self._reload_input_case)
+        parent.addWidget(self.btn_reload_input)
+        self.btn_run_segmentation_auto = QtWidgets.QPushButton("Run Automatic Segmentation")
+        self.btn_run_segmentation_auto.setProperty("role", "primary")
+        self.btn_run_segmentation_auto.clicked.connect(self._on_run_auto_segmentation)
+        self._attach_action_settings(self.btn_run_segmentation_auto, "segmentation", self._on_run_auto_segmentation)
+        parent.addWidget(self.btn_run_segmentation_auto)
 
         edit_grp = QtWidgets.QGroupBox("Interactive Edit")
         self._edit_panel = edit_grp
@@ -1029,87 +1018,6 @@ class MainWindow(QtWidgets.QMainWindow):
         edit_grp.setVisible(False)
         parent.addWidget(edit_grp, 0)
 
-    def _build_preprocess_params(self):
-        grp = QtWidgets.QGroupBox("Input Parameters")
-        fl = QtWidgets.QFormLayout(grp)
-        self.edit_input_resolution = QtWidgets.QLineEdit("1.0, 1.0, 1.0")
-        self.edit_input_venc = QtWidgets.QLineEdit("150.0, 150.0, 150.0")
-        self.edit_input_spatial_order = QtWidgets.QLineEdit("LR, AP, FH")
-        self.edit_input_venc_order = QtWidgets.QLineEdit("LR, AP, FH")
-        fl.addRow("Current Resolution XYZ", self.edit_input_resolution)
-        fl.addRow("Current VENC XYZ", self.edit_input_venc)
-        fl.addRow("Current Spatial Order", self.edit_input_spatial_order)
-        fl.addRow("Current VENC Order", self.edit_input_venc_order)
-        self.btn_reload_input = QtWidgets.QPushButton("Reload Input with Current Parameters")
-        self.btn_reload_input.setIcon(standard_icon(self, "SP_BrowserReload"))
-        self.btn_reload_input.clicked.connect(self._reload_input_case)
-        fl.addRow("", self.btn_reload_input)
-        self.params_layout.addWidget(grp)
-
-    def _build_background_correction_params(self):
-        grp = QtWidgets.QGroupBox("Background Correction")
-        fl = QtWidgets.QFormLayout(grp)
-        # Kept internally for older UI/workspace parameter bindings. Explicit
-        # correction actions always recompute; loading only applies saved caches.
-        self.chk_bpc_enabled = QtWidgets.QCheckBox()
-        self.chk_bpc_enabled.setChecked(True)
-        self.combo_bpc_method = QtWidgets.QComboBox()
-        for label, method in _BACKGROUND_PHASE_METHOD_ITEMS:
-            self.combo_bpc_method.addItem(label, method)
-        self.combo_bpc_method.currentIndexChanged.connect(self._on_bpc_method_changed)
-        self.spin_bpc_fit_order = QtWidgets.QSpinBox()
-        self.spin_bpc_fit_order.setRange(0, 3)
-        self.spin_bpc_fit_order.setValue(3)
-        self.spin_bpc_threshold = QtWidgets.QDoubleSpinBox()
-        self.spin_bpc_threshold.setDecimals(3)
-        self.spin_bpc_threshold.setRange(0.001, 10.0)
-        self.spin_bpc_threshold.setSingleStep(0.01)
-        self.spin_bpc_threshold.setValue(0.2)
-        self.spin_dual_venc_ratio1 = QtWidgets.QDoubleSpinBox()
-        self.spin_dual_venc_ratio2 = QtWidgets.QDoubleSpinBox()
-        for widget in (self.spin_dual_venc_ratio1, self.spin_dual_venc_ratio2):
-            widget.setDecimals(4)
-            widget.setRange(-10.0, 10.0)
-            widget.setSingleStep(0.01)
-        fl.addRow("Correction Method", self.combo_bpc_method)
-        fl.addRow("Corr Fit Order", self.spin_bpc_fit_order)
-        fl.addRow("MSAC Threshold", self.spin_bpc_threshold)
-        fl.addRow("Dual-VENC Ratio1", self.spin_dual_venc_ratio1)
-        fl.addRow("Dual-VENC Ratio2", self.spin_dual_venc_ratio2)
-        hint = QtWidgets.QLabel("Updates working velocity used by segmentation. Existing downstream results are retained; rerun them manually.")
-        hint.setWordWrap(True)
-        fl.addRow(hint)
-        self._on_bpc_method_changed()
-        self.params_layout.addWidget(grp)
-
-    def _build_noise_removal_params(self):
-        grp = QtWidgets.QGroupBox("Noise Removal (PC-MRA Rendering Only)")
-        fl = QtWidgets.QFormLayout(grp)
-        self.combo_noise_method = QtWidgets.QComboBox()
-        self.combo_noise_method.addItem("Magnitude + temporal speed SD", "magnitude_temporal")
-        self.combo_noise_method.addItem("Magnitude only", "magnitude")
-        self.spin_noise_magnitude = QtWidgets.QDoubleSpinBox()
-        self.spin_noise_magnitude.setRange(0.0, 1.0)
-        self.spin_noise_magnitude.setDecimals(3)
-        self.spin_noise_magnitude.setSingleStep(0.01)
-        self.spin_noise_magnitude.setValue(0.05)
-        self.spin_noise_magnitude.setSpecialValueText("Positive signal only")
-        self.spin_noise_magnitude.setToolTip("Fraction of maximum temporal-mean magnitude; default 0.05 (5%). Lower values retain more voxels. Zero keeps positive finite signal.")
-        self.spin_noise_std_max = QtWidgets.QDoubleSpinBox()
-        self.spin_noise_std_max.setRange(0.0, 1.0)
-        self.spin_noise_std_max.setDecimals(3)
-        self.spin_noise_std_max.setSingleStep(0.01)
-        self.spin_noise_std_max.setValue(0.80)
-        self.spin_noise_std_max.setSpecialValueText("Disabled")
-        self.spin_noise_std_max.setToolTip("Upper temporal speed SD fraction of maximum SD; default 0.80 (80%). Higher values retain more voxels; zero disables screening. Rerun after editing.")
-        fl.addRow("Method", self.combo_noise_method)
-        fl.addRow("Magnitude fraction of maximum", self.spin_noise_magnitude)
-        fl.addRow("Temporal SD fraction of maximum", self.spin_noise_std_max)
-        reset = QtWidgets.QPushButton("Reset PC-MRA Noise Mask")
-        reset.clicked.connect(self._reset_noise_removal)
-        fl.addRow(reset)
-        self.params_layout.addWidget(grp)
-
     def _reset_noise_removal(self):
         if self._pipeline_running_guard("resetting noise removal"):
             return
@@ -1123,566 +1031,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ortho_viewer.refresh()
         self._refresh_browser()
         self._refresh_workflow_status()
-
-    def _build_segmentation_params(self):
-        grp = QtWidgets.QGroupBox("Segmentation Parameters")
-        self.segmentation_params_group = grp
-        fl = QtWidgets.QFormLayout(grp)
-
-        self.combo_seg_mode = QtWidgets.QComboBox()
-        for label, value in [
-            ("3D", "nnUNet"),
-            ("4D", "nnUNet4D"),
-        ]:
-            self.combo_seg_mode.addItem(label, value)
-        self.combo_seg_mode.currentIndexChanged.connect(self._on_segmentation_mode_param_changed)
-        self.combo_seg_auto_model = QtWidgets.QComboBox()
-        self.combo_seg_auto_model.setToolTip("Select a detected local model or enter a custom model folder below.")
-        self.combo_seg_auto_model.currentIndexChanged.connect(self._on_segmentation_model_preset_changed)
-        self.edit_seg_auto_model = QtWidgets.QLineEdit()
-        self.edit_seg_auto_model.setPlaceholderText("auto (backend-specific model)")
-        self.edit_seg_auto_model.textChanged.connect(self._on_segmentation_model_text_changed)
-        self.btn_seg_browse_model = QtWidgets.QPushButton("Browse...")
-        self.btn_seg_browse_model.clicked.connect(self._browse_segmentation_model)
-        model_row = QtWidgets.QHBoxLayout()
-        model_row.addWidget(self.edit_seg_auto_model, 1)
-        model_row.addWidget(self.btn_seg_browse_model)
-        model_widget = QtWidgets.QWidget()
-        model_widget.setLayout(model_row)
-        self.edit_seg_auto_checkpoint = QtWidgets.QLineEdit()
-        self.edit_seg_auto_checkpoint.setPlaceholderText("auto, checkpoint_best.pth, or checkpoint_final.pth")
-        self.btn_seg_browse_checkpoint = QtWidgets.QPushButton("Browse...")
-        self.btn_seg_browse_checkpoint.clicked.connect(self._browse_segmentation_checkpoint)
-        checkpoint_row = QtWidgets.QHBoxLayout()
-        checkpoint_row.addWidget(self.edit_seg_auto_checkpoint, 1)
-        checkpoint_row.addWidget(self.btn_seg_browse_checkpoint)
-        checkpoint_widget = QtWidgets.QWidget()
-        checkpoint_widget.setLayout(checkpoint_row)
-        self.edit_seg_auto_folds = QtWidgets.QLineEdit()
-        self.edit_seg_auto_folds.setPlaceholderText("single, all, or 0,1,2,3,4")
-        self.combo_seg_auto_device = QtWidgets.QComboBox()
-        for label, value in [
-            ("Auto (GPU if available)", "auto"),
-            ("CPU", "cpu"),
-            ("CUDA", "cuda"),
-        ]:
-            self.combo_seg_auto_device.addItem(label, value)
-        self.edit_seg_auto_label_map = QtWidgets.QPlainTextEdit()
-        self.edit_seg_auto_label_map.setPlaceholderText('{"aorta": 1}')
-        self.edit_seg_auto_label_map.setMaximumHeight(70)
-
-        self.btn_run_segmentation_auto = QtWidgets.QPushButton("Run Automatic Segmentation")
-        self.btn_run_segmentation_auto.setProperty("role", "primary")
-        self.btn_run_segmentation_auto.clicked.connect(self._on_run_auto_segmentation)
-
-        fl.addRow("Mode", self.combo_seg_mode)
-        fl.addRow("Model preset", self.combo_seg_auto_model)
-        fl.addRow("Model path", model_widget)
-        fl.addRow("Checkpoint", checkpoint_widget)
-        fl.addRow("Folds", self.edit_seg_auto_folds)
-        fl.addRow("Device", self.combo_seg_auto_device)
-        fl.addRow("Label map", self.edit_seg_auto_label_map)
-        fl.addRow("", self.btn_run_segmentation_auto)
-        hint = QtWidgets.QLabel(
-            "3D predicts one mask and broadcasts it to all phases. 4D predicts each phase. "
-            "The source dock remains available for reviewing or importing a segmentation."
-        )
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color:#555;")
-        fl.addRow("", hint)
-        self.params_layout.addWidget(grp)
-        self._on_segmentation_mode_param_changed()
-
-    @staticmethod
-    def _segmentation_model_preset_entries(backend):
-        token = str(backend or "").strip().lower()
-        is_4d = token in {"nnunet4d", "nnunet_4d", "4d"}
-        resolver = resolve_nnunet_4d_model_folder if is_4d else resolve_nnunet_model_folder
-        entries = [("Automatic backend default", "auto")]
-        try:
-            resolved = str(resolver("auto"))
-        except Exception:
-            resolved = ""
-        if resolved and Path(resolved).is_dir():
-            family = "Dataset7020 4D" if is_4d else "Dataset7010 3D"
-            entries.append((f"{family} local model", resolved))
-        return entries
-
-    def _refresh_segmentation_model_presets(self, selected=None):
-        value = self.edit_seg_auto_model.text().strip() if selected is None else str(selected).strip()
-        entries = self._segmentation_model_preset_entries(self.combo_seg_mode.currentData())
-        self.combo_seg_auto_model.blockSignals(True)
-        self.combo_seg_auto_model.clear()
-        for label, path in entries:
-            self.combo_seg_auto_model.addItem(label, path)
-        self.combo_seg_auto_model.blockSignals(False)
-        self._segmentation_model_preset_values = {str(path) for _label, path in entries}
-        self._select_segmentation_model_preset(value)
-
-    def _select_segmentation_model_preset(self, value):
-        index = self.combo_seg_auto_model.findData(str(value or "").strip())
-        self.combo_seg_auto_model.blockSignals(True)
-        self.combo_seg_auto_model.setCurrentIndex(index if index >= 0 else -1)
-        self.combo_seg_auto_model.blockSignals(False)
-
-    def _on_segmentation_model_preset_changed(self, index):
-        if int(index) >= 0:
-            value = self.combo_seg_auto_model.itemData(int(index))
-            if value is not None:
-                self.edit_seg_auto_model.setText(str(value))
-
-    def _on_segmentation_model_text_changed(self, text):
-        self._select_segmentation_model_preset(text)
-
-    def _on_segmentation_mode_param_changed(self, _index=None):
-        if _index is not None and hasattr(self, "edit_seg_auto_model"):
-            previous = self.edit_seg_auto_model.text().strip()
-            presets = set(getattr(self, "_segmentation_model_preset_values", set()))
-            self._refresh_segmentation_model_presets("auto" if previous in presets else previous)
-        enabled = bool(self.workspace.data_loaded) and self._autoseg_thread is None
-        self.combo_seg_mode.setEnabled(enabled)
-        self.combo_seg_auto_model.setEnabled(enabled)
-        self.edit_seg_auto_model.setEnabled(enabled)
-        self.btn_seg_browse_model.setEnabled(enabled)
-        self.edit_seg_auto_checkpoint.setEnabled(enabled)
-        self.btn_seg_browse_checkpoint.setEnabled(enabled)
-        self.edit_seg_auto_folds.setEnabled(enabled)
-        self.combo_seg_auto_device.setEnabled(enabled)
-        self.edit_seg_auto_label_map.setEnabled(enabled)
-        self.btn_run_segmentation_auto.setEnabled(enabled)
-
-    def _browse_segmentation_model(self):
-        current = self.edit_seg_auto_model.text().strip()
-        start_dir = current if Path(current).is_dir() else ""
-        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select nnUNet Model Folder", start_dir)
-        if path:
-            self.edit_seg_auto_model.setText(path)
-            self._select_segmentation_model_preset(path)
-
-    def _browse_segmentation_checkpoint(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select nnUNet Checkpoint", "", "Checkpoint (*.pth);;All (*)")
-        if path:
-            checkpoint = Path(path)
-            self.edit_seg_auto_checkpoint.setText(checkpoint.name)
-            if checkpoint.parent.name.startswith("fold_"):
-                self.edit_seg_auto_model.setText(str(checkpoint.parent.parent))
-
-    def _build_skeleton_params(self):
-        grp = QtWidgets.QGroupBox("Generate Skeleton Parameters")
-        fl = QtWidgets.QFormLayout(grp)
-        self.chk_remove_small_cc = QtWidgets.QCheckBox()
-        self.chk_remove_small_cc.setChecked(False)
-        self.chk_separate_special_label_contacts = QtWidgets.QCheckBox()
-        self.chk_separate_special_label_contacts.setChecked(True)
-        self.chk_separate_special_label_contacts.setToolTip(
-            "Separate contacts between RBCT, CCA, and LBCT before skeletonization."
-        )
-        self.combo_special_handling = QtWidgets.QComboBox()
-        self.combo_special_handling.addItem("Three-pass merge", "three_pass_merge")
-        self.combo_special_handling.addItem("Contact surface", "contact_surface")
-        self.combo_special_handling.setToolTip(
-            "Choose how configured special labels are handled during skeletonization."
-        )
-        self.combo_cc_filter_mode = QtWidgets.QComboBox()
-        self.combo_cc_filter_mode.addItems(["hybrid", "absolute", "relative", "largest"])
-        self.edit_min_cc_volume = QtWidgets.QLineEdit("50.0")
-        self.edit_cc_rel_min_ratio = QtWidgets.QLineEdit("0.01")
-        self.edit_min_edge_points = QtWidgets.QLineEdit("3")
-        self.edit_min_edge_points.setToolTip(
-            "Remove terminal graph branches shorter than this number of edge segments."
-        )
-        self.chk_closing = QtWidgets.QCheckBox()
-        self.chk_closing.setChecked(True)
-        self.chk_opening = QtWidgets.QCheckBox()
-        self.chk_gaussian = QtWidgets.QCheckBox()
-        self.chk_gaussian.setChecked(True)
-        self.edit_gauss_sigma = QtWidgets.QLineEdit("0.5")
-        fl.addRow("Remove Small CC", self.chk_remove_small_cc)
-        fl.addRow("Special Handling", self.combo_special_handling)
-        fl.addRow("CC Filter Mode", self.combo_cc_filter_mode)
-        fl.addRow(u"Min Volume (mm\u00b3)", self.edit_min_cc_volume)
-        fl.addRow("Relative Min Ratio", self.edit_cc_rel_min_ratio)
-        fl.addRow("Minimum Edge Count", self.edit_min_edge_points)
-        fl.addRow("Closing", self.chk_closing)
-        fl.addRow("Opening", self.chk_opening)
-        fl.addRow("Gaussian", self.chk_gaussian)
-        fl.addRow(u"Gauss \u03c3", self.edit_gauss_sigma)
-        self.params_layout.addWidget(grp)
-
-    def _build_phase_unwrap_params(self):
-        grp = QtWidgets.QGroupBox("Phase Unwrapping")
-        fl = QtWidgets.QFormLayout(grp)
-        self.combo_phase_unwrap_method = QtWidgets.QComboBox()
-        for label, method in [
-            ("Laplacian 4D", "lap4D"),
-            ("Graph-cut 3D", "gc3D"),
-            ("NPRS", "nprs"),
-            ("PUDIP-Flow", "pudip"),
-            ("GUST-Flow", "gust"),
-        ]:
-            if method in {"pudip", "gust"} and not backend_available(method):
-                continue
-            self.combo_phase_unwrap_method.addItem(label, method)
-        self.combo_phase_unwrap_method.currentIndexChanged.connect(self._on_phase_unwrap_method_changed)
-        self.combo_phase_unwrap_mask = QtWidgets.QComboBox()
-        self._phase_unwrap_masks = {}
-        self._phase_unwrap_mask_method = None
-        self.combo_phase_unwrap_mask.currentIndexChanged.connect(self._on_phase_unwrap_mask_changed)
-        self.combo_phase_unwrap_device = QtWidgets.QComboBox()
-        for label, value in [("Auto (GPU if available)", "auto"), ("CPU", "cpu"), ("CUDA", "cuda")]:
-            self.combo_phase_unwrap_device.addItem(label, value)
-
-        self.phase_unwrap_method_stack = QtWidgets.QStackedWidget()
-        self.phase_unwrap_method_stack.addWidget(QtWidgets.QWidget())
-
-        lap_page = QtWidgets.QWidget()
-        lap_form = QtWidgets.QFormLayout(lap_page)
-        self.edit_phase_unwrap_ts = QtWidgets.QLineEdit("2.0")
-        lap_form.setContentsMargins(0, 0, 0, 0)
-        lap_form.addRow("Temporal weight", self.edit_phase_unwrap_ts)
-        self.phase_unwrap_method_stack.addWidget(lap_page)
-
-        nprs_page = QtWidgets.QWidget()
-        nprs_form = QtWidgets.QFormLayout(nprs_page)
-        self.edit_phase_unwrap_nprs_up = QtWidgets.QLineEdit("2")
-        self.chk_phase_unwrap_nprs_pi = QtWidgets.QCheckBox()
-        self.chk_phase_unwrap_nprs_pi.setChecked(True)
-        self.chk_phase_unwrap_nprs_crop = QtWidgets.QCheckBox()
-        self.chk_phase_unwrap_nprs_crop.setChecked(True)
-        nprs_form.setContentsMargins(0, 0, 0, 0)
-        nprs_form.addRow("Upsampling factor", self.edit_phase_unwrap_nprs_up)
-        nprs_form.addRow("π unwrap", self.chk_phase_unwrap_nprs_pi)
-        nprs_form.addRow("Auto crop", self.chk_phase_unwrap_nprs_crop)
-        self.phase_unwrap_method_stack.addWidget(nprs_page)
-
-        self.phase_unwrap_method_stack.addWidget(QtWidgets.QWidget())
-        self.phase_unwrap_method_stack.addWidget(QtWidgets.QWidget())
-
-        fl.addRow("Method", self.combo_phase_unwrap_method)
-        fl.addRow("Mask / initialization", self.combo_phase_unwrap_mask)
-        fl.addRow("Device", self.combo_phase_unwrap_device)
-        fl.addRow("Method parameters", self.phase_unwrap_method_stack)
-        self.btn_revert_phase_unwrap = QtWidgets.QPushButton("Revert to Pre-Unwrapping Flow")
-        self.btn_revert_phase_unwrap.clicked.connect(self._revert_phase_unwrap)
-        fl.addRow("", self.btn_revert_phase_unwrap)
-        self.params_layout.addWidget(grp)
-        self._on_phase_unwrap_method_changed()
-
-    def _build_plane_params(self):
-        grp = QtWidgets.QGroupBox("Generate Planes Parameters")
-        fl = QtWidgets.QFormLayout(grp)
-        self.combo_plane_mode = QtWidgets.QComboBox()
-        self.combo_plane_mode.addItem("Uniform", "uniform")
-        self.combo_plane_mode.addItem("Fixed Step", "fixed_step")
-        # Legacy values are retained so older workspaces can still be viewed.
-        self.combo_plane_mode.addItem("Evenly Spaced (legacy)", "count")
-        self.combo_plane_mode.addItem("Fixed Spacing (legacy)", "distance")
-        self.combo_plane_mode.addItem("From Junction", "anchored_offset")
-        self.combo_plane_mode.currentIndexChanged.connect(self._sync_plane_mode_ui)
-        self.edit_plane_count = QtWidgets.QLineEdit("3")
-        self.edit_plane_dist = QtWidgets.QLineEdit("5.0")
-        self.edit_plane_start = QtWidgets.QLineEdit("0.0")
-        self.edit_plane_end = QtWidgets.QLineEdit("0.0")
-        self.combo_plane_anchor = QtWidgets.QComboBox()
-        self.combo_plane_anchor.addItem("Start", "start")
-        self.combo_plane_anchor.addItem("Center", "center")
-        self.combo_plane_anchor.addItem("End", "end")
-        self.combo_plane_anchor.addItem("Junction", "junction")
-        self.combo_plane_direction = QtWidgets.QComboBox()
-        self.combo_plane_direction.addItem("Toward start", "toward_start")
-        self.combo_plane_direction.addItem("Toward end", "toward_end")
-        self.combo_plane_direction.addItem("Both sides", "both")
-        self.combo_plane_spacing_mode = QtWidgets.QComboBox()
-        self.combo_plane_spacing_mode.addItem("Fraction of path", "fraction")
-        self.combo_plane_spacing_mode.addItem("Distance (mm)", "distance")
-        self.edit_plane_ratio = QtWidgets.QLineEdit("0.25")
-        self.chk_plane_seg_filter = QtWidgets.QCheckBox()
-        self.chk_plane_seg_filter.setChecked(True)
-        self.edit_plane_offset = QtWidgets.QLineEdit("5.0")
-        self.edit_plane_smooth_win = QtWidgets.QLineEdit("15")
-        self.edit_plane_smooth_poly = QtWidgets.QLineEdit("2")
-        self.edit_plane_inter_time = QtWidgets.QLineEdit("10")
-        fl.addRow("Plane Mode", self.combo_plane_mode)
-        fl.addRow("Plane Count (-1 = all)", self.edit_plane_count)
-        fl.addRow("Spacing (mm)", self.edit_plane_dist)
-        fl.addRow("Spacing Mode", self.combo_plane_spacing_mode)
-        fl.addRow("Spacing Ratio", self.edit_plane_ratio)
-        fl.addRow("Start Distance (mm)", self.edit_plane_start)
-        fl.addRow("End Distance (mm)", self.edit_plane_end)
-        fl.addRow("Anchor", self.combo_plane_anchor)
-        fl.addRow("Direction", self.combo_plane_direction)
-        fl.addRow("Segmentation Filter", self.chk_plane_seg_filter)
-        fl.addRow("Junction Offset (mm)", self.edit_plane_offset)
-        fl.addRow("SavGol Window", self.edit_plane_smooth_win)
-        fl.addRow("SavGol Polyorder", self.edit_plane_smooth_poly)
-        fl.addRow("Inter-time", self.edit_plane_inter_time)
-        self.params_layout.addWidget(grp)
-        self._sync_plane_mode_ui()
-
-    def _build_streamline_params(self):
-        grp = QtWidgets.QGroupBox("Streamline / Pathline Parameters")
-        fl = QtWidgets.QFormLayout(grp)
-        self.edit_sl_ratio = QtWidgets.QLineEdit("0.1")
-        self.edit_sl_maxsteps = QtWidgets.QLineEdit("200")
-        self.edit_pathline_ratio = QtWidgets.QLineEdit("0.2")
-        self.edit_pathline_maxsteps = QtWidgets.QLineEdit("200")
-        self.edit_pathline_minseeds = QtWidgets.QLineEdit("50")
-        self.combo_pathline_seed_mode = QtWidgets.QComboBox()
-        self.combo_pathline_seed_mode.addItem("Fixed Count", "fixed")
-        self.combo_pathline_seed_mode.addItem("Ratio", "ratio")
-        self.edit_pathline_max_seeds = QtWidgets.QLineEdit("250")
-        self.edit_sl_terminal = QtWidgets.QLineEdit("0.01")
-        self.edit_pathline_terminal = QtWidgets.QLineEdit("0.01")
-        self.edit_pathline_rng_seed = QtWidgets.QLineEdit("0")
-        self.edit_pathline_tube_radius = QtWidgets.QLineEdit("0.25")
-        self.edit_pathline_temporal_cache_mb = QtWidgets.QLineEdit("512")
-        self.combo_pathline_color_mode = QtWidgets.QComboBox()
-        self.combo_pathline_color_mode.addItem("Uniform", "uniform")
-        self.combo_pathline_color_mode.addItem("Per Plane", "per_plane")
-        self.combo_pathline_color_mode.addItem("Per Group", "per_group")
-        self.edit_pathline_color = QtWidgets.QLineEdit("deepskyblue")
-        fl.addRow("Streamline Seed Ratio", self.edit_sl_ratio)
-        fl.addRow("Streamline Max Steps", self.edit_sl_maxsteps)
-        fl.addRow("Streamline Terminal Speed", self.edit_sl_terminal)
-        fl.addRow("Pathline Seed Mode", self.combo_pathline_seed_mode)
-        fl.addRow("Pathline Seed Count / Limit", self.edit_pathline_max_seeds)
-        fl.addRow("Pathline Seed Ratio", self.edit_pathline_ratio)
-        fl.addRow("Pathline Minimum Seeds", self.edit_pathline_minseeds)
-        fl.addRow("Pathline Max Steps", self.edit_pathline_maxsteps)
-        fl.addRow("Pathline Terminal Speed", self.edit_pathline_terminal)
-        fl.addRow("Pathline RNG Seed", self.edit_pathline_rng_seed)
-        fl.addRow("Pathline Tube Radius (mm)", self.edit_pathline_tube_radius)
-        fl.addRow("Temporal Cache (MiB)", self.edit_pathline_temporal_cache_mb)
-        fl.addRow("Pathline Color Mode", self.combo_pathline_color_mode)
-        fl.addRow("Uniform Pathline Color", self.edit_pathline_color)
-        self.params_layout.addWidget(grp)
-
-    def _build_pwv_params(self):
-        grp = QtWidgets.QGroupBox("PWV Parameters")
-        layout = QtWidgets.QVBoxLayout(grp)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(6)
-
-        form = QtWidgets.QFormLayout()
-        self.edit_pwv_interval = QtWidgets.QLineEdit("10.0")
-        self.edit_pwv_start = QtWidgets.QLineEdit("0.0")
-        self.edit_pwv_end = QtWidgets.QLineEdit("0.0")
-        self.edit_pwv_smooth_win = QtWidgets.QLineEdit("15")
-        self.edit_pwv_smooth_poly = QtWidgets.QLineEdit("2")
-        self.edit_pwv_inter_time = QtWidgets.QLineEdit("10")
-        self.edit_pwv_waveform = QtWidgets.QLineEdit("flowrate_mL_s")
-        self.combo_pwv_tt_method = QtWidgets.QComboBox()
-        self.combo_pwv_tt_method.addItems(["foot_to_foot", "cross_correlation"])
-        self.combo_pwv_foot_method = QtWidgets.QComboBox()
-        self.combo_pwv_foot_method.addItems(["tangent", "threshold"])
-        self.edit_pwv_foot_win = QtWidgets.QLineEdit("5")
-        self.edit_pwv_foot_poly = QtWidgets.QLineEdit("2")
-        self.edit_pwv_foot_threshold = QtWidgets.QLineEdit("10.0")
-        self.combo_pwv_xcorr_window = QtWidgets.QComboBox()
-        self.combo_pwv_xcorr_window.addItems(["full", "upstroke"])
-        self.edit_pwv_xcorr_interp = QtWidgets.QLineEdit("10")
-        self.chk_pwv_allow_wrap = QtWidgets.QCheckBox()
-        self.chk_pwv_allow_wrap.setChecked(True)
-        self.edit_pwv_min_planes = QtWidgets.QLineEdit("2")
-        self.chk_pwv_scene_visible = QtWidgets.QCheckBox()
-        self.chk_pwv_scene_visible.setChecked(True)
-        self.edit_pwv_scene_color = QtWidgets.QLineEdit("#ffd43b")
-        self.edit_pwv_plot_color = QtWidgets.QLineEdit("#2b8a3e")
-        self.edit_pwv_fit_color = QtWidgets.QLineEdit("#f08c00")
-        self.edit_pwv_plot_dpi = QtWidgets.QLineEdit("160")
-
-        form.addRow("Plane Interval (mm)", self.edit_pwv_interval)
-        form.addRow("Start Distance (mm)", self.edit_pwv_start)
-        form.addRow("End Distance (mm)", self.edit_pwv_end)
-        form.addRow("Path SavGol Window", self.edit_pwv_smooth_win)
-        form.addRow("Path SavGol Polyorder", self.edit_pwv_smooth_poly)
-        form.addRow("Inter-time", self.edit_pwv_inter_time)
-        form.addRow("Waveform Key", self.edit_pwv_waveform)
-        form.addRow("Transit-Time Method", self.combo_pwv_tt_method)
-        form.addRow("Foot Method", self.combo_pwv_foot_method)
-        form.addRow("Foot SavGol Window", self.edit_pwv_foot_win)
-        form.addRow("Foot SavGol Polyorder", self.edit_pwv_foot_poly)
-        form.addRow("Foot Threshold (%)", self.edit_pwv_foot_threshold)
-        form.addRow("XCorr Window", self.combo_pwv_xcorr_window)
-        form.addRow("XCorr Interp", self.edit_pwv_xcorr_interp)
-        form.addRow("Allow Cycle Wrap", self.chk_pwv_allow_wrap)
-        form.addRow("Minimum Valid Planes", self.edit_pwv_min_planes)
-        form.addRow("Show PWV Planes", self.chk_pwv_scene_visible)
-        form.addRow("PWV Plane Color", self.edit_pwv_scene_color)
-        form.addRow("Plot Color", self.edit_pwv_plot_color)
-        form.addRow("Fit Color", self.edit_pwv_fit_color)
-        form.addRow("Plot DPI", self.edit_pwv_plot_dpi)
-        layout.addLayout(form)
-
-        group_box = QtWidgets.QGroupBox("PWV Groups")
-        group_layout = QtWidgets.QVBoxLayout(group_box)
-        group_layout.setContentsMargins(6, 6, 6, 6)
-        group_layout.setSpacing(6)
-        self.table_pwv_groups = QtWidgets.QTableWidget(0, 2)
-        self.table_pwv_groups.setHorizontalHeaderLabels(["Name", "Labels"])
-        self.table_pwv_groups.verticalHeader().setVisible(False)
-        self.table_pwv_groups.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.table_pwv_groups.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        self.table_pwv_groups.setAlternatingRowColors(True)
-        self.table_pwv_groups.setMinimumHeight(130)
-        header = self.table_pwv_groups.horizontalHeader()
-        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
-        group_layout.addWidget(self.table_pwv_groups)
-
-        group_buttons = QtWidgets.QHBoxLayout()
-        self.btn_pwv_group_add = QtWidgets.QPushButton("Add Group")
-        self.btn_pwv_group_remove = QtWidgets.QPushButton("Remove Selected")
-        self.btn_pwv_group_add.clicked.connect(self._add_pwv_group_row)
-        self.btn_pwv_group_remove.clicked.connect(self._remove_selected_pwv_group_rows)
-        group_buttons.addWidget(self.btn_pwv_group_add)
-        group_buttons.addWidget(self.btn_pwv_group_remove)
-        group_buttons.addStretch()
-        group_layout.addLayout(group_buttons)
-
-        hint = QtWidgets.QLabel(
-            "Labels accept ids or symbols from labels.json, separated by comma, semicolon, or +."
-        )
-        hint.setWordWrap(True)
-        group_layout.addWidget(hint)
-        layout.addWidget(group_box)
-        self.params_layout.addWidget(grp)
-
-    def _build_derived_params(self):
-        grp_wss = QtWidgets.QGroupBox("WSS Parameters")
-        fl_wss = QtWidgets.QFormLayout(grp_wss)
-        self.edit_dm_smoothing = QtWidgets.QLineEdit("200")
-        self.edit_dm_viscosity = QtWidgets.QLineEdit("4.0")
-        self.edit_dm_inward = QtWidgets.QLineEdit("auto")
-        self.chk_dm_parabolic = QtWidgets.QCheckBox()
-        self.chk_dm_parabolic.setChecked(True)
-        self.chk_dm_noslip = QtWidgets.QCheckBox()
-        self.chk_dm_noslip.setChecked(False)
-        fl_wss.addRow("Smoothing Iterations", self.edit_dm_smoothing)
-        fl_wss.addRow(u"Viscosity (mPa\u00b7s)", self.edit_dm_viscosity)
-        fl_wss.addRow("Inward Distance (mm or auto)", self.edit_dm_inward)
-        fl_wss.addRow("Parabolic Fitting", self.chk_dm_parabolic)
-        fl_wss.addRow("No-Slip Condition", self.chk_dm_noslip)
-
-        render_group = QtWidgets.QGroupBox("Render / Colorbar")
-        render_layout = QtWidgets.QVBoxLayout(render_group)
-        render_layout.setContentsMargins(6, 6, 6, 6)
-        render_layout.setSpacing(6)
-
-        self.runtime_render_controls = {}
-        for key, label in _RUNTIME_RENDER_METRICS:
-            row = QtWidgets.QHBoxLayout()
-            row.addWidget(QtWidgets.QLabel(f"{label} clim"))
-            edit_min = QtWidgets.QLineEdit()
-            edit_min.setPlaceholderText("auto")
-            edit_max = QtWidgets.QLineEdit()
-            edit_max.setPlaceholderText("auto")
-            row.addWidget(edit_min)
-            row.addWidget(QtWidgets.QLabel("to"))
-            row.addWidget(edit_max)
-            row_widget = QtWidgets.QWidget()
-            row_widget.setLayout(row)
-            render_layout.addWidget(row_widget)
-            self.runtime_render_controls[key] = {"min": edit_min, "max": edit_max}
-
-        render_form = QtWidgets.QFormLayout()
-        self.edit_runtime_scalar_bar_width = QtWidgets.QLineEdit()
-        self.edit_runtime_scalar_bar_height = QtWidgets.QLineEdit()
-        self.edit_runtime_scalar_bar_gap = QtWidgets.QLineEdit()
-        self.edit_runtime_scalar_bar_pos_x = QtWidgets.QLineEdit()
-        self.edit_runtime_scalar_bar_pos_y = QtWidgets.QLineEdit()
-        self.edit_runtime_scalar_bar_title_font = QtWidgets.QLineEdit()
-        self.edit_runtime_scalar_bar_label_font = QtWidgets.QLineEdit()
-        render_form.addRow("Colorbar Width", self.edit_runtime_scalar_bar_width)
-        render_form.addRow("Colorbar Height", self.edit_runtime_scalar_bar_height)
-        render_form.addRow("Colorbar Gap", self.edit_runtime_scalar_bar_gap)
-        render_form.addRow("Colorbar X", self.edit_runtime_scalar_bar_pos_x)
-        render_form.addRow("Colorbar Y", self.edit_runtime_scalar_bar_pos_y)
-        render_form.addRow("Title Font", self.edit_runtime_scalar_bar_title_font)
-        render_form.addRow("Label Font", self.edit_runtime_scalar_bar_label_font)
-        render_layout.addLayout(render_form)
-
-        render_hint = QtWidgets.QLabel("These values default to config, update the live 3D scene immediately, and are reused by Export Videos in the current session.")
-        render_hint.setWordWrap(True)
-        render_layout.addWidget(render_hint)
-
-        for widgets in self.runtime_render_controls.values():
-            widgets["min"].editingFinished.connect(self._on_runtime_render_settings_changed)
-            widgets["max"].editingFinished.connect(self._on_runtime_render_settings_changed)
-        for widget in [
-            self.edit_runtime_scalar_bar_width,
-            self.edit_runtime_scalar_bar_height,
-            self.edit_runtime_scalar_bar_gap,
-            self.edit_runtime_scalar_bar_pos_x,
-            self.edit_runtime_scalar_bar_pos_y,
-            self.edit_runtime_scalar_bar_title_font,
-            self.edit_runtime_scalar_bar_label_font,
-        ]:
-            widget.editingFinished.connect(self._on_runtime_render_settings_changed)
-
-        self.params_layout.addWidget(grp_wss)
-        self.params_layout.addWidget(render_group)
-
-        grp_tke = QtWidgets.QGroupBox("Flow / TKE / Pressure Parameters")
-        fl_tke = QtWidgets.QFormLayout(grp_tke)
-        self.edit_dm_rho = QtWidgets.QLineEdit("1060.0")
-        self.edit_dm_pg_smoothing_sigma = QtWidgets.QLineEdit("0.0")
-        self.edit_dm_pg_support_erosion = QtWidgets.QLineEdit("1")
-        self.edit_dm_pg_opacity = QtWidgets.QLineEdit("0.6")
-        self.edit_dm_rp_opacity = QtWidgets.QLineEdit("0.6")
-        self.combo_dm_pressure_method = QtWidgets.QComboBox()
-        self.combo_dm_pressure_method.addItems(["ppe", "ste"])
-        self.chk_dm_multithread = QtWidgets.QCheckBox()
-        self.chk_dm_multithread.setChecked(False)
-        fl_tke.addRow(u"Density \u03c1 (kg/m\u00b3)", self.edit_dm_rho)
-        fl_tke.addRow("Relative Pressure Method", self.combo_dm_pressure_method)
-        fl_tke.addRow("Pressure-Gradient Gaussian Sigma (vox)", self.edit_dm_pg_smoothing_sigma)
-        fl_tke.addRow("Pressure Support Erosion (vox)", self.edit_dm_pg_support_erosion)
-        fl_tke.addRow("Pressure Gradient Opacity", self.edit_dm_pg_opacity)
-        fl_tke.addRow("Relative Pressure Opacity", self.edit_dm_rp_opacity)
-        fl_tke.addRow("Parallel Plane Metrics", self.chk_dm_multithread)
-        self.params_layout.addWidget(grp_tke)
-
-    def _build_vortex_params(self):
-        """Keep vortex controls visible without expanding every derived setting."""
-        grp = QtWidgets.QGroupBox("Vortex Kinematics Parameters")
-        form = QtWidgets.QFormLayout(grp)
-        self.edit_dm_vortex_smoothing_sigma = QtWidgets.QLineEdit("0.0")
-        self.edit_dm_vortex_support_erosion = QtWidgets.QLineEdit("1")
-        form.addRow("Gaussian Sigma (vox)", self.edit_dm_vortex_smoothing_sigma)
-        form.addRow("Support Erosion (vox)", self.edit_dm_vortex_support_erosion)
-        self.params_layout.addWidget(grp)
-
-    def _runtime_render_clim_keys(self):
-        return {
-            "wss": "wss_clim",
-            "tke": "tke_clim",
-            "pressure_gradient": "pressure_gradient_clim",
-            "relative_pressure": "relative_pressure_clim",
-            "streamline": "streamline_clim",
-        }
-
-    def _runtime_bar_cfg_keys(self):
-        return [
-            "wss_bar_cfg",
-            "tke_bar_cfg",
-            "pressure_gradient_bar_cfg",
-            "relative_pressure_bar_cfg",
-            "streamline_bar_cfg",
-        ]
-
-    def _parse_optional_clim_pair(self, min_text, max_text, fallback=None):
-        min_token = str(min_text or "").strip().lower()
-        max_token = str(max_text or "").strip().lower()
-        if min_token in {"", "auto"} and max_token in {"", "auto"}:
-            return None
-        lo = self._optional_float_from_text(min_text, None)
-        hi = self._optional_float_from_text(max_text, None)
-        if lo is None or hi is None:
-            return fallback
-        if hi < lo:
-            lo, hi = hi, lo
-        return (float(lo), float(hi))
 
     def _apply_render_settings_to_scene_objects(self):
         ws = self.workspace
@@ -1708,101 +1056,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 obj.clim = render_cfg.get(clim_key)
             obj.show_scalar_bar = bool(render_cfg.get(show_key, True))
             obj.scalar_bar_cfg = dict(render_cfg.get(bar_key, render_cfg.get("shared_colorbar_bar_cfg", {})) or {})
+            if obj.data_key == "pressure_gradient_volume":
+                obj.opacity = float(ws.derived_params.pressure_gradient_layer_opacity)
+            elif obj.data_key == "relative_pressure_volume":
+                obj.opacity = float(ws.derived_params.relative_pressure_layer_opacity)
             self.scene.readd_object(obj)
             touched = True
         if touched:
             self._refresh_browser()
             self._refresh_scene()
             self.ortho_viewer.refresh()
-
-    def _on_runtime_render_settings_changed(self):
-        if not hasattr(self, "runtime_render_controls"):
-            return
-        ws = self.workspace
-        render_cfg = dict(getattr(ws, "render_settings", {}) or {})
-        default_cfg = bundle_to_autoflow_kwargs(self._config_bundle)
-        for metric_key, cfg_key in self._runtime_render_clim_keys().items():
-            widgets = self.runtime_render_controls.get(metric_key, {})
-            clim_value = self._parse_optional_clim_pair(
-                widgets.get("min").text() if widgets.get("min") is not None else "",
-                widgets.get("max").text() if widgets.get("max") is not None else "",
-                fallback=default_cfg.get(cfg_key),
-            )
-            render_cfg[cfg_key] = clim_value
-
-        width = max(self._float_from_text(self.edit_runtime_scalar_bar_width.text(), 0.08), 0.01)
-        height = max(self._float_from_text(self.edit_runtime_scalar_bar_height.text(), 0.65), 0.05)
-        gap = max(self._float_from_text(self.edit_runtime_scalar_bar_gap.text(), 0.03), 0.0)
-        pos_x = min(max(self._float_from_text(self.edit_runtime_scalar_bar_pos_x.text(), 0.87), 0.0), 0.98)
-        pos_y = min(max(self._float_from_text(self.edit_runtime_scalar_bar_pos_y.text(), 0.15), 0.0), 0.95)
-        title_font = max(self._int_from_text(self.edit_runtime_scalar_bar_title_font.text(), 14), 1)
-        label_font = max(self._int_from_text(self.edit_runtime_scalar_bar_label_font.text(), 11), 1)
-        shared_bar_cfg = dict(render_cfg.get("shared_colorbar_bar_cfg", {}) or {})
-        shared_bar_cfg["width"] = float(width)
-        shared_bar_cfg["height"] = float(height)
-        shared_bar_cfg["position_x"] = float(pos_x)
-        shared_bar_cfg["position_y"] = float(pos_y)
-        shared_bar_cfg["stack_gap"] = float(gap)
-        shared_bar_cfg["title_font_size"] = int(title_font)
-        shared_bar_cfg["label_font_size"] = int(label_font)
-        render_cfg["shared_colorbar_bar_cfg"] = shared_bar_cfg
-        for bar_key in self._runtime_bar_cfg_keys():
-            bar_cfg = dict(render_cfg.get(bar_key, {}) or {})
-            bar_cfg["width"] = float(width)
-            bar_cfg["height"] = float(height)
-            bar_cfg["position_x"] = float(pos_x)
-            bar_cfg["position_y"] = float(pos_y)
-            bar_cfg["stack_gap"] = float(gap)
-            bar_cfg["title_font_size"] = int(title_font)
-            bar_cfg["label_font_size"] = int(label_font)
-            render_cfg[bar_key] = bar_cfg
-        ws.render_settings = render_cfg
-        self._apply_render_settings_to_scene_objects()
-
-    def _add_pwv_group_row(self, name="", labels=""):
-        row = self.table_pwv_groups.rowCount()
-        self.table_pwv_groups.insertRow(row)
-        self.table_pwv_groups.setItem(row, 0, QtWidgets.QTableWidgetItem(str(name or "")))
-        self.table_pwv_groups.setItem(row, 1, QtWidgets.QTableWidgetItem(str(labels or "")))
-        self.table_pwv_groups.setCurrentCell(row, 0)
-
-    def _remove_selected_pwv_group_rows(self):
-        rows = sorted({idx.row() for idx in self.table_pwv_groups.selectionModel().selectedRows()}, reverse=True)
-        if not rows and self.table_pwv_groups.rowCount() > 0:
-            rows = [self.table_pwv_groups.currentRow()]
-        for row in rows:
-            if row >= 0:
-                self.table_pwv_groups.removeRow(row)
-
-    def _split_pwv_group_labels_text(self, text):
-        tokens = re.split(r"[,;+\n\t]+", str(text or ""))
-        return [tok.strip() for tok in tokens if tok.strip()]
-
-    def _pwv_group_payload_from_ui(self):
-        groups = []
-        for row in range(self.table_pwv_groups.rowCount()):
-            name_item = self.table_pwv_groups.item(row, 0)
-            labels_item = self.table_pwv_groups.item(row, 1)
-            name = str(name_item.text()).strip() if name_item is not None else ""
-            labels_text = str(labels_item.text()).strip() if labels_item is not None else ""
-            groups.append({
-                "name": name,
-                "labels": self._split_pwv_group_labels_text(labels_text),
-            })
-        return groups
-
-    def _pwv_group_labels_for_ui(self, labels):
-        reverse_map = {}
-        for key, value in dict(self.workspace.label_params.label_map or {}).items():
-            reverse_map.setdefault(int(value), str(key))
-        display = []
-        for label_value in list(labels or []):
-            try:
-                label_id = int(label_value)
-            except Exception:
-                continue
-            display.append(reverse_map.get(label_id, str(label_id)))
-        return ", ".join(display)
 
     def _build_review_params(self):
         quality_group = QtWidgets.QGroupBox("Quality Control")
@@ -1813,7 +1076,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.quality_table = QtWidgets.QTreeWidget()
         self.quality_table.setHeaderLabels(["Status", "Stage", "Check", "Result"])
-        self.quality_table.setRootIsDecorated(False)
+        self.quality_table.setRootIsDecorated(True)
+        self.quality_table.setWordWrap(True)
         self.quality_table.setAlternatingRowColors(True)
         quality_header = self.quality_table.header()
         quality_header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
@@ -1869,6 +1133,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _workflow_stage_state(self, stage_key):
         ws = self.workspace
+        pending = set(ws.input_state.metadata.get("gui_pending_settings", []))
+        if ws.data_loaded and any(step.value in pending and not ws.pipeline.is_done(step)
+                                  for step in _WORKFLOW_STEPS.get(stage_key, ())):
+            return "Needs review"
         if stage_key == "input":
             return "Ready" if ws.data_loaded else "Not ready"
         if stage_key == "segmentation":
@@ -1919,17 +1187,11 @@ class MainWindow(QtWidgets.QMainWindow):
             f"QLabel {{ color: {foreground}; background: {background}; border: 1px solid {foreground}; padding: 3px 8px; border-radius: 4px; }}"
         )
 
-    def _on_advanced_toggled(self, checked):
-        self.btn_show_advanced.setArrowType(QtCore.Qt.DownArrow if checked else QtCore.Qt.RightArrow)
-        self._on_workflow_stage_changed(self.workflow_tabs.currentIndex())
-
     def _on_workflow_stage_changed(self, index):
         stage_key = self._workflow_stage_key(index)
-        show_advanced = bool(self.btn_show_advanced.isChecked())
-        for key, entries in self._workflow_param_widgets.items():
-            for widget, advanced in entries:
-                widget.setVisible(key == stage_key and (show_advanced or not advanced))
-
+        self.review_panel.setVisible(stage_key == "review")
+        self.btn_reload_input.setVisible(stage_key == "input")
+        self.btn_run_segmentation_auto.setVisible(stage_key == "segmentation")
         visible_steps = _WORKFLOW_STEPS.get(stage_key, set())
         # Reflow the action grid for the active stage so hidden stages do not
         # leave an empty first row or a confusing button order.
@@ -1981,7 +1243,7 @@ class MainWindow(QtWidgets.QMainWindow):
         stage_label = _WORKFLOW_STAGES[int(index)][0].replace("&", "&&")
         self.steps_group.setTitle(f"{stage_label} Actions")
         if hasattr(self, "mid_splitter"):
-            self.mid_splitter.setSizes([330, 360] if stage_key == "review" else [480, 220])
+            self.mid_splitter.setSizes([330, 360] if stage_key == "review" else [640, 100])
 
         if hasattr(self, "segmentation_dock"):
             self.segmentation_dock.setVisible(stage_key == "segmentation")
@@ -2153,6 +1415,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.segmentation_panel.check_visible.toggled.connect(self._on_segmentation_visibility_changed)
         self.segmentation_panel.slider_opacity.valueChanged.connect(self._on_segmentation_opacity_changed)
         self.segmentation_panel.btn_run_auto.clicked.connect(self._on_run_auto_segmentation)
+        self._attach_action_settings(self.segmentation_panel.btn_run_auto, "segmentation", self._on_run_auto_segmentation)
         self.segmentation_panel.btn_import.clicked.connect(self._on_import_segmentation)
         self.segmentation_panel.btn_save.clicked.connect(self._on_save_active_segmentation)
         self.segmentation_panel.table_labels.itemSelectionChanged.connect(self._on_segmentation_label_selected)
@@ -2251,19 +1514,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _analysis_mode(self):
         value = self.combo_analysis_mode.currentData() if hasattr(self, "combo_analysis_mode") else "pwv"
         return str(value or "pwv")
-
-    def _sync_plane_mode_ui(self):
-        mode = str(self.combo_plane_mode.currentData() or "fixed_step") if hasattr(self, "combo_plane_mode") else "fixed_step"
-        is_anchor = mode in {"anchored_offset", "fixed_step"}
-        for widget in [getattr(self, "edit_plane_count", None)]:
-            if widget is not None:
-                widget.setEnabled(True)
-        for widget in [getattr(self, "edit_plane_dist", None)]:
-            if widget is not None:
-                widget.setEnabled(True)
-        for widget in [getattr(self, "combo_plane_anchor", None), getattr(self, "edit_plane_offset", None)]:
-            if widget is not None:
-                widget.setEnabled(is_anchor)
 
     def _sync_analysis_controls(self):
         if not hasattr(self, "analysis_controls_stack"):
@@ -2706,6 +1956,12 @@ class MainWindow(QtWidgets.QMainWindow):
             a = QtGui.QAction(label, self)
             a.triggered.connect(slot)
             mf.addAction(a)
+        self.action_docs = QtGui.QAction("Docs", self)
+        self.action_docs.setObjectName("actionDocs")
+        self.action_docs.setShortcut(QtGui.QKeySequence("F1"))
+        self.action_docs.setStatusTip("Open AutoFlow documentation in your browser")
+        self.action_docs.triggered.connect(self._on_open_documentation)
+        mb.addAction(self.action_docs)
         me = mb.addMenu("Export")
         a = QtGui.QAction("Export Videos...", self)
         a.triggered.connect(self._on_export_videos)
@@ -2723,8 +1979,11 @@ class MainWindow(QtWidgets.QMainWindow):
         a = QtGui.QAction("3D Background Color...", self)
         a.triggered.connect(self._open_background_color_settings)
         ms.addAction(a)
-        a = QtGui.QAction("Ortho Viewer Display...", self)
+        a = QtGui.QAction("Viewer Display Settings...", self)
         a.triggered.connect(lambda: self.ortho_viewer.open_plane_display_settings())
+        ms.addAction(a)
+        a = QtGui.QAction("3D Display Settings...", self)
+        a.triggered.connect(lambda: self._open_action_settings("render"))
         ms.addAction(a)
         mv = mb.addMenu("View")
         for label, slot in [("Reset Camera", lambda: self.scene.reset_camera()), ("Toggle Axes", lambda: self.scene.toggle_axes()),
@@ -2732,6 +1991,64 @@ class MainWindow(QtWidgets.QMainWindow):
             a = QtGui.QAction(label, self)
             a.triggered.connect(slot)
             mv.addAction(a)
+
+    def _on_open_documentation(self):
+        index = documentation_index()
+        url = QtCore.QUrl.fromLocalFile(str(index)) if index is not None else QtCore.QUrl(DOCUMENTATION_URL)
+        if QtGui.QDesktopServices.openUrl(url):
+            self.statusBar().showMessage("Opened AutoFlow documentation in your browser.", 5000)
+        else:
+            self.log(f"Could not open documentation: {url.toDisplayString()}")
+            QtWidgets.QMessageBox.warning(
+                self, "Documentation", "Could not open the documentation in your browser.\n"
+                f"Open this address manually:\n{url.toDisplayString()}")
+
+    def _on_content_render_requested(self, content):
+        try:
+            had_scene = bool(self.scene._tracked_actors)
+            obj = self.scene.add_content_render(content, plane_index=self.ortho_viewer._selected_plane_idx)
+            if obj is None:
+                self.statusBar().showMessage("Selected Content has no 3D volume available; see Log.", 8000)
+                return
+            self._refresh_browser()
+            item = self._find_browser_item_by_uid(obj.uid)
+            if item is not None:
+                self.tree_objects.setCurrentItem(item, 0, QtCore.QItemSelectionModel.ClearAndSelect)
+                self.tree_objects.scrollToItem(item)
+            self._refresh_content_render_controls()
+            if not had_scene:
+                self.scene.reset_camera()
+            self._refresh_render_range_control()
+            message = (f"3D volume shown: {obj.name}. Controls are below Browser."
+                       if obj.actor is not None else f"3D rendering failed for {obj.name}; see Log.")
+            self.log(message)
+            self.statusBar().showMessage(message, 8000)
+        except Exception as exc:
+            self.log(f"3D RENDER ERROR: {type(exc).__name__}: {exc}")
+            self.log(traceback.format_exc())
+            self.statusBar().showMessage(f"3D rendering failed: {exc}; see Log.", 8000)
+
+    def _refresh_content_render_controls(self):
+        objects = self._browser_selected_objects()
+        obj = objects[0] if len(objects) == 1 and self.scene.is_content_render(objects[0]) else None
+        self.content_render_controls.set_object(obj, self.scene.content_render_settings(obj.data_key) if obj else None)
+        self.scene._content_position_callback = self._on_content_drag_position
+        self.scene.select_content_render(obj.uid if obj else None)
+
+    def _on_content_render_settings(self, settings):
+        uid = self._selected_uid()
+        if uid is not None:
+            self.scene.update_content_render(uid, **settings)
+            self._refresh_render_range_control()
+
+    def _on_content_render_position(self, axis, fraction):
+        uid = self._selected_uid()
+        if uid is not None:
+            self.scene.set_content_axis_position(uid, axis, fraction)
+
+    def _on_content_drag_position(self, uid, positions):
+        if self._selected_uid() == uid:
+            self.content_render_controls.set_positions(positions)
 
     def _open_display_orientation_settings(self):
         if self.scene is None:
@@ -2820,7 +2137,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _add_quality_flow_path_item(self, parent, node):
         item = QtWidgets.QTreeWidgetItem([
             str(node.get("name", "Path")),
-            str(int(node.get("branch_level", 0))),
+            str(node.get("branch_level")) if node.get("branch_level") is not None else "?",
             self._quality_flow_statistics_text(node.get("statistics", {})),
             self._quality_consistency_text(node),
         ])
@@ -2833,7 +2150,7 @@ class MainWindow(QtWidgets.QMainWindow):
         item.setToolTip(2, self._quality_flow_statistics_text(node.get("statistics", {})))
         item.setToolTip(3, self._quality_consistency_text(node))
         item.setData(0, _BROWSER_PATH_INDEX_ROLE, path_index)
-        if int(node.get("branch_level", 0)) == 0:
+        if node.get("parent_path_index") is None:
             for column in range(4):
                 font = item.font(column)
                 font.setBold(True)
@@ -2900,11 +2217,30 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.flow_report_summary_label.setText(
             f"Vessel flow report: {payload.get('summary', '')}. "
-            "Level-0 trunks are shown by default; expand a trunk for downstream branches, conservation equations, and per-plane details."
+            "Expand root rows for downstream branches, conservation equations, and per-plane details. Graph grades and loop connections are available after Generate Graph."
         )
+        groups, subgroups = {}, {}
+        metadata = {item["subgroup_id"]: item for item in payload.get("subgroups", [])}
         for root in roots:
-            self._add_quality_flow_path_item(None, root)
+            parent = None
+            subgroup_id = root.get("subgroup_id")
+            if subgroup_id in metadata:
+                subgroup = metadata[subgroup_id]
+                group_name = subgroup["group_name"]
+                if group_name not in groups:
+                    groups[group_name] = QtWidgets.QTreeWidgetItem([group_name, "Group", "", ""])
+                    self.flow_report_tree.addTopLevelItem(groups[group_name])
+                if subgroup_id not in subgroups:
+                    subgroups[subgroup_id] = QtWidgets.QTreeWidgetItem([
+                        f"Subgroup {subgroup['subgroup_index'] + 1}", "Component",
+                        f"{len(subgroup['path_indices'])} paths", ""])
+                    subgroups[subgroup_id].setToolTip(0, subgroup_id)
+                    groups[group_name].addChild(subgroups[subgroup_id])
+                parent = subgroups[subgroup_id]
+            self._add_quality_flow_path_item(parent, root)
         self.flow_report_tree.collapseAll()
+        for item in [*groups.values(), *subgroups.values()]:
+            item.setExpanded(True)
         self.flow_report_tree.setEnabled(status in {"available", "topology_only"})
 
     def _refresh_quality_panel(self):
@@ -2942,7 +2278,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "fail": "#b71c1c",
             "not_run": "#616161",
         }
-        for check in list(report.get("checks", []) or []):
+        def add_check(check, parent=None):
             status = str(check.get("status", "not_run"))
             item = QtWidgets.QTreeWidgetItem([
                 status.replace("_", " ").upper(),
@@ -2954,11 +2290,18 @@ class MainWindow(QtWidgets.QMainWindow):
             item.setForeground(0, QtGui.QBrush(color))
             action = str(check.get("action", "") or "")
             threshold = str(check.get("threshold", "") or "")
-            tooltip = "\n".join(part for part in [threshold, action] if part)
+            tooltip = "\n".join(part for part in [str(check.get("summary", "")), threshold, action] if part)
             if tooltip:
                 item.setToolTip(2, tooltip)
                 item.setToolTip(3, tooltip)
-            self.quality_table.addTopLevelItem(item)
+            if parent is None:
+                self.quality_table.addTopLevelItem(item)
+            else:
+                parent.addChild(item)
+            for detail in check.get("details", []):
+                add_check(detail, item)
+        for check in list(report.get("checks", []) or []):
+            add_check(check)
         self._populate_quality_flow_tree(report.get("flow_hierarchy", {}))
         self._refresh_workflow_status()
 
@@ -3252,12 +2595,10 @@ class MainWindow(QtWidgets.QMainWindow):
         obj.show_scalar_bar = show_shared_colorbar
         obj.scalar_bar_title = "Label"
         obj.scalar_bar_cfg = shared_bar_cfg
-        for grouped in ws.scene_objects.values():
-            if str(getattr(grouped, "data_key", "")).startswith("segmask_group_"):
-                grouped.visible = bool(ws.segmentation.visible)
+        # Group surfaces keep their Browser visibility during ordinary refreshes.
+        # Only an explicit segmentation visibility action changes every group.
 
     def _refresh_segmentation_ui(self):
-        self._refresh_phase_unwrap_masks()
         panel = self.segmentation_panel
         ws = self.workspace
         seg = ws.segmentation
@@ -3324,9 +2665,8 @@ class MainWindow(QtWidgets.QMainWindow):
             and self._labeler_process.state() != QtCore.QProcess.ProcessState.NotRunning
         )
         panel.btn_run_auto.setEnabled(bool(ws.data_loaded) and not labeler_running and self._autoseg_thread is None)
-        if hasattr(self, "segmentation_params_group"):
-            self.segmentation_params_group.setEnabled(bool(ws.data_loaded) and not labeler_running)
-            self._on_segmentation_mode_param_changed()
+        self.btn_run_segmentation_auto.setEnabled(panel.btn_run_auto.isEnabled())
+        self.btn_reload_input.setEnabled(bool(ws.data_loaded))
         panel.btn_import.setEnabled(bool(ws.data_loaded) and not labeler_running)
         panel.btn_save.setEnabled(ws.get_active_segmentation() is not None and not labeler_running)
         panel.btn_external_editor.setEnabled(
@@ -4023,6 +3363,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sync_segmentation_scene_object()
         for obj in self.workspace.scene_objects.values():
             if obj.data_key == "segmask_raw_surface" or obj.data_key.startswith("segmask_group_"):
+                if obj.data_key.startswith("segmask_group_"):
+                    obj.visible = bool(checked)
                 self.scene.apply_object_properties(obj, render=False)
         self.scene.render_all()
         self.ortho_viewer.refresh()
@@ -4330,6 +3672,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return "Segmentation"
         if data_key == "pcmra_volume":
             return "PC-MRA"
+        if data_key == "magnitude_volume" or data_key.startswith("content_volume_"):
+            return "3D Volumes"
         if data_key == "noise_region":
             return "Noise"
         if data_key == "pwv_planes":
@@ -4373,6 +3717,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _browser_type_sort_key(self, type_name):
         order = [
             "PC-MRA",
+            "3D Volumes",
             "Noise",
             "Segmentation",
             "Skeleton",
@@ -4447,7 +3792,146 @@ class MainWindow(QtWidgets.QMainWindow):
             and str(getattr(plane, "group_name", "") or "") == ("" if group_name == "Global" else str(group_name))
         )
         suffix = "plane" if count == 1 else "planes"
-        return f"Path {path_idx} · {count} {suffix}"
+        hierarchy = self.workspace.path_info[path_idx].get("hierarchy", {}) if 0 <= path_idx < len(self.workspace.path_info) else {}
+        if not hierarchy:
+            return f"Path {path_idx} · {count} {suffix}"
+        names = "/".join(hierarchy.get("label_names", [])) or "Unlabeled"
+        level = hierarchy.get("group_level")
+        grade = f"G{level}" if level is not None else "G?"
+        loop = " · Loop" if hierarchy.get("loop_id") else " · Cycle" if hierarchy.get("topological_cycle") else ""
+        return f"Path {path_idx} · {names} · {grade}{loop} · {count} {suffix}"
+
+    def _browser_subgroup_nodes(self, container, records, checked=True):
+        """Create connected-component containers before arranging flow paths."""
+        subgroups = {}
+        indices = sorted({record["subgroup_index"] for record in records.values() if "subgroup_index" in record})
+        for index in indices:
+            members = [record for record in records.values() if record.get("subgroup_index") == index]
+            names = "/".join(sorted({name for record in members for name in record.get("label_names", [])})) or "Unlabeled"
+            item = QtWidgets.QTreeWidgetItem([f"Subgroup {index + 1} · {names} · {len(members)} paths", "Subgroup"])
+            item.setData(0, _BROWSER_NODE_ROLE, "subgroup")
+            item.setToolTip(0, f"{members[0]['subgroup_id']}\nOne connected graph component. Inlets and grades are independent of other subgroups.")
+            self._browser_make_checkable(item, checked)
+            container.addChild(item)
+            item.setExpanded(True)
+            subgroups[index] = item
+        return subgroups
+
+    def _browser_apply_path_hierarchy(self, group_entry):
+        """One canonical row per path; joins/loops retain navigable references."""
+        nodes = {index: item for (_group, index), item in group_entry["paths"].items()}
+        container = group_entry["types"].get("Paths")
+        if container is None:
+            return
+        records = {index: self.workspace.path_info[index].get("hierarchy", {}) for index in nodes
+                   if 0 <= index < len(self.workspace.path_info)}
+        subgroups = self._browser_subgroup_nodes(container, records)
+        loops = {}
+
+        def move(item, parent):
+            if item.parent() is not None:
+                item.parent().removeChild(item)
+            parent.addChild(item)
+
+        for index, record in records.items():
+            loop_id = record.get("loop_id")
+            if loop_id and loop_id not in loops:
+                level = record.get("group_level")
+                item = QtWidgets.QTreeWidgetItem([f"Loop · G{level if level is not None else '?'}", "Loop"])
+                item.setData(0, _BROWSER_NODE_ROLE, "loop")
+                item.setToolTip(0, loop_id + "\nOriginal paths and all connections are retained.")
+                self._browser_make_checkable(item)
+                subgroups.get(record.get("subgroup_index"), container).addChild(item)
+                loops[loop_id] = item
+        for index, record in records.items():
+            parent_index = record.get("display_parent_path_index")
+            loop_id = record.get("loop_id")
+            if loop_id:
+                move(nodes[index], loops[loop_id])
+            elif parent_index in nodes:
+                parent_loop = records.get(parent_index, {}).get("loop_id")
+                move(nodes[index], loops[parent_loop] if parent_loop else nodes[parent_index])
+            else:
+                move(nodes[index], subgroups.get(record.get("subgroup_index"), container))
+            tooltip = dict(record)
+            nodes[index].setToolTip(0, nodes[index].text(0) + "\n" + json.dumps(tooltip, ensure_ascii=False, indent=2))
+            for other in record.get("reference_parent_path_indices", []):
+                if other == index:
+                    continue
+                reference = QtWidgets.QTreeWidgetItem([f"↗ Upstream Path {other}", "Connection"])
+                reference.setFlags(reference.flags() & ~QtCore.Qt.ItemIsUserCheckable)
+                reference.setData(0, _BROWSER_NODE_ROLE, "path_reference")
+                reference.setData(0, _BROWSER_PATH_INDEX_ROLE, other)
+                reference.setToolTip(0, "Additional graph connection; this reference does not duplicate visibility controls.")
+                nodes[index].addChild(reference)
+        for loop_id, item in loops.items():
+            members = [index for index, record in records.items() if record.get("loop_id") == loop_id]
+            parents = {parent for index in members for parent in records[index].get("parent_path_indices", [])
+                       if parent in nodes and parent not in members}
+            if parents:
+                parent = min(parents, key=lambda index: (-(records[index].get("group_level") or 0), index))
+                parent_loop = records[parent].get("loop_id")
+                move(item, loops[parent_loop] if parent_loop else nodes[parent])
+
+    def _browser_add_joint_hierarchies(self):
+        for report in self.workspace.graph_hierarchy.get("joint_systems", []):
+            top = QtWidgets.QTreeWidgetItem(["Joint cerebral arterial topology", "Analysis"])
+            self._browser_make_checkable(top, False)
+            top.setToolTip(0, "Combined connected mask topology; source groups, paths and measurements remain separate.")
+            self.tree_objects.addTopLevelItem(top)
+            records = {record["path_index"]: record for record in report.get("paths", [])}
+            subgroups = self._browser_subgroup_nodes(top, records, False)
+            nodes, loops = {}, {}
+            for record in records.values():
+                loop_id = record.get("loop_id")
+                if loop_id and loop_id not in loops:
+                    loops[loop_id] = QtWidgets.QTreeWidgetItem(["Loop", "Analysis loop"])
+                    self._browser_make_checkable(loops[loop_id], False)
+                    subgroups.get(record.get("subgroup_index"), top).addChild(loops[loop_id])
+            for index, record in records.items():
+                grade = record.get("group_level")
+                title = f"Branch {index} · {'/'.join(record['label_names']) or 'Unlabeled'} · G{grade if grade is not None else '?'}"
+                item = QtWidgets.QTreeWidgetItem([title, "Analysis branch"])
+                data_key = f"hierarchy_path_{report['group_name']}_{index}"
+                obj = next((obj for obj in self.workspace.scene_objects.values() if obj.data_key == data_key), None)
+                if obj is not None:
+                    item.setData(0, QtCore.Qt.UserRole, obj.uid)
+                    self._browser_make_checkable(item, obj.visible)
+                item.setData(0, _BROWSER_NODE_ROLE, "joint_path")
+                item.setData(0, _BROWSER_GROUP_ROLE, report["group_name"])
+                item.setData(0, _BROWSER_PATH_INDEX_ROLE, index)
+                item.setToolTip(0, json.dumps(record, ensure_ascii=False, indent=2))
+                top.addChild(item)
+                nodes[index] = item
+            for index, record in records.items():
+                loop_id = record.get("loop_id")
+                if loop_id:
+                    parent = loops[loop_id]
+                else:
+                    parent_index = record.get("display_parent_path_index")
+                    parent_loop = records.get(parent_index, {}).get("loop_id")
+                    base = subgroups.get(record.get("subgroup_index"), top)
+                    parent = loops.get(parent_loop, base) if parent_loop else nodes.get(parent_index, base)
+                nodes[index].parent().removeChild(nodes[index])
+                parent.addChild(nodes[index])
+                for other in record.get("reference_parent_path_indices", []):
+                    if other != index:
+                        reference = QtWidgets.QTreeWidgetItem([f"↗ Upstream Branch {other}", "Connection"])
+                        reference.setFlags(reference.flags() & ~QtCore.Qt.ItemIsUserCheckable)
+                        nodes[index].addChild(reference)
+            for loop_id, item in loops.items():
+                members = {i for i, record in records.items() if record.get("loop_id") == loop_id}
+                parents = {parent for i in members for parent in records[i]["parent_path_indices"] if parent not in members}
+                if parents:
+                    parent = min(parents, key=lambda i: (-(records[i].get("group_level") or 0), i))
+                    parent_loop = records[parent].get("loop_id")
+                    item.parent().removeChild(item)
+                    (loops[parent_loop] if parent_loop else nodes[parent]).addChild(item)
+                item.setCheckState(0, self._browser_check_state_for_item(item))
+            for item in [*subgroups.values(), top]:
+                item.setCheckState(0, self._browser_check_state_for_item(item))
+            for item in [top, *subgroups.values(), *loops.values()]:
+                item.setExpanded(True)
 
     def _browser_make_checkable(self, item, checked=True):
         item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
@@ -4527,7 +4011,9 @@ class MainWindow(QtWidgets.QMainWindow):
         for idx, node in enumerate(nodes):
             type_item.removeChild(node)
             type_item.insertChild(idx, node)
-            self._browser_sort_path_children(node)
+            if node.data(0, _BROWSER_NODE_ROLE) in {"path", "loop", "subgroup"}:
+                self._browser_sort_path_nodes(node)
+                self._browser_sort_path_children(node)
 
     def _iter_browser_leaf_items(self, item):
         if item is None:
@@ -4776,6 +4262,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.workspace.resolution,
                     self.workspace.origin,
                     branch_labels_3d=self.workspace.branch_labels,
+                    segmentation_labels_3d=self.workspace.segmask_labels_3d,
+                    segmentation_labels_4d=self.workspace.segmask_labels,
                     tke_array=self.workspace.derived.tke_array,
                     pressure_gradient_array=self.workspace.derived.pressure_gradient_array,
                     relative_pressure_array=self.workspace.derived.relative_pressure_array,
@@ -4836,10 +4324,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._plane_drag_metrics_dirty = False
             self.log(f"Plane {int(plane_idx)} contour saved; metric calculation deferred")
             return
-        # A contour operation only changes the current frame. Recomputing the
-        # full 4-D plane metric here rebuilds the VTK slice mesh for every
-        # cardiac phase and makes mouse release feel unnecessarily slow.
-        self._recompute_dragged_plane_metrics(persist=True, frame_only=True)
+        # Recalculate this plane's time series when later frames may depend
+        # on the edited contour. Fully observed contours keep the fast path.
+        metric = metrics[int(plane_idx)]
+        frame = int(self.workspace.current_t)
+        sources = metric.get("roi_source_frame_t", [])
+        affects_other_frames = any(metric.get("roi_carried_forward_t", [])) or (
+            not sources or any(source is None for source in sources[frame + 1:]))
+        self._recompute_dragged_plane_metrics(persist=True, frame_only=not affects_other_frames)
         self.log(f"Plane {int(plane_idx)} metric ROI updated")
 
     def _activate_plane_drag_widgets(self, plane_idx):
@@ -5048,6 +4540,10 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if not partial:
             return None
+        if "roi_source_frame_t" in partial[0]:
+            partial[0]["roi_source_frame_t"] = [
+                None if source is None else frame + int(source)
+                for source in partial[0]["roi_source_frame_t"]]
         previous = dict(
             ws.derived.plane_metrics[int(plane_idx)]
             or getattr(plane, "metrics", {})
@@ -5080,6 +4576,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 ws.resolution,
                 ws.origin,
                 branch_labels_3d=ws.branch_labels,
+                segmentation_labels_3d=ws.segmask_labels_3d,
+                segmentation_labels_4d=frame_slice(ws.segmask_labels),
                 tke_array=frame_slice(ws.derived.tke_array),
                 pressure_gradient_array=frame_slice(ws.derived.pressure_gradient_array),
                 relative_pressure_array=frame_slice(ws.derived.relative_pressure_array),
@@ -5184,6 +4682,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         self.workspace.resolution,
                         self.workspace.origin,
                         branch_labels_3d=self.workspace.branch_labels,
+                        segmentation_labels_3d=self.workspace.segmask_labels_3d,
+                        segmentation_labels_4d=self.workspace.segmask_labels,
                         tke_array=self.workspace.derived.tke_array,
                         pressure_gradient_array=self.workspace.derived.pressure_gradient_array,
                         relative_pressure_array=self.workspace.derived.relative_pressure_array,
@@ -5238,6 +4738,10 @@ class MainWindow(QtWidgets.QMainWindow):
             f"t={t}  Flow Rate={flow_t:.4f} mL/s  Area={area_t:.3f} mm^2  Mean Velocity={meanv_t:.3f} cm/s\n"
             f"Peak Velocity={float(metric.get('peakv_cm_s', 0.0)):.3f} cm/s  Net Flow={float(metric.get('netflow_mL_beat', 0.0)):.4f} mL/beat  IC={path_ic_text}"
         )
+        carried = metric.get("roi_carried_forward_t", [])
+        sources = metric.get("roi_source_frame_t", [])
+        if t < len(carried) and carried[t] and t < len(sources):
+            text_block += f"\nROI carried forward from phase {sources[t]}; velocity sampled at phase {t}."
         self._set_plane_info_text(text_block)
 
     def _log_selected_path_info(self, path_idx):
@@ -5340,6 +4844,13 @@ class MainWindow(QtWidgets.QMainWindow):
             f"incoming: {incoming if incoming else 'none'}  outgoing: {outgoing if outgoing else 'none'}\n"
             f"forks: {fork_txt}"
         )
+        hierarchy = info.get("hierarchy", {})
+        if hierarchy:
+            text_block += (f"\nGroup level: {hierarchy.get('group_level')} ({hierarchy.get('level_status')})"
+                           f" | label-local levels: {hierarchy.get('label_local_levels', {})}"
+                           f"\nParents: {hierarchy.get('parent_path_indices', [])}"
+                           f" | children: {hierarchy.get('child_path_indices', [])}"
+                           f" | loop: {hierarchy.get('loop_id') or 'none'}")
         self._set_path_info_text(text_block)
 
     def _select_browser_item_by_uid(self, uid):
@@ -5503,395 +5014,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return values[:3]
         return [str(x).upper() for x in default]
 
-    def _set_background_phase_method(self, method):
-        token = str(method or "wrls_arto").strip().lower().replace("-", "_").replace("+", "_")
-        token = {"wrls": "wrls_arto", "arto": "wrls_arto", "wrlsarto": "wrls_arto"}.get(token, token)
-        index = self.combo_bpc_method.findData(token)
-        self.combo_bpc_method.setCurrentIndex(index if index >= 0 else 0)
-
-    def _on_bpc_method_changed(self, *_args):
-        is_msac = str(self.combo_bpc_method.currentData() or "wrls_arto") == "msac"
-        self.spin_bpc_threshold.setEnabled(is_msac)
-
-    def _on_phase_unwrap_method_changed(self, *_args):
-        if not hasattr(self, "phase_unwrap_method_stack"):
-            return
-        method = str(self.combo_phase_unwrap_method.currentData() or "lap4D")
-        page = {"lap4D": 1, "gc3D": 0, "nprs": 2, "pudip": 3, "gust": 4}.get(method, 0)
-        self.phase_unwrap_method_stack.setCurrentIndex(page)
-        self._refresh_phase_unwrap_masks()
-
-    def _on_phase_unwrap_mask_changed(self, *_args):
-        method = str(self.combo_phase_unwrap_method.currentData() or "lap4D")
-        choice = self.combo_phase_unwrap_mask.currentData()
-        if choice is not None:
-            self._phase_unwrap_masks[method] = str(choice)
-
-    def _refresh_phase_unwrap_masks(self):
-        if not hasattr(self, "_phase_unwrap_masks"):
-            return
-        method = str(self.combo_phase_unwrap_method.currentData() or "lap4D")
-        sources = mask_sources_for_method(method)
-        selected = self._phase_unwrap_masks.get(method, sources[0])
-        if selected not in sources or (selected == "segmask" and self.workspace.segmask_raw is None):
-            selected = sources[0]
-        combo = self.combo_phase_unwrap_mask
-        combo.blockSignals(True)
-        combo.clear()
-        labels = {"none": "None (whole volume)", "segmask": "segmask",
-                  "pcmra_std": "PCMRAStd", "pcmra_mean": "PCMRAMean"}
-        for source in sources:
-            combo.addItem(labels[source], source)
-        item = combo.model().item(combo.findData("segmask"))
-        item.setEnabled(self.workspace.segmask_raw is not None)
-        item.setToolTip("Uses the active segmentation" if self.workspace.segmask_raw is not None
-                        else "Generate or import a segmentation first")
-        combo.setCurrentIndex(combo.findData(selected))
-        combo.blockSignals(False)
-        self._phase_unwrap_mask_method = method
-        self._phase_unwrap_masks[method] = selected
-
-    def _sync_params_to_ws(self):
-        ws = self.workspace
-        if hasattr(self, "combo_phase_unwrap_method"):
-            # Selecting a method is the opt-in action.  The step itself still
-            # runs only when the user presses "Unwrap Phase" (or explicitly
-            # requests it from the CLI/configuration).
-            ws.phase_unwrap_params.enabled = True
-            ws.phase_unwrap_params.method = str(self.combo_phase_unwrap_method.currentData() or "lap4D")
-            ws.phase_unwrap_params.mask_source = str(self.combo_phase_unwrap_mask.currentData() or "none")
-            ws.phase_unwrap_params.device = str(self.combo_phase_unwrap_device.currentData() or "auto")
-            ws.phase_unwrap_params.lap4d_ts = self._float_from_text(self.edit_phase_unwrap_ts.text(), 2.0)
-            ws.phase_unwrap_params.nprs_upsampling_factor = max(1, self._int_from_text(self.edit_phase_unwrap_nprs_up.text(), 2))
-            ws.phase_unwrap_params.nprs_pi_unwrap = bool(self.chk_phase_unwrap_nprs_pi.isChecked())
-            ws.phase_unwrap_params.nprs_auto_crop = bool(self.chk_phase_unwrap_nprs_crop.isChecked())
-        ws.noise_removal_params.method = str(self.combo_noise_method.currentData() or "magnitude_temporal")
-        ws.noise_removal_params.magnitude_fraction = float(self.spin_noise_magnitude.value())
-        ws.noise_removal_params.velocity_std_max = float(self.spin_noise_std_max.value())
-        ws.loader_params.background_phase_correction.enabled = self.chk_bpc_enabled.isChecked()
-        ws.loader_params.background_phase_correction.method = str(
-            self.combo_bpc_method.currentData() or "wrls_arto"
-        )
-        ws.loader_params.background_phase_correction.corr_fit_order = int(self.spin_bpc_fit_order.value())
-        ws.loader_params.background_phase_correction.threshold = float(self.spin_bpc_threshold.value())
-        ws.loader_params.background_phase_correction.dual_venc_ratio1 = float(self.spin_dual_venc_ratio1.value())
-        ws.loader_params.background_phase_correction.dual_venc_ratio2 = float(self.spin_dual_venc_ratio2.value())
-        ws.resolution = self._parse_float_list(self.edit_input_resolution.text(), ws.resolution)
-        ws.venc = self._parse_float_list(self.edit_input_venc.text(), ws.venc if np.asarray(ws.venc).size >= 3 else [150.0, 150.0, 150.0])
-        ws.spatial_order = self._parse_label_order(self.edit_input_spatial_order.text(), ws.spatial_order)
-        ws.venc_order = self._parse_label_order(self.edit_input_venc_order.text(), ws.venc_order)
-        if isinstance(ws.input_state.metadata, dict):
-            ws.input_state.metadata["spatial_order_raw"] = list(ws.spatial_order)
-            ws.input_state.metadata["venc_order_raw"] = list(ws.venc_order)
-        if hasattr(self, "combo_seg_mode"):
-            # The GUI exposes only the two supported automatic model families.
-            # Existing original/imported/threshold sources remain available in
-            # the right-side source dock and in the CLI/API state model.
-            ws.segmentation.auto_backend = str(self.combo_seg_mode.currentData() or "nnUNet4D")
-            ws.segmentation.auto_model = self.edit_seg_auto_model.text().strip() or "auto"
-            ws.segmentation.auto_checkpoint = self.edit_seg_auto_checkpoint.text().strip() or "auto"
-            ws.segmentation.auto_folds = self.edit_seg_auto_folds.text().strip() or "single"
-            ws.segmentation.auto_device = str(self.combo_seg_auto_device.currentData() or "auto")
-            ws.segmentation.auto_label_map = self.edit_seg_auto_label_map.toPlainText().strip()
-        ws.skeleton_params.remove_small_cc = self.chk_remove_small_cc.isChecked()
-        ws.skeleton_params.special_handling = str(self.combo_special_handling.currentData() or "three_pass_merge")
-        ws.skeleton_params.separate_special_label_contacts = self.chk_separate_special_label_contacts.isChecked()
-        ws.skeleton_params.cc_filter_mode = str(self.combo_cc_filter_mode.currentText().strip() or "hybrid")
-        ws.skeleton_params.min_cc_volume_mm3 = self._float_from_text(self.edit_min_cc_volume.text(), 50.0)
-        ws.skeleton_params.cc_rel_min_ratio = self._float_from_text(self.edit_cc_rel_min_ratio.text(), 0.01)
-        ws.skeleton_params.min_edge_points = max(0, self._int_from_text(self.edit_min_edge_points.text(), 3))
-        ws.skeleton_params.do_closing = self.chk_closing.isChecked()
-        ws.skeleton_params.do_opening = self.chk_opening.isChecked()
-        ws.skeleton_params.gaussian_enabled = self.chk_gaussian.isChecked()
-        ws.skeleton_params.gaussian_sigma = self._float_from_text(self.edit_gauss_sigma.text(), 0.5)
-        if hasattr(self, "segmentation_panel"):
-            seg_ui = self.segmentation_panel
-            ws.segmentation.cleanup_4d_components = bool(seg_ui.check_cleanup_4d.isChecked())
-            ws.segmentation.cleanup_4d_mode = str(seg_ui.combo_cleanup_4d_mode.currentData() or "absolute")
-            ws.segmentation.cleanup_4d_min_volume_mm3 = float(seg_ui.spin_cleanup_4d_volume.value())
-        ws.plane_gen_params.plane_mode = str(self.combo_plane_mode.currentData() or "fixed_step")
-        plane_count = self._int_from_text(self.edit_plane_count.text(), 3)
-        ws.plane_gen_params.plane_count = -1 if plane_count == -1 else max(plane_count, 1)
-        ws.plane_gen_params.cross_section_distance = self._float_from_text(self.edit_plane_dist.text(), 5.0)
-        ws.plane_gen_params.start_distance = self._float_from_text(self.edit_plane_start.text(), 0.0)
-        ws.plane_gen_params.end_distance = self._float_from_text(self.edit_plane_end.text(), 0.0)
-        ws.plane_gen_params.anchor = str(self.combo_plane_anchor.currentData() or "center")
-        ws.plane_gen_params.anchor_offset_mm = self._float_from_text(self.edit_plane_offset.text(), 5.0)
-        ws.plane_gen_params.direction = str(self.combo_plane_direction.currentData() or "both")
-        ws.plane_gen_params.spacing_mode = str(self.combo_plane_spacing_mode.currentData() or "fraction")
-        ws.plane_gen_params.spacing_ratio = self._float_from_text(self.edit_plane_ratio.text(), 0.25)
-        ws.plane_gen_params.segmentation_filter = bool(self.chk_plane_seg_filter.isChecked())
-        ws.plane_gen_params.smoothing_window = self._int_from_text(self.edit_plane_smooth_win.text(), 15)
-        ws.plane_gen_params.smoothing_polyorder = self._int_from_text(self.edit_plane_smooth_poly.text(), 3)
-        ws.plane_gen_params.inter_time = self._int_from_text(self.edit_plane_inter_time.text(), 10)
-        pwv_payload = {
-            "enabled": True,
-            "groups": self._pwv_group_payload_from_ui(),
-            "plane_interval_mm": max(self._float_from_text(self.edit_pwv_interval.text(), 10.0), 0.1),
-            "start_distance": self._float_from_text(self.edit_pwv_start.text(), 0.0),
-            "end_distance": self._float_from_text(self.edit_pwv_end.text(), 0.0),
-            "smoothing_window": max(self._int_from_text(self.edit_pwv_smooth_win.text(), 15), 1),
-            "smoothing_polyorder": max(self._int_from_text(self.edit_pwv_smooth_poly.text(), 2), 0),
-            "inter_time": max(self._int_from_text(self.edit_pwv_inter_time.text(), 10), 1),
-            "waveform_key": str(self.edit_pwv_waveform.text().strip() or "flowrate_mL_s"),
-            "transit_time_method": str(self.combo_pwv_tt_method.currentText().strip() or "foot_to_foot"),
-            "foot_method": str(self.combo_pwv_foot_method.currentText().strip() or "tangent"),
-            "foot_savgol_window": max(self._int_from_text(self.edit_pwv_foot_win.text(), 5), 1),
-            "foot_savgol_polyorder": max(self._int_from_text(self.edit_pwv_foot_poly.text(), 2), 0),
-            "foot_threshold_percent": min(max(self._float_from_text(self.edit_pwv_foot_threshold.text(), 10.0), 0.0), 100.0),
-            "xcorr_window": str(self.combo_pwv_xcorr_window.currentText().strip() or "full"),
-            "xcorr_interp_factor": max(self._int_from_text(self.edit_pwv_xcorr_interp.text(), 10), 1),
-            "allow_cycle_wrap": self.chk_pwv_allow_wrap.isChecked(),
-            "minimum_valid_planes": max(self._int_from_text(self.edit_pwv_min_planes.text(), 2), 2),
-            "scene_visible": self.chk_pwv_scene_visible.isChecked(),
-            "scene_color": str(self.edit_pwv_scene_color.text().strip() or "#ffd43b"),
-            "plot_color": str(self.edit_pwv_plot_color.text().strip() or "#2b8a3e"),
-            "fit_color": str(self.edit_pwv_fit_color.text().strip() or "#f08c00"),
-            "plot_dpi": max(self._int_from_text(self.edit_pwv_plot_dpi.text(), 160), 72),
-        }
-        ws.pwv_params = PwvParams.from_dict(pwv_payload, label_map=ws.label_params.label_map)
-        ws.streamline_params.seed_ratio = min(max(self._float_from_text(self.edit_sl_ratio.text(), 0.1), 0.0001), 1.0)
-        ws.streamline_params.max_steps = min(max(self._int_from_text(self.edit_sl_maxsteps.text(), 200), 1), 200000)
-        ws.streamline_params.terminal_speed = min(max(self._float_from_text(self.edit_sl_terminal.text(), 0.01), 0.0), 1e6)
-        ws.streamline_params.pathline_seed_ratio = min(max(self._float_from_text(self.edit_pathline_ratio.text(), 0.2), 0.0001), 1.0)
-        ws.streamline_params.pathline_max_steps = min(max(self._int_from_text(self.edit_pathline_maxsteps.text(), 200), 1), 200000)
-        ws.streamline_params.pathline_min_seeds = min(max(self._int_from_text(self.edit_pathline_minseeds.text(), 50), 1), 100000)
-        ws.streamline_params.pathline_seed_mode = str(self.combo_pathline_seed_mode.currentData() or "fixed")
-        ws.streamline_params.pathline_max_seeds = min(max(self._int_from_text(self.edit_pathline_max_seeds.text(), 250), 1), 100000)
-        ws.streamline_params.pathline_terminal_speed = min(max(self._float_from_text(self.edit_pathline_terminal.text(), 0.01), 0.0), 1e6)
-        ws.streamline_params.pathline_rng_seed = self._int_from_text(self.edit_pathline_rng_seed.text(), 0)
-        ws.streamline_params.pathline_tube_radius = min(max(self._float_from_text(self.edit_pathline_tube_radius.text(), 0.25), 0.001), 1e4)
-        ws.streamline_params.pathline_temporal_cache_mb = min(max(self._float_from_text(self.edit_pathline_temporal_cache_mb.text(), 512.0), 0.0), 8192.0)
-        ws.streamline_params.pathline_color = str(self.edit_pathline_color.text().strip() or "deepskyblue")
-        ws.streamline_params.pathline_color_mode = str(self.combo_pathline_color_mode.currentData() or "per_plane")
-        ws.derived_params.smoothing_iteration = max(self._int_from_text(self.edit_dm_smoothing.text(), 200), 0)
-        ws.derived_params.viscosity = max(self._float_from_text(self.edit_dm_viscosity.text(), 4.0), 0.0)
-        inward_distance = self._optional_float_from_text(self.edit_dm_inward.text(), None)
-        ws.derived_params.inward_distance = None if inward_distance is None else max(inward_distance, 0.01)
-        ws.derived_params.parabolic_fitting = self.chk_dm_parabolic.isChecked()
-        ws.derived_params.no_slip_condition = self.chk_dm_noslip.isChecked()
-        ws.derived_params.rho = max(self._float_from_text(self.edit_dm_rho.text(), 1060.0), 1.0)
-        pressure_method = str(self.combo_dm_pressure_method.currentText().strip() or "ppe").lower()
-        if pressure_method not in {"ppe", "ste"}:
-            pressure_method = "ppe"
-        ws.derived_params.pressure_method = pressure_method
-        ws.derived_params.pressure_gradient_smoothing_sigma = max(self._float_from_text(self.edit_dm_pg_smoothing_sigma.text(), 0.0), 0.0)
-        ws.derived_params.pressure_gradient_support_erosion_iters = max(self._int_from_text(self.edit_dm_pg_support_erosion.text(), 1), 0)
-        ws.derived_params.pressure_gradient_layer_opacity = min(max(self._float_from_text(self.edit_dm_pg_opacity.text(), 1.0), 0.0), 1.0)
-        ws.derived_params.relative_pressure_layer_opacity = min(max(self._float_from_text(self.edit_dm_rp_opacity.text(), 1.0), 0.0), 1.0)
-        ws.derived_params.vortex_smoothing_sigma = max(self._float_from_text(self.edit_dm_vortex_smoothing_sigma.text(), 0.0), 0.0)
-        ws.derived_params.vortex_support_erosion_iters = max(self._int_from_text(self.edit_dm_vortex_support_erosion.text(), 1), 0)
-        ws.derived_params.use_multithread = self.chk_dm_multithread.isChecked()
-        if hasattr(self, "runtime_render_controls"):
-            default_cfg = bundle_to_autoflow_kwargs(self._config_bundle)
-            render_cfg = dict(getattr(ws, "render_settings", {}) or default_cfg)
-            for metric_key, cfg_key in self._runtime_render_clim_keys().items():
-                widgets = self.runtime_render_controls.get(metric_key, {})
-                render_cfg[cfg_key] = self._parse_optional_clim_pair(
-                    widgets.get("min").text() if widgets.get("min") is not None else "",
-                    widgets.get("max").text() if widgets.get("max") is not None else "",
-                    fallback=default_cfg.get(cfg_key),
-                )
-            width = max(self._float_from_text(self.edit_runtime_scalar_bar_width.text(), 0.08), 0.01)
-            height = max(self._float_from_text(self.edit_runtime_scalar_bar_height.text(), 0.65), 0.05)
-            gap = max(self._float_from_text(self.edit_runtime_scalar_bar_gap.text(), 0.03), 0.0)
-            pos_x = min(max(self._float_from_text(self.edit_runtime_scalar_bar_pos_x.text(), 0.87), 0.0), 0.98)
-            pos_y = min(max(self._float_from_text(self.edit_runtime_scalar_bar_pos_y.text(), 0.15), 0.0), 0.95)
-            title_font = max(self._int_from_text(self.edit_runtime_scalar_bar_title_font.text(), 14), 1)
-            label_font = max(self._int_from_text(self.edit_runtime_scalar_bar_label_font.text(), 11), 1)
-            shared_bar_cfg = dict(render_cfg.get("shared_colorbar_bar_cfg", {}) or {})
-            shared_bar_cfg.update({
-                "width": float(width),
-                "height": float(height),
-                "position_x": float(pos_x),
-                "position_y": float(pos_y),
-                "stack_gap": float(gap),
-                "title_font_size": int(title_font),
-                "label_font_size": int(label_font),
-            })
-            render_cfg["shared_colorbar_bar_cfg"] = shared_bar_cfg
-            for bar_key in self._runtime_bar_cfg_keys():
-                bar_cfg = dict(render_cfg.get(bar_key, {}) or {})
-                bar_cfg["width"] = float(width)
-                bar_cfg["height"] = float(height)
-                bar_cfg["position_x"] = float(pos_x)
-                bar_cfg["position_y"] = float(pos_y)
-                bar_cfg["stack_gap"] = float(gap)
-                bar_cfg["title_font_size"] = int(title_font)
-                bar_cfg["label_font_size"] = int(label_font)
-                render_cfg[bar_key] = bar_cfg
-            ws.render_settings = render_cfg
-
-    def _sync_params_to_ui(self):
-        ws = self.workspace
-        if hasattr(self, "combo_phase_unwrap_method"):
-            idx = self.combo_phase_unwrap_method.findData(str(ws.phase_unwrap_params.method))
-            # Older workspaces used method="none" plus an Enable checkbox.
-            # Select the first real backend when opening those workspaces;
-            # unwrapping remains an explicit step in the GUI.
-            self.combo_phase_unwrap_method.setCurrentIndex(max(0, idx))
-            method = str(self.combo_phase_unwrap_method.currentData() or "lap4D")
-            try:
-                source = resolve_mask_source(method, ws.phase_unwrap_params.mask_source)
-            except ValueError:
-                source = resolve_mask_source(method)
-            self._phase_unwrap_masks[method] = source
-            self._refresh_phase_unwrap_masks()
-            idx = self.combo_phase_unwrap_device.findData(str(ws.phase_unwrap_params.device))
-            self.combo_phase_unwrap_device.setCurrentIndex(max(0, idx))
-            self.edit_phase_unwrap_ts.setText(str(ws.phase_unwrap_params.lap4d_ts))
-            self.edit_phase_unwrap_nprs_up.setText(str(ws.phase_unwrap_params.nprs_upsampling_factor))
-            self.chk_phase_unwrap_nprs_pi.setChecked(bool(ws.phase_unwrap_params.nprs_pi_unwrap))
-            self.chk_phase_unwrap_nprs_crop.setChecked(bool(ws.phase_unwrap_params.nprs_auto_crop))
-            self._on_phase_unwrap_method_changed()
-        self.combo_noise_method.setCurrentIndex(max(0, self.combo_noise_method.findData(ws.noise_removal_params.method)))
-        self.spin_noise_magnitude.setValue(ws.noise_removal_params.magnitude_fraction)
-        self.spin_noise_std_max.setValue(ws.noise_removal_params.velocity_std_max)
-        self.chk_bpc_enabled.setChecked(ws.loader_params.background_phase_correction.enabled)
-        self._set_background_phase_method(ws.loader_params.background_phase_correction.method)
-        self.spin_bpc_fit_order.setValue(int(ws.loader_params.background_phase_correction.corr_fit_order))
-        self.spin_bpc_threshold.setValue(float(ws.loader_params.background_phase_correction.threshold))
-        self.spin_dual_venc_ratio1.setValue(float(ws.loader_params.background_phase_correction.dual_venc_ratio1))
-        self.spin_dual_venc_ratio2.setValue(float(ws.loader_params.background_phase_correction.dual_venc_ratio2))
-        self.edit_input_resolution.setText(", ".join(f"{float(x):.6g}" for x in np.asarray(ws.resolution, dtype=float).reshape(-1)[:3]))
-        self.edit_input_venc.setText(", ".join(f"{float(x):.6g}" for x in np.asarray(ws.venc, dtype=float).reshape(-1)[:3]))
-        self.edit_input_spatial_order.setText(", ".join(str(x) for x in ws.spatial_order[:3]))
-        self.edit_input_venc_order.setText(", ".join(str(x) for x in ws.venc_order[:3]))
-        if hasattr(self, "combo_seg_mode"):
-            self.combo_seg_mode.blockSignals(True)
-            self.combo_seg_mode.setCurrentIndex(max(self.combo_seg_mode.findData(str(ws.segmentation.auto_backend or "nnUNet4D")), 0))
-            self.combo_seg_mode.blockSignals(False)
-            self.edit_seg_auto_model.setText(str(ws.segmentation.auto_model or "auto"))
-            self._refresh_segmentation_model_presets(ws.segmentation.auto_model or "auto")
-            self.edit_seg_auto_checkpoint.setText(str(ws.segmentation.auto_checkpoint or "auto"))
-            self.edit_seg_auto_folds.setText(str(ws.segmentation.auto_folds or "single"))
-            self.combo_seg_auto_device.blockSignals(True)
-            self.combo_seg_auto_device.setCurrentIndex(max(self.combo_seg_auto_device.findData(str(ws.segmentation.auto_device or "auto")), 0))
-            self.combo_seg_auto_device.blockSignals(False)
-            self.edit_seg_auto_label_map.setPlainText(str(ws.segmentation.auto_label_map or ""))
-            self._on_segmentation_mode_param_changed()
-        self.chk_remove_small_cc.setChecked(ws.skeleton_params.remove_small_cc)
-        idx = self.combo_special_handling.findData(str(getattr(ws.skeleton_params, "special_handling", "three_pass_merge") or "three_pass_merge"))
-        self.combo_special_handling.setCurrentIndex(max(idx, 0))
-        self.chk_separate_special_label_contacts.setChecked(bool(getattr(ws.skeleton_params, "separate_special_label_contacts", True)))
-        self.combo_cc_filter_mode.setCurrentText(str(getattr(ws.skeleton_params, "cc_filter_mode", "hybrid") or "hybrid"))
-        self.edit_min_cc_volume.setText(str(ws.skeleton_params.min_cc_volume_mm3))
-        self.edit_cc_rel_min_ratio.setText(str(getattr(ws.skeleton_params, "cc_rel_min_ratio", 0.01)))
-        self.edit_min_edge_points.setText(str(getattr(ws.skeleton_params, "min_edge_points", 3)))
-        self.chk_closing.setChecked(ws.skeleton_params.do_closing)
-        self.chk_opening.setChecked(ws.skeleton_params.do_opening)
-        self.chk_gaussian.setChecked(ws.skeleton_params.gaussian_enabled)
-        self.edit_gauss_sigma.setText(str(ws.skeleton_params.gaussian_sigma))
-        if hasattr(self, "segmentation_panel"):
-            seg_ui = self.segmentation_panel
-            seg_ui.check_cleanup_4d.setChecked(bool(ws.segmentation.cleanup_4d_components))
-            seg_ui.combo_cleanup_4d_mode.setCurrentIndex(max(seg_ui.combo_cleanup_4d_mode.findData(str(ws.segmentation.cleanup_4d_mode)), 0))
-            seg_ui.spin_cleanup_4d_volume.setValue(float(ws.segmentation.cleanup_4d_min_volume_mm3))
-        mode = str(getattr(ws.plane_gen_params, "plane_mode", "fixed_step") or "fixed_step")
-        idx = max(self.combo_plane_mode.findData(mode), 0)
-        self.combo_plane_mode.setCurrentIndex(idx)
-        self._sync_plane_display_controls()
-        self.edit_plane_count.setText(str(getattr(ws.plane_gen_params, "plane_count", 3)))
-        self.edit_plane_dist.setText(str(ws.plane_gen_params.cross_section_distance))
-        self.edit_plane_start.setText(str(ws.plane_gen_params.start_distance))
-        self.edit_plane_end.setText(str(ws.plane_gen_params.end_distance))
-        self.combo_plane_anchor.setCurrentIndex(max(self.combo_plane_anchor.findData(str(getattr(ws.plane_gen_params, "anchor", "center") or "center")), 0))
-        self.edit_plane_offset.setText(str(getattr(ws.plane_gen_params, "anchor_offset_mm", 5.0)))
-        self.combo_plane_direction.setCurrentIndex(max(self.combo_plane_direction.findData(str(getattr(ws.plane_gen_params, "direction", "both") or "both")), 0))
-        self.combo_plane_spacing_mode.setCurrentIndex(max(self.combo_plane_spacing_mode.findData(str(getattr(ws.plane_gen_params, "spacing_mode", "fraction") or "fraction")), 0))
-        self.edit_plane_ratio.setText(str(getattr(ws.plane_gen_params, "spacing_ratio", 0.25)))
-        self.chk_plane_seg_filter.setChecked(bool(getattr(ws.plane_gen_params, "segmentation_filter", True)))
-        self.edit_plane_smooth_win.setText(str(ws.plane_gen_params.smoothing_window))
-        self.edit_plane_smooth_poly.setText(str(ws.plane_gen_params.smoothing_polyorder))
-        self.edit_plane_inter_time.setText(str(ws.plane_gen_params.inter_time))
-        self._sync_plane_mode_ui()
-        self.edit_pwv_interval.setText(str(ws.pwv_params.plane_interval_mm))
-        self.edit_pwv_start.setText(str(ws.pwv_params.start_distance))
-        self.edit_pwv_end.setText(str(ws.pwv_params.end_distance))
-        self.edit_pwv_smooth_win.setText(str(ws.pwv_params.smoothing_window))
-        self.edit_pwv_smooth_poly.setText(str(ws.pwv_params.smoothing_polyorder))
-        self.edit_pwv_inter_time.setText(str(ws.pwv_params.inter_time))
-        self.edit_pwv_waveform.setText(str(ws.pwv_params.waveform_key))
-        self.combo_pwv_tt_method.setCurrentText(str(ws.pwv_params.transit_time_method))
-        self.combo_pwv_foot_method.setCurrentText(str(ws.pwv_params.foot_method))
-        self.edit_pwv_foot_win.setText(str(ws.pwv_params.foot_savgol_window))
-        self.edit_pwv_foot_poly.setText(str(ws.pwv_params.foot_savgol_polyorder))
-        self.edit_pwv_foot_threshold.setText(str(ws.pwv_params.foot_threshold_percent))
-        self.combo_pwv_xcorr_window.setCurrentText(str(ws.pwv_params.xcorr_window))
-        self.edit_pwv_xcorr_interp.setText(str(ws.pwv_params.xcorr_interp_factor))
-        self.chk_pwv_allow_wrap.setChecked(bool(ws.pwv_params.allow_cycle_wrap))
-        self.edit_pwv_min_planes.setText(str(ws.pwv_params.minimum_valid_planes))
-        self.chk_pwv_scene_visible.setChecked(bool(ws.pwv_params.scene_visible))
-        self.edit_pwv_scene_color.setText(str(ws.pwv_params.scene_color))
-        self.edit_pwv_plot_color.setText(str(ws.pwv_params.plot_color))
-        self.edit_pwv_fit_color.setText(str(ws.pwv_params.fit_color))
-        self.edit_pwv_plot_dpi.setText(str(ws.pwv_params.plot_dpi))
-        self.table_pwv_groups.blockSignals(True)
-        self.table_pwv_groups.setRowCount(0)
-        for group in list(ws.pwv_params.groups or []):
-            self._add_pwv_group_row(name=str(group.name), labels=self._pwv_group_labels_for_ui(group.labels))
-        self.table_pwv_groups.clearSelection()
-        self.table_pwv_groups.blockSignals(False)
-        self.edit_sl_ratio.setText(str(ws.streamline_params.seed_ratio))
-        self.edit_sl_maxsteps.setText(str(ws.streamline_params.max_steps))
-        self.edit_sl_terminal.setText(str(ws.streamline_params.terminal_speed))
-        self.combo_pathline_seed_mode.setCurrentIndex(max(self.combo_pathline_seed_mode.findData(str(getattr(ws.streamline_params, "pathline_seed_mode", "fixed") or "fixed")), 0))
-        self.edit_pathline_max_seeds.setText(str(getattr(ws.streamline_params, "pathline_max_seeds", 250)))
-        self.edit_pathline_ratio.setText(str(getattr(ws.streamline_params, "pathline_seed_ratio", 0.2)))
-        self.edit_pathline_minseeds.setText(str(getattr(ws.streamline_params, "pathline_min_seeds", 50)))
-        self.edit_pathline_maxsteps.setText(str(getattr(ws.streamline_params, "pathline_max_steps", 200)))
-        self.edit_pathline_terminal.setText(str(getattr(ws.streamline_params, "pathline_terminal_speed", 0.01)))
-        self.edit_pathline_rng_seed.setText(str(getattr(ws.streamline_params, "pathline_rng_seed", 0)))
-        self.edit_pathline_tube_radius.setText(str(getattr(ws.streamline_params, "pathline_tube_radius", 0.25)))
-        self.edit_pathline_temporal_cache_mb.setText(str(getattr(ws.streamline_params, "pathline_temporal_cache_mb", 512.0)))
-        self.edit_pathline_color.setText(str(ws.streamline_params.pathline_color))
-        self.combo_pathline_color_mode.setCurrentIndex(max(self.combo_pathline_color_mode.findData(str(getattr(ws.streamline_params, "pathline_color_mode", "per_plane") or "per_plane")), 0))
-        self.edit_dm_smoothing.setText(str(ws.derived_params.smoothing_iteration))
-        self.edit_dm_viscosity.setText(str(ws.derived_params.viscosity))
-        self.edit_dm_inward.setText("auto" if ws.derived_params.inward_distance is None else str(ws.derived_params.inward_distance))
-        self.chk_dm_parabolic.setChecked(ws.derived_params.parabolic_fitting)
-        self.chk_dm_noslip.setChecked(ws.derived_params.no_slip_condition)
-        self.edit_dm_rho.setText(str(ws.derived_params.rho))
-        self.combo_dm_pressure_method.setCurrentText(str(ws.derived_params.pressure_method))
-        self.edit_dm_pg_smoothing_sigma.setText(str(ws.derived_params.pressure_gradient_smoothing_sigma))
-        self.edit_dm_pg_support_erosion.setText(str(ws.derived_params.pressure_gradient_support_erosion_iters))
-        self.edit_dm_pg_opacity.setText(str(ws.derived_params.pressure_gradient_layer_opacity))
-        self.edit_dm_rp_opacity.setText(str(ws.derived_params.relative_pressure_layer_opacity))
-        self.edit_dm_vortex_smoothing_sigma.setText(str(ws.derived_params.vortex_smoothing_sigma))
-        self.edit_dm_vortex_support_erosion.setText(str(ws.derived_params.vortex_support_erosion_iters))
-        self.chk_dm_multithread.setChecked(ws.derived_params.use_multithread)
-        render_cfg = dict((getattr(ws, "render_settings", {}) or {}) or self._rendering_kwargs())
-        for metric_key, cfg_key in self._runtime_render_clim_keys().items():
-            widgets = getattr(self, "runtime_render_controls", {}).get(metric_key, {})
-            value = render_cfg.get(cfg_key)
-            min_widget = widgets.get("min")
-            max_widget = widgets.get("max")
-            if min_widget is None or max_widget is None:
-                continue
-            min_widget.blockSignals(True)
-            max_widget.blockSignals(True)
-            if value is None:
-                min_widget.setText("auto")
-                max_widget.setText("auto")
-            else:
-                min_widget.setText(f"{float(value[0]):.6g}")
-                max_widget.setText(f"{float(value[1]):.6g}")
-            min_widget.blockSignals(False)
-            max_widget.blockSignals(False)
-        shared_bar_cfg = dict(render_cfg.get("shared_colorbar_bar_cfg", {}) or {})
-        for widget, key, default in [
-            (self.edit_runtime_scalar_bar_width, "width", 0.08),
-            (self.edit_runtime_scalar_bar_height, "height", 0.65),
-            (self.edit_runtime_scalar_bar_gap, "stack_gap", 0.03),
-            (self.edit_runtime_scalar_bar_pos_x, "position_x", 0.87),
-            (self.edit_runtime_scalar_bar_pos_y, "position_y", 0.15),
-            (self.edit_runtime_scalar_bar_title_font, "title_font_size", 14),
-            (self.edit_runtime_scalar_bar_label_font, "label_font_size", 11),
-        ]:
-            widget.blockSignals(True)
-            widget.setText(f"{float(shared_bar_cfg.get(key, default)):.6g}")
-            widget.blockSignals(False)
-
     def _rebuild_plane_objects(self):
         self._clear_plane_drag_widgets()
         ws = self.workspace
@@ -5996,6 +5118,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # so planes and pathlines can be attached to their owning path even if
         # SceneObjects were inserted in a different order.
         for obj in self.workspace.scene_objects.values():
+            if str(obj.data_key).startswith("hierarchy_path_"):
+                continue
             if obj.data_key == "branch_surface":
                 continue
             if obj.kind == ObjectKind.BRANCH or str(obj.data_key).startswith("smooth_path_"):
@@ -6053,6 +5177,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._browser_add_leaf(ensure_type(group_entry, "Pathlines"), obj)
 
         for group_entry in groups.values():
+            self._browser_apply_path_hierarchy(group_entry)
             top = group_entry["item"]
             type_items = list(group_entry["types"].items())
             type_items.sort(key=lambda pair: self._browser_type_sort_key(pair[0]))
@@ -6074,10 +5199,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 type_item.setExpanded(True)
                 if type_item.text(0) == "Paths":
                     for k in range(type_item.childCount()):
-                        type_item.child(k).setExpanded(False)
+                        child = type_item.child(k)
+                        child.setExpanded(any(child.child(n).data(0, _BROWSER_NODE_ROLE) in {"path", "loop"}
+                                              for n in range(child.childCount())))
+        self._browser_add_joint_hierarchies()
         self.tree_objects.blockSignals(False)
         self._sync_render_category_visibility_controls()
         self._refresh_browser_opacity_control()
+        self._refresh_content_render_controls()
+
+        self.chk_selection_on_top.blockSignals(True)
+        self.chk_selection_on_top.setChecked(self.workspace.render_settings.get("selected_layer_on_top", True))
+        self.chk_selection_on_top.blockSignals(False)
+        self.scene.set_selected_layers([], render=False)
 
     def _render_category_objects(self, category):
         if category == "planes":
@@ -6299,14 +5433,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scene.render_all()
         self._refresh_render_range_control()
 
+    def _on_selection_on_top_changed(self, checked):
+        self.scene.set_selected_layers([obj.uid for obj in self._browser_selected_objects()], on_top=checked)
+
     def _on_browser_select(self):
+        self.scene.set_selected_layers([obj.uid for obj in self._browser_selected_objects()], render=False)
+        self._refresh_content_render_controls()
         self._refresh_browser_opacity_control()
         self._refresh_render_range_control()
         items = self.tree_objects.selectedItems()
         item = items[0] if items else None
         uid = item.data(0, QtCore.Qt.UserRole) if item is not None else None
         node_type = item.data(0, _BROWSER_NODE_ROLE) if item is not None else None
-        if uid is None and node_type == "path":
+        if uid is not None and node_type == "joint_path":
+            self.workspace.selected_path_index = -1
+            self._selected_plane_index = -1
+            self._clear_plane_drag_widgets()
+            self.scene.highlight_plane(None)
+            self.scene.highlight_path(uid)
+            self.scene.show_forks_for_path(-1)
+            self.ortho_viewer.set_selected_plane(None)
+            self._set_plane_info_text("")
+            self._set_path_info_text(item.toolTip(0))
+            self._refresh_analysis_panel()
+            return
+        if uid is None and node_type in {"path", "path_reference"}:
             path_idx = item.data(0, _BROWSER_PATH_INDEX_ROLE)
             try:
                 path_idx = int(path_idx)
@@ -6534,7 +5685,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if 0 <= int(idx) < len(self.workspace.planes)
             and self._find_uid_by_indexed_data_key("pathline", int(idx)) is not None
         }
-        missing_indices = [idx for idx in valid_indices if idx not in active_indices]
+        pending_indices = set(self.workspace.input_state.metadata.get("gui_pending_pathline_planes", []))
+        missing_indices = [idx for idx in valid_indices if idx not in active_indices or idx in pending_indices]
         if not missing_indices:
             selected_idx = (
                 int(selected_plane_idx)
@@ -6687,7 +5839,15 @@ class MainWindow(QtWidgets.QMainWindow):
             for plane_idx, seeds in dict(data.get("seeds", {}) or {}).items()
             if seeds is not None
         }
+        # Publish replacement caches only after integration succeeds. A failed
+        # rerun keeps the previous visible trajectories and their caches.
+        for idx in indices:
+            self.workspace.pathline_cache.pop(idx, None)
         self.scene.trigger_pathlines(indices, precomputed=meshes)
+        pending_indices = set(self.workspace.input_state.metadata.get("gui_pending_pathline_planes", [])) - set(indices)
+        self.workspace.input_state.metadata["gui_pending_pathline_planes"] = sorted(pending_indices)
+        if not pending_indices and set(self.workspace.active_pathline_plane_indices) >= set(range(len(self.workspace.planes))):
+            self.workspace.pipeline.mark_done(StepId.PLANE_STREAMLINES)
         self.workspace.pathline_seed_cache.update(seed_payload)
         self._refresh_browser()
         self.scene.invalidate_cache("pathline_")
@@ -6931,22 +6091,23 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self.log(f"VIEW ERROR: {type(e).__name__}: {e}")
 
-    def _load_selected_input_case(self, case):
+    def _load_selected_input_case(self, case, parameter_overrides=None):
         if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
             return
         try:
             resolved = resolve_input_case(case)
-            self._sync_params_to_ws()
             previous = self.workspace
             pending = Workspace()
             apply_config_bundle_to_workspace(pending, self._config_bundle)
-            # Read UI parameters on the GUI thread, while retaining the loaded
-            # case until the background load actually succeeds.
-            self.workspace = pending
-            try:
-                self._sync_params_to_ws()
-            finally:
-                self.workspace = previous
+            # Carry processing settings, but retain source metadata and review
+            # arrays in the previous case until the load succeeds.
+            self._sync_params_to_ws()
+            for name in ("loader_params", "phase_unwrap_params", "noise_removal_params", "skeleton_params",
+                         "plane_gen_params", "pwv_params", "streamline_params", "derived_params", "render_settings"):
+                setattr(pending, name, copy.deepcopy(getattr(previous, name)))
+            for name in ("auto_backend", "auto_model", "auto_checkpoint", "auto_folds", "auto_device", "auto_label_map",
+                         "cleanup_4d_components", "cleanup_4d_mode", "cleanup_4d_min_volume_mm3"):
+                setattr(pending.segmentation, name, copy.deepcopy(getattr(previous.segmentation, name)))
             pending.paths.segmask_path = resolved.input_path
             pending.paths.flow_path = resolved.input_path
             configured_out = str(self._config_bundle.get("batch", {}).get("output_dir", "") or "").strip()
@@ -6955,7 +6116,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             def load(progress, log):
                 self.pipeline.load_data(pending, log, input_source=resolved, progress_callback=progress,
-                                        reuse_existing_corr=True)
+                                        reuse_existing_corr=True, parameter_overrides=parameter_overrides)
                 return pending
 
             self._run_modal_task("Load Input", f"Loading {resolved.display_name or resolved.input_path}…", load)
@@ -6971,31 +6132,30 @@ class MainWindow(QtWidgets.QMainWindow):
             self._last_plane_import_report = None
             self.scene.workspace = pending
             self.ortho_viewer.workspace = pending
+            self.ortho_viewer.reset_state()
             self.ortho_viewer.update_slider_ranges()
             self.scene.reset_display_reference()
             self.scene.reset_scene()
             self._refresh_all()
             self.log(f"Loaded input: {resolved.display_name or resolved.input_path}. Saved corr applied when available; Background Correction recomputes from source.")
             self._input_signature = self._current_input_signature()
+            return True
         except TaskCancelled:
             self.log("Input loading cancelled; the previous workspace is retained.")
         except Exception as e:
             self.log(f"LOAD ERROR: {type(e).__name__}: {e}")
             self.log(traceback.format_exc())
+        return False
 
     def _current_input_signature(self):
         """Stable signature for deciding whether an input reload is necessary."""
-        self._sync_params_to_ws()
         ws = self.workspace
         return json.dumps({
             "path": str(getattr(self._active_input_case, "input_path", "") or ws.paths.flow_path),
             "kind": str(getattr(self._active_input_case, "input_kind", "")),
             "group": getattr(self._active_input_case, "source_group", None),
             "dual_venc_ratios": [ws.loader_params.background_phase_correction.dual_venc_ratio1, ws.loader_params.background_phase_correction.dual_venc_ratio2],
-            "resolution": self.edit_input_resolution.text().strip(),
-            "venc": self.edit_input_venc.text().strip(),
-            "spatial_order": self.edit_input_spatial_order.text().strip(),
-            "venc_order": self.edit_input_venc_order.text().strip(),
+            "parameters": self._input_parameters_from_ui(),
             "dual_venc_mode": dict(getattr(self._active_input_case, "metadata", {}) or {}).get("dual_venc_mode", "dv"),
         }, sort_keys=True, default=str)
 
@@ -7038,13 +6198,19 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if self._pipeline_running_guard("reloading input") or self._autoseg_running_guard("reloading input"):
             return
-        signature = self._current_input_signature()
+        try:
+            parameters = self._input_parameters_from_ui()
+            signature = self._current_input_signature()
+        except ValueError as exc:
+            self.log(f"INPUT PARAMETER ERROR: {exc}")
+            self.statusBar().showMessage(str(exc), 10000)
+            return
         if signature == self._input_signature:
             self.log("Input parameters unchanged; reload skipped.")
             self.statusBar().showMessage("Input unchanged", 4000)
             return
         self.log("Input parameters changed; reloading input and invalidating downstream results.")
-        self._load_selected_input_case(self._active_input_case)
+        self._load_selected_input_case(self._active_input_case, parameter_overrides=parameters)
 
     def _on_load_h5(self):
         if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
@@ -7071,22 +6237,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self._load_selected_input_case(resolved)
 
     def _on_load_dicom(self):
+        if getattr(self, "_dicom_conversion_thread", None) is not None:
+            self.statusBar().showMessage("DICOM conversion is already running.", 8000)
+            return
         if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
             return
-        root = QtWidgets.QFileDialog.getExistingDirectory(self, "Load DICOM", "")
+        options = QtWidgets.QFileDialog.Option.DontUseNativeDialog
+        root = QtWidgets.QFileDialog.getExistingDirectory(self, "Load DICOM", "", options=options)
         if not root:
+            self.statusBar().showMessage("DICOM import cancelled: no directory selected.", 8000)
             return
+        self.statusBar().showMessage("DICOM directory selected. Choose a new H5 destination in Save Converted H5.")
+        self.log(f"DICOM directory selected: {root}. Waiting for H5 destination.")
         target, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Save Converted H5", os.path.join(root, "../converted-flow.h5"),
             "H5 (*.h5 *.hdf5)",
-            options=QtWidgets.QFileDialog.Option.DontConfirmOverwrite,
+            options=options | QtWidgets.QFileDialog.Option.DontConfirmOverwrite,
         )
         if not target:
+            self.statusBar().showMessage("DICOM import cancelled: no H5 destination selected.", 8000)
+            self.log("DICOM import cancelled before conversion: no H5 destination selected.")
             return
         if not target.lower().endswith((".h5", ".hdf5")):
             target += ".h5"
         if os.path.exists(target):
-            self.log(f"DICOM CONVERSION ERROR: destination exists: {target}. Choose a new filename or use File > Load H5.")
+            message = f"Destination exists: {target}. Choose a new filename or use File > Load H5."
+            self.log(f"DICOM CONVERSION ERROR: {message}")
+            self.statusBar().showMessage("DICOM import stopped: destination already exists.", 10000)
+            QtWidgets.QMessageBox.warning(self, "DICOM import", message)
             return
         self._dicom_conversion_progress = self._create_progress_dialog(
             "Load DICOM", "Converting DICOM and validating H5..."
@@ -7095,6 +6273,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._dicom_conversion_thread = QtCore.QThread(self)
         self._dicom_conversion_worker = _DicomConversionWorker(root, target)
         self._bind_task_progress(self._dicom_conversion_progress, self._dicom_conversion_worker)
+        self._dicom_conversion_worker.progress.connect(self._dicom_conversion_progress.update_progress)
         self._dicom_conversion_worker.moveToThread(self._dicom_conversion_thread)
         self._dicom_conversion_thread.started.connect(self._dicom_conversion_worker.run)
         self._dicom_conversion_worker.finished.connect(self._on_dicom_conversion_finished)
@@ -7104,11 +6283,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._dicom_conversion_thread.finished.connect(self._dicom_conversion_worker.deleteLater)
         self._dicom_conversion_thread.finished.connect(self._cleanup_dicom_conversion)
         self.log(f"Dicom2H5: {root} -> {target}")
+        self.statusBar().showMessage("Converting DICOM to H5...")
         self._dicom_conversion_thread.start()
 
     def _on_dicom_conversion_finished(self, cases):
         if not self._dicom_conversion_progress.cancel_token.cancelled:
             self._dicom_completed_cases = cases
+            self.statusBar().showMessage("DICOM converted. Loading H5...")
 
     def _apply_dicom_conversion_cases(self, cases):
         self.log(f"Dicom2H5 saved {len(cases)} case(s): {cases[0].input_path}")
@@ -7116,18 +6297,30 @@ class MainWindow(QtWidgets.QMainWindow):
         if len(cases) > 1:
             dialog = H5CaseSelectDialog(cases, self)
             if dialog.exec() != QtWidgets.QDialog.Accepted:
+                self.statusBar().showMessage("Converted H5 saved; case selection cancelled.", 10000)
                 return
             selected = dialog.selected_case()
             if selected is None:
                 return
         if selected is not None:
-            self._load_selected_input_case(selected)
+            if self._load_selected_input_case(selected):
+                frames = self.workspace.mag_raw.shape[3] if self.workspace.mag_raw.ndim == 4 else 1
+                self.statusBar().showMessage(f"DICOM loaded: {frames} phases.", 10000)
+            else:
+                self.statusBar().showMessage("H5 conversion completed, but input was not loaded; see Log.", 10000)
 
     def _on_dicom_conversion_failed(self, details):
         self.log("DICOM conversion cancelled." if str(details) == "Cancelled" else f"DICOM CONVERSION ERROR: {details}")
+        self.statusBar().showMessage("DICOM conversion cancelled." if str(details) == "Cancelled" else "DICOM conversion failed; see Log.", 10000)
+        self._dicom_conversion_error = None if str(details) == "Cancelled" else str(details)
 
+    @QtCore.Slot()
     def _cleanup_dicom_conversion(self):
         self._close_progress_dialog(self._dicom_conversion_progress)
+        # finished() precedes final thread-local/Python wrapper destruction.
+        # Join with QThread.wait (which releases the GIL) before deleting the
+        # QThread, avoiding a destructor wait while the GUI holds the GIL.
+        self._dicom_conversion_thread.wait()
         self._dicom_conversion_thread.deleteLater()
         self._dicom_conversion_worker = None
         self._dicom_conversion_thread = None
@@ -7136,6 +6329,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if cases is not None:
             QtCore.QTimer.singleShot(0, lambda: self._apply_dicom_conversion_cases(cases))
         self._dicom_conversion_progress = None
+        details = getattr(self, "_dicom_conversion_error", None)
+        self._dicom_conversion_error = None
+        if details:
+            message = details.strip().splitlines()[-1] + "\nSee Log for details."
+            QtCore.QTimer.singleShot(0, lambda: QtWidgets.QMessageBox.warning(self, "DICOM conversion failed", message))
 
     def _rendering_kwargs(self):
         rendering_cfg = bundle_to_autoflow_kwargs(self._config_bundle)
@@ -7441,7 +6639,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "swirling_strength_volume",
             ),
         }
-        rebuild_prefixes = []
+        rebuild_prefixes = ["content_volume_"]
         for step in steps:
             rebuild_prefixes.extend(prefix_map.get(step, ()))
         if any(
@@ -7476,6 +6674,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ortho_viewer.btn_noise_overlay.setChecked(True)
         self._refresh_render_range_control()
         self.ortho_viewer.refresh()
+        if StepId.GENERATE_PCMRA in steps and self.workspace.pcmra_array is not None:
+            self.ortho_viewer.combo_content.setCurrentIndex(self.ortho_viewer.combo_content.findData(4))
+            self._on_content_render_requested(4)
 
     def _on_pipeline_finished(self, payload):
         if self._pipeline_progress_dialog is not None and self._pipeline_progress_dialog.cancel_token.cancelled:
@@ -7527,6 +6728,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self.pipeline.preprocess(self.workspace)
             self.scene.trigger_streamlines()
+            self.workspace.pipeline.mark_done(StepId.GENERATE_STREAMLINES)
             self._refresh_browser()
             self._refresh_workflow_status()
             self.log("[Run All: Hemodynamics] Live streamlines enabled; generating pathlines for all planes.")
@@ -7559,6 +6761,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         try:
             self._sync_params_to_ws()
+            if step == StepId.UNWRAP_PHASE:
+                self._prepare_unwrap_action()
+            if step == StepId.COMPUTE_PWV:
+                self.workspace.pwv_params.enabled = True
             self._clear_plane_drag_widgets()
             if step == StepId.EDIT_SKELETON:
                 self._start_skeleton_interactive_edit()
@@ -7569,6 +6775,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if step == StepId.GENERATE_STREAMLINES:
                 self.pipeline.preprocess(self.workspace)
                 self.scene.trigger_streamlines()
+                self.workspace.pipeline.mark_done(StepId.GENERATE_STREAMLINES)
+                self._sync_params_to_ui()
                 self._refresh_browser()
                 self._refresh_workflow_status()
                 return
@@ -7607,6 +6815,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._clear_plane_drag_widgets()
         stage_key = self._workflow_stage_key()
         all_steps = _workflow_run_all_steps(stage_key)
+        if StepId.UNWRAP_PHASE in all_steps:
+            self._prepare_unwrap_action()
         if not all_steps:
             self.log("Run All is available in Correction, Centerline & Planes or Hemodynamics.")
             return
@@ -8220,8 +7430,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_delete_obj.setEnabled(False)
         if hasattr(self, "workflow_tabs"):
             self.workflow_tabs.setEnabled(False)
-        if hasattr(self, "btn_show_advanced"):
-            self.btn_show_advanced.setEnabled(False)
         if self._edit_btn_edge is not None:
             self._edit_btn_edge.setVisible(mode == "graph")
         if getattr(self, "_edit_hint_label", None) is not None:
@@ -8246,8 +7454,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_delete_obj.setEnabled(True)
         if hasattr(self, "workflow_tabs"):
             self.workflow_tabs.setEnabled(True)
-        if hasattr(self, "btn_show_advanced"):
-            self.btn_show_advanced.setEnabled(True)
         try:
             self.statusBar().clearMessage()
         except Exception:
@@ -8449,6 +7655,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _clear_centerline_edit_dependents(self):
         """Remove paths, planes, and metrics that no longer match edited topology."""
         ws = self.workspace
+        ws.graph_hierarchy = {}
+        ws.remove_objects_by_prefix("hierarchy_path_")
         ws.centerline_paths = []
         ws.centerline_node_paths = []
         ws.centerline_paths_smooth = []
@@ -8635,6 +7843,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._clear_plane_drag_widgets()
         except Exception:
             pass
+        self.scene._clear_content_widgets()
+        self.scene._close_interaction_rendering()
+        # Finalize VTK while its Qt/Win32 window still exists. Letting Python
+        # destroy it after the native window closes leaves an invalid WGL handle.
+        self.plotter.close()
         event.accept()
 
 

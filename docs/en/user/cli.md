@@ -1,5 +1,23 @@
 # CLI Guide
 
+
+### Regional plane configurations
+
+Use one of the complete lists below. Each uses shared observed connections with per-label positions and explicit unconnected fallbacks; actual output counts depend on topology and section QC.
+
+```bash
+autoflow-run case.h5 --plane-config configs/plane_plans/cardiopulmonary.json --output-dir results/heart
+autoflow-run case.h5 --plane-config configs/plane_plans/portal.json --output-dir results/portal
+autoflow-run case.h5 --plane-config configs/plane_plans/renal.json --output-dir results/renal
+autoflow-run case.h5 --plane-config configs/plane_plans/brain.json --output-dir results/brain
+autoflow-run case.h5 --plane-config configs/plane_plans/neck.json --output-dir results/neck
+```
+
+These files declare 12, 3, 2, 14 and 8 primary positions respectively, rather than fixed output totals. Every actual connected arm can be measured; unconnected components use their declared fallback, whose position count may differ. Brain includes ICA, PCA and ACA; neck uses connected ICA/VA offsets or longest-L1 33%/66% positions without connections. IJV always uses longest L1 at 1/3 and 2/3. Missing levels and unsupported sections are reported in QC. Labels omitted from the file receive no planes. GUI Load/Save uses the same files. See [Label plane rules](parameter-schemas.md#label-plane-rules).
+
+Skeleton graph adjacency defaults to 26 face/edge/corner neighbors. Use `--graph-connectivity 6` for face-only connections. For example: `autoflow-run neck.h5 --plane-config configs/plane_plans/neck.json --graph-connectivity 26`. With 6, diagonal skeletons can split into more components, each receiving its own per-component measurements.
+
+
 ## Status
 `autoflow-run` is the main batch entry point. It is supported.
 
@@ -230,8 +248,11 @@ WRLS+ARTO automatically uses CUDA for its ARTO GMM stage when the installed PyTo
 
 | CLI flag | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `--plane-mode` | string | `fixed_step` | `configs/planes.json` | choose `uniform` or composable `fixed_step` placement (legacy modes remain accepted) | `autoflow/algorithms/planes.py` |
+| `--plane-mode` | string | `by_label` | `configs/planes.json` | use independent per-label measurements, or choose global `uniform` / `fixed_step` placement (legacy modes remain accepted) | `autoflow/algorithms/planes.py` |
+| `--plane-config` | path | module file | `configs/plane_plans/*.json` | select a complete GUI/CLI-shared measurement list; missing labels mean zero | `autoflow/plane_rules.py; autoflow/api.py` |
 | `--plane-count` | int | `3` | `configs/planes.json` | requested planes; even symmetric counts omit center; `-1` fills positions that fit | `autoflow/algorithms/planes.py` |
+| `--fov-boundary-max-fraction` | float | `0.25` | `configs/planes.json` | omit generated planes when FOV contact length / outer ROI perimeter reaches this fraction | `autoflow/algorithms/metrics/fov.py` |
+| `--no-fov-boundary-filter` | switch | filter enabled | CLI; `configs/planes.json` | keep candidates regardless of FOV contact; inspect full decisions in QC | `autoflow/core/pipeline.py` |
 | `--cross-section-dist` | float mm | `5.0` | `configs/planes.json` | fixed-step spacing in mm when distance spacing is selected | `autoflow/algorithms/planes.py` |
 | `--plane-spacing-mode` | string | `fraction` | `configs/planes.json` | `distance` or `fraction` of the usable centerline | `autoflow/algorithms/planes.py` |
 | `--plane-spacing-ratio` | float | `0.25` | `configs/planes.json` | fractional fixed-step spacing | `autoflow/algorithms/planes.py` |
@@ -272,8 +293,8 @@ WSS, TKE, and pressure-analysis compute defaults are now split by metric:
 | `--separate-special-label-contacts` / `--no-separate-special-label-contacts` | bool | `True` | `configs/skeleton.json` | enable/disable contact separation for the configured special labels (default: `RBCT`, `CCA`, `LBCT`) | `autoflow/algorithms/preprocess.py` |
 | `--min-cc-volume` | float mm^3 | `50.0` | `configs/skeleton.json` | component-volume threshold | `autoflow/algorithms/preprocess.py` |
 | `--cc-filter-mode` | string | `hybrid` | `configs/skeleton.json` | choose `absolute`, `relative`, `hybrid`, or `largest` component filtering | `autoflow/algorithms/preprocess.py` |
-| `--cc-rel-min-ratio` | float | `0.01` | `configs/skeleton.json` | relative threshold against the largest component for `relative` and `hybrid` filtering | `autoflow/algorithms/preprocess.py` |
-| `--min-edge-points` / `--min-edge-count` | int | `3` | `configs/skeleton.json` | remove terminal graph branches shorter than this edge count; `0` or `1` disables the filter | `autoflow/algorithms/graph.py` |
+| `--cc-rel-min-ratio` | float | `0.1` | `configs/skeleton.json` | relative threshold against the largest component for `relative` and `hybrid` filtering | `autoflow/algorithms/preprocess.py` |
+| `--min-edge-points` / `--min-edge-count` | int | `5` | `configs/skeleton.json` | remove terminal graph branches shorter than this edge count; `0` or `1` disables the filter | `autoflow/algorithms/graph.py` |
 
 ### Streamlines and pathline styling
 
@@ -350,3 +371,12 @@ Typical CLI outputs are documented in [Outputs](outputs.md).
 ## Complete flag reference
 
 [All CLI arguments](cli-parameters.md) lists every accepted option, alias, parser type, allowed choices and effect. Omitted overrides inherit [module defaults](parameters.md).
+
+## Exit status
+
+`autoflow-run` and `python -m autoflow.cli` return `0` only when at least one
+case was processed and every case has `status: "ok"`. They return `1` for an
+error, a completed case with a failed requested video (`partial`), or no
+supported cases. Argument parsing errors return `2`. Review `batch_report.json`
+for per-case details. Missing optional TKE remains a clean skip. Case timing
+includes output generation; see [Outputs](outputs.md#case-timing-and-partial-video-output).

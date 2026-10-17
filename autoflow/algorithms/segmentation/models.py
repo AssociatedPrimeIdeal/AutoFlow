@@ -5,6 +5,8 @@ import os
 import re
 from pathlib import Path
 
+from ...runtime_paths import portable_model_folder
+
 
 _AUTOFLOW_INTERNAL_SPATIAL_ORDER = ("LR", "AP", "FH")
 
@@ -124,12 +126,18 @@ def _detect_nnunet_folds(model_path):
 
 
 def bundled_nnunet_model_folder():
+    portable = portable_model_folder("nnunet3d-bundled")
+    if portable is not None:
+        return portable
     model_name = "nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm"
     return Path(__file__).resolve().parents[2] / "segmodel" / model_name
 
 
 def default_nnunet_model_folder():
     """Return the preferred static model, with the packaged model as fallback."""
+    portable = portable_model_folder("nnunet3d")
+    if portable is not None:
+        return portable
     if _NNUNET_3D_MODEL_DEFAULT.is_dir():
         return _NNUNET_3D_MODEL_DEFAULT
     return bundled_nnunet_model_folder()
@@ -145,7 +153,7 @@ def _resolve_bundled_relative_path(path):
     package_root = Path(__file__).resolve().parents[3]
     packaged_path = package_root / path
     bundled_default = bundled_nnunet_model_folder()
-    legacy_default = Path("autoflow") / "segmodel" / bundled_default.name
+    legacy_default = Path("autoflow") / "segmodel" / "nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm"
     if path == legacy_default:
         return bundled_default
     if packaged_path.is_dir():
@@ -283,6 +291,14 @@ def resolve_nnunet_4d_model_folder(model_folder=""):
         return str(_model_folder_from_4d_pipeline_script(candidate))
     if candidate:
         return str(_resolve_bundled_relative_path(candidate))
+    portable = portable_model_folder("nnunet4d")
+    if portable is not None:
+        if portable.is_dir():
+            return str(portable)
+        raise FileNotFoundError(
+            f"portable 4D nnUNet model folder is missing: {portable}. "
+            "Extract the matching models archive beside AutoFlow.exe or set an explicit model folder."
+        )
     if _NNUNET_4D_MODEL_DEFAULT.is_dir():
         return str(_NNUNET_4D_MODEL_DEFAULT)
     model = _model_folder_from_4d_pipeline_script(_NNUNET_4D_PIPELINE_DEFAULT)

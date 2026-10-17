@@ -1,5 +1,7 @@
 # Phase Unwrapping
 
+The [full Windows portable distribution](../user/windows-portable.md) includes this feature and its optional runtime dependencies. GPU-only backends still require compatible NVIDIA hardware and drivers.
+
 ## Status
 Supported as an optional GUI, CLI, and Python workflow step for the bundled backends; PUDIP-Flow and GUST-Flow are Experimental. Explicit action in GUI; CLI/API remain opt-in, while `--correction` / `correction_all=True` default to `lap4D` with no mask; `DV` dual-VENC inputs are skipped while `LV` and `HV` selections can be unwrapped.
 
@@ -15,7 +17,7 @@ Use for single-VENC data containing phase wraps or for a dual-VENC case loaded a
 
 ## Quick use
 
-GUI: open **Correction > Phase Unwrapping**; the method defaults to `lap4D` and the mask to `none`. Click **Unwrap Phase** to run only this stage, or **Run All** to run Background Correction → Noise Removal → Unwrap Phase → Generate PC-MRA. PUDIP/GUST training settings come from `phase_unwrapping.json` under `backend_params`. Review **Estimated Wrap Locations** and **Phase Wrap Count** in the Browser.
+GUI: right-click **Correction > Unwrap Phase** to open settings; the method defaults to `lap4D` and the mask to `none`. Save settings, then left-click **Unwrap Phase** to run only this stage, or **Run All** to run Background Correction → Noise Removal → Unwrap Phase → Generate PC-MRA. PUDIP/GUST training settings come from `phase_unwrapping.json` under `backend_params`. Review **Estimated Wrap Locations** and **Phase Wrap Count** in the Browser.
 
 CLI:
 
@@ -54,6 +56,12 @@ When omitted, the learned backends use the upstream notebook settings: PUDIP-Flo
 Correction updates `Workspace.flow_raw`, the working velocity used by later segmentation and analysis. Every unwrap run starts from stored wrapped phase, preventing repeated unwrapping of already recovered phase. A masked rerun preserves current velocity outside the mask; exported recovered phase matches that combined velocity, while wrap counts/statistics describe the latest mask (`diagnostic_scope=latest_masked_run`). `flow_input` retains the pre-unwrapping baseline (after saved corr is applied during GUI load or background correction is run), used by **Revert to Pre-Unwrapping Flow**.
 
 Existing segmentation, skeleton, graph, paths, planes, metrics and trajectories are retained after unwrap or revert. They do not automatically recompute: rerun the desired downstream actions yourself. After segmentation, return to Correction and select `segmask` to run a masked refinement.
+
+### Preparing reusable unwrapped inputs
+
+Offline dataset preparation can persist the recovered velocity in a normalized H5 containing floating-point `mag` and `flow` in cm/s, geometry, VENC, RR and optional `segmask`. Writing recovered phase back as a complex exponential loses every integer `2pi` wrap, so a complex `img` alone cannot preserve the recovered velocity. Apply any existing source correction once before unwrapping; omit an active root `corr` dataset when that correction is already included in the stored velocity, because GUI loading would otherwise apply it again.
+
+Record the preparation method, parameters and source in H5 provenance attributes. These attributes describe the prepared data; they do not schedule processing stages. Load the prepared H5 and run the desired centerline and plane analysis directly. For a matching test DICOM export, use `4DFlow_H52Dicom` with the native `mag` + `flow` contract, `orientation="Tra"` and its default `pcmra=True`. The input magnitude must be actual magnitude; PCMRA is computed from that magnitude and the recovered physical velocity. The obsolete `norm` and `corr` options have been removed; no second correction or unwrap is performed. All three velocity series share one export VENC: `max(ceil(max(acquisition VENC)), ceil(max(abs(velocity))) + 1)` across every component, voxel and phase. Pixels and VENC tags use that same common calibration without clipping unwrapped velocity. Unequal directional export VENC caused a direction error in the tested CVI setup; a common-VENC comparison was accepted. Verify a DICOM-to-H5 round trip within the pixel quantization tolerance. Tra is the default because the bundled shells are Tra; other orientations can confuse CVI direction recognition. See [Exporting prepared H5 as test DICOM](../user/inputs.md#exporting-prepared-h5-as-test-dicom) for the input contract and shell-position limitation.
 
 ## Limitations
 

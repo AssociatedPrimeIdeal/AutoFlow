@@ -10,6 +10,9 @@ from ..rendering.style import (
 )
 from ..rendering.datasets import (tke_display_mesh, display_support_surface,
                                   sample_display_field, active_wrap_mesh, noise_display_points)
+from .content_rendering import ContentRenderingMixin
+from .interaction_rendering import InteractionRenderingMixin
+from .scene_layers import SceneLayersMixin
 from ..algorithms import (
     build_multilabel_surface_t,
     build_surface_from_mask3d,
@@ -87,7 +90,7 @@ def _pwv_planes_polydata(planes, origin, plane_size=25.0):
     return merged
 
 
-class SceneController:
+class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLayersMixin):
     def __init__(self, plotter, workspace, logger):
         self.plotter = plotter
         self.workspace = workspace
@@ -128,11 +131,14 @@ class SceneController:
         self._volume_wl_user_callback = None
         self._qt_mouse_filter = None
         self._plane_overlay_renderer = None
+        self._initialize_scene_layers()
+        self._initialize_content_rendering()
+        self._initialize_interaction_rendering()
 
-    @staticmethod
-    def _is_volume_object(obj):
-        """Return whether *obj* should be drawn with VTK volume rendering."""
-        return str(getattr(obj, "data_key", "")) in {"pcmra_volume", "tke_volume"}
+    def _is_volume_object(self, obj):
+        if self.is_content_render(obj):
+            return self.content_render_settings(obj.data_key)["mode"] != "slices"
+        return obj.data_key == "tke_volume"
 
     @staticmethod
     def _foreground_volume_range(values):
@@ -160,6 +166,11 @@ class SceneController:
         if respect_clim and getattr(obj, "clim", None) is not None:
             lo, hi = (float(x) for x in obj.clim)
         else:
+            if self.is_content_render(obj):
+                if data is not None and "Content display range" in data.field_data:
+                    lo, hi = (float(value) for value in data.field_data["Content display range"])
+                    if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+                        return lo, hi
             if obj.data_key == "pcmra_volume" and self.workspace.pcmra_array is not None:
                 key = (id(self.workspace.pcmra_array), id(self.workspace.pcmra_render_mask), int(self.workspace.current_t))
                 cached = self._volume_range_cache.get(key)
@@ -221,9 +232,17 @@ class SceneController:
                     return
                 colors = prop.GetRGBTransferFunction(0)
                 colors.RemoveAllPoints()
-                for fraction in (0.0, 0.18, 0.42, 0.68, 1.0):
-                    colors.AddRGBPoint(lo + (hi - lo) * fraction, fraction, fraction, fraction)
-                prop.SetInterpolationTypeToNearest()
+                anatomy = (self.content_render_settings(obj.data_key) if self.is_content_render(obj) else None)
+                if anatomy:
+                    lut = pv.LookupTable(cmap=obj.cmap, n_values=32)
+                    for fraction, rgba in zip(np.linspace(0, 1, 32), lut.values):
+                        colors.AddRGBPoint(lo + (hi - lo) * fraction, *(np.asarray(rgba[:3]) / 255.0))
+                    prop.SetInterpolationTypeToLinear()
+                    prop.SetShade(bool(anatomy["shade"]))
+                else:
+                    for fraction in (0.0, 0.18, 0.42, 0.68, 1.0):
+                        colors.AddRGBPoint(lo + (hi - lo) * fraction, fraction, fraction, fraction)
+                    prop.SetInterpolationTypeToNearest()
                 prop.SetScalarOpacityUnitDistance(max(float(np.mean(np.asarray(self.workspace.resolution, dtype=float))), 0.1))
                 transfer.RemoveAllPoints()
                 width = max(float(hi - lo), 1e-6)
@@ -240,6 +259,22 @@ class SceneController:
                     value = lo + width * fraction
                     transfer.AddPoint(value, alpha * opacity_scale if value > 0.0 else 0.0)
                 transfer.AddPoint(0.0, 0.0)
+                if anatomy:
+                    cutoff = lo + width * float(anatomy["threshold"])
+                    transfer.RemoveAllPoints()
+                    transfer.AddPoint(min(0.0, lo), 0.0)
+                    transfer.AddPoint(cutoff, 0.0)
+                    for fraction, alpha in ((0.18, 0.015), (0.38, 0.05), (0.62, 0.14), (0.82, 0.28), (1.0, 0.42)):
+                        value = cutoff + (hi - cutoff) * fraction
+                        transfer.AddPoint(value, alpha * opacity_scale)
+                    if lo < 0:
+                        extent = max(abs(lo), abs(hi))
+                        cutoff = extent * float(anatomy["threshold"])
+                        transfer.RemoveAllPoints()
+                        for value in np.linspace(lo, hi, 129):
+                            alpha = max(0.0, (abs(value) - cutoff) / max(extent - cutoff, 1e-12))
+                            transfer.AddPoint(float(value), 0.42 * opacity_scale * alpha)
+                        transfer.AddPoint(0.0, 0.0)
             except Exception:
                 pass
         except Exception:
@@ -258,11 +293,13 @@ class SceneController:
 
     def initialize(self):
         configure_plotter(self.plotter, self._background_color, workspace=self.workspace)
+        self._ensure_interaction_rendering()
         self._ensure_plane_overlay_renderer()
+        self._ensure_scene_layers()
         self._add_orientation_axes()
         self._ensure_volume_window_level_interaction()
         self._ensure_native_qt_mouse_bridge()
-        self.plotter.reset_camera()
+        self.reset_camera(render=False)
 
     def _ensure_plane_overlay_renderer(self):
         render_window = getattr(self.plotter, "render_window", None)
@@ -426,6 +463,7 @@ class SceneController:
                 if data is None:
                     return
                 self._volume_wl_active = True
+                self.set_interaction_preview(True)
                 try:
                     self.plotter._autoflow_window_level_active = True
                 except Exception:
@@ -474,6 +512,7 @@ class SceneController:
                     self.plotter._autoflow_window_level_active = False
                 except Exception:
                     pass
+                self.set_interaction_preview(False)
             return
 
         def _on_native_left_press(_obj, _event):
@@ -562,6 +601,9 @@ class SceneController:
                 zlabel=self._display_axis_directions[2],
                 line_width=2,
             )
+            widget = getattr(self.plotter.renderer, "axes_widget", None)
+            if widget is not None:
+                widget.GetRenderer().SetLayer(3)
             if not self._axes_shown:
                 self.plotter.hide_axes()
         except Exception:
@@ -686,10 +728,10 @@ class SceneController:
         if data is None or np.all(self._display_axis_signs == 1.0):
             return data
         center = tuple(float(value) for value in self._ensure_display_center(data))
-        key = (id(data), tuple(float(value) for value in self._display_axis_signs), center)
+        key = (id(data), int(data.GetMTime()), tuple(float(value) for value in self._display_axis_signs), center)
         cached = self._display_transform_cache.get(key)
         if cached is not None:
-            return cached
+            return cached[1]
         try:
             matrix = np.eye(4, dtype=float)
             matrix[:3, :3] = np.diag(self._display_axis_signs)
@@ -702,10 +744,19 @@ class SceneController:
                 transformed.points = self.world_to_display_points(np.asarray(data.points, dtype=float))
             except Exception:
                 transformed = data
-        self._display_transform_cache[key] = transformed
+        # Retain the source with its transform: temporary cut/axis meshes can
+        # otherwise reuse an object's Python id and retrieve unrelated scalars.
+        if len(self._display_transform_cache) >= 64:
+            self._display_transform_cache.pop(next(iter(self._display_transform_cache)))
+        self._display_transform_cache[key] = (data, transformed)
         return transformed
 
     def reset_scene(self):
+        self.set_interaction_preview(False, render=False)
+        self._clear_scene_layers()
+        self._clear_content_widgets()
+        self._content_selected_uid = None
+        self._ensure_content_source()
         if self._plane_overlay_renderer is not None:
             try:
                 self._plane_overlay_renderer.RemoveAllViewProps()
@@ -738,6 +789,7 @@ class SceneController:
         self._display_transform_cache.clear()
 
     def invalidate_cache(self, prefix=None):
+        self._content_source._cache.clear()
         self._phase_lookup_cache.clear()
         self._automatic_clim_cache.clear()
         self._volume_range_cache.clear()
@@ -769,10 +821,11 @@ class SceneController:
         except Exception:
             pass
 
-    def reset_camera(self):
+    def reset_camera(self, render=True):
         try:
-            self.plotter.reset_camera()
-            self.plotter.render()
+            self.plotter.reset_camera(bounds=self._visible_scene_bounds(), render=False)
+            if render:
+                self.plotter.render()
         except Exception:
             pass
 
@@ -817,13 +870,15 @@ class SceneController:
                 self._apply_basic_properties_only(obj)
         self._refresh_shared_scalar_bar(render=False)
         if not had_rendered_scene and self._tracked_actors:
-            self.plotter.reset_camera()
+            self.reset_camera(render=False)
         try:
             self.plotter.render()
         except Exception:
             pass
 
     def remove_object(self, uid):
+        if self._content_selected_uid == uid:
+            self.select_content_render(None)
         obj = self.workspace.scene_objects.get(uid)
         if obj is not None:
             self._remove_actor(obj)
@@ -849,7 +904,7 @@ class SceneController:
                 self._apply_basic_properties_only(obj)
         self._refresh_shared_scalar_bar(render=False)
         if not had_rendered_scene and self._tracked_actors:
-            self.plotter.reset_camera()
+            self.reset_camera(render=False)
         try:
             self.plotter.render()
         except Exception:
@@ -908,6 +963,9 @@ class SceneController:
             mapper.Update()
             if self._is_volume_object(obj):
                 self._set_volume_opacity(obj, data_show)
+                self._apply_interaction_mapper_quality(obj)
+            elif (self.content_render_settings(obj.data_key) if self.is_content_render(obj) else None):
+                mapper.scalar_range = self._volume_scalar_range(obj, data_show)
         except Exception:
             self.readd_object(obj, refresh_scalar_bar=False)
 
@@ -948,6 +1006,8 @@ class SceneController:
         return updated
 
     def apply_object_properties(self, obj, *, render=True, refresh_scalar_bar=True):
+        if self.is_content_render(obj):
+            self._sync_content_widgets()
         self._sync_plane_highlight_visibility(obj)
         if obj.actor is None:
             self._render_object(obj, refresh_scalar_bar=refresh_scalar_bar)
@@ -1164,6 +1224,7 @@ class SceneController:
 
     def _remove_plane_highlight(self):
         if self._highlight_plane_actor is not None:
+            self._forget_front_prop(self._highlight_plane_actor)
             if self._plane_overlay_renderer is not None:
                 try:
                     self._plane_overlay_renderer.RemoveActor(self._highlight_plane_actor)
@@ -1181,6 +1242,7 @@ class SceneController:
 
     def _remove_path_highlight(self):
         if self._highlight_path_actor is not None:
+            self._forget_front_prop(self._highlight_path_actor)
             if self._plane_overlay_renderer is not None:
                 try:
                     self._plane_overlay_renderer.RemoveActor(self._highlight_path_actor)
@@ -1267,6 +1329,7 @@ class SceneController:
         except Exception:
             pass
         self._move_actor_to_plane_overlay(actor)
+        self._place_selected_highlights()
 
     def refresh_plane_labels(self):
         pass
@@ -1277,6 +1340,7 @@ class SceneController:
     def _detach_actor(self, actor):
         """Remove an actor from every renderer that can own a scene object."""
         if actor is not None:
+            self._forget_front_prop(actor)
             if self._plane_overlay_renderer is not None:
                 try:
                     self._plane_overlay_renderer.RemoveActor(actor)
@@ -1291,6 +1355,8 @@ class SceneController:
                     pass
 
     def _remove_actor(self, obj):
+        if self._content_widget_uid == obj.uid:
+            self._clear_content_widgets()
         self._detach_actor(obj.actor)
         self._detach_actor(getattr(obj, "label_actor", None))
         self._tracked_actors.pop(obj.uid, None)
@@ -1331,13 +1397,17 @@ class SceneController:
                 if obj.kind == ObjectKind.PLANE:
                     self._move_actor_to_plane_overlay(obj.actor)
             self._tracked_actors[obj.uid] = obj.actor
+            self._apply_interaction_mapper_quality(obj)
             self._apply_basic_properties_only(obj)
+            self._place_selected_object(obj)
         except Exception as e:
             self.logger(f"Render failed: {obj.name}: {type(e).__name__}: {e}")
         if refresh_scalar_bar:
             self._refresh_shared_scalar_bar(preferred_uid=obj.uid if obj.visible else None, render=False)
 
     def _apply_basic_properties_only(self, obj):
+        if self.is_content_render(obj):
+            self._sync_content_widgets()
         self._sync_plane_highlight_visibility(obj)
         try:
             obj.actor.SetVisibility(1 if self._object_visible_in_view(obj) else 0)
@@ -1362,6 +1432,18 @@ class SceneController:
             pass
 
     def _mesh_kwargs(self, obj, data):
+        anatomy = (self.content_render_settings(obj.data_key) if self.is_content_render(obj) else None)
+        if anatomy and anatomy["mode"] == "slices":
+            # An explicit LUT uses byte alpha, not normalized 0–1 values.
+            lut = np.full(256, 255, dtype=np.uint8)
+            lo, hi = self._volume_scalar_range(obj, data)
+            levels = np.linspace(lo, hi, 256)
+            if lo < 0:
+                lut[np.abs(levels) <= anatomy["threshold"] * max(abs(lo), abs(hi))] = 0
+            else:
+                lut[levels <= lo + (hi - lo) * anatomy["threshold"]] = 0
+            return dict(scalars=obj.scalars, cmap=obj.cmap, clim=self._volume_scalar_range(obj, data),
+                        opacity=lut, lighting=False, show_scalar_bar=False, render=False, reset_camera=False)
         if obj.data_key == 'tke_volume':
             kwargs = metric_volume_kwargs(self.workspace, obj.data_key, self._volume_scalar_range(obj, data))
             return dict(kwargs, scalars='TKE', mapper=self._volume_mapper_name(),
@@ -1386,7 +1468,7 @@ class SceneController:
                 "specular": 0.05,
                 "specular_power": 8.0,
                 "shade": False,
-                "blending": "composite",
+                "blending": anatomy["mode"] if anatomy else "composite",
                 "mapper": self._volume_mapper_name(),
                 "opacity_unit_distance": max(float(np.mean(np.asarray(self.workspace.resolution, dtype=float))), 0.1),
                 "show_scalar_bar": False,
@@ -1535,6 +1617,7 @@ class SceneController:
             return False
 
     def _clear_shared_scalar_bar(self, render=False):
+        self._clear_hud_scalar_bars()
         try:
             scalar_bars = getattr(self.plotter, "scalar_bars", None)
             titles = list(scalar_bars.keys()) if scalar_bars is not None else []
@@ -1589,7 +1672,8 @@ class SceneController:
             return
         self._clear_shared_scalar_bar(render=False)
         try:
-            self.plotter.add_scalar_bar(mapper=mapper, render=False, **self._scalar_bar_args_for_object(obj))
+            bar = self.plotter.add_scalar_bar(mapper=mapper, render=False, **self._scalar_bar_args_for_object(obj))
+            self._place_hud_scalar_bar(bar)
             self._active_scalar_bar_uid = obj.uid
         except Exception as e:
             self._active_scalar_bar_uid = None
@@ -1617,6 +1701,25 @@ class SceneController:
         sp = ws.resolution
         org = ws.origin
 
+        if data_key.startswith("content_volume_"):
+            return self._build_content_volume(data_key)
+
+        if data_key == "magnitude_volume":
+            if ws.mag_raw is None:
+                return None
+            magnitude = np.asarray(ws.mag_raw)
+            if magnitude.ndim not in {3, 4} or not magnitude.size:
+                return None
+            phase = min(max(int(t), 0), magnitude.shape[3] - 1) if magnitude.ndim == 4 else 0
+            def build_magnitude():
+                values = magnitude[..., phase] if magnitude.ndim == 4 else magnitude
+                values = np.where(np.isfinite(values) & (values > 0), values, 0).astype(np.float32)
+                grid = self._voxel_centered_grid(values, "Magnitude")
+                grid.field_data["Magnitude display range"] = self._foreground_volume_range(values)
+                return grid
+            grid = self._cached(f"magnitude_volume_{id(ws.mag_raw)}", phase, build_magnitude)
+            return self._content_slice_dataset(data_key, grid)
+
         if data_key == 'noise_region':
             return self._cached(f'noise_region_{id(ws.pcmra_render_mask)}_{id(ws.mag_raw)}', 0,
                                 lambda: noise_display_points(ws))
@@ -1642,7 +1745,7 @@ class SceneController:
                 grid = self._voxel_centered_grid(values, "PC-MRA")
                 grid.field_data["PC-MRA display range"] = self._volume_range_cache[range_key]
                 return grid
-            return self._cached(cache_key, t, _build_pcmra)
+            return self._content_slice_dataset(data_key, self._cached(cache_key, t, _build_pcmra))
 
         if data_key == "segmask_raw_surface":
             seg_display = ws.segmentation_display_4d()
@@ -1882,11 +1985,20 @@ class SceneController:
             plane_size = max(10.0, float(np.mean(np.asarray(sp, dtype=float).reshape(3))) * 12.0)
             return self._cached(data_key, 0, lambda: _pwv_planes_polydata(ws.derived.pwv_planes, org, plane_size=plane_size))
 
+        if isinstance(data_key, str) and data_key.startswith("hierarchy_path_"):
+            token, index = data_key[len("hierarchy_path_"):].rsplit("_", 1)
+            for report in ws.graph_hierarchy.get("joint_systems", []):
+                if report["group_name"] == token and int(index) < len(report["node_chains"]):
+                    points = np.asarray(report["graph"]["points"], dtype=float)
+                    return _path_polydata(points[report["node_chains"][int(index)]], org)
+            return None
+
         idx = _parse_indexed_data_key(data_key, "smooth_path")
         if idx is not None:
-            if idx >= len(ws.centerline_paths_smooth):
+            paths = ws.centerline_paths_smooth if ws.centerline_paths_smooth else ws.centerline_paths
+            if idx >= len(paths):
                 return None
-            path = np.asarray(ws.centerline_paths_smooth[idx], dtype=float)
+            path = np.asarray(paths[idx], dtype=float)
             if len(path) == 0:
                 return None
             return _path_polydata(path, org)
@@ -2298,8 +2410,10 @@ class SceneController:
                 return
             ren = self.plotter.renderer
             pos = None
-            if self._plane_overlay_renderer is not None:
-                overlay_ok = picker.Pick(float(x), float(y), 0.0, self._plane_overlay_renderer)
+            for overlay in (self._selection_renderer, self._plane_overlay_renderer):
+                if overlay is None:
+                    continue
+                overlay_ok = picker.Pick(float(x), float(y), 0.0, overlay)
                 picked_actor = picker.GetActor() if overlay_ok else None
                 picked_plane_uid = None
                 picked_plane_idx = None
@@ -2314,6 +2428,12 @@ class SceneController:
                     if self._plane_pick_callback is not None:
                         self._plane_pick_callback(picked_plane_uid, picked_plane_idx)
                     return
+                if overlay_ok and overlay is self._selection_renderer:
+                    pos = picker.GetPickPosition()
+                    path_uid, path_idx = self.find_path_uid_at_position(pos)
+                    if path_uid is not None and path_idx is not None and self._path_pick_callback is not None:
+                        self._path_pick_callback(path_uid, path_idx)
+                        return
             screen_plane_uid, screen_plane_idx = self._plane_uid_at_display_position(x, y)
             if screen_plane_uid is not None and screen_plane_idx is not None:
                 if self._plane_pick_callback is not None:

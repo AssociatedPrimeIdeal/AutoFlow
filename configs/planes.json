@@ -1,5 +1,6 @@
 {
-  "plane_mode": "fixed_step",
+  "plane_mode": "by_label",
+  "label_rules_file": "plane_plans/default.json",
   "plane_count": 3,
   "cross_section_distance": 5.0,
   "start_distance": 0.0,
@@ -10,6 +11,8 @@
   "spacing_mode": "fraction",
   "spacing_ratio": 0.25,
   "segmentation_filter": true,
+  "fov_boundary_filter": true,
+  "fov_boundary_max_fraction": 0.25,
   "smoothing_window": 15,
   "smoothing_polyorder": 2,
   "inter_time": 10,

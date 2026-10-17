@@ -685,7 +685,8 @@ def compute_pwv_groups(
             result.update({"status": "skipped", "message": "no skeleton points"})
             results.append(result)
             continue
-        graph = build_graph_from_points(skeleton_points, resolution)
+        graph = build_graph_from_points(skeleton_points, resolution,
+                                        connectivity=skeleton_params.graph_connectivity)
         group_binary = _repeat_mask_to_time(group_mask, time_count)
         local_flow = flow * group_binary[..., None]
         branch_labels, local_paths, _node_paths, local_path_info, _forks = segment_vessels_from_graph_and_mask(

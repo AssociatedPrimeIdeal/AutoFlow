@@ -1,5 +1,7 @@
 # Current pipeline performance
 
+The [2026-10-07 cross-anatomy pipeline and interaction audit](pipeline-audit-2026-10-07.md) covers five input categories, optional metrics and videos, GUI state, failure semantics and remaining optimization opportunities.
+
 ## Validated changes on 2026-10-04
 
 The current comparison uses the registered DV H5, 20 phases, **39 paths and 113 planes**, with a frozen `fold_all/checkpoint_best.pth`. Its SHA-256 is `a3b253f440bb9b1935c6457faf9eb6790a82af098e9ccc8fbce6645ad459987c`. The baseline is a Python-source snapshot taken before these changes. Raw timings, hashes, numerical comparisons and GUI checks are in the [validation record](performance-validation-2026-10-04.json).
@@ -162,3 +164,198 @@ This is about 56–65% less time for **base plane metrics**, not the entire pipe
 ## Code and validation
 
 Measure through the public API and the metric functions above. Algorithm owners: `autoflow/algorithms/segmentation/`, `autoflow/algorithms/data/`, `phase_correction.py`, `metrics/`; orchestration: `autoflow/core/pipeline.py`, `autoflow/processing.py`. Numerical optimizations must preserve smoke/phantom truth and use controlled real-case comparisons. See [Testing](testing.md).
+
+## Interactive Content cuts and volume dragging (2026-10-16)
+
+Focused display replay used the default local `DV_heart_2026.03.01_B-01220711V013.h5`
+case, normalized shape `(158, 44, 144, 20)`, phase 3, and a 900 × 600 offscreen
+view in `autoflow311`. Loading and PC-MRA generation were outside the timers;
+the source H5 size/mtime were unchanged. Each row is the median of eight
+movements on shared server hardware, not a cold whole-pipeline comparison.
+
+| Operation | Previous | Updated | Conditions |
+| --- | ---: | ---: | --- |
+| Orthogonal cut geometry | 68.69 ms | 2.11 ms | EGL, NVIDIA RTX PRO 6000 Blackwell |
+| Cut update including render | 72.34 ms | 6.04 ms | Same GPU view, normal stationary quality |
+| Orthogonal cut geometry | 73.01 ms | 3.01 ms | OSMesa/llvmpipe software fallback |
+| Cut update including render | 95.79 ms | 21.38 ms | Same software view, normal stationary quality |
+| Camera render during drag | 16.97 ms | 4.64 ms | Software baseline versus temporary interactive quality |
+
+Orthogonal geometry now samples only its two adjacent image arrays and reuses
+plane templates, rather than scanning the full voxel grid with VTK cutters.
+Dragging temporarily disables antialiasing and uses coarser volume ray sampling;
+release restores the exact previous mapper settings and render pass. SSH views
+also cap the preview's longest side at 960 pixels, returning to native size on
+release. Numerical source arrays and metrics remain unchanged.
+
+The numbers above exclude X11/network transfer and do not establish the user's
+desktop frame rate. Geometry preservation is checked against independent
+trilinear sampling, and Qt phantoms verify direct-axis activation, mouse-driven
+preview restoration and correct pointer mapping in large SSH widgets.
+
+SSH mouse movement also coalesces pointer packets before dispatch to VTK, using
+an approximately 30 ms preview interval. Frame capture throttling alone does
+not prevent every incoming mouse event from triggering a render. Pending events
+retain only the newest coordinate; release flushes it before ending the gesture
+and restoring native resolution. Discarded packets never update VTK's last-event
+position, so camera motion retains the full pointer displacement. This reduces
+redundant rendering under queued input; X11/network latency still needs
+measurement in the user's session.
+
+
+## DICOM converter update and profiling (2026-10-16)
+
+The Dicom2H5 submodule and both installation extras now pin
+`d13d0a49e1debd08bb659d447de1a51c32cf6920`, the upstream `main` tip fetched
+on 2026-10-16. The previous pin was `c6693c07f51255cd1004beb5bce9704a8f219e5c`.
+The intervening commit changes Siemens single-frame velocity direction
+resolution to use private encoding metadata when present; it does not change
+conversion scheduling or remove discovery-time pixel decoding.
+
+### Measurement scope
+
+Manual comparisons used the real `dicom/SYF_880` acquisition on HP-Z8-G5 in
+`autoflow311`, eight converter processes, NAS input/output, and a fresh H5
+output for every run. This acquisition contains 6,623 candidate files, of
+which 5,280 belong to the selected flow group (224 x 224 x 88, 15 phases).
+OS/NAS caches were not flushed and became warm. These are conversion-only
+experiments, not a repeated cold end-to-end pipeline benchmark. The earlier
+75.72-second conversion cannot be compared directly to these warm runs as a
+version-upgrade speedup.
+
+| Variant, in execution order | Conversion wall | Filter/group | SOP-UID deduplication | Pixel decode and assembly | H5 dataset creation |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Latest upstream, first control | 18.97 s | 1.37 s | 2.61 s | 3.99 s | 1.66 s |
+| Header-only discovery prototype | 17.91 s | 0.82 s | 2.54 s | 3.75 s | 1.55 s |
+| Header-only discovery, filter chunksize 16 | 18.67 s | 0.90 s | 2.90 s | 4.07 s | 1.54 s |
+| Latest upstream, last control | 19.35 s | 1.58 s | 3.03 s | 3.88 s | 1.57 s |
+
+The prototype reads discovery metadata with `stop_before_pixels=True` and
+uses Rows, Columns, NumberOfFrames and SamplesPerPixel to reproduce the array
+layout used by the existing vendor classifiers. It retains all upstream
+classification and velocity-calibration branches. This is an isolated
+experiment: active AutoFlow continues to use the unmodified latest upstream
+converter. Broader vendor and malformed/unsupported-pixel validation is
+required before promoting header-only discovery to production; this single
+UIH acquisition does not establish equivalence for every supported scanner.
+
+All variants selected the same file/group inventory and produced exactly
+equal values, shapes, dtypes and attributes for all 32 H5 datasets, including
+magnitude, velocity, calibration, spatial ordering and metadata. The latest
+upstream UIH output also exactly matches the earlier pinned-version output.
+No source DICOM was modified. The retained regression suites passed:
+**230 passed in 47.31 s**. An initial timing-harness type error was corrected
+before the accepted runs; its failed-run records are separate from the table.
+
+### Remaining optimization candidates
+
+A separate cProfile run took 25.20 s, including profiling overhead. H5 file
+close/flush accounted for 9.03 s, explaining much of the time outside the
+function timers above. Deduplication performed another 5,280 header reads;
+its normal unprofiled cost is shown in the table. Do not add cumulative
+profile timers to the stage timings or use the profiled run as a speedup
+control.
+
+1. Reuse SOPInstanceUID collected during discovery for deduplication, retaining
+   the same order and duplicate-selection rules. This avoids a full second
+   header scan and is a larger warm-path opportunity than metadata-only
+   classification by itself.
+2. Use local NVMe for the preserved conversion and downstream reads, then
+   overlap required NAS publication with later computation where feasible.
+   If final delivery must be on NAS, include or overlap that copy; staging
+   alone does not eliminate its cost. Preserve atomic no-replace publication,
+   cancellation cleanup and the final converted-source provenance.
+3. Retain header-only discovery as a candidate for validation on other vendors
+   and uncached input. The observed warm-run saving was about one second;
+   chunksize 16 did not show a convincing benefit in this comparison.
+4. These costs are CPU/file-I/O work. Multiple GPUs primarily help the later
+   segmentation stage rather than this converter path.
+
+Local evidence is in `results/dicom2h5_update_20261016/comparison.json`,
+`profile.txt`, `regression.log` and the isolated `metadata-filter*.patch`
+files. These real validation inputs and H5 outputs are not test/demo data.
+
+
+## SSH interaction and X11 presentation audit on 2026-10-17
+
+The interactive GUI was no longer running when inspected. A fresh forwarded
+X11 session to `HP-Z8-G5` (the `10.19.125.3` SSH alias) was measured using its
+NVIDIA RTX PRO 6000 Blackwell, NVIDIA driver 595.99.02, `autoflow311`, and the
+Moba/X client X server. VTK reported `vtkEGLRenderWindow` and the NVIDIA GPU
+as its actual OpenGL renderer. This establishes hardware rendering for this
+benchmark, not the renderer of the earlier closed GUI session.
+
+The existing private default validation H5 was opened read-only. Only its first
+magnitude/reference frame, embedded first-frame segmentation, and resolution
+were read. The scene variants were a contour of the segmentation, magnitude
+volume rendering, and orthogonal magnitude slices. This is a display benchmark,
+not a cold-start analysis/segmentation pipeline benchmark.
+
+At a measured 960 x 630 logical-pixel widget, four control groups ran in the
+order full repaint, partial repaint, partial repaint, full repaint. Each group
+started with the same camera and used four warm-up rotations plus 32 measured
+rotations. SSH compression was disabled. Medians below pool the two groups of
+each policy (64 frames); median stage values need not sum to the total median.
+
+| Scene | Full repaint total | Partial repaint total | Full Qt presentation/sync | Partial Qt presentation/sync | Mean painted area after change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Segmentation surface | 30.86 ms | 16.56 ms | 26.22 ms | 9.91 ms | 34.2% |
+| Magnitude volume | 30.40 ms | 18.74 ms | 24.19 ms | 11.07 ms | 40.5% |
+| Orthogonal magnitude slices | 31.80 ms | 17.66 ms | 26.75 ms | 10.47 ms | 37.5% |
+
+GPU render-call medians remained about 2.6-3.8 ms in the full-repaint controls.
+Partial repaint adds about 2 ms of CPU frame comparison while substantially
+reducing Qt/X11 presentation time in these scenes. The total measured frame
+cost fell by 38-46% (1.62-1.86x throughput potential). These are render, capture,
+and synchronized presentation costs, **not** measured monitor FPS or physical
+mouse-to-photon latency. `QApplication.sync()` drains Qt/window-system updates;
+production still coalesces pointer movement at roughly 30 ms and therefore
+does not gain an uncapped frame rate from this change.
+
+`remote_plotter.py` now compares exact RGB pixels in 64-pixel source tiles
+during interaction. Touching changed tiles become a few bounding rectangles,
+mapped conservatively to logical widget coordinates. Qt's backing store keeps
+unchanged areas. Many tiny rectangles performed inconsistently, so components
+are grouped before painting. Changed capture/widget dimensions and stationary
+frames force a full update; unchanged frames need no new paint. A mostly
+changing image falls back to a full repaint. Only the interactive previous
+frame is retained, and release restores the existing native-size/full-quality
+path. No analysis arrays, picking coordinates, or video exports are modified.
+
+Exploratory SSH-compression runs improved the sparse surface but slowed the
+volume; selecting AES-GCM or converting Qt images to RGB32 did not establish a
+consistent improvement. Neither is forced by AutoFlow. TurboVNC/VirtualGL,
+NoMachine, and other remote-desktop alternatives are deployment candidates,
+not measured results from this audit.
+
+Reproduce from the repository root in a forwarded SSH session:
+
+```bash
+conda activate autoflow311
+QT_QPA_PLATFORM=xcb python tools/benchmark_remote_rendering.py \
+  --input /nas-data2/ryy/CMR4DFlow2026/Segdata/qingtian_h5/DV/DV_heart_2026.03.01_B-01220711V013.h5 \
+  --output results/x11_rendering_20261017/compare_x11.json \
+  --sizes 960x630 --frames 32 --compare
+```
+
+Use `QT_QPA_PLATFORM=offscreen` for a server-only control. This helper currently
+expects the validation file's legacy `img_complex`, `segmask`, and `Resolution`
+datasets. It records actual widget and render sizes; a window manager can
+constrain a requested size. Source owners are `ui/remote_plotter.py`,
+`ui/interaction_rendering.py`, and `tools/benchmark_remote_rendering.py`.
+The `--full-repaint` control bypasses the RGB comparison, and `--compare`
+alternates controls within one SSH connection to reduce connection variability.
+
+The retained smoke/phantom suite passed: **263 passed in 52.48 s**. The added
+phantom checks compose partial updates with Qt and compare every output pixel
+against a full repaint at native size, non-integer scaling, downscaling, and
+device-pixel ratio 2, including erasure of old geometry and separate markers.
+Existing drag coalescing and quality/coordinate restoration checks also pass.
+Evidence is in local `results/x11_rendering_20261017/compare_x11.json`,
+`summary.json`, `before_offscreen.json`, and `regression.log`; the exploratory
+run files are separate from the accepted comparison above.
+
+Documentation builds normally. Strict MkDocs validation still reports the
+pre-existing unlisted page `en/developer/pipeline-audit-2026-10-07.md` in the
+repository navigation; this audit did not change that navigation. Logs are
+`results/x11_rendering_20261017/docs_build.log` and `docs_build_nonstrict.log`.

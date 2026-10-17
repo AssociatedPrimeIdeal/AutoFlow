@@ -22,6 +22,7 @@ Find a feature owner here, then use its feature page for algorithms, inputs, out
 | `autoflow/core/pipeline.py` | Step orchestration, geometry/metrics dispatch, dependencies, derived signatures and scene registration. |
 | `autoflow/algorithms/data/__init__.py` | Compatible H5 loader, normalization and orientation entry points. |
 | `autoflow/algorithms/data/h5_loader.py` | H5 layout dispatch and normalized case loading. |
+| `autoflow/algorithms/data/input_parameters.py` | Validate session calibration overrides and map normalized resolution/VENC to source axes before decoding. |
 | `autoflow/algorithms/data/orientation.py` | Spatial-axis and vector-component direction normalization. |
 | `autoflow/algorithms/data/normalization.py` | LoadedCase array layouts, time broadcasting and optional sigma/TKE fields. |
 | `autoflow/algorithms/data/h5_metadata.py` | Key lookup, metadata coercion and supported acquisition groups. |
@@ -62,7 +63,8 @@ Find a feature owner here, then use its feature page for algorithms, inputs, out
 | `autoflow/algorithms/branch.py` | Branch ownership, junctions and branch labels. |
 | `autoflow/algorithms/paths.py` | Ordered/smoothed centreline paths, tangents and flow-direction interpretation. |
 | `autoflow/algorithms/intracranial.py` | Intracranial group topology and Circle of Willis diagnostics. |
-| `autoflow/algorithms/planes.py` | Plane placement, centreline spacing, support validation and contour geometry. |
+| `autoflow/plane_rules.py`, `autoflow/algorithms/label_planes.py` | Default per-label measurements, label-contained candidate segments and explicit selection. |
+| `autoflow/algorithms/planes.py` | Global plane placement, centreline spacing, support validation and contour geometry. |
 | `autoflow/algorithms/metrics/__init__.py` | Compatible metric imports; re-exports the existing entry points and legacy helpers. |
 | `autoflow/algorithms/metrics/sampling.py` | Shared segmentation support meshes, phase/ROI-aware plane geometry and field sampling. |
 | `autoflow/algorithms/metrics/planes.py` | Plane flow/area/velocity integration and isolated-process dispatch. |
@@ -78,6 +80,13 @@ Find a feature owner here, then use its feature page for algorithms, inputs, out
 | `autoflow/algorithms/metrics/_parallel.py` | Plane worker cancellation markers and parent-thread progress collection. |
 | `autoflow/algorithms/pwv.py` | PWV group paths/planes, waveform timing, transit fitting and plots. |
 | `autoflow/algorithms/streamlines.py` | Instantaneous streamlines, plane seeds, temporal VTK pathlines and bounded frame caches. |
+| `autoflow/algorithms/slice_streamlines.py` | In-plane midpoint integration in mm and segment-level clipping/projection of 3D streamline slabs. |
+| `autoflow/ui/display_settings.py` | Unified display dock, grouped controls, scope and saved style defaults. |
+| `autoflow/ui/viewer_display.py` | Per-source/per-view display state, speed-color ranges, legends and layer styles. |
+| `autoflow/rendering/content.py` | Shared 2D/3D scalar Content sources, including optional metrics. |
+| `autoflow/ui/content_rendering.py`, `autoflow/ui/content_controls.py` | Per-Browser volume modes, orthogonal cuts and constrained 3-axis drag handles. |
+| `autoflow/ui/interaction_rendering.py` | Temporary drag sampling and antialiasing policy, with full-quality restoration on release. |
+| `autoflow/ui/scene_layers.py` | Browser selection priority above anatomy, foreground legends, and camera bounds across render layers. |
 | `autoflow/algorithms/surfaces.py` | VTK grids, velocity/field conversion, segmentation surfaces and connected support meshes. |
 | `autoflow/ui/progress.py` | Application-modal animated progress, input lock and close-to-cancel lifecycle. |
 | `autoflow/ui/app.py` | Main Qt window, menus/docks, actions, worker coordination and user workflow. |

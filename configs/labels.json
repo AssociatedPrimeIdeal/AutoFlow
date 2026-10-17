@@ -51,7 +51,7 @@
         "dilation_iters": 0,
         "erosion_iters": 0,
         "opening_iters": 0,
-        "closing_iters": 1
+        "closing_iters": 0
       }
     },
     "pulmonary_arteries": {

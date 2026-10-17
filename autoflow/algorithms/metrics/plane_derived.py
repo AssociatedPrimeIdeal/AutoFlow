@@ -14,7 +14,9 @@ from ._parallel import (
 from .sampling import (
     _build_mask_phase_lookup,
     _build_plane_support_mesh_cache,
-    _get_cached_plane_slice_spec,
+    _get_plane_metric_slice_spec,
+    _add_labeled_plane_support_meshes,
+    _plane_slice_point_mask,
     _plane_roi_point_mask,
     _sample_field_from_slice_spec,
     _target_label_for_plane,
@@ -78,7 +80,9 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
                                     tke_array=None, pressure_gradient_array=None,
                                     relative_pressure_array=None, wss_surfaces=None,
                                     branch_grid=None, mask_phase_lookup=None,
-                                    support_mesh_cache=None, pressure_gradient_support_mask=None):
+                                    support_mesh_cache=None, pressure_gradient_support_mask=None, *,
+                                    segmentation_labels_3d=None, segmentation_labels_4d=None,
+                                    _tke_prepared=False):
     mask4d = _ensure_mask4d(mask4d)
     spacing = np.asarray(spacing, dtype=float).reshape(3)
     origin = np.asarray(origin, dtype=float).reshape(3)
@@ -95,9 +99,9 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
     has_pressure_gradient = pressure_gradient_array is not None
     has_relative_pressure = relative_pressure_array is not None
     has_wss = bool(wss_surfaces)
-    needs_volume_slice = has_tke or has_pressure_gradient or has_relative_pressure
+    needs_volume_slice = has_tke or has_pressure_gradient or has_relative_pressure or has_wss
 
-    if has_tke:
+    if has_tke and not _tke_prepared:
         tke_array = _prepare_tke_array(mask4d, tke_array=tke_array, sigma=None)
     if has_pressure_gradient:
         pressure_gradient_array = np.asarray(pressure_gradient_array, dtype=np.float32)
@@ -117,6 +121,11 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
         mask_phase_lookup = _build_mask_phase_lookup(mask4d) if needs_volume_slice else []
     if support_mesh_cache is None and needs_volume_slice:
         support_mesh_cache = _build_plane_support_mesh_cache(mask4d, mask_phase_lookup, spacing, origin)
+        _add_labeled_plane_support_meshes(
+            support_mesh_cache, mask4d,
+            segmentation_labels_4d if segmentation_labels_4d is not None else segmentation_labels_3d,
+            [plane], spacing, origin,
+        )
     slice_cache = {}
 
     tke_mean_t = []
@@ -147,20 +156,16 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
         areas = np.array([], dtype=float)
         slice_spec = None
         if needs_volume_slice:
-            rep_t = int(mask_phase_lookup[tidx])
-            slice_spec = _get_cached_plane_slice_spec(
-                slice_cache,
-                (rep_t, tidx) if getattr(plane, "roi_edit_operations", {}) else rep_t,
-                mask4d[..., rep_t],
-                plane,
-                spacing,
-                origin,
-                branch_grid=branch_grid,
-                target_label=target_label,
-                select_connected=False,
-                support_mesh=support_mesh_cache.get(rep_t) if support_mesh_cache is not None else None,
-                frame_index=tidx,
+            slice_spec = _get_plane_metric_slice_spec(
+                slice_cache, mask4d, mask_phase_lookup, support_mesh_cache, plane, tidx,
+                spacing, origin, branch_grid=branch_grid, target_label=target_label,
+                segmentation_labels_3d=segmentation_labels_3d,
+                segmentation_labels_4d=segmentation_labels_4d,
             )
+            entry["roi_source_frame"] = np.asarray([
+                -1 if slice_spec is None else slice_spec["roi_source_frame"]], dtype=np.int32)
+            entry["roi_carried_forward"] = np.asarray([
+                False if slice_spec is None else slice_spec["roi_carried_forward"]], dtype=np.uint8)
 
         sampled_pressure_support = None
         if pressure_support is not None and slice_spec is not None:
@@ -266,7 +271,9 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
                     vals = np.asarray(wall.point_data.get("wss", []), dtype=float).reshape(-1)
                     sample_points = np.asarray(wall.points, dtype=float)
                 if len(vals) == len(sample_points):
-                    vals = vals[_plane_roi_point_mask(sample_points, plane, origin)]
+                    selected = _plane_slice_point_mask(sample_points, slice_spec, mask4d.shape[:3], spacing, origin)
+                    selected &= _plane_roi_point_mask(sample_points, plane, origin)
+                    vals = vals[selected]
                 wss_vals = vals[np.isfinite(vals)]
         if wss_vals.size:
             wss_mean_t.append(float(np.mean(wss_vals)))
@@ -306,11 +313,17 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
 def _augment_plane_metrics_serial(plane_metrics, planes, mask4d, spacing, origin, branch_labels_3d=None,
                                  tke_array=None, pressure_gradient_array=None,
                                  relative_pressure_array=None, wss_surfaces=None, progress_callback=None,
-                                 pressure_gradient_support_mask=None):
+                                 pressure_gradient_support_mask=None,
+                                 segmentation_labels_3d=None, segmentation_labels_4d=None):
     mask4d = _ensure_mask4d(mask4d)
     shared_branch_grid = _build_branch_grid(branch_labels_3d, spacing, origin)
     mask_phase_lookup = _build_mask_phase_lookup(mask4d)
     support_mesh_cache = _build_plane_support_mesh_cache(mask4d, mask_phase_lookup, spacing, origin)
+    _add_labeled_plane_support_meshes(
+        support_mesh_cache, mask4d,
+        segmentation_labels_4d if segmentation_labels_4d is not None else segmentation_labels_3d,
+        planes, spacing, origin,
+    )
     metrics = [dict(m) for m in plane_metrics]
     pixelwise = []
     for idx, metric in enumerate(metrics):
@@ -326,7 +339,10 @@ def _augment_plane_metrics_serial(plane_metrics, planes, mask4d, spacing, origin
             branch_grid=shared_branch_grid,
             mask_phase_lookup=mask_phase_lookup,
             support_mesh_cache=support_mesh_cache,
+            _tke_prepared=True,
             pressure_gradient_support_mask=pressure_gradient_support_mask,
+            segmentation_labels_3d=segmentation_labels_3d,
+            segmentation_labels_4d=segmentation_labels_4d,
         )
         metric.update(summary)
         payload["plane_index"] = int(idx)
@@ -334,6 +350,14 @@ def _augment_plane_metrics_serial(plane_metrics, planes, mask4d, spacing, origin
         payload["normal"] = np.asarray(planes[idx].normal, dtype=float).reshape(3).tolist()
         payload["label"] = int(getattr(planes[idx], "label", 0) or 0)
         payload["path_index"] = int(getattr(planes[idx], "path_index", -1))
+        for entry in payload["timepoints"]:
+            t = int(entry["time_index"])
+            sources = metric.get("roi_source_frame_t", [])
+            carried = metric.get("roi_carried_forward_t", [])
+            if t < len(sources):
+                entry["roi_source_frame"] = np.asarray([-1 if sources[t] is None else sources[t]], dtype=np.int32)
+            if t < len(carried):
+                entry["roi_carried_forward"] = np.asarray([carried[t]], dtype=np.uint8)
         pixelwise.append(payload)
         if progress_callback is not None:
             progress_callback({"stage": "plane_derived", "current": idx + 1, "total": len(metrics),
@@ -343,7 +367,8 @@ def _augment_plane_metrics_serial(plane_metrics, planes, mask4d, spacing, origin
 
 def _augment_plane_metrics_chunk(indexed_metrics, planes, mask4d, spacing, origin, branch_labels_3d,
                                  tke_array, pressure_gradient_array, relative_pressure_array, wss_surfaces,
-                                 progress_path, pressure_gradient_support_mask):
+                                 progress_path, pressure_gradient_support_mask,
+                                 segmentation_labels_3d, segmentation_labels_4d):
     indices = [index for index, _metric in indexed_metrics]
     local_planes = [planes[index] for index in indices]
     with task_scope(_PlaneProcessToken(progress_path)):
@@ -352,6 +377,8 @@ def _augment_plane_metrics_chunk(indexed_metrics, planes, mask4d, spacing, origi
             branch_labels_3d, tke_array, pressure_gradient_array, relative_pressure_array, wss_surfaces,
             progress_callback=lambda _payload: _mark_plane_process_progress(progress_path),
             pressure_gradient_support_mask=pressure_gradient_support_mask,
+            segmentation_labels_3d=segmentation_labels_3d,
+            segmentation_labels_4d=segmentation_labels_4d,
         )
     for index, payload in zip(indices, payloads):
         payload["plane_index"] = int(index)
@@ -362,8 +389,11 @@ def augment_plane_metrics_with_derived(plane_metrics, planes, mask4d, spacing, o
                                        tke_array=None, pressure_gradient_array=None,
                                        relative_pressure_array=None, wss_surfaces=None, *,
                                        use_multithread=False, max_workers=None, progress_callback=None,
-                                       pressure_gradient_support_mask=None):
+                                       pressure_gradient_support_mask=None,
+                                       segmentation_labels_3d=None, segmentation_labels_4d=None):
     mask4d = _ensure_mask4d(mask4d)
+    if tke_array is not None:
+        tke_array = _prepare_tke_array(mask4d, tke_array=tke_array)
     count = min(len(plane_metrics), len(planes))
     if max_workers is None:
         max_workers = min(4, count, max(1, os.cpu_count() or 1)) if use_multithread and count * mask4d.shape[3] >= 1920 else 1
@@ -371,7 +401,7 @@ def augment_plane_metrics_with_derived(plane_metrics, planes, mask4d, spacing, o
         return _augment_plane_metrics_serial(
             plane_metrics, planes, mask4d, spacing, origin, branch_labels_3d,
             tke_array, pressure_gradient_array, relative_pressure_array, wss_surfaces, progress_callback,
-            pressure_gradient_support_mask,
+            pressure_gradient_support_mask, segmentation_labels_3d, segmentation_labels_4d,
         )
     import tempfile
     from joblib import Parallel, delayed
@@ -385,7 +415,7 @@ def augment_plane_metrics_with_derived(plane_metrics, planes, mask4d, spacing, o
                 delayed(_augment_plane_metrics_chunk)(
                     indexed[offset::workers], planes, mask4d, spacing, origin, branch_labels_3d,
                     tke_array, pressure_gradient_array, relative_pressure_array, wss_surfaces, progress_path,
-                    pressure_gradient_support_mask,
+                    pressure_gradient_support_mask, segmentation_labels_3d, segmentation_labels_4d,
                 ) for offset in range(workers)
             )
         chunks = _wait_plane_processes(calculate, progress_path, count, progress_callback, stage="plane_derived")

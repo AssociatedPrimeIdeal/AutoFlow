@@ -106,8 +106,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.set_defaults(background_phase_correction=None)
     parser.set_defaults(background_phase_write_cache=None)
 
-    parser.add_argument("--plane-mode", choices=["uniform", "fixed_step", "count", "distance", "anchored_offset"], default=None, help="Plane placement mode.")
-    parser.add_argument("--plane-count", type=int, default=None, help="Plane count; -1 places every position that fits. Symmetric even counts omit the center plane.")
+    parser.add_argument("--plane-mode", choices=["by_label", "uniform", "fixed_step", "count", "distance", "anchored_offset"], default=None, help="Plane placement mode. Default by_label uses one selected label-contained segment per label.")
+    parser.add_argument("--plane-config", default=None, help="Standalone per-label plane JSON shared with the GUI. Missing labels are disabled.")
+    parser.add_argument("--plane-count", type=int, default=None, help="Global plane modes only: plane count; -1 places every position that fits. By-label counts come from planes.label_rules.")
     parser.add_argument("--plane-anchor", choices=["start", "center", "end", "junction"], default=None, help="Anchor for fixed_step placement.")
     parser.add_argument("--plane-direction", choices=["toward_start", "toward_end", "both"], default=None, help="Direction from the anchor.")
     parser.add_argument("--plane-spacing-mode", choices=["distance", "fraction"], default=None, help="Interpret fixed-step spacing as millimetres or a fraction of path length.")
@@ -115,6 +116,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--segmentation-filter", dest="segmentation_filter", action="store_true", help="Restrict each path and its planes/metrics to its topology-aware segmentation label (default).")
     parser.add_argument("--no-segmentation-filter", dest="segmentation_filter", action="store_false", help="Disable topology-aware segmentation path filtering.")
     parser.set_defaults(segmentation_filter=None)
+    parser.add_argument("--fov-boundary-max-fraction", type=float, default=None, help="Omit generated planes when FOV contact length / outer ROI perimeter reaches this fraction (default: 0.25).")
+    parser.add_argument("--no-fov-boundary-filter", dest="fov_boundary_filter", action="store_false", default=None, help="Keep generated planes even when their ROI touches the FOV boundary.")
     parser.add_argument("--plane-offset-mm", type=float, default=None, help="First distance in mm from a graph junction in anchored_offset mode.")
     parser.add_argument("--plane-by-distance", dest="use_center_plane", action="store_false", help="Deprecated compatibility flag. Equivalent to --plane-mode distance.")
     parser.add_argument("--cross-section-dist", type=float, default=None, help="Plane spacing in mm when using distance spacing mode.")
@@ -147,13 +150,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-cc-volume", type=float, default=None, help="Minimum component volume in mm^3 when removal is enabled.")
     parser.add_argument("--cc-filter-mode", choices=["absolute", "relative", "hybrid", "largest"], default=None, help="Connected-component filtering mode used during skeleton preprocessing.")
     parser.add_argument("--cc-rel-min-ratio", type=float, default=None, help="Relative component threshold ratio against the largest connected component when using relative or hybrid filtering.")
+    parser.add_argument("--graph-connectivity", type=int, choices=[6, 26], default=None,
+                        help="Skeleton graph neighbors: 26 including edges/corners (default), or 6 face neighbors.")
     parser.add_argument(
         "--min-edge-points",
         "--min-edge-count",
         dest="min_edge_points",
         type=int,
         default=None,
-        help="Minimum number of graph edge segments in a terminal branch; shorter endpoint spurs are removed (default: 3).",
+        help="Minimum number of graph edge segments in a terminal branch; shorter endpoint spurs are removed (default: 5).",
     )
 
     parser.add_argument("--seed-ratio", type=float, default=None, help="Seed ratio for streamline rendering.")
@@ -237,7 +242,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
+def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     config = AutoFlowConfig.from_config_dir(args.config_dir, inputs=args.inputs)
@@ -278,6 +283,7 @@ def main() -> None:
         "dicom_backend": args.dicom_backend,
         "dicom_h5_dir": args.dicom_h5_dir,
         "plane_mode": args.plane_mode,
+        "plane_config": args.plane_config,
         "plane_count": args.plane_count,
         "use_center_plane": args.use_center_plane,
         "cross_section_dist": args.cross_section_dist,
@@ -289,12 +295,15 @@ def main() -> None:
         "plane_spacing_mode": args.plane_spacing_mode,
         "plane_spacing_ratio": args.plane_spacing_ratio,
         "segmentation_filter": args.segmentation_filter,
+        "fov_boundary_filter": args.fov_boundary_filter,
+        "fov_boundary_max_fraction": args.fov_boundary_max_fraction,
         "min_cc_volume": args.min_cc_volume,
         "special_handling": args.special_handling,
         "separate_special_label_contacts": args.separate_special_label_contacts,
         "cc_filter_mode": args.cc_filter_mode,
         "cc_rel_min_ratio": args.cc_rel_min_ratio,
         "min_edge_points": args.min_edge_points,
+        "graph_connectivity": args.graph_connectivity,
         "seed_ratio": args.seed_ratio,
         "tube_radius": args.tube_radius,
         "pressure_method": args.pressure_method,
@@ -326,6 +335,9 @@ def main() -> None:
     for key, value in overrides.items():
         if value is not None:
             setattr(config, key, value)
+
+    if args.plane_config is not None:
+        config.plane_label_rules = None
 
     if args.skip_derived:
         config.skip_derived = True
@@ -366,8 +378,9 @@ def main() -> None:
                            velocity_std_max=config.noise_velocity_std_max)
     except ValueError as exc:
         parser.error(str(exc))
-    run_batch(config)
+    results, _ = run_batch(config)
+    return 0 if results and all(item.get("status") == "ok" for item in results) else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

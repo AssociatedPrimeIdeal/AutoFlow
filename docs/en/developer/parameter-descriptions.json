@@ -48,16 +48,17 @@
       "write_output": "Write phase_unwrap.npz when phase recovery runs; has no effect when the method is disabled or DV input skips recovery."
     },
     "skeleton": {
-      "remove_small_cc": "Filter small connected components before skeletonization.",
+      "remove_small_cc": "Filter merged-group components after morphology in the voted topology, and independently per temporal frame without skeleton morphology.",
       "special_handling": "Special systemic-branch strategy: three_pass_merge separates and merges branch skeleton passes; other supported modes are described in the skeleton guide.",
       "special_merge_radius_mm": "Maximum physical distance in mm for joining the special-handling skeleton passes.",
       "separate_special_label_contacts": "Separate configured special labels where they touch before skeleton generation.",
       "special_contact_labels": "Anatomical label names subject to the contact-separation rule; resolve IDs through labels.label_map.",
       "min_cc_volume_mm3": "Absolute connected-component volume threshold in cubic millimetres.",
-      "cc_filter_mode": "Component retention rule: absolute, relative or hybrid combines physical volume and a fraction of the largest component.",
-      "cc_rel_min_ratio": "Smallest retained component as a fraction of the largest component in relative/hybrid filtering.",
-      "min_edge_points": "Minimum graph-edge point count retained during graph cleanup; controls short terminal-edge removal.",
-      "do_closing": "Legacy Boolean binary-closing switch used in default preprocessing.",
+      "cc_filter_mode": "Component retention after group morphology: hybrid (default) keeps volumes at least max(50 mm3, 10% of the largest); largest explicitly keeps one. Temporal group masks are filtered per frame.",
+      "cc_rel_min_ratio": "Smallest retained component as a fraction of the largest in relative/hybrid filtering; default 0.10.",
+      "min_edge_points": "Minimum retained terminal-branch length in graph edges; default 5 removes one-to-four-edge endpoint arms.",
+      "graph_connectivity": "Skeleton graph neighbors: 26 including edges and corners (default), or 6 face neighbors. Separate from preprocessing component filtering.",
+      "do_closing": "Boolean binary-closing switch, off by default; explicit closing_iters also defaults to zero.",
       "do_opening": "Legacy Boolean binary-opening switch used in default preprocessing.",
       "gaussian_sigma": "Gaussian mask smoothing width in voxels before binary thresholding.",
       "gaussian_enabled": "Enable Gaussian mask smoothing; per-group overrides in labels.label_groups can replace this value.",
@@ -74,7 +75,9 @@
       "label_groups": "Named group definitions containing member labels, colours and optional preprocessing overrides; each group is processed independently."
     },
     "planes": {
-      "plane_mode": "Placement rule: count, distance, anchored_offset, uniform or fixed_step. Controls which spacing/anchor parameters are active.",
+      "label_rules_file": "Shared external complete measurement list; relative paths in planes.json resolve against the module directory.",
+      "label_rules": "Complete per-label positions on shared observed label connections or explicit path properties, including declared fallbacks only for unconnected components. Missing labels mean zero; missing or unsupported positions are reported in QC.",
+      "plane_mode": "Placement rule: by_label (default), count, distance, anchored_offset, uniform or fixed_step. By-label placement uses label_rules; global placement fields apply only to other modes.",
       "plane_count": "Number of planes in count/fixed-step placement; -1 requests all available valid locations where supported.",
       "cross_section_distance": "Physical separation in mm used by distance/fixed-step layouts.",
       "start_distance": "Millimetres trimmed from the start of each usable path before plane placement.",
@@ -85,6 +88,8 @@
       "spacing_mode": "Anchor-layout spacing interpretation: distance in mm or fraction of usable path length.",
       "spacing_ratio": "Dimensionless usable-path-length fraction between anchored planes when spacing_mode=fraction.",
       "segmentation_filter": "Discard candidate planes whose centreline location lacks compatible segmentation support.",
+      "fov_boundary_filter": "Enable FOV-boundary filtering of generated planes independently of branch filtering.",
+      "fov_boundary_max_fraction": "Omit a generated plane when contact length on the image box faces / outer ROI perimeter reaches this fraction; uses temporal-union geometry.",
       "smoothing_window": "Savitzky-Golay window length for centreline smoothing; must admit the selected polynomial order.",
       "smoothing_polyorder": "Polynomial degree of centreline Savitzky-Golay smoothing.",
       "inter_time": "Centreline interpolation density multiplier; increases resampled path points before plane generation.",
@@ -478,7 +483,15 @@
     },
     "plane_mode": {
       "path": "planes.plane_mode",
-      "effect": "Placement rule: count, distance, anchored_offset, uniform or fixed_step. Controls which spacing/anchor parameters are active."
+      "effect": "Placement rule: by_label (default), count, distance, anchored_offset, uniform or fixed_step. By-label placement uses label_rules; global placement fields apply only to other modes."
+    },
+    "plane_config": {
+      "path": "planes.label_rules_file",
+      "effect": "Shared external complete measurement list used by CLI and GUI; missing labels are disabled."
+    },
+    "plane_label_rules": {
+      "path": "planes.label_rules",
+      "effect": "Complete connection/path placement plans; positive counts match primary declared positions, while actual counts depend on connected arms and explicit unconnected fallbacks. Missing or unsupported positions are reported in QC."
     },
     "plane_count": {
       "path": "planes.plane_count",
@@ -520,13 +533,21 @@
       "path": "planes.segmentation_filter",
       "effect": "Discard candidate planes whose centreline location lacks compatible segmentation support."
     },
+    "fov_boundary_filter": {
+      "path": "planes.fov_boundary_filter",
+      "effect": "Enable FOV-boundary filtering of generated planes independently of branch filtering."
+    },
+    "fov_boundary_max_fraction": {
+      "path": "planes.fov_boundary_max_fraction",
+      "effect": "Omit a generated plane when contact length on FOV faces / outer ROI perimeter reaches this fraction."
+    },
     "use_center_plane": {
       "path": "planes.use_center_plane",
       "effect": "Legacy centre-plane override for older layouts; None leaves the configured layout unchanged. Prefer fixed_step anchor/direction/spacing controls."
     },
     "remove_small_cc": {
       "path": "skeleton.remove_small_cc",
-      "effect": "Filter small connected components before skeletonization."
+      "effect": "Filter merged-group components after morphology in the voted topology, and independently per temporal frame without skeleton morphology."
     },
     "special_handling": {
       "path": "skeleton.special_handling",
@@ -550,15 +571,19 @@
     },
     "cc_filter_mode": {
       "path": "skeleton.cc_filter_mode",
-      "effect": "Component retention rule: absolute, relative or hybrid combines physical volume and a fraction of the largest component."
+      "effect": "Component retention after group morphology: hybrid (default) keeps volumes at least max(50 mm3, 10% of the largest); largest explicitly keeps one. Temporal group masks are filtered per frame."
     },
     "cc_rel_min_ratio": {
       "path": "skeleton.cc_rel_min_ratio",
-      "effect": "Smallest retained component as a fraction of the largest component in relative/hybrid filtering."
+      "effect": "Smallest retained component as a fraction of the largest in relative/hybrid filtering; default 0.10."
     },
     "min_edge_points": {
       "path": "skeleton.min_edge_points",
-      "effect": "Minimum graph-edge point count retained during graph cleanup; controls short terminal-edge removal."
+      "effect": "Minimum retained terminal-branch length in graph edges; default 5 removes one-to-four-edge endpoint arms. Junction-to-junction links are retained."
+    },
+    "graph_connectivity": {
+      "path": "skeleton.graph_connectivity",
+      "effect": "Skeleton graph adjacency: 26 including edges/corners (default), or 6 face neighbors. Applies to grouped, joint cerebral, Willis and PWV graph generation."
     },
     "seed_ratio": {
       "path": "streamlines.seed_ratio",

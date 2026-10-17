@@ -1,0 +1,2 @@
+# Build tools only; do not install into the portable application runtime.
+mkdocs-material==9.7.7

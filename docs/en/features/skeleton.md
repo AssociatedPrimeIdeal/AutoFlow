@@ -16,12 +16,18 @@ See [Scientific references: centerline](../references/index.md#centerline-skelet
 For grouped multi-label segmentations, AutoFlow now:
 
 1. reduces 4D labels to 3D by majority vote along time
-2. removes small connected components per label when enabled
-3. merges labels into configured groups from `configs/labels.json`
-4. filters grouped components with the configured connected-component rule, which defaults to `hybrid = max(min_cc_volume_mm3, cc_rel_min_ratio * largest_component_volume_mm3)`
-5. applies per-group preprocessing
-6. applies the configured special-label handling for groups containing at least two special labels
+2. merges labels into configured groups from `configs/labels.json`
+3. applies per-group dilation, erosion, closing, opening, and Gaussian smoothing when enabled; closing is off by default (`do_closing=false`, `closing_iters=0`, including the aorta override)
+4. applies optional special-label contact separation before component selection
+5. filters connected components last: the default `hybrid` rule retains every merged-group component with volume at least `max(50 mm³, 0.10 × largest component volume)`
+6. applies the same volume rule independently to every 4D group frame for phase-dependent metrics, without skeleton morphology or cropping to the static majority mask
 7. skeletonizes each group separately
+
+Component connectivity uses the existing 6-neighbour (face-connected) rule. Attached small labels survive as part of the retained group. Disconnected left/right vessels both survive when each meets the volume threshold; components below it are removed. Explicit `cc_filter_mode=largest` still retains only one component. Source labels are never expanded into voxels added by morphology. Component decisions are projected back onto their original source support, so ordinary erosion does not silently shrink the labels used to classify paths. The optional segmentation-stage `cleanup_4d_components` setting remains a separate, explicitly enabled per-label cleanup.
+
+Skeletonization follows preprocessing, and graph construction follows skeletonization. Morphology changes the group binary mask, while label attribution uses the source label volume. A skeleton junction on a newly filled voxel can therefore be connected in the graph yet have source label `0`; clipping paths to one label can lose that junction and create apparent extra roots. Moving component filtering last cannot remove such a voxel if it belongs to a retained component. Closing is disabled by default; no graph connections are added to repair these junctions.
+
+Preprocessing records every input label in `Workspace.segmentation_preprocess_qc`, including labels that disappear before groups are built. [QC](quality-control.md#temporal-label-voting-and-preprocessing) distinguishes optional 4D cleanup, temporal voting, merged-group component removal, and skeleton-mask preprocessing. Expand `Temporal label voting` by label and phase to inspect partial-loss fractions, overlap, gains, and winning labels. Phase loss divides by that phase's voting-input label count; union loss divides by the label's spatial union, counting each location once. Absent-phase fractions are `N/A`. These phase-to-static-topology differences can reflect motion and are separate from actual losses in the downstream temporal group masks.
 
 The built-in label groups keep the non-cranial workflows unchanged. Cranial
 labels are organized as `intracranial_anterior_arteries` (`LICA`, `RICA`,
@@ -38,6 +44,11 @@ anterior and vertebrobasilar graphs separate.
 
 `special_handling` selects the special-label strategy. `three_pass_merge` (the
 default) skeletonizes `A+B`, `A+C`, and so on, then merges nearby points.
+Each pass excludes the other configured special labels after morphology and
+before its final component filter. This prevents closing or dilation from growing back into a
+neighbouring special branch and creating false loops, short tails, or a lost
+branch endpoint during graph cleanup. Morphology still applies to the shared
+trunk and background; the original segmentation labels remain unchanged.
 `contact_surface` keeps the previous contact-surface separation algorithm.
 
 Graph paths derived from the skeleton are split at graph nodes with degree
@@ -46,8 +57,18 @@ directions. Flow is sampled on the segmentation-filtered path geometry to
 orient each path and assign incoming/outgoing roles after topology has been
 established.
 
+Before path extraction, an isolated triangular junction with at least three
+distinct external neighbors is contracted to the physical-coordinate centroid
+of its three graph points. Existing external edges are remapped to that point;
+there is no new neighbor search. This replaces the earlier triangle-edge
+deletion that could create a local gap despite a long alternate route. Original
+skeleton points and masks are preserved. Overlapping triangles, closed rings
+and contractions that would merge distinct external edges are retained; see
+[Graph and paths](graph-paths.md) for the scope and centroid limitations.
+
 During graph generation, terminal branches shorter than `min_edge_points` graph
-edge segments are removed. The default is `3`; set it to `0` or `1` to disable
+edge segments are removed. The default is `5`: arms with one to four edges
+are removed, while a five-edge arm is retained. Set it to `0` or `1` to disable
 this cleanup. This filters graph edges and derived paths while leaving the
 original skeleton mask and points available for inspection.
 
@@ -62,7 +83,7 @@ Regenerating the skeleton clears the previous graph, paths, planes, plane measur
 
 ### GUI
 1. load or create segmentation
-2. click `Generate Skeleton`
+2. right-click `Generate Skeleton` for cleanup and smoothing settings, then Save and run. Filter thresholds and Gaussian sigma appear only when applicable
 3. inspect grouped skeleton points in the browser and 3D view
 4. optionally click `Edit Skeleton` when exactly one segmentation group is active
 
@@ -123,6 +144,7 @@ score.
 | Change you want | Edit here | Also check | Tests |
 | --- | --- | --- | --- |
 | preprocessing before skeletonization | `autoflow/algorithms/preprocess.py` | `autoflow/core/models.py`, `autoflow/config.py` | `tests/test_smoke_phantoms.py` |
+| label and phase loss provenance | `autoflow/algorithms/preprocess_qc.py` | `autoflow/core/pipeline.py`, `autoflow/quality_exclusions.py` | `tests/test_smoke_phantoms.py` |
 | grouped skeleton pipeline flow | `autoflow/core/pipeline.py` | `autoflow/algorithms/skeleton.py` | `tests/test_smoke_phantoms.py` |
 | Willis-ring topology check | `autoflow/algorithms/intracranial.py`, `autoflow/core/pipeline.py` | `autoflow/core/models.py`, `autoflow/ui/viewer.py` | `tests/test_smoke_phantoms.py` |
 | short terminal branch cleanup | `autoflow/algorithms/graph.py` | `autoflow/core/pipeline.py`, `autoflow/core/models.py` | `tests/test_smoke_phantoms.py` |
@@ -131,6 +153,9 @@ score.
 
 ## Tests
 - `/home/renyuyang/miniconda3/envs/autoflow311/bin/python -m pytest tests/test_smoke_phantoms.py -q`
+- The close-branch phantom checks that closing and dilation cannot reintroduce
+  excluded special labels into a per-pass skeleton input, and that the source
+  segmentation remains unchanged.
 
 ## Common problems
 

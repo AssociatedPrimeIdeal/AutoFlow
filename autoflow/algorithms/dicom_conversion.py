@@ -48,6 +48,9 @@ def convert_dicom_input(dicom_directory, output_h5, progress_callback=None):
         if progress_callback:
             progress_callback({"message": "Converting DICOM to H5...", "current": 0, "total": 0})
         converter.convert_dicom_to_h5(str(root), temporary)
+        check_cancelled()
+        if progress_callback:
+            progress_callback({"message": "Validating converted H5 geometry and calibration...", "current": 0, "total": 0})
         report = converter.validate_native_h5(temporary)
         if not report.get("valid") or not report.get("groups"):
             raise ValueError(f"Dicom2H5 produced no valid flow cases: {report.get('errors', [])}")

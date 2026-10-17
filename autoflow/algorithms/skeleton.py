@@ -73,8 +73,8 @@ def generate_three_pass_special_skeleton(
 
     ``A`` is every label in ``group_label_values`` except the configured
     special labels.  Each pass uses the normal AutoFlow preprocessing and
-    voxel skeletonizer.  The returned mask is the union of the three pass
-    skeleton masks so graph construction can use the same topology.
+    voxel skeletonizer, but cannot grow back into an excluded special label.
+    The returned mask is the union of the per-pass skeleton masks.
     """
     labels = np.asarray(label_mask_3d)
     if labels.ndim != 3:
@@ -93,10 +93,18 @@ def generate_three_pass_special_skeleton(
 
     pass_points = []
     merged_mask = np.zeros(labels.shape, dtype=bool)
+    special_regions = np.isin(labels, special_values)
     for special_value in special_values:
         pass_values = base_values + [special_value]
         union_mask = np.isin(labels, pass_values)
-        processed = preprocess_mask_for_skeleton(union_mask, params, resolution=resolution)
+        # Closing can fill a narrow gap with voxels belonging to another
+        # special branch. Reapplying the exclusion after morphology keeps
+        # A+B independent of C/D and prevents false loops and terminal spurs
+        # when the per-pass skeletons are merged into a neighbouring graph.
+        excluded = special_regions & (labels != special_value)
+        processed = preprocess_mask_for_skeleton(
+            union_mask, params, resolution=resolution,
+            post_morphology=lambda mask: mask & ~excluded)
         points, skeleton_mask = generate_skeleton_from_mask3d(processed, resolution)
         if len(points):
             pass_points.append(np.asarray(points, dtype=float))

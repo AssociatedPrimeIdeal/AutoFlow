@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 import numpy as np
 from scipy.ndimage import label as ndi_label
 
+from .quality_exclusions import build_exclusion_checks
+
 
 QUALITY_REPORT_SCHEMA = "autoflow.quality.v1"
 
@@ -308,6 +310,8 @@ def _flow_hierarchy_report(workspace):
     path_ids = sorted(path_ids)
     owner_label = _path_owner_labels(workspace, metrics_by_path, path_ids)
     reverse_labels = _label_names(workspace)
+    graph_topology = {int(record["path_index"]): record for record in
+                      dict(getattr(workspace, "graph_hierarchy", {}) or {}).get("paths", [])}
     group_for_path = {}
     for path_index in path_ids:
         info = path_info[path_index] if 0 <= path_index < len(path_info) else {}
@@ -393,6 +397,9 @@ def _flow_hierarchy_report(workspace):
     parent_of = {}
     for child, candidates in parent_candidates.items():
         parent_of[child] = sorted(set(candidates), key=lambda value: (-sort_flow(value), value))[0]
+    if graph_topology:
+        parent_of = {path_index: record["display_parent_path_index"] for path_index, record in graph_topology.items()
+                     if path_index in path_ids and record.get("display_parent_path_index") in path_ids}
 
     # A directed cycle is not a valid report tree.  Preserve every path and
     # break the first cyclic parent link deterministically into another root.
@@ -427,6 +434,11 @@ def _flow_hierarchy_report(workspace):
             return
         display_names[path_index] = str(name)
         levels[path_index] = int(level)
+        if path_index in graph_topology:
+            record = graph_topology[path_index]
+            levels[path_index] = record["group_level"]
+            grade = record["group_level"] if record["group_level"] is not None else "?"
+            display_names[path_index] = f"{'/'.join(record['label_names']) or label_name(path_index)} · G{grade} · Path {path_index}"
         for sibling_index, child in enumerate(children_of.get(path_index, []), start=1):
             suffix = (
                 str(sibling_index)
@@ -435,7 +447,8 @@ def _flow_hierarchy_report(workspace):
             )
             assign_names(child, f"{name}{suffix}", int(level) + 1)
 
-    label_keys = sorted(roots_by_label, key=lambda item: (item[0] <= 0, item[0], item[1].casefold()))
+    label_keys = sorted({(int(owner_label.get(i, 0)), label_name(i)) for i in path_ids},
+                        key=lambda item: (item[0] <= 0, item[0], item[1].casefold()))
     for _label_value, name in label_keys:
         roots = roots_by_label[(_label_value, name)]
         for root_index, path_index in enumerate(roots, start=1):
@@ -470,8 +483,11 @@ def _flow_hierarchy_report(workspace):
             "label_id": int(owner_label.get(path_index, 0) or 0),
             "label_name": label_name(path_index),
             "group_name": group_for_path.get(path_index, ""),
+            "subgroup_id": graph_topology.get(path_index, {}).get("subgroup_id"),
+            "subgroup_index": graph_topology.get(path_index, {}).get("subgroup_index"),
             "path_index": int(path_index),
-            "branch_level": int(levels.get(path_index, 0)),
+            "branch_level": levels.get(path_index, 0),
+            "graph_topology": dict(graph_topology.get(path_index, {})),
             "parent_path_index": int(parent_of[path_index]) if path_index in parent_of else None,
             "statistics": path_stats[path_index],
             "internal_consistency": _json_value(path_ic.get(str(path_index))),
@@ -521,6 +537,10 @@ def _flow_hierarchy_report(workspace):
             "consistency": "0-1",
         },
         "labels": label_summaries,
+        "subgroups": [{**subgroup, "root_path_indices": [root["path_index"] for root in roots
+                       if root.get("subgroup_id") == subgroup["subgroup_id"]]}
+                      for group in dict(getattr(workspace, "graph_hierarchy", {}) or {}).get("groups", [])
+                      for subgroup in group.get("subgroups", [])],
         "junctions": junctions,
         "roots": roots,
     }
@@ -529,6 +549,8 @@ def _flow_hierarchy_report(workspace):
 def build_quality_report(workspace, source_path="", run_context=None):
     ws = workspace
     checks = []
+    exclusion_checks, exclusions = build_exclusion_checks(ws, _check)
+    checks.extend(exclusion_checks)
     flow_hierarchy = _flow_hierarchy_report(ws)
     flow = getattr(ws, "flow_raw", None)
     mag = getattr(ws, "mag_raw", None)
@@ -690,6 +712,19 @@ def build_quality_report(workspace, source_path="", run_context=None):
             action="Review short branches, disconnected segments, and loops before trusting downstream planes." if topology_status != "pass" else "",
         ))
 
+    hierarchy = dict(getattr(ws, "graph_hierarchy", {}) or {})
+    hierarchy_paths = list(hierarchy.get("paths", []))
+    if hierarchy_paths:
+        unresolved = [record["path_index"] for record in hierarchy_paths if record.get("group_level") is None]
+        conflicts = [dict(group_name=group["group_name"], node=junction["node"])
+                     for group in hierarchy.get("groups", []) for junction in group.get("junctions", [])
+                     if junction.get("kind") == "direction_conflict"]
+        checks.append(_check("centerline.hierarchy", "Centerline & Planes", "warn" if unresolved or conflicts else "pass",
+            "Group flow topology", f"{len(hierarchy_paths) - len(unresolved)}/{len(hierarchy_paths)} paths ranked; {len(conflicts)} direction conflicts",
+            value={"unresolved_path_indices": unresolved, "direction_conflicts": conflicts,
+                   "details_ref": "graph_hierarchy"}, threshold="reliable rooted direction or an explicitly marked loop",
+            action="Review flow direction, disconnected segmentation, junctions and scan boundaries; unknown grades remain undefined." if unresolved or conflicts else ""))
+
     if not list(getattr(ws, "planes", []) or []):
         checks.append(_check(
             "planes.geometry",
@@ -847,6 +882,8 @@ def build_quality_report(workspace, source_path="", run_context=None):
         "status_counts": status_counts,
         "checks": checks,
         "flow_hierarchy": flow_hierarchy,
+        "graph_hierarchy": dict(getattr(ws, "graph_hierarchy", {}) or {}),
+        "exclusions": _json_value(exclusions),
         "run_context": _json_value(dict(run_context or {})),
         "interpretation": "Automated engineering QC for review prioritization; it is not clinical validation or a diagnostic conclusion.",
     }

@@ -1,0 +1,10 @@
+.md-typeset .autoflow-mermaid {
+  background: transparent;
+  padding: 0;
+  text-align: center;
+}
+
+.md-typeset .autoflow-mermaid svg {
+  max-width: 100%;
+  height: auto;
+}

@@ -1,5 +1,7 @@
 # Feature: Offline Videos
 
+The [full Windows portable distribution](../user/windows-portable.md) includes this feature and its optional runtime dependencies. GPU-only backends still require compatible NVIDIA hardware and drivers.
+
 ## Status
 
 | Entry point | Status | Notes |
@@ -10,6 +12,8 @@
 
 ## What It Does
 Offline video rendering exports rotating or time-resolved MP4 files for planes, WSS, TKE, pressure gradient, relative pressure, and streamlines. In grouped vessel workflows, plane videos render each segmentation group as a colored translucent vessel surface, then overlay its configured skeleton and centerline colors from `configs/labels.json`; the plane colors come from the same group configuration. Plane rotation videos annotate `planeidx=<index>` by default so the rendered label matches the saved plane index, and `configs/video_exporting.json -> plane_video.label` controls the label prefix, font size, text color, and label background styling. GUI and offline movies share a deep navy background, edge smoothing, matte anatomical surfaces, unlit quantitative colours and one colourbar layout. WSS uses `turbo`; TKE uses `inferno`; pressure gradient uses `magma`; relative pressure uses `RdBu_r`; velocity uses `turbo`. WSS, TKE and pressure movies render their metric geometry without an extra white vessel shell. Invalid WSS probes are transparent gaps, retaining their NaNs and `wss_valid` flags; they are never displayed as measured zero shear. Frames are encoded as they are rendered; exports do not retain the full RGB frame sequence. Complete MP4s replace the destination atomically, retaining an existing complete video on encoding failure or cancellation. Dynamic exports cache per-timepoint streamline polylines and sampled WSS, TKE or pressure meshes. Streamline phases are prepared in parallel, identical pressure-support phases share one smoothed surface, and VTK actors stay attached while their mapper input and camera are updated for each frame.
+
+Movies use a fixed-margin caption in the same foreground colour as the GUI: the feature title and current phase appear at the upper left, with rotation and export-frame progress at the lower left. Phase ordinals start at 1 (the GUI time index starts at 0). When the workspace has a finite positive RR, the caption adds cycle time in milliseconds using `phase_index * RR / phase_count`; this is acquisition-cycle time, independent of video FPS and repeated export frames. Missing or invalid RR omits milliseconds. Plane overviews have no changing acquisition phase and show only the title and export progress. Caption actors persist for the whole export; only their text changes. For canvases smaller than the default 1600 x 1200, caption padding and font sizes scale down proportionally once at export setup; the default layout is unchanged, and positions and sizes stay fixed throughout the movie.
 
 ## When To Use It
 - use it for reports, demos, or review packages
@@ -72,6 +76,8 @@ TKE movies use the same padded voxel-centre volume and transparent-background op
 
 Direct renderer calls use explicit `*_clim` arguments first, then the current scene limits, then workspace rendering settings, then the automatic data range. This keeps direct Python exports consistent with the GUI while preserving an explicit export override.
 
+The `dynamic_time_repeat` value holds **each** cardiac phase for that many consecutive export frames. A fixed-camera movie contains one complete cycle (`phase_count * dynamic_time_repeat` frames); rotating movies cycle through the same phase schedule until their configured rotation duration is filled.
+
 ## Outputs
 
 | Output file | Created when | Meaning |
@@ -101,6 +107,7 @@ GUI process isolation and task cleanup are owned by `autoflow/rendering/jobs.py`
 | --- | --- | --- | --- |
 | shared styling and metric geometry | defaults: `autoflow/config.py`; VTK styling: `autoflow/rendering/style.py`; geometry: `autoflow/rendering/datasets.py` | `autoflow/ui/viewer.py`, `autoflow/ui/ortho_viewer.py` | `tests/test_smoke_phantoms.py`; GUI/video visual verification |
 | video rendering logic | `autoflow/rendering/videos.py` | `autoflow/processing.py` | `tests/test_smoke_phantoms.py` |
+| movie captions and phase/time display | `autoflow/rendering/video_layout.py` | `autoflow/rendering/videos.py`, shared foreground colours in `autoflow/rendering/style.py` | manual first/middle-frame visual verification |
 | GUI video export wiring | `autoflow/ui/app.py` | `autoflow/rendering/videos.py`, `autoflow/config.py` | GUI manual verification |
 | CLI or API video flags | `autoflow/cli.py`, `autoflow/api.py` | `autoflow/config.py` | `tests/test_smoke_phantoms.py` |
 

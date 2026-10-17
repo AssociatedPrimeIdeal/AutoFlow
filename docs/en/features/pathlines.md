@@ -14,7 +14,7 @@ Use to review time-dependent transport from one plane, selected planes or all pl
 
 ## Quick use
 
-GUI: generate planes, then choose **Pathlines**, a plane context-menu action, or **Hemodynamics → Run All**. Repeated requests select/reuse existing trajectories; unchanged planes accumulate pathlines. Use timeline playback, Browser visibility/opacity and **Set Pathline Color**.
+GUI: generate planes, right-click **Pathlines** to edit Integration and Display settings, then Save and run. Ratio fields appear only for ratio seeding, and uniform color only for uniform coloring. Alternatively choose a plane context-menu action, or **Hemodynamics → Run All**. Repeated requests select/reuse existing trajectories; unchanged planes accumulate pathlines. Use timeline playback, Browser visibility/opacity and **Set Pathline Color**.
 
 CLI: no public pathline export command. [Streamline video](streamlines.md) is available for instantaneous trajectories.
 

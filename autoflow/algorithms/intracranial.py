@@ -47,6 +47,7 @@ def detect_willis_ring(
     anterior_label_values=(),
     posterior_label_values=(),
     candidate_mask=None,
+    connectivity=26,
 ):
     """Return a conservative topology report for a Willis ring candidate.
 
@@ -76,7 +77,7 @@ def detect_willis_ring(
         component_points, _ = generate_skeleton_from_mask3d(component_mask, spacing)
         if len(component_points) == 0:
             continue
-        component_graph = build_graph_from_points(component_points, spacing)
+        component_graph = build_graph_from_points(component_points, spacing, connectivity=connectivity)
         point_chunks.append(np.asarray(component_points, dtype=float))
         if len(component_graph.edges):
             edge_chunks.append(np.asarray(component_graph.edges, dtype=int) + int(point_offset))

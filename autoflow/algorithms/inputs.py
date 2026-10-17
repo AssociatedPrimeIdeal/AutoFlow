@@ -101,6 +101,8 @@ def load_input_data(
     dicom_backend="dicom2h5",
     dicom_h5_dir="",
     reuse_existing_corr=False,
+    preserve_source_sigma=False,
+    parameter_overrides=None,
 ):
     """Load normalized H5 data; DICOM decoding belongs to Dicom2H5."""
     case = resolve_input_case(input_source, dicom_backend, dicom_h5_dir)
@@ -113,6 +115,8 @@ def load_input_data(
         ignore_embedded_segmentation=ignore_embedded_segmentation,
         dual_venc_mode=dual_venc_mode,
         reuse_existing_corr=reuse_existing_corr,
+        preserve_source_sigma=preserve_source_sigma,
+        parameter_overrides=parameter_overrides,
     )
     if case.metadata.get("dicom_backend"):
         loaded.metadata.update({

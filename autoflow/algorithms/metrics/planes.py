@@ -17,7 +17,7 @@ from .sampling import (
     _add_labeled_plane_support_meshes,
     _build_mask_phase_lookup,
     _build_plane_support_mesh_cache,
-    _get_cached_plane_slice_spec,
+    _get_plane_metric_slice_spec,
     _sample_field_from_slice_spec,
     _target_label_for_plane,
 )
@@ -131,58 +131,19 @@ def _compute_single_plane_metric(args):
     meanv_fwd_t = []     
     meanv_rev_t = []     
     slice_cache = {}
-    labels4d_arr = None if segmentation_labels_4d is None else np.asarray(segmentation_labels_4d)
-    labels3d_arr = None if segmentation_labels_3d is None else np.asarray(segmentation_labels_3d)
+    roi_source_frame_t = []
+    roi_carried_forward_t = []
 
     for t in range(Nt):
         check_cancelled()
-        rep_t = int(mask_phase_lookup[t]) if mask_phase_lookup else int(t)
-        mask_t = mask_template if mask_template is not None else mask[..., rep_t]
-        plane_seg_label = int(getattr(plane, "segmentation_label", 0) or 0)
-        mask_t = np.asarray(mask_t, dtype=bool)
-        label_support = None
-        if plane_seg_label > 0 and support_mesh_cache is not None:
-            label_support = support_mesh_cache.get(
-                ("seg4d", int(t), plane_seg_label) if segmentation_labels_4d is not None
-                else ("seg3d", rep_t, plane_seg_label)
-            )
-        if plane_seg_label > 0:
-            # Prefer phase-specific labels when available, while retaining
-            # the legacy 3-D label behavior for older workspaces and H5
-            # inputs that do not carry a 4-D label sequence.
-            if labels4d_arr is not None and labels4d_arr.ndim == 4 and labels4d_arr.shape[:3] == mask_t.shape[:3]:
-                if label_support is None:
-                    mask_t = mask_t & (labels4d_arr[..., int(t)] == plane_seg_label)
-            elif labels3d_arr is not None:
-                labels3d = labels3d_arr[..., 0] if labels3d_arr.ndim == 4 else labels3d_arr
-                if labels3d.shape == mask_t.shape[:3] and label_support is None:
-                    mask_t = mask_t & (labels3d == plane_seg_label)
-        frame_specific_roi = bool(getattr(plane, "roi_edit_operations", {}) or {})
-        frame_specific_labels = plane_seg_label > 0 and segmentation_labels_4d is not None
-        label_phase = (
-            support_mesh_cache.get(("seg_phase", int(t), plane_seg_label), t)
-            if support_mesh_cache is not None else t
+        slice_spec = _get_plane_metric_slice_spec(
+            slice_cache, mask, mask_phase_lookup, support_mesh_cache, plane, t,
+            spacing, origin, branch_grid=branch_grid, target_label=target_label,
+            segmentation_labels_3d=segmentation_labels_3d,
+            segmentation_labels_4d=segmentation_labels_4d,
         )
-        slice_cache_key = (rep_t, t) if frame_specific_roi else (
-            (rep_t, label_phase) if frame_specific_labels else rep_t
-        )
-        slice_spec = _get_cached_plane_slice_spec(
-            slice_cache,
-            slice_cache_key,
-            mask_t,
-            plane,
-            spacing,
-            origin,
-            branch_grid=branch_grid,
-            target_label=target_label,
-            select_connected=True,
-            support_mesh=(
-                label_support
-                if plane_seg_label > 0 and support_mesh_cache is not None
-                else (support_mesh_cache.get(rep_t) if support_mesh_cache is not None else None)
-            ),
-            frame_index=t,
-        )
+        roi_source_frame_t.append(None if slice_spec is None else slice_spec["roi_source_frame"])
+        roi_carried_forward_t.append(False if slice_spec is None else slice_spec["roi_carried_forward"])
         if slice_spec is None:
             flowrate.append(0.0); flowrate_fwd.append(0.0); flowrate_rev.append(0.0)
             meanv_t.append(0.0); meanv_fwd_t.append(0.0); meanv_rev_t.append(0.0)
@@ -260,6 +221,8 @@ def _compute_single_plane_metric(args):
         "meanv_cm_s": float(np.mean(meanv_t)) if meanv_t else 0.0,
         "meanv_cm_s_t": [float(x) for x in meanv_t],
         "area_mm2": [float(x) for x in area],
+        "roi_source_frame_t": roi_source_frame_t,
+        "roi_carried_forward_t": roi_carried_forward_t,
         "flowrate_forward_mL_s": [float(x) for x in flowrate_fwd],
         "flowrate_reverse_mL_s": [float(x) for x in flowrate_rev],
         "meanv_forward_cm_s_t": [float(x) for x in meanv_fwd_t],

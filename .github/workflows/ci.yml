@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+  workflow_call:
   pull_request:
     branches:
       - main
@@ -34,6 +35,39 @@ jobs:
 
       - name: Install package and test dependencies
         run: python -m pip install -e ".[test]"
+
+      - name: Restore inference models for smoke coverage
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/autoflow-models
+          key: inference-models-${{ hashFiles('packaging/windows/models.lock.json') }}
+      - name: Prepare bundled model fixture
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, pathlib, subprocess, zipfile
+          lock = json.loads(pathlib.Path('packaging/windows/models.lock.json').read_text())
+          cache = pathlib.Path(os.environ['RUNNER_TEMP']) / 'autoflow-models'
+          cache.mkdir(exist_ok=True)
+          archive = cache / lock['asset']
+          if not archive.is_file():
+              subprocess.run(['gh', 'release', 'download', lock['tag'], '--repo', os.environ['GITHUB_REPOSITORY'], '--pattern', lock['asset'], '--dir', str(cache)], check=True)
+          digest = hashlib.file_digest(archive.open('rb'), 'sha256').hexdigest()
+          if digest != lock['sha256']:
+              raise RuntimeError('Inference model checksum mismatch')
+          target = pathlib.Path('autoflow/segmodel/nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm')
+          prefix = 'models/nnunet3d-bundled/'
+          with zipfile.ZipFile(archive) as source:
+              for name in source.namelist():
+                  if name.startswith(prefix) and not name.endswith('/'):
+                      relative = pathlib.PurePosixPath(name[len(prefix):])
+                      if '..' in relative.parts:
+                          raise RuntimeError('Invalid model path')
+                      destination = target / relative
+                      destination.parent.mkdir(parents=True, exist_ok=True)
+                      destination.write_bytes(source.read(name))
+          PY
 
       - name: Run retained regression suite
         env:

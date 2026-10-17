@@ -48,6 +48,18 @@ This page explains where the major runtime responsibilities live so maintainers 
 8. rendering consumes planes, metrics, and derived arrays
 9. quality reporting inspects the current workspace without mutating algorithm results
 
+### Graph topology and display hierarchy
+
+`autoflow/algorithms/hierarchy.py` decomposes every graph edge into an arm, including closed rings. Physical graph connected components become subgroups; each compressed subgroup is independently graded before final centerline geometry is produced. Signed velocity alignment supplies direction; all parent/child links survive merges. Strongly connected components are condensed only for depth calculation, preserving physical edges and loop membership. Label-relative depths annotate the same connectivity and never reset subgroup grades. Paths retain `group_level` as a compatibility alias for `subgroup_level`.
+
+`PipelineEngine._step_generate_graph()` stores the canonical `Workspace.graph_hierarchy`, attaches native records under `path_info[].hierarchy`, exports `graph_hierarchy.json`, and registers raw path geometry for immediate browsing. The anterior/posterior cerebral groups additionally provide a combined-mask analysis view with separate geometry/ids. Workspace snapshots and batch/QC outputs preserve this data. Resets and centerline edits clear it alongside dependent paths.
+
+Native arm order is normalized by subgroup and depth in `segment_vessels_from_graph_and_mask()` before fork metadata and nearest-path branch rasters are built. Joint analysis normalizes its chains the same way. This keeps index-based arrays and downstream references consistent without renumbering existing planes in place.
+
+`metrics/sampling.py::_resolve_plane_roi_frame()` supplies a request-order-independent carry-forward contract for GUI region geometry and basic/derived sampling. It finds the last observed/edited valid ROI before a missing frame; an explicit empty edit is a barrier. Slice specifications retain source-frame provenance while scalar/vector fields are sampled at the requested phase. GUI edits recalculate a selected plane's series when missing frames can depend on the edited geometry; the one-frame path remaps local provenance to the original cardiac phase.
+
+The Browser uses one canonical item per native path and references for additional parents, with containers for directed loops. Joint analysis geometry has separate hidden-by-default objects and does not create planes. Metric flow reports use the computed display parent/grade when available; old saved workspaces without this metadata retain legacy presentation until graphs are regenerated.
+
 ### Temporal segmentation path
 
 `autoflow/algorithms/segmentation/nnunet_temporal.py:generate_nnunet_4d_auto_segmentation()`

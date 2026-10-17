@@ -1,4 +1,5 @@
 from .case_types import normalize_dicom_backend
+from .plane_rules import default_label_plane_rules, load_plane_rules_file, normalize_label_plane_rules
 import copy
 import json
 import math
@@ -232,7 +233,7 @@ DEFAULT_SKELETON_LABEL_GROUPS = {
         "graph_color": "#e03131",
         "path_color": "#f76707",
         "plane_color": "#ffd43b",
-        "preprocess": {"gaussian_enabled": True, "gaussian_sigma": 0.5, "dilation_iters": 0, "erosion_iters": 0, "opening_iters": 0, "closing_iters": 1},
+        "preprocess": {"gaussian_enabled": True, "gaussian_sigma": 0.5, "dilation_iters": 0, "erosion_iters": 0, "opening_iters": 0, "closing_iters": 0},
     },
     "pulmonary_arteries": {
         "labels": ["MPA", "RPA", "LPA"],
@@ -351,9 +352,10 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "special_contact_labels": list(DEFAULT_SPECIAL_CONTACT_LABELS),
         "min_cc_volume_mm3": 50.0,
         "cc_filter_mode": "hybrid",
-        "cc_rel_min_ratio": 0.01,
-        "min_edge_points": 3,
-        "do_closing": True,
+        "cc_rel_min_ratio": 0.10,
+        "min_edge_points": 5,
+        "graph_connectivity": 26,
+        "do_closing": False,
         "do_opening": False,
         "gaussian_sigma": 0.5,
         "gaussian_enabled": True,
@@ -370,7 +372,9 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "label_groups": copy.deepcopy(DEFAULT_SKELETON_LABEL_GROUPS),
     },
     "planes": {
-        "plane_mode": "fixed_step",
+        "plane_mode": "by_label",
+        "label_rules": default_label_plane_rules(),
+        "label_rules_file": "",
         "plane_count": 3,
         "cross_section_distance": 5.0,
         "start_distance": 0.0,
@@ -381,6 +385,8 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "spacing_mode": "fraction",
         "spacing_ratio": 0.25,
         "segmentation_filter": True,
+        "fov_boundary_filter": True,
+        "fov_boundary_max_fraction": 0.25,
         "smoothing_window": 15,
         "smoothing_polyorder": 2,
         "inter_time": 10,
@@ -537,6 +543,11 @@ CONFIG_MODULES = tuple(DEFAULT_CONFIG_BUNDLE.keys())
 
 
 def default_config_dir() -> Path:
+    from .runtime_paths import portable_root
+
+    root = portable_root()
+    if root is not None:
+        return root / "configs"
     return Path(__file__).resolve().parents[1] / "configs"
 
 
@@ -682,7 +693,21 @@ def load_config_module(module_name: str, config_dir: Optional[str] = None) -> Di
         payload = json.load(f)
     if not isinstance(payload, dict):
         raise ValueError(f"config file must contain a JSON object: {config_path}")
-    return _deep_merge(defaults, payload)
+    merged = _deep_merge(defaults, payload)
+    if module_name == "planes":
+        if payload.get("label_rules_file"):
+            if "label_rules" in payload:
+                raise ValueError("Use either planes.label_rules_file or inline label_rules, not both")
+            source = Path(payload["label_rules_file"]).expanduser()
+            if not source.is_absolute():
+                source = config_root / source
+            merged["label_rules"] = load_plane_rules_file(source)
+            merged["label_rules_file"] = str(source.resolve())
+        elif "label_rules" in payload:
+            # The measurement list is complete: unspecified labels mean zero.
+            merged["label_rules"] = normalize_label_plane_rules(payload["label_rules"])
+            merged["label_rules_file"] = ""
+    return merged
 
 
 def load_config_bundle(config_dir: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
@@ -1044,7 +1069,9 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
         "dicom_backend": normalize_dicom_backend(loader_cfg.get("dicom_backend", "dicom2h5")),
         "dicom_h5_dir": str(loader_cfg.get("dicom_h5_dir", "")),
         "ignore_embedded_segmentation": bool(loader_cfg.get("ignore_embedded_segmentation", False)),
-        "plane_mode": str(plane_cfg.get("plane_mode", "fixed_step") or "fixed_step"),
+        "plane_mode": str(plane_cfg.get("plane_mode", "by_label") or "by_label"),
+        "plane_config": str(plane_cfg.get("label_rules_file", "") or ""),
+        "plane_label_rules": None if plane_cfg.get("label_rules_file") else copy.deepcopy(plane_cfg.get("label_rules", default_label_plane_rules())),
         "plane_count": plane_count,
         "cross_section_dist": float(plane_cfg.get("cross_section_distance", 5.0)),
         "start_dist": float(plane_cfg.get("start_distance", 0.0)),
@@ -1055,6 +1082,8 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
         "plane_spacing_mode": str(plane_cfg.get("spacing_mode", "fraction") or "fraction"),
         "plane_spacing_ratio": float(plane_cfg.get("spacing_ratio", 0.25)),
         "segmentation_filter": bool(plane_cfg.get("segmentation_filter", True)),
+        "fov_boundary_filter": bool(plane_cfg.get("fov_boundary_filter", True)),
+        "fov_boundary_max_fraction": float(plane_cfg.get("fov_boundary_max_fraction", 0.25)),
         "use_center_plane": plane_cfg.get("use_center_plane", None),
         "remove_small_cc": bool(skeleton_cfg.get("remove_small_cc", True)),
         "special_handling": str(skeleton_cfg.get("special_handling", "three_pass_merge") or "three_pass_merge"),
@@ -1063,8 +1092,9 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
         "special_contact_labels": copy.deepcopy(skeleton_cfg.get("special_contact_labels", DEFAULT_SPECIAL_CONTACT_LABELS)),
         "min_cc_volume": float(skeleton_cfg.get("min_cc_volume_mm3", 50.0)),
         "cc_filter_mode": str(skeleton_cfg.get("cc_filter_mode", "hybrid") or "hybrid"),
-        "cc_rel_min_ratio": float(skeleton_cfg.get("cc_rel_min_ratio", 0.01)),
-        "min_edge_points": max(0, int(skeleton_cfg.get("min_edge_points", skeleton_cfg.get("min_edge_count", 3)) or 0)),
+        "cc_rel_min_ratio": float(skeleton_cfg.get("cc_rel_min_ratio", 0.10)),
+        "min_edge_points": max(0, int(skeleton_cfg.get("min_edge_points", skeleton_cfg.get("min_edge_count", 5)) or 0)),
+        "graph_connectivity": skeleton_cfg.get("graph_connectivity", 26),
         "seed_ratio": float(streamline_cfg.get("seed_ratio", 0.1)),
         "max_steps": int(streamline_cfg.get("max_steps", 200)),
         "min_seeds": int(streamline_cfg.get("min_seeds", 50)),

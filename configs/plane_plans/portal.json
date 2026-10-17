@@ -1,0 +1,100 @@
+{
+  "label_rules": {
+    "PV": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "offset_mm": 15.0
+        }
+      ]
+    },
+    "SMV": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "offset_mm": 15.0
+        }
+      ]
+    },
+    "SV": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "offset_mm": 15.0
+        }
+      ]
+    }
+  }
+}

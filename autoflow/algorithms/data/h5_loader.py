@@ -13,6 +13,7 @@ from .correction_cache import (
     _write_background_phase_corr_cache,
 )
 from .dual_venc import _load_legacy_dual_venc_h5
+from .input_parameters import apply_input_parameters, normalize_input_parameters
 from .h5_metadata import (
     _coerce_h5_scalar_float,
     _coerce_h5_text_array,
@@ -30,6 +31,7 @@ from .normalization import (
     normalize_loaded_case,
 )
 from .orientation import (
+    _axis_pair,
     _reorient_component_abs,
     _reorient_component_signed,
     _reorient_real_valued_fields,
@@ -47,7 +49,10 @@ def load_h5_data(
     ignore_embedded_segmentation=False,
     dual_venc_mode="dv",
     reuse_existing_corr=False,
+    preserve_source_sigma=False,
+    parameter_overrides=None,
 ):
+    parameter_overrides = normalize_input_parameters(parameter_overrides)
     target_spatial_order = ("LR", "AP", "FH")
     target_venc_order = ("LR", "AP", "FH")
     dual_venc_mode = _coerce_dual_venc_mode(dual_venc_mode)
@@ -89,6 +94,19 @@ def load_h5_data(
             default=("FH", "AP", "LR"),
         )
 
+        source_spatial_order, source_venc_order = list(spatial_order), list(venc_order)
+        source_resolution, source_venc = np.array(resolution), np.array(VENC)
+        resolution, VENC, spatial_order, venc_order = apply_input_parameters(
+            parameter_overrides, resolution, VENC, spatial_order, venc_order, dual_venc_mode,
+        )
+        calibration_changed = (
+            list(spatial_order) != source_spatial_order or list(venc_order) != source_venc_order
+            or not np.allclose(resolution, source_resolution) or not np.allclose(VENC, source_venc)
+        )
+        if calibration_changed:
+            # Do not overwrite caches tied to unchanged H5 acquisition metadata.
+            cfg.write_cache = False
+
         seg_ds = _find_h5_dataset_from_scopes(scopes, "segmask", "segmentation", "seg")
         if seg_ds is not None and bool(ignore_embedded_segmentation):
             seg_ds = None
@@ -109,6 +127,7 @@ def load_h5_data(
             "venc_order_raw": [str(x) for x in venc_order[:3]],
             "force_recompute_seg": bool(force_recompute_seg),
             "ignore_embedded_segmentation": bool(ignore_embedded_segmentation),
+            "input_parameter_overrides": parameter_overrides,
         }
 
         if img_complex_ds is not None:
@@ -138,6 +157,7 @@ def load_h5_data(
                 )
                 loaded.source_group = group_name
                 loaded.metadata = dict(loaded.metadata or {})
+                loaded.metadata["input_parameter_overrides"] = parameter_overrides
                 loaded.metadata.setdefault("h5_layout", "complex_img")
                 return loaded
             cfg, cached_corr, cache_report = _prepare_background_phase_corr_cache(
@@ -166,7 +186,12 @@ def load_h5_data(
             img_complex_use = img_complex_corr if bool(corr_report.get("applied", False)) else img_complex
             mag = np.abs(img_complex[..., 0]).astype(np.float32)
             flow_raw = np.angle(img_complex_use[..., 1:4] * np.conj(img_complex_use[..., 0][..., None])).astype(np.float32)
-            sigma_raw = _sigma_from_complex(img_complex_use, VENC)
+            # Pipeline correction previously retained the first decode's
+            # source sigma. Preserve it during a fused decode so small complex
+            # rotation roundoff cannot alter the downstream TKE input.
+            sigma_raw = _sigma_from_complex(
+                img_complex if preserve_source_sigma else img_complex_use, VENC
+            )
             segmask_for_reorient = segmask if segmask is not None else np.zeros(mag.shape, dtype=np.int16)
             # Reorient once in phase units.  The velocity conversion performed
             # by ``reorient(return_velocity=True)`` is a final scale; keeping
@@ -196,6 +221,7 @@ def load_h5_data(
                 "background_phase_correction": background_phase_report_for_metadata(corr_report),
                 "force_recompute_corr": bool(getattr(cfg, "force_recompute", False)),
                 "h5_layout": "complex_img",
+                "sigma_source": "source_complex" if preserve_source_sigma else "working_complex",
                 "spatial_order_raw": [str(x) for x in spatial_order[:3]],
                 "venc_order_raw": [str(x) for x in venc_order[:3]],
             })
@@ -255,6 +281,7 @@ def load_h5_data(
                 flow_raw = np.asarray(img[..., 1:4], dtype=np.float32)
                 flow_is_phase_radians = _flow_looks_like_phase_radians(flow_raw, VENC)
                 layout_name = "combined_img_real"
+            source_shape = flow_raw.shape
             # Preserve the raw phase before reorientation/rescaling.  The helper
             # below may convert radians to velocity and permute axes, so using
             # its output to reconstruct ``phase_wrapped`` would double-transform
@@ -291,12 +318,25 @@ def load_h5_data(
                     return_velocity=False,
                     normalize_mag=False,
                 )
+            source_pairs = [_axis_pair(axis) for axis in source_spatial_order]
+            cache_shape = tuple(source_shape[source_pairs.index(_axis_pair(axis))]
+                                for axis in target_spatial_order) + tuple(source_shape[3:])
             cfg, cached_corr, cache_report = _prepare_background_phase_corr_cache(
-                scopes, "corr", tuple(flow_raw.shape[:-1]) + (3,), cfg,
+                scopes, "corr", cache_shape, cfg,
                 expected_source_group=group_name, allow_untagged_root=allow_untagged_root,
                 reuse_existing_corr=reuse_existing_corr,
                 progress_callback=_progress_prefix(progress_callback, "h5_"),
             )
+            if cached_corr is not None and (list(spatial_order) != source_spatial_order or list(venc_order) != source_venc_order):
+                # Real-valued H5 caches use normalized coordinates. Restore
+                # source coordinates before applying the edited orders.
+                cached_corr = _reorient_component_signed(
+                    cached_corr, target_spatial_order, source_spatial_order,
+                    target_venc_order, source_venc_order,
+                )
+                cached_corr = _reorient_component_signed(
+                    cached_corr, spatial_order, target_spatial_order, venc_order, target_venc_order,
+                )
             flow_corr, _stationary_mask, corr_report = apply_background_phase_correction_to_mag_flow(
                 mag_raw,
                 flow_raw,

@@ -1,0 +1,17 @@
+INHERIT: mkdocs.yml
+
+site_url: ""
+use_directory_urls: false
+
+plugins:
+  - search
+  - offline
+
+# A local shim prevents the offline plugin from adding its CDN URL.
+extra:
+  polyfills:
+    - assets/javascripts/vendor/iframe-worker.js
+
+extra_javascript:
+  - assets/javascripts/vendor/mermaid.tiny.js
+  - assets/javascripts/mermaid-offline.js

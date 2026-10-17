@@ -78,6 +78,7 @@ from .sampling import (
     _add_labeled_plane_support_meshes,
     filter_planes_by_branch_support,
     _build_plane_slice_region,
+    _resolve_plane_roi_frame,
     _points_in_polygon,
     _plane_roi_point_mask,
     _build_plane_slice_spec,

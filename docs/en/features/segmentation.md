@@ -34,18 +34,26 @@ The nnU-Net framework citation and distinction from local checkpoint/4-D validat
 The GUI respects `configs/segmentation.json -> write_auto_cache`: false preserves the source H5 while retaining prediction sidecars for review.
 1. load a case
 2. open the `Segmentation` workflow stage; loading never starts automatic segmentation
-3. in the `Segmentation Parameters` panel, choose `3D` or `4D`, then set the model path, checkpoint, folds, device, and label map
+3. right-click `Run Automatic Segmentation` in the workflow or dock, choose `3D` or `4D`, then set the model path, checkpoint, folds, device, and label map
 4. click `Run Automatic Segmentation` to start nnUNet
 5. wait for the auto-segmentation progress dialog to finish
 6. click `Open in SpatioTemporal Labeler`; AutoFlow prepares six exchange files in background workers and opens the separately installed GPL-3.0 editor
 7. in Labeler, save `segmentation.nii` with `Ctrl+S` before closing; AutoFlow detects the changed file and offers to apply it as the imported segmentation source
 
-The right dock opens on `Segmentation`. Its first `Source` section contains active-source switching, visibility, opacity, provenance, `Import...`, and `Save...`; its `Edit` section retains the automatic-run shortcut, review, and cleanup actions. Segmentation generation settings are kept with the other workflow parameters in the main window. The top menu bar does not duplicate these commands in a separate `Segmentation` menu.
+The right dock opens on `Segmentation`. Its first `Source` section contains active-source switching, visibility, opacity, provenance, `Import...`, and `Save...`; its `Edit` section retains the automatic-run shortcut, review, and cleanup actions. Generation settings are edited in a transactional action dialog; Save keeps the current segmentation until it is regenerated, and Cancel discards edits. The top menu bar does not duplicate these commands in a separate `Segmentation` menu.
 
-The right ortho viewer's `Overlay` slider controls the opacity of the
+The right viewer's `Display → Overlays → Segmentation → Opacity` controls the
 segmentation label overlay on the `Content` slices. The 3-D Browser has a
 separate per-object opacity control for segmentation surfaces and other scene
 layers such as planes and streamlines.
+
+Selecting a plane shows its metric ROI as a cyan contour in the right-hand
+`U × V` view. Display smoothing is capped at 10% of the cross-section's
+equivalent diameter (`D = 2 × sqrt(area / π)`, from its rasterized area), so
+smaller vessels receive less smoothing. If minimum contour points, smoothing,
+or display raster sampling would hide a small vessel's contour, the viewer uses the actual cut-cell ROI
+boundary. This display fallback does not alter segmentation labels, saved ROI
+edits, or metric results; empty ROIs have no cyan contour.
 
 During a manual stroke, only the active slice overlay is redrawn. Linked views refresh when the stroke ends, and the label browser uses incrementally maintained counts instead of repeatedly scanning the complete XYZT label array.
 
@@ -117,6 +125,14 @@ summary = run_case("case.h5", config=config)
 
 See [segmentation parameters](../user/parameters.md#segmentation), [labels parameters](../user/parameters.md#labels), [CLI flags](../user/cli-parameters.md), and [API fields](../user/api-parameters.md) for complete type/default/unit/effect/owner tables. Dictionary controls are expanded in [Structured parameters](../user/parameter-schemas.md).
 
+Selected-plane display controls:
+
+| Parameter | Type | Default | Where configured | Effect | Code owner |
+| --- | --- | --- | --- | --- | --- |
+| Contour smoothing | float, display pixels | `0.8` | `Display → Overlays` | additional Gaussian smoothing combined with base smoothing, subject to the ROI size limit | `autoflow/ui/ortho_viewer.py` |
+| ROI size limit | float, fraction of equivalent diameter | `0.10` | automatic in `_smooth_plane_display_mask()` | caps total Gaussian sigma relative to cross-section size | `autoflow/ui/ortho_viewer.py` |
+| Minimum contour points | int | `8` | `Display → Overlays` | filters smoothed curves; retains the actual ROI boundary if all curves would disappear | `autoflow/ui/ortho_viewer.py` |
+
 ## Outputs
 
 | Output file or object | Created when | Meaning |
@@ -140,8 +156,8 @@ Changing the active segmentation compares the processed masks and skeleton/group
 - the `nnUNet` backend predicts one 3D label volume from Dataset7010's 12 summary channels and broadcasts that unchanged volume across the input time count
 - the `nnUNet4D` backend predicts one label volume per frame from Dataset7020's 37 global and temporal channels and returns the stacked dynamic `XYZT` labels
 - automatic segmentation requires loaded `mag` and `flow`
-- `auto` or an empty model setting selects the matching local Dataset7010/Dataset7020 profile when available; static 3D falls back to the model bundled in the installed package, and the legacy Dataset7020 orchestration script remains the 4D fallback
-- pip wheels and the Windows standalone build include only `fold_all/checkpoint_final.pth` plus `dataset.json` and `plans.json`; training logs, debug output, `checkpoint_best.pth`, and `checkpoint_latest.pth` are not packaged
+- `auto` or an empty model setting selects the matching local Dataset7010/Dataset7020 profile when available; static 3D falls back to the model bundled in the installed package, and the legacy Dataset7020 orchestration script remains the 4D fallback. In the Windows portable distribution, automatic profiles resolve directly under `models/` (or `AUTOFLOW_MODELS_DIR`), without NAS paths or a shell script
+- pip wheels include the original bundled static `fold_all/checkpoint_final.pth`, `dataset.json`, and `plans.json`. The [full Windows portable build](../user/windows-portable.md) additionally provides the active Dataset7010 3D and Dataset7020 4D profiles under a separate `models/` directory, with best/final inference-only checkpoints. Training tensors are unchanged; optimizer state, training-case maps, logs, and training data are excluded
 - the nnUNet model was trained with `HF/AP/RL` feature geometry, so AutoFlow performs one required conversion from its normalized `LR/AP/FH` arrays before inference and restores the predicted labels once afterward; removing either conversion would change model inputs or downstream geometry
 - when inference uses CUDA, AutoFlow creates a temporary model plan that uses nnUNet's `resample_torch_fornnunet` implementation for floating-point input channels; the source model and its `plans.json` are not modified
 - CUDA input and prediction-probability resampling use nnUNet's linear torch interpolation instead of the default cubic SciPy interpolation; label export remains unchanged
@@ -179,6 +195,7 @@ Changing the active segmentation compares the processed masks and skeleton/group
 | change models, channels or subprocess behavior | `autoflow/algorithms/segmentation/models.py`, `autoflow/algorithms/segmentation/channels.py`, `autoflow/algorithms/segmentation/runtime.py` | static and temporal inference modules | `tests/test_smoke_phantoms.py` |
 | change segmentation import/export | `autoflow/algorithms/segmentation/io.py`, `autoflow/algorithms/segmentation/_common.py` | `autoflow/ui/labeler_exchange.py` | `tests/test_smoke_phantoms.py` |
 | change segmentation dock behavior | `autoflow/ui/segmentation.py`, `autoflow/ui/app.py` | `autoflow/core/models.py` | `tests/test_smoke_phantoms.py` |
+| change selected-plane ROI contour display | `autoflow/ui/ortho_viewer.py` | `autoflow/ui/slice_view.py`, `autoflow/algorithms/metrics/sampling.py` | small-vessel contour phantom in `tests/test_smoke_phantoms.py` |
 | change external editor exchange | `autoflow/ui/labeler_exchange.py`, `autoflow/ui/app.py` | `autoflow/algorithms/segmentation/io.py`, `third_party/SpatioTemporalLabeler/src/spatiotemporal_labeler/io/nrrd_sequence.py` | NIfTI round-trip plus GUI manual verification |
 
 ## Tests

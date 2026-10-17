@@ -4,6 +4,17 @@ Complete supported defaults from `load_config_bundle("configs")`, including ship
 
 Lengths are mm, input velocity is cm/s, RR is ms, density is kg/m3 and viscosity is mPa s unless a row states otherwise. Rendering changes display, not numerical metrics. Expand dictionary controls in [structured parameters](parameter-schemas.md).
 
+In the GUI, right-click an action (or press Shift+F10) to edit parameters. There are no permanent parameter panels or Advanced switch. Method-specific controls appear only when applicable. Save commits workspace settings; Save and run also executes the action; Cancel discards drafts. Restore defaults uses the selected config directory. See [Action settings](gui.md#action-settings). CLI/API keys and defaults below are unchanged.
+
+Interactive viewer controls are documented separately in [Viewer display
+settings](../features/viewer-display.md). They are saved in workspace
+`render_settings.viewer_display` and local GUI style preferences, rather than
+adding CLI flags, `AutoFlowConfig` fields or another shipped JSON module.
+
+Browser Content renders are configured separately; their modes and orthogonal
+cut positions are stored in `render_settings.content_renders`. See
+[Content volumes and PC-MRA](../features/pcmra-volume-rendering.md#parameters).
+
 ## batch
 
 Code owner: `autoflow/processing.py`.
@@ -110,16 +121,17 @@ Code owner: `autoflow/algorithms/preprocess.py; autoflow/algorithms/skeleton.py`
 
 | Parameter | Type | Effective default | Where configured | Effect and units | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `remove_small_cc` | bool | `true` | `configs/skeleton.json` | Filter small connected components before skeletonization. | `autoflow/algorithms/preprocess.py; autoflow/algorithms/skeleton.py` |
+| `remove_small_cc` | bool | `true` | `configs/skeleton.json` | Enable connected-component filtering after labels are merged into each group, with the same rule applied independently to each temporal frame. | `autoflow/algorithms/preprocess.py; autoflow/algorithms/skeleton.py` |
 | `special_handling` | string | `"three_pass_merge"` | `configs/skeleton.json` | Special systemic-branch strategy: three_pass_merge separates and merges branch skeleton passes; other supported modes are described in the skeleton guide. | `autoflow/algorithms/preprocess.py; autoflow/algorithms/skeleton.py` |
 | `special_merge_radius_mm` | float | `1.5` | `configs/skeleton.json` | Maximum physical distance in mm for joining the special-handling skeleton passes. | `autoflow/algorithms/preprocess.py; autoflow/algorithms/skeleton.py` |
 | `separate_special_label_contacts` | bool | `true` | `configs/skeleton.json` | Separate configured special labels where they touch before skeleton generation. | `autoflow/algorithms/preprocess.py; autoflow/algorithms/skeleton.py` |
 | `special_contact_labels` | list | `["RBCT", "CCA", "LBCT"]` | `configs/skeleton.json` | Anatomical label names subject to the contact-separation rule; resolve IDs through labels.label_map. | `autoflow/algorithms/preprocess.py; autoflow/algorithms/skeleton.py` |
 | `min_cc_volume_mm3` | float | `50.0` | `configs/skeleton.json` | Absolute connected-component volume threshold in cubic millimetres. | `autoflow/algorithms/preprocess.py; autoflow/algorithms/skeleton.py` |
-| `cc_filter_mode` | string | `"hybrid"` | `configs/skeleton.json` | Component retention rule: absolute, relative or hybrid combines physical volume and a fraction of the largest component. | `autoflow/algorithms/preprocess.py; autoflow/algorithms/skeleton.py` |
-| `cc_rel_min_ratio` | float | `0.01` | `configs/skeleton.json` | Smallest retained component as a fraction of the largest component in relative/hybrid filtering. | `autoflow/algorithms/preprocess.py; autoflow/algorithms/skeleton.py` |
-| `min_edge_points` | int | `3` | `configs/skeleton.json` | Minimum graph-edge point count retained during graph cleanup; controls short terminal-edge removal. | `autoflow/algorithms/preprocess.py; autoflow/algorithms/skeleton.py` |
-| `do_closing` | bool | `true` | `configs/skeleton.json` | Legacy Boolean binary-closing switch used in default preprocessing. | `autoflow/algorithms/preprocess.py; autoflow/algorithms/skeleton.py` |
+| `cc_filter_mode` | string | `"hybrid"` | `configs/skeleton.json` | Component retention after group morphology: hybrid (default) keeps volumes at least max(50 mm³, 10% of the largest); largest explicitly keeps one component. Temporal group masks are filtered per frame. | `autoflow/algorithms/preprocess.py; autoflow/algorithms/skeleton.py` |
+| `cc_rel_min_ratio` | float | `0.1` | `configs/skeleton.json` | Smallest retained component as a fraction of the largest in relative/hybrid filtering; default 0.10. | `autoflow/algorithms/preprocess.py; autoflow/algorithms/skeleton.py` |
+| `min_edge_points` | int | `5` | `configs/skeleton.json` | Minimum retained terminal-branch length in graph edges; shorter arms are removed. | `autoflow/algorithms/graph.py` |
+| `graph_connectivity` | int enum: 6, 26 | `26` | `configs/skeleton.json`; group overrides | Skeleton-point adjacency in voxel units: face-only or face/edge/corner. Separate from preprocessing component filtering. | `autoflow/algorithms/graph.py; autoflow/core/pipeline.py` |
+| `do_closing` | bool | `false` | `configs/skeleton.json` | Boolean binary-closing switch, off by default; explicit closing_iters also defaults to zero. | `autoflow/algorithms/preprocess.py; autoflow/algorithms/skeleton.py` |
 | `do_opening` | bool | `false` | `configs/skeleton.json` | Legacy Boolean binary-opening switch used in default preprocessing. | `autoflow/algorithms/preprocess.py; autoflow/algorithms/skeleton.py` |
 | `gaussian_sigma` | float | `0.5` | `configs/skeleton.json` | Gaussian mask smoothing width in voxels before binary thresholding. | `autoflow/algorithms/preprocess.py; autoflow/algorithms/skeleton.py` |
 | `gaussian_enabled` | bool | `true` | `configs/skeleton.json` | Enable Gaussian mask smoothing; per-group overrides in labels.label_groups can replace this value. | `autoflow/algorithms/preprocess.py; autoflow/algorithms/skeleton.py` |
@@ -146,7 +158,9 @@ Code owner: `autoflow/algorithms/planes.py`.
 
 | Parameter | Type | Effective default | Where configured | Effect and units | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| `plane_mode` | string | `"fixed_step"` | `configs/planes.json` | Placement rule: count, distance, anchored_offset, uniform or fixed_step. Controls which spacing/anchor parameters are active. | `autoflow/algorithms/planes.py` |
+| `plane_mode` | string | `"by_label"` | `configs/planes.json` | Placement rule: by_label (default), count, distance, anchored_offset, uniform or fixed_step. By-label placement uses label_rules; global count/anchor/spacing/trims apply only to the other modes. | `autoflow/algorithms/planes.py` |
+| `label_rules_file` | path string | `plane_plans/default.json` | `configs/planes.json` | Shared external complete measurement list; relative to the module directory. | `autoflow/config.py; autoflow/plane_rules.py` |
+| `label_rules` | object | selected file; built-in 32-label connection/path plans | inline `configs/planes.json` or external file | Shared observed connections with per-label positions and explicit unconnected fallbacks; ARCH/HA/SMA disabled. Missing labels mean zero; unavailable or unsupported positions are reported in QC. See [Label plane rules](parameter-schemas.md#label-plane-rules). | `autoflow/plane_rules.py; autoflow/algorithms/label_connections.py; autoflow/algorithms/landmark_planes.py` |
 | `plane_count` | int | `3` | `configs/planes.json` | Number of planes in count/fixed-step placement; -1 requests all available valid locations where supported. | `autoflow/algorithms/planes.py` |
 | `cross_section_distance` | float | `5.0` | `configs/planes.json` | Physical separation in mm used by distance/fixed-step layouts. | `autoflow/algorithms/planes.py` |
 | `start_distance` | float | `0.0` | `configs/planes.json` | Millimetres trimmed from the start of each usable path before plane placement. | `autoflow/algorithms/planes.py` |
@@ -157,6 +171,8 @@ Code owner: `autoflow/algorithms/planes.py`.
 | `spacing_mode` | string | `"fraction"` | `configs/planes.json` | Anchor-layout spacing interpretation: distance in mm or fraction of usable path length. | `autoflow/algorithms/planes.py` |
 | `spacing_ratio` | float | `0.25` | `configs/planes.json` | Dimensionless usable-path-length fraction between anchored planes when spacing_mode=fraction. | `autoflow/algorithms/planes.py` |
 | `segmentation_filter` | bool | `true` | `configs/planes.json` | Discard candidate planes whose centreline location lacks compatible segmentation support. | `autoflow/algorithms/planes.py` |
+| `fov_boundary_filter` | bool | `true` | `configs/planes.json`; GUI | Enable independent FOV-boundary filtering of generated planes. | `autoflow/algorithms/metrics/fov.py; autoflow/algorithms/metrics/sampling.py` |
+| `fov_boundary_max_fraction` | float | `0.25` | `configs/planes.json`; GUI; CLI; API | Omit a plane when contact length on FOV faces / outer ROI perimeter reaches this fraction; uses temporal-union geometry. | `autoflow/algorithms/metrics/fov.py` |
 | `smoothing_window` | int | `15` | `configs/planes.json` | Savitzky-Golay window length for centreline smoothing; must admit the selected polynomial order. | `autoflow/algorithms/planes.py` |
 | `smoothing_polyorder` | int | `2` | `configs/planes.json` | Polynomial degree of centreline Savitzky-Golay smoothing. | `autoflow/algorithms/planes.py` |
 | `inter_time` | int | `10` | `configs/planes.json` | Centreline interpolation density multiplier; increases resampled path points before plane generation. | `autoflow/algorithms/planes.py` |
@@ -406,7 +422,7 @@ Code owner: `autoflow/rendering/videos.py`.
 | `rotate_dynamic_video` | bool | `true` | `configs/video_exporting.json` | Rotate the camera during dynamic metric videos; false retains a fixed view. | `autoflow/rendering/videos.py` |
 | `dynamic_rotation_frames` | int | `180` | `configs/video_exporting.json` | Frames for one dynamic camera rotation cycle. | `autoflow/rendering/videos.py` |
 | `dynamic_rotation_elevation_deg` | float | `10.0` | `configs/video_exporting.json` | Elevation in degrees for the dynamic camera orbit; null uses the renderer's standard setting. | `autoflow/rendering/videos.py` |
-| `dynamic_time_repeat` | int | `3` | `configs/video_exporting.json` | Number of cardiac playback repeats within the dynamic export. | `autoflow/rendering/videos.py` |
+| `dynamic_time_repeat` | int | `3` | `configs/video_exporting.json` | Number of consecutive export frames per cardiac phase. Applies to fixed and rotating movies; rotations cycle through the phases as needed. | `autoflow/rendering/videos.py` |
 | `add_plane_idx` | bool | `true` | `configs/video_exporting.json` | Annotate the plane index in plane-video labels. | `autoflow/rendering/videos.py` |
 | `add_path_idx` | bool | `false` | `configs/video_exporting.json` | Annotate the owning path index in plane-video labels. | `autoflow/rendering/videos.py` |
 | `window_size` | list | `[1600, 1200]` | `configs/video_exporting.json` | Render canvas [width,height] in pixels; larger dimensions increase rendering and encoding cost. | `autoflow/rendering/videos.py` |

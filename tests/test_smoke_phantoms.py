@@ -90,6 +90,258 @@ def test_cvi_style_contour_edit_creates_and_replaces_one_local_arc():
     assert abs(polygon_area(edited)) > abs(polygon_area(original))
 
 
+def _verify_hierarchy_browser_phantom(ws, report, monkeypatch):
+    from autoflow.core.models import ObjectKind
+    from types import SimpleNamespace, MethodType
+    from PySide6 import QtCore, QtWidgets
+    import autoflow.ui.app as ui_app
+    _smoke_qt_application(monkeypatch)
+    browser = SimpleNamespace(workspace=ws)
+    for name in ("_browser_path_label", "_browser_make_checkable", "_browser_add_path_node", "_browser_add_leaf",
+                 "_browser_subgroup_nodes", "_browser_apply_path_hierarchy", "_browser_add_joint_hierarchies",
+                 "_browser_sort_path_nodes", "_browser_sort_path_children",
+                 "_iter_browser_leaf_items", "_browser_check_state_for_item"):
+        setattr(browser, name, MethodType(getattr(ui_app.MainWindow, name), browser))
+    top = QtWidgets.QTreeWidgetItem(["phantom", "Group"])
+    group = {"name": "phantom", "item": top, "types": {}, "paths": {}}
+    ws.path_info = [{"hierarchy": record} for record in report["paths"]]
+    for record in report["paths"]:
+        index = record["path_index"]
+        uid = ws.add_object(f"path {index}", ObjectKind.BRANCH, f"smooth_path_phantom_{index}", group_name="phantom")
+        node = browser._browser_add_path_node(group, index)
+        browser._browser_add_leaf(node, ws.scene_objects[uid])
+    browser._browser_apply_path_hierarchy(group)
+    browser._browser_sort_path_nodes(group["types"]["Paths"])
+    leaves = list(browser._iter_browser_leaf_items(top))
+    assert len(leaves) == len(report["paths"])  # References never duplicate objects/visibility controls.
+    for record in report["paths"]:
+        node = group["paths"]["phantom", record["path_index"]]
+        if record["loop_id"]:
+            assert node.parent().data(0, ui_app._BROWSER_NODE_ROLE) == "loop"
+        elif record["display_parent_path_index"] is not None:
+            parent = record["display_parent_path_index"]
+            expected = group["paths"]["phantom", parent]
+            if report["paths"][parent]["loop_id"]:
+                expected = expected.parent()
+            assert node.parent() is expected
+        else:
+            assert node.parent().data(0, ui_app._BROWSER_NODE_ROLE) == "subgroup"
+        ancestor = node.parent()
+        while ancestor is not None and ancestor.data(0, ui_app._BROWSER_NODE_ROLE) != "subgroup":
+            ancestor = ancestor.parent()
+        assert ancestor is not None
+        assert ancestor.text(0).startswith(f"Subgroup {record['subgroup_index'] + 1} ·")
+        for child in [node.child(i) for i in range(node.childCount())]:
+            if child.data(0, ui_app._BROWSER_NODE_ROLE) == "path_reference":
+                assert not child.flags() & QtCore.Qt.ItemIsUserCheckable
+    browser.tree_objects = QtWidgets.QTreeWidget()
+    ws.graph_hierarchy = {"joint_systems": [report]}
+    for record in report["paths"]:
+        ws.add_object("joint", ObjectKind.BRANCH,
+                      f"hierarchy_path_{report['group_name']}_{record['path_index']}", visible=False)
+    browser._browser_add_joint_hierarchies()
+    joint = browser.tree_objects.topLevelItem(0)
+    assert joint.childCount() == len(report["subgroups"])
+    assert len(list(browser._iter_browser_leaf_items(joint))) == len(report["paths"])
+    for index in range(joint.childCount()):
+        assert joint.child(index).data(0, ui_app._BROWSER_NODE_ROLE) == "subgroup"
+
+
+def test_graph_hierarchy_phantom_multiple_inlets_merge_and_label_boundaries(monkeypatch):
+    from autoflow.algorithms.hierarchy import analyze_group_graph, graph_edge_chains
+    graph = GraphData(points=np.array([[2, 8, 3], [12, 2, 3], [7, 8, 3],
+                                      [10, 14, 3], [17, 8, 3], [25, 8, 3]], dtype=float),
+                      edges=np.array([[0, 2], [2, 3], [2, 4], [1, 4], [4, 5]]))
+    flow = np.zeros((30, 20, 7, 2, 3), dtype=np.float32)
+    flow[..., 0] = 20
+    labels = np.ones(flow.shape[:3], dtype=np.int16) * 14
+    labels[:8] = 15
+    labels[:, :4] = 16
+    chains = graph_edge_chains(graph)
+    original = graph.edges.copy()
+    report = analyze_group_graph(graph, chains, flow=flow, segmentation_labels=labels,
+                                label_map={"PV": 14, "SMV": 15, "SV": 16}, group_name="portal")
+    records = {(r["source_node"], r["target_node"]): r for r in report["paths"]}
+    assert records[0, 2]["group_level"] == records[1, 4]["group_level"] == 1
+    assert records[2, 4]["group_level"] == 2
+    merged = records[4, 5]
+    assert merged["group_level"] == 3 and len(merged["parent_path_indices"]) == 2
+    assert len(merged["root_path_indices"]) == 2
+    assert {r["kind"] for r in report["junctions"]} >= {"inlet", "outlet", "split", "merge"}
+    assert records[2, 4]["label_local_levels"]["14"] == 0
+    assert merged["label_local_levels"]["14"] == 1
+    np.testing.assert_array_equal(graph.edges, original)
+    _verify_hierarchy_browser_phantom(Workspace(), report, monkeypatch)
+
+
+@pytest.mark.parametrize("with_terminals", [True, False])
+def test_graph_hierarchy_phantom_directed_cycle_keeps_edges_and_closed_rings(with_terminals, monkeypatch):
+    from autoflow.algorithms.hierarchy import analyze_group_graph, graph_edge_chains
+    points = [[8, 8, 3], [18, 8, 3], [18, 18, 3], [8, 18, 3]]
+    edges = [[0, 1], [1, 2], [2, 3], [3, 0]]
+    if with_terminals:
+        points += [[3, 8, 3], [23, 18, 3]]
+        edges += [[4, 0], [2, 5]]
+    graph = GraphData(points=np.asarray(points, dtype=float), edges=np.asarray(edges))
+    x, y, _ = np.indices((28, 28, 7))
+    flow = np.zeros((28, 28, 7, 1, 3))
+    flow[..., 0, 0] = -(y - 13)
+    flow[..., 0, 1] = x - 13
+    if with_terminals:
+        flow[x > 18, 0, 0] = 20
+    chains = graph_edge_chains(graph)
+    covered = [tuple(sorted((a, b))) for chain in chains for a, b in zip(chain, chain[1:])]
+    assert sorted(covered) == sorted(tuple(sorted(edge)) for edge in edges)
+    report = analyze_group_graph(graph, chains, flow=flow, group_name="ring")
+    assert report["undirected_cycle_rank"] == 1 and len(report["loops"]) == 1
+    if with_terminals:
+        assert [r["group_level"] for r in report["paths"] if r["is_inlet"]] == [1]
+        assert all(r["group_level"] == 2 for r in report["paths"] if r["loop_id"])
+        assert [r["group_level"] for r in report["paths"] if r["is_outlet"]] == [3]
+        _verify_hierarchy_browser_phantom(Workspace(), report, monkeypatch)
+    else:
+        assert len(chains) == 1 and chains[0][0] == chains[0][-1]
+        assert report["paths"][0]["group_level"] is None
+        assert report["paths"][0]["level_status"] == "unrooted_loop"
+
+
+def test_graph_hierarchy_phantom_missing_direction_does_not_invent_roots():
+    from autoflow.algorithms.hierarchy import analyze_group_graph, graph_edge_chains
+    graph = GraphData(points=np.array([[2., 2, 2], [8, 2, 2], [12, 5, 2], [12, 1, 2]]),
+                      edges=np.array([[0, 1], [1, 2], [1, 3]]))
+    report = analyze_group_graph(graph, graph_edge_chains(graph), flow=np.zeros((15, 8, 5, 1, 3)))
+    assert all(r["group_level"] is None and r["level_status"] == "unoriented" for r in report["paths"])
+    assert not report["inlet_path_indices"] and not report["outlet_path_indices"]
+
+
+def test_graph_hierarchy_phantom_connected_subgroups_grade_independently(monkeypatch):
+    from autoflow.algorithms.hierarchy import analyze_group_graph, graph_edge_chains
+    graph = GraphData(points=np.array([
+        [2, 8, 3], [12, 2, 3], [7, 8, 3], [10, 14, 3], [17, 8, 3], [25, 8, 3],
+        [2, 4, 6], [8, 4, 6], [15, 2, 6], [15, 6, 6], [3, 22, 8], [10, 22, 8]], dtype=float),
+        edges=np.array([[0, 2], [2, 3], [2, 4], [1, 4], [4, 5], [6, 7], [7, 8], [7, 9], [10, 11]]))
+    flow = np.zeros((30, 26, 10, 2, 3), dtype=np.float32)
+    flow[:, :, :7, :, 0] = 20
+    report = analyze_group_graph(graph, graph_edge_chains(graph), flow=flow, group_name="phantom")
+    assert report["grading_scope"] == "connected_subgroup"
+    first, second, uncertain = report["subgroups"]
+    assert len(first["inlet_path_indices"]) == 2 and first["maximum_level"] == 3
+    assert len(second["inlet_path_indices"]) == 1 and second["maximum_level"] == 2
+    assert uncertain["maximum_level"] is None and uncertain["unresolved_path_count"] == 1
+    assert [s["subgroup_id"] for s in report["subgroups"]] == [f"phantom:subgroup_{i}" for i in (1, 2, 3)]
+    by_index = {r["path_index"]: r for r in report["paths"]}
+    for subgroup in report["subgroups"]:
+        for index in subgroup["path_indices"]:
+            record = by_index[index]
+            assert record["subgroup_id"] == subgroup["subgroup_id"]
+            assert record["subgroup_level"] == record["group_level"]
+            assert set(record["parent_path_indices"]) <= set(subgroup["path_indices"])
+            if record["is_inlet"]:
+                assert record["subgroup_level"] == 1
+    ws = Workspace()
+    _verify_hierarchy_browser_phantom(ws, report, monkeypatch)
+    ws.centerline_paths = [graph.points[chain] for chain in graph_edge_chains(graph)]
+    ws.graph_hierarchy.update(paths=report["paths"], groups=[report])
+    flow_report = build_quality_report(ws)["flow_hierarchy"]
+    assert len(flow_report["subgroups"]) == 3
+    assert {root["subgroup_id"] for root in flow_report["roots"]} == {s["subgroup_id"] for s in report["subgroups"]}
+
+
+def test_graph_hierarchy_phantom_joint_analysis_and_snapshot(tmp_path):
+    from autoflow.algorithms.hierarchy import build_workspace_hierarchy
+    ws = build_workspace(AutoFlowConfig.from_config_dir())
+    # Thinning produces diagonal corner steps; this ring phantom explicitly
+    # explicitly tests the 26-neighbor topology.
+    ws.skeleton_params.graph_connectivity = 26
+    ws.paths.output_dir = str(tmp_path)
+    labels = np.zeros((32, 32, 7), dtype=np.int16)
+    # A closed voxel ring with two source groups; each separate group is open.
+    labels[8:24, 8, 3] = 17
+    labels[23, 8:24, 3] = 17
+    labels[8:24, 23, 3] = 21
+    labels[8, 8:24, 3] = 21
+    ws.segmask_raw = labels
+    ws.flow_raw = np.zeros(labels.shape + (1, 3))
+    x, y, _ = np.indices(labels.shape)
+    ws.flow_raw[..., 0, 0] = -(y - 15.5)
+    ws.flow_raw[..., 0, 1] = x - 15.5
+    ws.skeleton_params.remove_small_cc = False
+    ws.skeleton_params.gaussian_enabled = False
+    ws.skeleton_params.min_edge_points = 0
+    engine = PipelineEngine()
+    assert engine._step_generate_skeleton(ws).success
+    assert engine._step_generate_graph(ws).success
+    hierarchy = ws.graph_hierarchy
+    assert hierarchy["schema"] == "autoflow.graph_hierarchy.v1"
+    assert "ascending level" in hierarchy["path_numbering"]
+    joint = hierarchy["joint_systems"][0]
+    assert joint["view_only"] and len(joint["source_group_names"]) == 2
+    assert joint["undirected_cycle_rank"] >= 1
+    assert joint["paths"] and all(item["group_level"] is None for item in joint["paths"])
+    for report in [*hierarchy["groups"], *hierarchy["joint_systems"]]:
+        by_index = {record["path_index"]: record for record in report["paths"]}
+        for subgroup in report["subgroups"]:
+            keys = [(by_index[index]["subgroup_level"] is None, by_index[index]["subgroup_level"] or 0)
+                    for index in subgroup["path_indices"]]
+            assert keys == sorted(keys)
+    assert json.loads((tmp_path / "graph_hierarchy.json").read_text())["schema"] == hierarchy["schema"]
+    assert all("hierarchy" in info for info in ws.path_info)
+    assert any(obj.data_key.startswith("hierarchy_path_") for obj in ws.scene_objects.values())
+    restored = Workspace()
+    restored.restore_dict(ws.snapshot_dict())
+    assert restored.graph_hierarchy == hierarchy
+    assert build_quality_report(ws)["graph_hierarchy"] == hierarchy
+    import pyvista as pv
+    from autoflow.ui.viewer import SceneController
+    plotter = pv.Plotter(off_screen=True)
+    try:
+        scene = SceneController(plotter, ws, lambda *_: None)
+        native = scene._build_dataset("smooth_path_intracranial_anterior_arteries_0")
+        joint_curve = scene._build_dataset("hierarchy_path_cerebral_arterial_system_0")
+        assert native.n_points > 0 and joint_curve.n_points > 0
+    finally:
+        plotter.close()
+    engine._clear_graph_state(restored)
+    assert not restored.graph_hierarchy
+    assert not any(obj.data_key.startswith("hierarchy_path_") for obj in restored.scene_objects.values())
+
+
+def test_graph_hierarchy_phantom_path_numbers_follow_depth_and_branch_references(monkeypatch):
+    import autoflow.algorithms.branch as branch_module
+    from autoflow.algorithms.branch import segment_vessels_from_graph_and_mask
+    graph = GraphData(points=np.array([[2, 8, 3], [12, 2, 3], [7, 8, 3],
+                                      [10, 14, 3], [17, 8, 3], [25, 8, 3]], dtype=float),
+                      edges=np.array([[0, 2], [2, 3], [2, 4], [1, 4], [4, 5]]))
+    mask = np.ones((30, 20, 7), dtype=bool)
+    flow = np.zeros(mask.shape + (2, 3), dtype=np.float32)
+    flow[..., 0] = 20
+    branch_labels, paths, chains, infos, forks = segment_vessels_from_graph_and_mask(
+        mask, graph, (1, 1, 1), flow_xyzt3=flow, segmask_binary_4d=mask[..., None])
+    assert [info["path_index"] for info in infos] == list(range(5))
+    assert [info["hierarchy"]["subgroup_level"] for info in infos] == [1, 1, 2, 2, 3]
+    for index, (path, chain, info) in enumerate(zip(paths, chains, infos)):
+        np.testing.assert_array_equal(path, graph.points[chain])
+        assert info["start_node"] == chain[0] and info["end_node"] == chain[-1]
+        for node in chain:
+            if np.count_nonzero(graph.edges == node) == 1:
+                voxel = np.rint(graph.points[node]).astype(int)
+                assert branch_labels[tuple(voxel)] == index + 1
+        for parent in info["hierarchy"]["parent_path_indices"]:
+            assert parent < index
+    merged = infos[-1]["hierarchy"]
+    assert len(merged["parent_path_indices"]) == 2
+    assert any(4 in fork["right"] and len(fork["left"]) == 2 for fork in forks)
+    # Number changes must preserve voxel ownership, including nearest-node ties.
+    monkeypatch.setattr(branch_module, "hierarchy_path_order",
+                        lambda report: list(range(len(report["paths"]))))
+    old_labels, _, old_chains, _, _ = segment_vessels_from_graph_and_mask(
+        mask, graph, (1, 1, 1), flow_xyzt3=flow, segmask_binary_4d=mask[..., None])
+    remap = np.zeros(len(old_chains) + 1, dtype=np.int16)
+    for old, chain in enumerate(old_chains):
+        remap[old + 1] = next(index + 1 for index, candidate in enumerate(chains) if candidate == chain)
+    np.testing.assert_array_equal(branch_labels, remap[old_labels])
+
+
 def test_willis_ring_detection_requires_a_mixed_arterial_cycle():
     size = 41
     labels = np.zeros((size, size, 3), dtype=np.int16)
@@ -100,7 +352,7 @@ def test_willis_ring_detection_requires_a_mixed_arterial_cycle():
     labels[:, :, 1][ring & (xx >= 20)] = 26  # PCA/posterior side
     detected = detect_willis_ring(labels, spacing=(1.0, 1.0, 1.0),
                                   anterior_label_values=[17],
-                                  posterior_label_values=[26])
+                                      posterior_label_values=[26], connectivity=26)
     assert detected["status"] == "detected"
     assert detected["cycle_rank"] >= 1
     assert set(detected["member_labels"]) == {17, 26}
@@ -144,6 +396,178 @@ def test_three_pass_special_skeleton_merges_configured_branch_passes():
     assert SkeletonParams.from_dict({"special_handling": "contact_surface"}).special_handling == "contact_surface"
 
 
+@pytest.mark.parametrize("morphology", ["closing", "dilation"])
+def test_three_pass_special_skeleton_excludes_neighbour_labels_after_morphology(monkeypatch, morphology):
+    import autoflow.algorithms.skeleton as skeleton_module
+    from autoflow.algorithms.preprocess import preprocess_mask_for_skeleton
+
+    # A thick trunk and three close, parallel branches. Closing or dilation
+    # can refill the excluded neighbour at the inside corner of a junction.
+    labels = np.zeros((18, 20, 24), dtype=np.int16)
+    labels[3:12, 3:16, 3:9] = 1
+    labels[6:9, 4:7, 9:20] = 5
+    labels[6:9, 8:11, 9:20] = 6
+    labels[6:9, 11:14, 9:20] = 7
+    original_labels = labels.copy()
+    special_values = [5, 6, 7]
+    params = SkeletonParams(
+        remove_small_cc=False,
+        do_closing=morphology == "closing",
+        dilation_iters=1 if morphology == "dilation" else 0,
+        gaussian_enabled=False,
+    )
+    spacing = np.full(3, 2.4)
+    # Ensure the phantom actually exercises growth into another label.
+    leaked_voxels = 0
+    for value in special_values:
+        excluded = np.isin(labels, [other for other in special_values if other != value])
+        processed = preprocess_mask_for_skeleton(np.isin(labels, [1, value]), params, spacing)
+        leaked_voxels += int(np.count_nonzero(processed & excluded))
+    assert leaked_voxels > 0
+
+    pass_masks = []
+    original_skeletonizer = skeleton_module.generate_skeleton_from_mask3d
+
+    def record_skeleton_input(mask, resolution):
+        pass_masks.append(mask.copy())
+        return original_skeletonizer(mask, resolution)
+
+    monkeypatch.setattr(skeleton_module, "generate_skeleton_from_mask3d", record_skeleton_input)
+    points, skeleton_mask = generate_three_pass_special_skeleton(
+        labels, [1, 5, 6, 7], special_values, params, spacing,
+    )
+
+    assert len(pass_masks) == len(special_values)
+    for value, mask in zip(special_values, pass_masks):
+        excluded = np.isin(labels, [other for other in special_values if other != value])
+        assert not np.any(mask & excluded)
+        assert np.any(mask & (labels == value))
+    assert len(points) > 0 and np.any(skeleton_mask)
+    assert np.array_equal(labels, original_labels)
+
+
+@pytest.mark.parametrize("offset", [(1, 0, 0), (1, 1, 0), (1, 1, 1)])
+def test_skeleton_graph_connectivity_phantom_respects_faces_edges_and_corners(offset):
+    from autoflow.algorithms.graph import build_graph_from_points
+    spacing = np.array([1.2, 1.2, 1.1])
+    points = np.asarray([[0, 0, 0], offset], dtype=float) * spacing
+    six = build_graph_from_points(points, spacing, connectivity=6)
+    twenty_six = build_graph_from_points(points, spacing, connectivity=26)
+    assert len(six.edges) == (1 if offset == (1, 0, 0) else 0)
+    assert len(twenty_six.edges) == 1
+    assert len(build_graph_from_points(points, spacing).edges) == 1
+
+
+def test_skeleton_graph_connectivity_phantom_config_group_gui_and_snapshot():
+    from PySide6 import QtWidgets
+    from autoflow.ui.action_settings import ActionSettingsDialog, action_sections
+    assert AutoFlowConfig().graph_connectivity == AutoFlowConfig.from_config_dir().graph_connectivity == 26
+    assert SkeletonParams.from_dict({}).graph_connectivity == 26
+    ws = build_workspace(AutoFlowConfig.from_config_dir(graph_connectivity=26))
+    assert ws.skeleton_params.graph_connectivity == 26
+    ws.skeleton_params.label_groups['custom'] = {'labels': [17], 'preprocess': {'graph_connectivity': 6}}
+    assert ws.skeleton_params.params_for_group('custom').graph_connectivity == 6
+    restored = Workspace()
+    restored.restore_dict(ws.snapshot_dict())
+    assert restored.skeleton_params.graph_connectivity == 26
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    dialog = ActionSettingsDialog('Graph', action_sections(StepId.GENERATE_GRAPH, ws), ws, ws)
+    try:
+        control = dialog.controls['skeleton_params.graph_connectivity']
+        assert control.currentData() == 26
+        control.setCurrentIndex(control.findData(6))
+        assert dialog.values()['skeleton_params.graph_connectivity'] == 6
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        app.processEvents()
+
+
+@pytest.mark.parametrize("connectivity", [18, True, 6.5])
+def test_skeleton_graph_connectivity_phantom_rejects_invalid_values(connectivity):
+    from autoflow.algorithms.graph import build_graph_from_points
+    with pytest.raises(ValueError, match='graph_connectivity'):
+        build_graph_from_points(np.zeros((0, 3)), [1, 1, 1], connectivity=connectivity)
+    with pytest.raises(ValueError, match='graph_connectivity'):
+        build_workspace(AutoFlowConfig(graph_connectivity=connectivity))
+
+
+def test_triangle_junction_phantom_uses_centroid_and_existing_external_edges():
+    from autoflow.algorithms.graph import build_graph_from_points, graph_to_networkx
+
+    spacing = np.array([1.2, 1.2, 1.1])
+    voxels = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0],
+                       [-1, -1, 0], [2, -1, 0], [-1, 2, 0]], dtype=float)
+    points = voxels * spacing
+    original = points.copy()
+    graph = build_graph_from_points(points, spacing)
+    assert graph.points.shape == (4, 3)
+    np.testing.assert_allclose(graph.points[0], original[:3].mean(axis=0))
+    np.testing.assert_array_equal(graph.points[1:], original[3:])
+    assert {tuple(edge) for edge in graph.edges} == {(0, 1), (0, 2), (0, 3)}
+    assert dict(graph_to_networkx(graph).degree()) == {0: 3, 1: 1, 2: 1, 3: 1}
+    # Rebuilding adjacency after moving the junction would drop this branch.
+    assert np.linalg.norm((graph.points[0] - graph.points[1]) / spacing) > np.sqrt(3)
+    np.testing.assert_array_equal(points, original)
+
+
+@pytest.mark.parametrize("permuted", [False, True])
+def test_triangle_junction_phantom_preserves_external_ring_and_components(permuted):
+    import networkx as nx
+    from autoflow.algorithms.graph import graph_to_networkx, remove_triangle_cycles
+    from autoflow.algorithms.hierarchy import graph_edge_chains
+
+    points = np.array([[0, 1, 0], [1, 0, 1], [1, 1, 1],
+                       [1, 1, -1], [1, -1, 2], [2, 1, 2],
+                       [1, -1, 3], [2, 1, 3], [10, 0, 0],
+                       [11, 0, 0], [20, 0, 0]], dtype=float)
+    edges = np.array([[0, 1], [0, 2], [1, 2], [0, 3], [1, 4], [2, 5],
+                      [4, 6], [6, 7], [7, 5], [8, 9]], dtype=int)
+    if permuted:
+        order = np.array([5, 2, 10, 1, 8, 4, 0, 9, 3, 7, 6])
+        edges = np.argsort(order)[edges[::-1, ::-1]]
+        points = points[order]
+    graph = GraphData(points=points.copy(), edges=edges.copy())
+    cleaned = remove_triangle_cycles(graph)
+    before, after = graph_to_networkx(graph), graph_to_networkx(cleaned)
+    assert len(cleaned.points) == len(points) - 2
+    assert len(cleaned.edges) == len(edges) - 3
+    assert nx.number_connected_components(before) == nx.number_connected_components(after) == 3
+    assert len(nx.cycle_basis(before)) == 2 and len(nx.cycle_basis(after)) == 1
+    junction = np.flatnonzero(np.all(np.isclose(cleaned.points, [2 / 3, 2 / 3, 2 / 3]), axis=1))
+    assert len(junction) == 1 and after.degree(int(junction[0])) == 3
+    neighbors = {tuple(cleaned.points[node]) for node in after[int(junction[0])]}
+    assert neighbors == {(1., 1., -1.), (1., -1., 2.), (2., 1., 2.)}
+    chains = graph_edge_chains(cleaned)
+    assert sum(len(chain) - 1 for chain in chains) == len(cleaned.edges)
+    assert any(chain[0] == chain[-1] for chain in chains)
+    np.testing.assert_array_equal(graph.points, points)
+    np.testing.assert_array_equal(graph.edges, edges)
+
+
+@pytest.mark.parametrize("kind", ["closed_ring", "overlap", "parallel_connections"])
+def test_triangle_junction_phantom_keeps_ambiguous_regions(kind):
+    from autoflow.algorithms.graph import remove_triangle_cycles
+
+    if kind == "closed_ring":
+        points = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=float)
+        edges = [[0, 1], [0, 2], [1, 2]]
+    elif kind == "overlap":
+        points = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0],
+                           [-1, 0, 0], [2, 0, 0], [2, 1, 0]], dtype=float)
+        edges = [[0, 1], [0, 2], [1, 2], [1, 3], [2, 3], [0, 4], [1, 5], [3, 6]]
+    else:
+        points = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0],
+                           [2, 0, 0], [3, 0, 0], [2, 1, 0],
+                           [0, 2, 0], [2, 2, 0]], dtype=float)
+        edges = [[0, 1], [0, 2], [1, 2], [3, 4], [3, 5], [4, 5],
+                 [0, 3], [1, 4], [2, 6], [5, 7]]
+    graph = GraphData(points=points, edges=np.asarray(edges, dtype=int))
+    cleaned = remove_triangle_cycles(graph)
+    np.testing.assert_array_equal(cleaned.points, graph.points)
+    np.testing.assert_array_equal(cleaned.edges, graph.edges)
+
+
 def test_short_terminal_graph_branches_use_minimum_edge_points():
     points = np.arange(7 * 3, dtype=float).reshape(7, 3)
     graph = GraphData(
@@ -153,9 +577,22 @@ def test_short_terminal_graph_branches_use_minimum_edge_points():
 
     filtered = remove_short_terminal_branches(graph, min_edge_points=3)
     assert {tuple(edge) for edge in filtered.edges.tolist()} == {(0, 1), (1, 2), (2, 3)}
-    assert SkeletonParams.from_dict({}).min_edge_points == 3
+    assert SkeletonParams.from_dict({}).min_edge_points == 5
     assert SkeletonParams.from_dict({"min_edge_points": 0}).min_edge_points == 0
     assert SkeletonParams.from_dict({"min_edge_count": 4}).min_edge_points == 4
+
+    # The default keeps a five-edge arm and removes four-edge and one-edge
+    # terminal arms. It is a branch-length threshold, not a deletion quota.
+    default_graph = GraphData(
+        points=np.arange(11 * 3, dtype=float).reshape(11, 3),
+        edges=np.asarray([[0, 1], [1, 2], [2, 3], [3, 4], [4, 5],
+                          [0, 6], [6, 7], [7, 8], [8, 9], [0, 10]], dtype=int),
+    )
+    default_filtered = remove_short_terminal_branches(default_graph)
+    assert len(default_filtered.edges) == 5
+    assert np.array_equal(default_filtered.points, default_graph.points[:6])
+    assert AutoFlowConfig().min_edge_points == 5
+    assert AutoFlowConfig.from_config_dir().min_edge_points == 5
 
 
 def test_separate_longitudinal_label_contacts_preserves_end_to_end_transition():
@@ -269,6 +706,103 @@ def test_plane_branch_support_drops_only_unmatched_planes():
     assert qc[0]["valid"] is True
     assert qc[1]["valid"] is False
     assert qc[1]["reason"] == "no_branch_support"
+
+
+@pytest.mark.parametrize("face", ["min", "max"])
+@pytest.mark.parametrize("hole", [False, True])
+def test_fov_contact_phantom_uses_outer_physical_perimeter(face, hole):
+    mask = np.zeros((20, 20, 8, 1), dtype=bool)
+    xs = slice(0, 8) if face == "min" else slice(12, 20)
+    mask[xs, 4:12, 2:6, 0] = True
+    if hole:
+        inner = slice(2, 4) if face == "min" else slice(14, 16)
+        mask[inner, 7:9, 2:6, 0] = False
+    plane = PlaneData(center=np.array([4.5 if face == "min" else 16.5, 8.5, 3.5]),
+                      normal=np.array([0., 0., 1.]), path_index=0, label=1)
+    origin = np.array([100., -200., 300.])
+    kept, qc = filter_planes_by_branch_support(
+        [plane], mask, np.ones(3), origin, branch_labels_3d=mask[..., 0].astype(np.int16),
+        fov_boundary_max_fraction=0.25,
+    )
+    assert not kept
+    assert qc[0]["reason"] == "fov_boundary_contact"
+    fov = qc[0]["fov_boundary"]
+    assert fov["perimeter_mm"] == pytest.approx(32.)
+    assert fov["contact_length_mm"] == pytest.approx(8.)
+    assert fov["contact_fraction"] == pytest.approx(0.25)
+    assert fov["faces"] == [{"face": f"x_{face}", "contact_length_mm": pytest.approx(8.)}]
+    kept, qc = filter_planes_by_branch_support(
+        [plane], mask, np.ones(3), origin, branch_labels_3d=mask[..., 0].astype(np.int16),
+        fov_boundary_max_fraction=0.26,
+    )
+    assert kept == [plane] and qc[0]["fov_boundary"]["status"] == "below_threshold"
+
+
+def test_fov_contact_phantom_is_independent_of_branch_filter_and_respects_spacing():
+    mask = np.zeros((20, 20, 8, 1), dtype=bool)
+    mask[0:8, 4:12, 2:6, 0] = True
+    plane = PlaneData(center=np.array([9., 8.5, 10.5]), normal=np.array([0., 0., 1.]))
+    kept, qc = filter_planes_by_branch_support(
+        [plane], mask, np.array([2., 1., 3.]), np.zeros(3),
+        check_branch_support=False, fov_boundary_max_fraction=0.25,
+    )
+    assert kept == [plane]
+    assert not qc[0]["branch_support_checked"]
+    assert qc[0]["fov_boundary"]["perimeter_mm"] == pytest.approx(48.)
+    assert qc[0]["fov_boundary"]["contact_fraction"] == pytest.approx(1 / 6)
+    kept, qc = filter_planes_by_branch_support(
+        [plane], mask, np.array([2., 1., 3.]), np.zeros(3),
+        check_branch_support=False, fov_boundary_max_fraction=0.15,
+    )
+    assert not kept and qc[0]["reason"] == "fov_boundary_contact"
+
+
+def test_vote_loss_phantom_reports_each_phase_and_winning_labels(tmp_path):
+    ws = Workspace()
+    raw = np.zeros((7, 7, 7, 5), dtype=np.int16)
+    raw[1, 1, 1] = [1, 1, 1, 1, 1]
+    raw[1, 1, 2] = [1, 0, 0, 0, 0]
+    raw[1, 1, 3] = [1, 2, 2, 2, 2]
+    raw[1, 1, 4] = [0, 1, 1, 1, 1]
+    raw[2, 2, 2] = [3, 0, 0, 0, 0]
+    raw[2, 2, 3] = [4, 4, 0, 0, 0]
+    raw[2, 2, 4] = [5, 5, 6, 6, 0]
+    ws.segmask_raw = raw.copy()
+    ws.flow_raw = np.zeros(raw.shape + (3,), dtype=np.float32)
+    ws.skeleton_params.label_map = {"AAO": 1, "MPA": 2, "RPA": 3, "LPA": 4, "BA": 5, "LPCA": 6}
+    ws.skeleton_params.remove_small_cc = False
+    ws.skeleton_params.do_closing = False
+    ws.skeleton_params.do_opening = False
+    ws.skeleton_params.gaussian_enabled = False
+    engine = PipelineEngine()
+    assert engine.preprocess(ws)
+    records = {item["label"]: item for item in ws.segmentation_preprocess_qc["labels"]}
+    aao = records[1]
+    assert aao["vote_input_union_voxels"] == 4 and aao["voted_voxels"] == 2
+    assert aao["vote_removed_union_fraction"] == pytest.approx(0.5)
+    first = aao["phases"][0]
+    assert first["vote_input_voxels"] == 3 and first["vote_overlap_voxels"] == 1
+    assert first["vote_removed_fraction"] == pytest.approx(2 / 3)
+    assert first["vote_added_voxels"] == 1
+    assert first["vote_removed_to_background_voxels"] == first["vote_removed_to_other_labels_voxels"] == 1
+    assert {item["label"]: item["voxel_count"] for item in first["vote_destinations"]} == {0: 1, 2: 1}
+    assert aao["phases"][1]["vote_removed_fraction"] == 0
+    assert records[2]["phases"][0]["vote_removed_fraction"] is None
+    assert records[3]["status"] == records[6]["status"] == "removed_by_majority_vote"
+    assert records[3]["phases"][0]["vote_removed_fraction"] == 1
+    assert records[3]["phases"][0]["temporal_group_removed_fraction"] == 1
+    assert ws.segmask_labels_3d[2, 2, 4] == 5  # plurality tie, not an absolute majority
+    assert np.array_equal(ws.segmask_raw, raw)
+    report = build_quality_report(ws)
+    vote_check = next(item for item in report["checks"] if item["id"] == "segmentation.majority_vote")
+    assert vote_check["status"] == "warn"
+    assert len(vote_check["details"]) == 6
+    assert "lost=2/3 (66.7%)" in vote_check["details"][0]["details"][0]["summary"]
+    phase_group_check = next(item for item in report["checks"] if item["id"] == "segmentation.temporal_group_components")
+    assert phase_group_check["status"] == "warn"
+    saved = tmp_path / "quality_report.json"
+    save_quality_report(ws, str(saved), report=report)
+    assert json.loads(saved.read_text())["exclusions"]["segmentation_preprocess"] == ws.segmentation_preprocess_qc
 
 
 def test_internal_consistency_marks_missing_path_metrics_undefined():
@@ -485,11 +1019,15 @@ def test_workspace_snapshot_restores_nonzero_origin():
     workspace.origin = np.array([10.0, 20.0, 30.0], dtype=float)
     workspace.correction_raw = np.ones((2, 2, 2, 1, 3), dtype=np.float32)
     workspace.correction_high_raw = np.full((2, 2, 2, 1, 3), 2.0, dtype=np.float32)
+    workspace.segmask_labels_3d = np.ones((2, 2, 2), dtype=np.int16)
+    workspace.segmentation_preprocess_qc = {"schema": "autoflow.segmentation_preprocess_qc.v1", "labels": []}
     restored = Workspace()
     restored.restore_dict(workspace.snapshot_dict())
     assert np.allclose(restored.origin, workspace.origin)
     assert np.array_equal(restored.correction_raw, workspace.correction_raw)
     assert np.array_equal(restored.correction_high_raw, workspace.correction_high_raw)
+    assert np.array_equal(restored.segmask_labels_3d, workspace.segmask_labels_3d)
+    assert restored.segmentation_preprocess_qc == workspace.segmentation_preprocess_qc
 
 
 def test_loading_case_preserves_segmentation_cache_settings(monkeypatch):
@@ -538,6 +1076,1003 @@ def test_loading_case_preserves_segmentation_cache_settings(monkeypatch):
     assert workspace.segmentation.auto_folds == "all"
     assert workspace.segmentation.cleanup_4d_components is True
     assert workspace.segmentation.cleanup_4d_mode == "relative"
+
+
+def test_label_plane_phantom_default_connections_and_explicit_fallbacks():
+    from autoflow.algorithms.label_planes import generate_label_planes
+    from autoflow.plane_rules import default_label_plane_rules
+
+    rules = default_label_plane_rules()
+    counts = {name: rule["plane_count"] for name, rule in rules.items()}
+    counts.update(dict.fromkeys(["LICA", "RICA", "LVA", "RVA"], 2))
+    label_map = {name: i + 1 for i, name in enumerate(counts)}
+    labels = np.zeros((35, len(counts) * 4 + 5, 5), dtype=np.int16)
+    paths = []
+    for row, (name, value) in enumerate(label_map.items()):
+        y = row * 4 + 2
+        labels[1:32, y - 1:y + 2, 1:4] = value
+        paths.append(np.column_stack((np.arange(1., 32.), np.full(31, y), np.full(31, 2.))))
+    infos = [{"start_node": 2 * i, "end_node": 2 * i + 1,
+              "hierarchy": {"label_local_levels": {str(label_map[name]): 0}, "flow_sign": 1}}
+             for i, name in enumerate(label_map)]
+    planes, smooth, _, qc = generate_label_planes(
+        paths, labels, label_map, rules, path_info=infos, smoothing_window=3, inter_time=1)
+    # Each isolated physical component uses its declared no-connection plan.
+    assert len(planes) == sum(counts.values()) == 39
+    for name, count in counts.items():
+        selected = [p for p in planes if p.segmentation_label == label_map[name]]
+        expected = ([] if not count else [.2, .5, .8] if name in {"AAO", "DAO"}
+                    else [1 / 3, 2 / 3] if name in {"LIJV", "RIJV"}
+                    else [.33, .66] if name in {"LICA", "RICA", "LVA", "RVA"} else [.5])
+        assert len(selected) == len(expected) == count
+        assert [p.distance / 30 for p in selected] == pytest.approx(expected)
+        assert all(np.allclose(p.normal, [1, 0, 0]) for p in selected)
+    assert rules["LPCA"]["plane_count"] == rules["RPCA"]["plane_count"] == 1
+    assert rules["LICA"]["plane_count"] == rules["RICA"]["plane_count"] == 1
+    assert rules["ACA"]["plane_count"] == 1
+    assert all(rules[name]["plane_count"] == 0 for name in ("ARCH", "HA", "SMA"))
+    assert len(smooth) == len(paths)
+    assert all(q["status"] == ("disabled" if rules[q["label_name"]]["plane_count"] == 0 else "selected") for q in qc)
+    assert all("main_path" not in rule and rule["plane_mode"] == "landmark" for rule in rules.values())
+    config = AutoFlowConfig.from_config_dir()
+    assert config.plane_mode == "by_label" and config.cc_filter_mode == "hybrid"
+    assert config.cc_rel_min_ratio == .10 and config.min_cc_volume == 50.
+    assert build_workspace(config).plane_gen_params.label_rules == default_label_plane_rules()
+    from autoflow.plane_rules import load_plane_rules_file
+    plan_dir = DATA_DIR.parent / "configs" / "plane_plans"
+    for name, total in [("cardiopulmonary", 12), ("portal", 3), ("renal", 2), ("brain", 14), ("neck", 8)]:
+        source = plan_dir / f"{name}.json"
+        case_config = AutoFlowConfig.from_config_dir(plane_config=str(source))
+        regional_rules = build_workspace(case_config).plane_gen_params.label_rules
+        assert set(regional_rules) == set(load_plane_rules_file(source))
+        if name == "brain":
+            assert {"LICA", "RICA", "ACA"} <= set(regional_rules)
+        if name == "neck":
+            assert regional_rules["LICA"]["plane_count"] == regional_rules["RICA"]["plane_count"] == 1
+            assert regional_rules["LICA"]["placements"][0]["fallback"]["fractions"] == [.33, .66]
+        assert sum(rule["plane_count"] for rule in regional_rules.values()) == total, name
+        assert all(rule["placements"] and "main_path" not in rule for rule in regional_rules.values())
+    from autoflow.core.models import PlaneGenerationParams
+    assert PlaneGenerationParams.from_dict({"use_center_plane": False}).plane_mode == "distance"
+
+
+def _landmark_phantom(paths, labels, endpoints, label_map, hierarchy=None):
+    """Small physical-path phantom, including label transitions inside edges."""
+    volume = np.zeros((65, 65, 21), dtype=np.int16)
+    for points, values in zip(paths, labels):
+        for point, value in zip(points, values):
+            x, y, z = np.rint(point).astype(int)
+            volume[x, y, z] = value
+    infos = [{"start_node": u, "end_node": v, "group_name": "phantom",
+              "hierarchy": (hierarchy or [{}] * len(paths))[index]}
+             for index, (u, v) in enumerate(endpoints)]
+    return volume, infos
+
+
+def _legacy_landmark_rule(anchor, *, fractions=None, offset=5.):
+    """Explicit saved named-anchor plans remain supported after default changes."""
+    spec = {"anchor": anchor, "position": "fractions" if fractions else "near"}
+    spec.update({"fractions": fractions} if fractions else {"offset_mm": offset})
+    return {"plane_mode": "landmark", "plane_count": len(fractions) if fractions else 1,
+            "placements": [spec]}
+
+
+def test_connection_default_phantom_retains_two_same_label_renal_arms():
+    from autoflow.algorithms.label_planes import generate_label_planes
+    from autoflow.plane_rules import default_label_plane_rules
+    paths = [np.column_stack((np.arange(5., 21.), np.full(16, 20.), np.full(16, 10.))),
+             np.column_stack((np.arange(20., 51.), np.full(31, 20.), np.full(31, 10.))),
+             np.column_stack((np.full(31, 20.), np.arange(20., 51.), np.full(31, 10.)))]
+    mapping = {"DAO": 4, "LRA": 12}
+    labels = [np.full(16, 4), np.where(np.arange(31) < 3, 4, 12),
+              np.where(np.arange(31) < 3, 4, 12)]
+    volume, infos = _landmark_phantom(paths, labels, [(0, 1), (1, 2), (1, 3)], mapping)
+    rules = {name: default_label_plane_rules()[name] for name in mapping}
+    planes, _, _, qc = generate_label_planes(paths, volume, mapping, rules,
+        path_info=infos, smoothing_window=1, inter_time=1)
+    renal = [plane for plane in planes if plane.segmentation_label == 12]
+    aorta = [plane for plane in planes if plane.segmentation_label == 4]
+    assert {plane.path_index for plane in renal} == {1, 2} and len(renal) == 2
+    assert len(aorta) == 3 and {plane.path_index for plane in aorta} == {0}
+    assert sorted(plane.placement["fraction"] for plane in aorta) == [.2, .5, .8]
+    assert all(not plane.placement["connection_fallback"] for plane in planes)
+    assert len({plane.placement["connection_id"] for plane in planes}) == 1
+    assert all(row["selection_source"] == "observed_label_connections" for row in qc)
+
+
+@pytest.mark.parametrize("name", ["PV", "SMV", "SV", "StrS", "LTS", "RTS", "SSS"])
+@pytest.mark.parametrize("length", [12, 40])
+def test_connection_default_phantom_offsets_stay_inside_short_label(name, length):
+    from autoflow.algorithms.label_planes import generate_label_planes
+    from autoflow.plane_rules import default_label_plane_rules
+    path = np.column_stack((np.arange(5., 56.), np.full(51, 20.), np.full(51, 10.)))
+    # A two-label boundary is sufficient; no named anatomical triple is needed.
+    values = np.where(np.arange(51) <= length, 101, 102)
+    volume, infos = _landmark_phantom([path], [values], [(0, 1)], {name: 101, "other": 102})
+    planes, _, _, _ = generate_label_planes([path], volume, {name: 101, "other": 102},
+        {name: default_label_plane_rules()[name]}, path_info=infos, smoothing_window=1, inter_time=1)
+    assert len(planes) == 1
+    placement = planes[0].placement
+    assert placement["anchor"] == "label_connections" and placement["near_end"]
+    assert placement["nominal_distance_in_interval_mm"] == pytest.approx(min(15., length / 2))
+    assert placement["short_interval_midpoint"] == (length < 30)
+    assert planes[0].center[0] == pytest.approx(5 + length - min(15., length / 2))
+
+
+def test_connection_phantom_background_gap_uses_only_declared_fallback():
+    from autoflow.algorithms.label_planes import generate_label_planes
+    from autoflow.plane_rules import default_label_plane_rules
+    path = np.column_stack((np.arange(5., 56.), np.full(51, 20.), np.full(51, 10.)))
+    values = np.where(np.arange(51) < 20, 12, np.where(np.arange(51) == 20, 0, 4))
+    volume, infos = _landmark_phantom([path], [values], [(0, 1)], {"LRA": 12, "DAO": 4})
+    rule = default_label_plane_rules()["LRA"]
+    planes, _, _, _ = generate_label_planes([path], volume, {"LRA": 12, "DAO": 4}, {"LRA": rule},
+        path_info=infos, smoothing_window=1, inter_time=1)
+    assert len(planes) == 1 and planes[0].placement["connection_fallback"]
+    assert planes[0].placement["anchor"] == "label_longest"
+    rule["placements"][0].pop("fallback")
+    omitted, _, _, qc = generate_label_planes([path], volume, {"LRA": 12, "DAO": 4}, {"LRA": rule},
+        path_info=infos, smoothing_window=1, inter_time=1)
+    assert not omitted and qc[0]["selection_warnings"] == ["label_connection_not_found"]
+
+
+@pytest.mark.parametrize("both_connected", [True, False])
+def test_connection_ba_phantom_level_depends_on_actual_connections(both_connected):
+    from autoflow.algorithms.label_planes import generate_label_planes
+    from autoflow.plane_rules import default_label_plane_rules
+    paths = [np.column_stack((np.arange(5., 21.), np.full(16, 20.), np.full(16, 10.))),
+             np.column_stack((np.arange(20., 51.), np.full(31, 20.), np.full(31, 10.))),
+             np.column_stack((np.full(16, 20.), np.arange(5., 21.), np.full(16, 10.))),
+             np.column_stack((np.full(21, 20.), np.arange(20., 41.), np.full(21, 10.)))]
+    mapping = {"BA": 21, "LVA": 18, "RVA": 19}
+    hierarchy = [{"label_local_levels": {"21": level}, "flow_sign": 1} for level in (0, 1, 0, 0)]
+    if not both_connected:
+        paths[3][:, 0] = 55.
+    volume, infos = _landmark_phantom(paths, [np.full(len(p), value) for p, value in zip(paths, (21, 21, 18, 19))],
+        [(0, 1), (1, 2), (3, 1), (1, 4)], mapping, hierarchy)
+    volume[20, 19:23, 10] = 21
+    if not both_connected:
+        infos[3]["group_name"] = "independent-RVA"
+    planes, _, _, _ = generate_label_planes(paths, volume, mapping,
+        {"BA": default_label_plane_rules()["BA"]}, path_info=infos, smoothing_window=1, inter_time=1)
+    assert len(planes) == 1
+    assert planes[0].path_index == (1 if both_connected else 0)
+    assert planes[0].placement["label_level"] == (2 if both_connected else 1)
+    assert planes[0].placement["fraction"] == .5
+
+
+def test_connection_default_gui_phantom_preserves_fallback_and_conditional_levels(tmp_path):
+    from PySide6 import QtWidgets
+    from autoflow.plane_rules import default_label_plane_rules, save_plane_rules_file, load_plane_rules_file
+    from autoflow.ui.landmark_editor import LandmarkPlanDialog
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    rules = default_label_plane_rules()
+    edited = {}
+    for name in ("LICA", "BA", "RIJV"):
+        dialog = LandmarkPlanDialog(name, rules[name])
+        try:
+            dialog.accept()
+            assert dialog.result() == QtWidgets.QDialog.Accepted
+            assert dialog.rule == rules[name]
+            edited[name] = dialog.rule
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+            app.processEvents()
+    source = tmp_path / "connections.json"
+    save_plane_rules_file(source, edited)
+    assert load_plane_rules_file(source) == edited
+
+
+def test_landmark_pulmonary_phantom_uses_label_boundary_and_never_flow_roots(monkeypatch):
+    import autoflow.algorithms.label_planes as lp
+    from autoflow.plane_rules import default_label_plane_rules
+    paths = [np.column_stack((np.arange(5., 21.), np.full(16, 20.), np.full(16, 10.))),
+             np.column_stack((np.arange(20., 51.), np.full(31, 20.), np.full(31, 10.))),
+             np.column_stack((np.full(31, 20.), np.arange(20., 51.), np.full(31, 10.)))]
+    mapping = {"MPA": 2, "LPA": 9, "RPA": 8}
+    labels = [np.full(16, 2), np.where(np.arange(31) < 10, 2, 9), np.where(np.arange(31) < 7, 2, 8)]
+    volume, infos = _landmark_phantom(paths, labels, [(0, 1), (1, 2), (1, 3)], mapping)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("landmark plans must not call the old flow-root selector")
+    monkeypatch.setattr(lp, "_select_main_paths", forbidden)
+    rules = {name: _legacy_landmark_rule("pulmonary_split") for name in mapping}
+    planes, _, _, qc = lp.generate_label_planes(paths, volume, mapping, rules,
+        path_info=infos, smoothing_window=1, inter_time=10, flow_xyzt3=np.zeros((*volume.shape, 2, 3)))
+    assert len(planes) == 3
+    by_label = {plane.segmentation_label: plane for plane in planes}
+    assert by_label[2].path_index == 0 and by_label[2].center[0] == pytest.approx(15.)
+    assert by_label[9].path_index == 1 and by_label[9].center[0] >= 34.
+    assert by_label[8].path_index == 2 and by_label[8].center[1] >= 31.
+    assert all(p.placement["anchor"] == "pulmonary_split" for p in planes)
+    assert all(p.placement["matched_arms"] == {"MPA": 0, "LPA": 1, "RPA": 2} for p in planes)
+    assert all(row["selection_source"] == "anatomical_landmarks" for row in qc)
+    # Removing one daughter cannot silently select the remaining label root.
+    no_rpa = volume.copy()
+    no_rpa[no_rpa == 8] = 0
+    omitted, _, _, qc = lp.generate_label_planes(paths, no_rpa, mapping, {"MPA": rules["MPA"]},
+        path_info=infos, smoothing_window=1, inter_time=10)
+    assert not omitted and qc[0]["requested_plane_count"] == 1
+    assert qc[0]["omitted_positions"][0]["reason"] == "landmark_not_found"
+
+
+@pytest.mark.parametrize("system", ["portal", "posterior"])
+def test_landmark_confluence_split_phantom_selects_common_trunk(system):
+    from autoflow.algorithms.label_planes import generate_label_planes
+    from autoflow.plane_rules import default_label_plane_rules
+    paths = [np.column_stack((np.arange(5., 21.), np.full(16, 20.), np.full(16, 10.))),
+             np.column_stack((np.full(16, 20.), np.arange(5., 21.), np.full(16, 10.))),
+             np.column_stack((np.arange(20., 41.), np.full(21, 20.), np.full(21, 10.))),
+             np.column_stack((np.full(16, 40.), np.arange(20., 36.), np.full(16, 10.))),
+             np.column_stack((np.full(16, 40.), np.arange(20., 4., -1), np.full(16, 10.)))]
+    names = ["SV", "SMV", "PV", "PV", "PV"] if system == "portal" else ["LVA", "RVA", "BA", "LPCA", "RPCA"]
+    mapping = {name: i + 1 for i, name in enumerate(dict.fromkeys(names))}
+    labels = [np.full(len(path), mapping[name]) for path, name in zip(paths, names)]
+    volume, infos = _landmark_phantom(paths, labels, [(0, 2), (1, 2), (2, 3), (3, 4), (3, 5)], mapping)
+    name = "PV" if system == "portal" else "BA"
+    # Deliberately disagree with L1: the anatomical common trunk remains P2.
+    infos[0]["hierarchy"] = {"label_local_levels": {str(mapping[name]): 0}}
+    infos[2]["hierarchy"] = {"label_local_levels": {str(mapping[name]): 2}, "flow_sign": 1}
+    rule = (_legacy_landmark_rule("portal_trunk", fractions=[.25, .5, .75]) if system == "portal"
+            else {"plane_mode": "landmark", "plane_count": 2, "placements": [
+                {"anchor": anchor, "position": "near", "offset_mm": 5.}
+                for anchor in ("vertebral_confluence", "pca_split")]})
+    planes, _, _, qc = generate_label_planes(paths, volume, mapping,
+        {name: rule}, path_info=infos, smoothing_window=1, inter_time=10)
+    expected = [25., 30., 35.] if system == "portal" else [25., 20. + planes[-1].placement["label_interval_mm"][1] - 5.]
+    assert [p.center[0] for p in planes] == pytest.approx(expected)
+    assert all(p.path_index == 2 for p in planes)
+    assert qc[0]["actual_plane_count"] == len(expected)
+    if system == "portal":
+        assert planes[1].placement["route_path_indices"] == [2]
+    else:
+        assert [p.placement["anchor"] for p in planes] == ["vertebral_confluence", "pca_split"]
+
+
+def test_landmark_phantom_groups_do_not_join_by_proximity_and_ties_omit():
+    from autoflow.algorithms.label_planes import generate_label_planes
+    from autoflow.plane_rules import default_label_plane_rules
+    paths = [np.column_stack((np.arange(5., 21.), np.full(16, 20.), np.full(16, 10.))),
+             np.column_stack((np.arange(20., 41.), np.full(21, 20.), np.full(21, 10.))),
+             np.column_stack((np.full(21, 20.), np.arange(20., 41.), np.full(21, 10.)))]
+    mapping = {"MPA": 2, "LPA": 9, "RPA": 8}
+    volume, infos = _landmark_phantom(paths, [np.full(len(p), label) for p, label in zip(paths, (2, 9, 8))],
+        [(0, 1), (1, 2), (1, 3)], mapping)
+    infos[2]["group_name"] = "disconnected"
+    planes, _, _, qc = generate_label_planes(paths, volume, mapping,
+        {"MPA": _legacy_landmark_rule("pulmonary_split")}, path_info=infos, smoothing_window=1, inter_time=10)
+    assert not planes and qc[0]["selection_warnings"] == ["landmark_not_found"]
+    # Two equally supported L1 paths in the SAME physical component are
+    # ambiguous; choosing the longest would reintroduce the rejected policy.
+    infos[2]["group_name"] = "phantom"
+    for row in infos:
+        row["hierarchy"] = {"label_local_levels": {"2": 0}}
+    volume[volume > 0] = 2
+    rule = {"plane_mode": "landmark", "plane_count": 1,
+            "placements": [{"anchor": "label_level", "level": 1, "position": "fractions", "fractions": [.5]}]}
+    planes, _, _, qc = generate_label_planes(paths, volume, mapping, {"MPA": rule},
+        path_info=infos, smoothing_window=1, inter_time=10)
+    assert not planes and qc[0]["omitted_positions"][0]["reason"] == "ambiguous_label_level"
+
+
+@pytest.mark.parametrize("policy,expected", [("unique", []), ("longest", [1]), ("all", [0, 1, 2])])
+def test_landmark_same_level_path_selection_phantom_is_explicit(policy, expected):
+    from autoflow.algorithms.label_planes import generate_label_planes
+    paths = [np.column_stack((np.arange(5., 21.), np.full(16, 20.), np.full(16, 10.))),
+             np.column_stack((np.arange(20., 51.), np.full(31, 20.), np.full(31, 10.))),
+             np.column_stack((np.full(21, 20.), np.arange(20., 41.), np.full(21, 10.)))]
+    mapping = {"LICA": 17}
+    hierarchy = [{"label_local_levels": {"17": 0}, "flow_sign": 1}] * 3
+    volume, infos = _landmark_phantom(paths, [np.full(len(p), 17) for p in paths],
+                                    [(0, 1), (1, 2), (1, 3)], mapping, hierarchy)
+    rules = {"LICA": {"plane_mode": "landmark", "plane_count": 1, "placements": [
+        {"anchor": "label_level", "level": 1, "path_selection": policy, "position": "fractions", "fractions": [.5]}]}}
+    planes, _, _, qc = generate_label_planes(paths, volume, mapping, rules, path_info=infos, smoothing_window=1, inter_time=10)
+    assert [p.path_index for p in planes] == expected
+    assert all(p.placement["path_selection"] == policy for p in planes)
+    assert all(p.placement["paths_at_level"] == [0, 1, 2] for p in planes)
+    if not expected:
+        assert qc[0]["selection_warnings"] == ["ambiguous_label_level"]
+
+
+def test_landmark_structured_gui_phantom_edits_anchor_positions_and_count():
+    from PySide6 import QtWidgets
+    from autoflow.ui.landmark_editor import LandmarkPlanDialog
+    from autoflow.plane_rules import default_label_plane_rules
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    original = default_label_plane_rules()["MPA"]
+    dialog = LandmarkPlanDialog("MPA", original)
+    try:
+        table = dialog.table
+        assert table.rowCount() == 1
+        anchor = table.cellWidget(0, 0)
+        assert anchor.currentData() == "label_connections"
+        anchor.setCurrentIndex(anchor.findData("label_level"))
+        table.cellWidget(0, 1).setValue(3)
+        paths = table.cellWidget(0, 2)
+        paths.setCurrentIndex(paths.findData("all"))
+        position = table.cellWidget(0, 3)
+        position.setCurrentIndex(position.findData("fractions"))
+        table.cellWidget(0, 5).setText("20, 50, 80")
+        dialog.accept()
+        assert dialog.result() == QtWidgets.QDialog.Accepted
+        assert dialog.rule["plane_count"] == 3
+        assert dialog.rule["placements"] == [{"anchor": "label_level", "level": 3, "path_selection": "all",
+                                                "position": "fractions", "fractions": [.2, .5, .8]}]
+        assert original["placements"][0]["anchor"] == "label_connections"
+        assert not dialog.findChildren(QtWidgets.QPlainTextEdit)
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        app.processEvents()
+
+
+def test_landmark_neck_preset_gui_phantom_is_visible_and_roundtrips(tmp_path):
+    from PySide6 import QtWidgets
+    from autoflow.ui.action_settings import ActionSettingsDialog, action_sections
+    from autoflow.plane_rules import save_plane_rules_file, load_plane_rules_file
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    ws = Workspace()
+    dialog = ActionSettingsDialog("Planes", action_sections(StepId.GENERATE_PLANES, ws), ws, ws)
+    try:
+        preset = dialog.findChild(QtWidgets.QComboBox, "plane_plan_preset")
+        index = next(i for i in range(preset.count()) if preset.itemText(i).startswith("Neck"))
+        dialog._load_plane_preset(preset.itemData(index))
+        table = dialog.controls["plane_gen_params.label_rules"]
+        assert table.isColumnHidden(2) and table.isColumnHidden(3)
+        row = next(i for i in range(table.rowCount()) if table.item(i, 0).text() == "LICA")
+        assert "L1" in table.item(row, 6).text() and "Longest" in table.item(row, 6).text()
+        rules = dialog.values()["plane_gen_params.label_rules"]
+        assert rules["LICA"]["plane_count"] == 1
+        assert rules["LICA"]["placements"][0]["anchor"] == "label_connections"
+        assert rules["LICA"]["placements"][0]["fallback"]["path_selection"] == "longest"
+        filename = tmp_path / "neck.json"
+        save_plane_rules_file(filename, rules)
+        assert load_plane_rules_file(filename) == rules
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        app.processEvents()
+
+
+def test_landmark_phantom_gui_and_provenance_roundtrip(tmp_path):
+    from PySide6 import QtWidgets
+    from autoflow.plane_rules import default_label_plane_rules, save_plane_rules_file, load_plane_rules_file
+    from autoflow.ui.action_settings import ActionSettingsDialog, action_sections
+    from autoflow.plane_io import build_plane_records, save_plane_positions, load_plane_positions, project_planes_to_workspace
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    ws = Workspace()
+    ws.skeleton_params.label_map = {"MPA": 2}
+    rules = {"MPA": default_label_plane_rules()["MPA"]}
+    ws.plane_gen_params.label_rules = rules
+    dialog = ActionSettingsDialog("Planes", action_sections(StepId.GENERATE_PLANES, ws), ws, ws)
+    try:
+        table = dialog.controls["plane_gen_params.label_rules"]
+        assert table.cellWidget(0, 4).currentData() == "landmark"
+        assert not table.cellWidget(0, 3).isEnabled()
+        normalized = dialog.values()["plane_gen_params.label_rules"]
+        assert normalized == rules and "main_path" not in normalized["MPA"]
+        filename = tmp_path / "landmarks.json"
+        save_plane_rules_file(filename, normalized)
+        assert load_plane_rules_file(filename) == rules
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        app.processEvents()
+    ws.planes = [PlaneData(center=np.array([1., 2., 3.]), normal=np.array([1., 0., 0.]),
+                           path_index=-1, segmentation_label=2, placement={"anchor": "pulmonary_split", "anchor_nodes": [{"node_id": 4}]})]
+    assert build_plane_records(ws)[0]["placement"] == ws.planes[0].placement
+    restored = Workspace()
+    restored.restore_dict(ws.snapshot_dict())
+    assert restored.planes[0].placement == ws.planes[0].placement
+    positions = tmp_path / "positions.json"
+    save_plane_positions(ws, str(positions))
+    imported = project_planes_to_workspace(load_plane_positions(str(positions)), restored)
+    assert imported[0].placement == ws.planes[0].placement
+
+
+def test_landmark_sinus_phantom_matches_extended_two_fork_region():
+    from autoflow.algorithms.label_planes import generate_label_planes
+    from autoflow.plane_rules import default_label_plane_rules
+    paths = [np.column_stack((np.arange(5., 21.), np.full(16, 20.), np.full(16, 10.))),
+             np.column_stack((np.full(16, 20.), np.arange(5., 21.), np.full(16, 10.))),
+             np.column_stack((np.arange(20., 31.), np.full(11, 20.), np.full(11, 10.))),
+             np.column_stack((np.arange(30., 51.), np.full(21, 20.), np.full(21, 10.))),
+             np.column_stack((np.full(21, 30.), np.arange(20., 41.), np.full(21, 10.)))]
+    mapping = {"SSS": 23, "StrS": 25, "LTS": 22, "RTS": 24}
+    labels = [np.full(len(path), value) for path, value in zip(paths, (23, 25, 23, 22, 24))]
+    volume, infos = _landmark_phantom(paths, labels, [(0, 2), (1, 2), (2, 3), (3, 4), (3, 5)], mapping)
+    planes, _, _, qc = generate_label_planes(paths, volume, mapping,
+        {name: _legacy_landmark_rule("sinus_confluence") for name in mapping}, path_info=infos,
+        smoothing_window=1, inter_time=10)
+    assert {plane.path_index for plane in planes} == {0, 1, 3, 4}
+    assert all(len(plane.placement["anchor_nodes"]) == 2 for plane in planes)
+    assert all(plane.placement["boundary_path_indices"] == [0, 1, 3, 4] for plane in planes)
+    assert all(row["actual_plane_count"] == 1 for row in qc)
+
+
+def test_landmark_search_phantom_stays_on_selected_label_arm(monkeypatch):
+    from autoflow.algorithms.label_planes import generate_label_planes
+    import autoflow.algorithms.metrics.sampling as sampling
+    from autoflow.plane_rules import default_label_plane_rules
+    path = np.column_stack((np.arange(5., 36.), np.full(31, 20.), np.full(31, 10.)))
+    mapping = {"AAO": 1}
+    volume, infos = _landmark_phantom([path], [np.ones(31, dtype=int)], [(0, 1)], mapping,
+        [{"label_local_levels": {"1": 0}, "flow_sign": 1}])
+    inspected = []
+    def support(planes, *args, **kwargs):
+        plane = planes[0]
+        inspected.append(plane.center.copy())
+        valid = plane.center[0] >= 12. - 1e-8
+        assert plane.path_index == 0 and plane.segmentation_label == 1
+        assert kwargs["fov_boundary_max_fraction"] == .2
+        return ([plane] if valid else []), [{"valid": valid, "reason": "fov_boundary_contact"}]
+    monkeypatch.setattr(sampling, "filter_planes_by_branch_support", support)
+    rule = default_label_plane_rules()["AAO"]
+    rule["plane_count"] = 1
+    rule["placements"] = [{"anchor": "label_level", "level": 1, "position": "fractions", "fractions": [.2]}]
+    planes, _, _, qc = generate_label_planes([path], volume, mapping, {"AAO": rule}, path_info=infos,
+        smoothing_window=1, inter_time=10, segmask_binary_4d=(volume > 0)[..., None],
+        filter_defaults={"fov_boundary_max_fraction": .2})
+    assert len(planes) == 1 and planes[0].center[0] == pytest.approx(12.)
+    assert planes[0].placement["search_shift_mm"] == pytest.approx(1.)
+    assert len(inspected) >= 3 and qc[0]["requested_plane_count"] == 1
+
+
+@pytest.mark.parametrize("placement", [
+    {"anchor": "missing", "position": "near"},
+    {"anchor": "pulmonary_split", "position": "fractions", "fractions": [0.]},
+    {"anchor": "pulmonary_split", "position": "near", "offset_mm": -1},
+    {"anchor": "label_level", "position": "near", "level": 0},
+])
+def test_landmark_config_phantom_rejects_invalid_positions(placement):
+    from autoflow.plane_rules import normalize_label_plane_rules
+    with pytest.raises(ValueError):
+        normalize_label_plane_rules({"MPA": {"plane_mode": "landmark", "plane_count": 1, "placements": [placement]}})
+
+
+def test_label_plane_phantom_cross_label_path_and_disconnected_roots():
+    from autoflow.algorithms.label_planes import generate_label_planes
+
+    labels = np.zeros((70, 8, 5), dtype=np.int16)
+    labels[1:21, 1:4, 1:4] = 1
+    labels[21:41, 1:4, 1:4] = 4
+    path = np.column_stack((np.arange(1., 41.), np.full(40, 2.), np.full(40, 2.)))
+    planes, smooth, _, qc = generate_label_planes(
+        [path], labels, {"AAO": 1, "DAO": 4},
+        {"AAO": {"plane_count": 3}, "DAO": {"plane_count": 3}},
+        smoothing_window=3, inter_time=1)
+    assert len(planes) == 6 and len(smooth) == 1
+    assert all(p.path_index == 0 for p in planes)
+    assert [p.distance for p in planes[:3]] == pytest.approx([3.8, 9.5, 15.2])
+    assert [p.distance for p in planes[3:]] == pytest.approx([23.8, 29.5, 35.2])
+    assert all(labels[tuple(np.rint(p.center).astype(int))] == p.segmentation_label for p in planes)
+
+    # Separate components of a label each retain their own root, automatically.
+    labels[41:51, 1:4, 1:4] = 0
+    labels[51:66, 1:4, 1:4] = 1
+    longer = np.column_stack((np.arange(1., 66.), np.full(65, 2.), np.full(65, 2.)))
+    planes, _, _, qc = generate_label_planes(
+        [longer], labels, {"AAO": 1}, {"AAO": {"plane_count": 3, "path_index": 0}},
+        smoothing_window=3, inter_time=1)
+    assert len(planes) == 6 and qc[0]["status"] == "selected"
+    assert qc[0]["main_path_count"] == 2 and qc[0]["requested_plane_count"] == 6
+    assert len(qc[0]["candidates"]) == 2
+    planes, _, _, qc = generate_label_planes(
+        [longer], labels, {"AAO": 1},
+        {"AAO": {"plane_count": 1, "path_index": 0, "segment_index": 1}},
+        smoothing_window=3, inter_time=1)
+    assert len(planes) == 2
+    assert [p.center[0] for p in planes] == pytest.approx([10.5, 58.0])
+    assert not {"path_index", "segment_index"} & set(qc[0]["rule"])
+
+
+def test_label_plane_phantom_sv_outlets_do_not_require_pv():
+    from autoflow.algorithms.label_planes import generate_label_planes
+
+    labels = np.zeros((65, 12, 5), dtype=np.int16)
+    labels[1:21, 1:4, 1:4] = 16
+    labels[21:61, 1:4, 1:4] = 14
+    labels[1:21, 7:10, 1:4] = 16
+    paths = [np.column_stack((np.arange(1., 61.), np.full(60, 2.), np.full(60, 2.))),
+             np.column_stack((np.arange(1., 21.), np.full(20, 8.), np.full(20, 2.)))]
+    rule = {"SV": {"plane_count": 1, "require_pv_connection": True}}
+    planes, _, _, qc = generate_label_planes(
+        paths, labels, {"SV": 16, "PV": 14}, rule, smoothing_window=3, inter_time=1)
+    assert len(planes) == 2
+    assert qc[0]["main_path"] == "outflow" and qc[0]["main_path_count"] == 2
+    assert "require_pv_connection" not in qc[0]["rule"]
+
+    # Neither an intervening label nor an absent PV disables SV measurements.
+    labels[21, 1:4, 1:4] = 10
+    planes, _, _, qc = generate_label_planes(
+        paths, labels, {"SV": 16, "PV": 14}, rule, smoothing_window=3, inter_time=1)
+    assert len(planes) == 2
+
+    labels[labels == 14] = 0
+    planes, _, _, qc = generate_label_planes(
+        paths, labels, {"SV": 16, "PV": 14}, rule, smoothing_window=3, inter_time=1)
+    assert len(planes) == 2
+    rule["SV"]["path_index"] = 1
+    planes, _, _, qc = generate_label_planes(
+        paths, labels, {"SV": 16, "PV": 14}, rule, smoothing_window=3, inter_time=1)
+    assert len(planes) == 2
+    assert "path_index" not in qc[0]["rule"]
+
+
+@pytest.mark.parametrize("name,side,sign,expected", [
+    ("MPA", "inflow", 1, [0]), ("MPA", "outflow", 1, [1, 2]),
+    ("SV", "outflow", -1, [0]), ("SMV", "outflow", -1, [0]),
+    ("PV", "inflow", 1, [0]), ("PV", "inflow", -1, [1, 2]),
+    ("ACA", "inflow", -1, [1, 2]),
+])
+def test_label_plane_branch_phantom_flow_roots_and_isolated_pv(name, side, sign, expected):
+    from scipy.ndimage import binary_dilation
+    from autoflow.algorithms.label_planes import generate_label_planes
+
+    trunk = np.column_stack((np.arange(2., 11.), np.full(9, 15.), np.full(9, 3.)))
+    arms = [np.column_stack((np.linspace(10, 18, 17), np.linspace(15, y, 17), np.full(17, 3.)))
+            for y in (7., 23.)]
+    paths = [trunk[::-1], *arms]  # Graph traversal order must not dictate flow direction.
+    labels = np.zeros((25, 31, 7), dtype=np.int16)
+    for path in paths:
+        labels[tuple(np.rint(path).astype(int).T)] = 1
+    labels = binary_dilation(labels, iterations=1).astype(np.int16)
+    flow = np.zeros(labels.shape + (3, 3), dtype=np.float32)
+    flow[..., :, 0] = np.asarray([20., -5., 20.]) * sign
+    flow[labels == 0] = 0
+    # Deliberately omit all other vessel labels, including SMV/SV for PV.
+    planes, _, _, qc = generate_label_planes(paths, labels, {name: 1},
+        {name: {"plane_count": 2, "main_path": side}}, flow_xyzt3=flow,
+        segmask_binary_4d=labels > 0, smoothing_window=3, inter_time=2)
+    selected = qc[0]["selected_main_paths"]
+    assert [p["path_index"] for p in selected] == expected
+    assert len(planes) == 2 * len(expected) == qc[0]["requested_plane_count"]
+    assert qc[0]["main_path_count"] == len(expected)
+    assert not qc[0]["selection_warnings"]
+    assert all(p.normal[0] * sign > 0 for p in planes)
+    assert all(c["flow_direction_status"] == "reliable" for c in qc[0]["topology_candidates"])
+    assert all(labels[tuple(np.rint(p.center).astype(int))] == 1 for p in planes)
+
+
+@pytest.mark.parametrize("flow_available", [False, True])
+def test_label_plane_branch_phantom_unreliable_flow_uses_visible_fallback(flow_available):
+    from scipy.ndimage import binary_dilation
+    from autoflow.algorithms.label_planes import generate_label_planes
+
+    paths = [np.array([[3., 10., 3.], [10., 10., 3.]]),
+             np.array([[10., 10., 3.], [20., 10., 3.]]),
+             np.array([[10., 10., 3.], [10., 15., 3.]])]
+    labels = np.zeros((25, 20, 7), dtype=np.int16)
+    for path in paths:
+        for point in np.linspace(*path, 30):
+            labels[tuple(np.rint(point).astype(int))] = 1
+    labels = binary_dilation(labels).astype(np.int16)
+    flow = np.zeros(labels.shape + (2, 3)) if flow_available else None
+    planes, _, _, qc = generate_label_planes(paths, labels, {"MPA": 1}, {"MPA": 1},
+        flow_xyzt3=flow, smoothing_window=3, inter_time=10)
+    assert len(planes) == 1 and planes[0].path_index == 1
+    assert qc[0]["selection_source"] == "automatic_with_fallback"
+    assert qc[0]["selection_warnings"] == ["flow_direction_unreliable" if flow_available else "flow_unavailable"]
+    assert qc[0]["selected_main_paths"][0]["selection_reason"] == "geometry_fallback_longest"
+
+
+def test_label_plane_cycle_phantom_uses_visible_fallback():
+    from scipy.ndimage import binary_dilation
+    from autoflow.algorithms.label_planes import generate_label_planes
+
+    vertices = np.array([[5., 5., 3.], [19., 5., 3.], [19., 19., 3.], [5., 19., 3.]])
+    paths = [np.linspace(vertices[i], vertices[(i + 1) % 4], 15) for i in range(4)]
+    labels = np.zeros((25, 25, 7), dtype=np.int16)
+    for path in paths:
+        labels[tuple(path.astype(int).T)] = 1
+    labels = binary_dilation(labels).astype(np.int16)
+    x, y, _ = np.indices(labels.shape)
+    flow = np.zeros(labels.shape + (1, 3))
+    flow[..., 0, 0] = -(y - 12)
+    flow[..., 0, 1] = x - 12
+    planes, _, _, qc = generate_label_planes(paths, labels, {"ACA": 1}, {"ACA": 1},
+        flow_xyzt3=flow, smoothing_window=3, inter_time=1)
+    assert len(planes) == 1 and planes[0].path_index == 0
+    assert qc[0]["selection_warnings"] == ["directed_cycle_no_root"]
+
+
+def test_label_plane_curved_phantom_smoothing_cannot_create_extra_roots():
+    from scipy.ndimage import binary_dilation
+    from autoflow.algorithms.label_planes import generate_label_planes
+    from autoflow.algorithms.paths import inter_points, smooth_path_savgol
+    from autoflow.algorithms.planes import _sample_path_labels
+
+    x = np.linspace(4., 35., 40)
+    path = np.column_stack((x, 12 + 7 * np.sin((x - 4) * .32), np.full(40, 3.)))
+    labels = np.zeros((40, 25, 7), dtype=np.int16)
+    dense = inter_points(path, time=5)
+    labels[tuple(np.rint(dense).astype(int).T)] = 1
+    labels = binary_dilation(labels).astype(np.int16)
+    unconstrained = smooth_path_savgol(dense, window=151, polyorder=2)
+    assert np.any(_sample_path_labels(unconstrained, labels, np.ones(3), np.zeros(3)) == 0)
+    flow = np.zeros(labels.shape + (2, 3))
+    flow[..., 0] = 20.
+    source = path.copy(), labels.copy()
+    planes, smooth, _, qc = generate_label_planes([path], labels, {"RRA": 1}, {"RRA": 3},
+        flow_xyzt3=flow, smoothing_window=151, inter_time=5)
+    assert qc[0]["main_path_count"] == 1 and len(planes) == 3
+    assert qc[0]["selected_main_paths"][0]["smoothing_label_restored_samples"] > 0
+    assert np.all(_sample_path_labels(smooth[0], labels, np.ones(3), np.zeros(3)) == 1)
+    assert all(labels[tuple(np.rint(p.center).astype(int))] == 1 for p in planes)
+    np.testing.assert_array_equal(path, source[0])
+    np.testing.assert_array_equal(labels, source[1])
+
+
+def test_label_plane_phantom_pipeline_offsets_origin_and_qc(tmp_path):
+    ws = Workspace()
+    ws.paths.output_dir = str(tmp_path)
+    ws.origin = np.array([100., 200., 300.])
+    labels = np.zeros((35, 14, 7), dtype=np.int16)
+    labels[1:32, 1:6, 1:6] = 1
+    labels[1:32, 8:13, 1:6] = 21
+    ws.segmask_raw = np.repeat(labels[..., None], 2, axis=3)
+    ws.segmask_labels = ws.segmask_raw.copy()
+    ws.segmask_labels_3d = labels
+    ws.segmask_binary = ws.segmask_raw > 0
+    ws.flow_raw = np.zeros(labels.shape + (2, 3), dtype=np.float32)
+    ws.flow_raw[..., 0] = ws.segmask_binary * 20.
+    ws.skeleton_params.label_map = {"AAO": 1, "BA": 21}
+    ws.branch_labels = np.where(labels == 1, 1, np.where(labels == 21, 2, 0)).astype(np.int16)
+    ws.plane_gen_params.label_rules = {"AAO": {"plane_count": 3}, "BA": {"plane_count": 2}}
+    ws.plane_gen_params.smoothing_window = 3
+    ws.plane_gen_params.inter_time = 1
+    ws.centerline_paths = [np.column_stack((np.arange(1., 32.), np.full(31, y), np.full(31, 3.)))
+                           for y in (3., 10.)]
+    ws.graph = GraphData(points=np.vstack(ws.centerline_paths))
+    ws.group_order = ["aorta", "brain"]
+    ws.path_info = [{"group_name": name} for name in ws.group_order]
+    ws.multilabel_groups = {
+        name: {"centerline_paths": [ws.centerline_paths[i]], "path_index_offset": i}
+        for i, name in enumerate(ws.group_order)
+    }
+    engine = PipelineEngine()
+    result = engine._step_generate_planes(ws)
+    assert result.success and len(ws.planes) == 5, result.message
+    assert [p.path_index for p in ws.planes] == [0, 0, 0, 1, 1]
+    assert [p.segmentation_label for p in ws.planes] == [1, 1, 1, 21, 21]
+    layout = json.loads((tmp_path / "plane_qc.json").read_text())
+    assert layout["requested_plane_count"] == layout["actual_plane_count"] == 5
+    assert all(q["status"] == "ok" for q in layout["labels"])
+    records = json.loads((tmp_path / "planes.json").read_text())
+    assert len(records) == 5
+    metrics, qc, _ = engine._compute_plane_metrics_internal(ws, save=True, include_derived=False)
+    assert len(metrics) == 5
+    assert qc["plane_layout"]["plane_mode"] == "by_label"
+    assert qc["plane_layout"]["labels"] == layout["labels"]
+    assert qc["plane_layout"]["requested_plane_count"] == 5
+
+
+def test_label_plane_phantom_pipeline_counts_each_aca_root(tmp_path):
+    ws = Workspace()
+    ws.paths.output_dir = str(tmp_path)
+    labels = np.zeros((35, 16, 7), dtype=np.int16)
+    for y in (4, 11):
+        labels[1:32, y - 1:y + 2, 1:6] = 30
+    ws.segmask_raw = labels[..., None]
+    ws.segmask_labels_3d = labels
+    ws.segmask_binary = ws.segmask_raw > 0
+    ws.flow_raw = np.zeros(labels.shape + (1, 3), dtype=np.float32)
+    ws.flow_raw[..., 0] = 20
+    ws.skeleton_params.label_map = {"ACA": 30}
+    ws.plane_gen_params.label_rules = {"ACA": {"plane_count": 2, "main_path": "inflow"}}
+    ws.plane_gen_params.smoothing_window = 3
+    ws.plane_gen_params.inter_time = 1
+    ws.centerline_paths = [np.column_stack((np.arange(1., 32.), np.full(31, y), np.full(31, 3.)))
+                           for y in (4., 11.)]
+    ws.graph = GraphData(points=np.vstack(ws.centerline_paths))
+    ws.branch_labels = np.where(labels > 0, np.where(np.indices(labels.shape)[1] < 8, 1, 2), 0).astype(np.int16)
+    ws.group_order = ["brain"]
+    ws.path_info = [{"group_name": "brain"}, {"group_name": "brain"}]
+    ws.multilabel_groups = {"brain": {"centerline_paths": ws.centerline_paths, "path_index_offset": 0}}
+    result = PipelineEngine()._step_generate_planes(ws)
+    assert result.success and len(ws.planes) == 4
+    layout = json.loads((tmp_path / "plane_qc.json").read_text())
+    assert layout["requested_plane_count"] == layout["actual_plane_count"] == 4
+    row = layout["labels"][0]
+    assert row["main_path_count"] == 2 and row["plane_count_per_main_path"] == 2
+    assert [root["actual_plane_count"] for root in row["selected_main_paths"]] == [2, 2]
+    assert row["status"] == "ok"
+
+
+def test_fov_plane_phantom_pipeline_preserves_excluded_candidate_ids_and_qc(tmp_path):
+    ws = Workspace()
+    ws.paths.output_dir = str(tmp_path)
+    labels = np.zeros((20, 20, 20), dtype=np.int16)
+    labels[0:8, 4:12, 1:18] = 1
+    labels[10:18, 4:12, 1:18] = 21
+    ws.segmask_raw = labels[..., None]
+    ws.segmask_labels = ws.segmask_raw.copy()
+    ws.segmask_labels_3d = labels.copy()
+    ws.segmask_binary = ws.segmask_raw > 0
+    ws.flow_raw = np.zeros(labels.shape + (1, 3), dtype=np.float32)
+    ws.skeleton_params.label_map = {"AAO": 1, "BA": 21}
+    ws.branch_labels = np.where(labels == 1, 1, np.where(labels == 21, 2, 0)).astype(np.int16)
+    ws.plane_gen_params.label_rules = {"AAO": 1, "BA": 1}
+    ws.plane_gen_params.smoothing_window = 3
+    ws.plane_gen_params.inter_time = 1
+    ws.centerline_paths = [np.column_stack((np.full(17, x), np.full(17, 8.), np.arange(1., 18.)))
+                           for x in (4., 14.)]
+    ws.graph = GraphData(points=np.vstack(ws.centerline_paths))
+    ws.group_order = ["aorta", "brain"]
+    ws.path_info = [{"group_name": name} for name in ws.group_order]
+    ws.multilabel_groups = {name: {"centerline_paths": [ws.centerline_paths[i]], "path_index_offset": i}
+                           for i, name in enumerate(ws.group_order)}
+    engine = PipelineEngine()
+    result = engine._step_generate_planes(ws)
+    assert result.success and len(ws.planes) == 1, result.message
+    layout = json.loads((tmp_path / "plane_qc.json").read_text())
+    assert layout["fov_boundary_max_fraction"] == 0.25
+    assert layout["planes"][0]["plane_index_source"] == 0
+    assert layout["planes"][0]["plane_index"] is None
+    assert layout["planes"][0]["reason"] == "fov_boundary_contact"
+    assert layout["planes"][1]["plane_index_source"] == 1
+    assert layout["planes"][1]["plane_index"] == 0
+    assert layout["labels"][0]["excluded_plane_counts"] == {"fov_boundary_contact": 1}
+    assert layout["labels"][0]["selected_main_paths"][0]["actual_plane_count"] == 0
+    _, qc, _ = engine._compute_plane_metrics_internal(ws, save=True, include_derived=False)
+    assert qc["plane_layout"]["fov_boundary_max_fraction"] == 0.25
+    assert qc["plane_layout"]["planes"] == layout["planes"]
+    report = build_quality_report(ws)
+    check = next(item for item in report["checks"] if item["id"] == "planes.exclusions")
+    assert check["status"] == "warn"
+    assert "FOV=8.000/32.000 mm (25.0%)" in check["details"][0]["details"][0]["summary"]
+    ws.plane_gen_params.label_rules = {"AAO": {"plane_count": 1, "fov_boundary_filter": False}, "BA": 1}
+    assert engine._step_generate_planes(ws).success and len(ws.planes) == 2
+    records = ws.derived.plane_qc["planes"]
+    assert [record["plane_index_source"] for record in records] == [0, 1]
+    assert records[0]["main_path_fraction"] == .5
+    assert records[0]["fov_boundary"]["status"] == "disabled"
+
+
+def test_fov_plane_phantom_point_contact_does_not_discard_roi():
+    import pyvista as pv
+    from autoflow.algorithms.metrics.fov import measure_fov_boundary_contact
+    region = pv.PolyData(np.array([[0., 3., 4.], [2., 1., 4.], [4., 3., 4.], [2., 5., 4.]]),
+                         np.array([4, 0, 1, 2, 3]))
+    plane = PlaneData(center=np.array([2., 3., 4.]), normal=np.array([0., 0., 1.]))
+    record = measure_fov_boundary_contact(region, plane, (10, 10, 10), np.ones(3), np.zeros(3), 0.25)
+    assert record["status"] == "clear"
+    assert record["contact_length_mm"] == record["contact_fraction"] == 0
+
+
+def test_merged_group_largest_phantom_preserves_small_attached_labels_and_motion():
+    ws = Workspace()
+    ws.skeleton_params.cc_filter_mode = "largest"  # Explicit legacy mode remains supported.
+    first = np.zeros((30, 30, 30), dtype=np.int16)
+    first[2:8, 2:8, 2:8] = 1
+    first[8:10, 3:5, 3:5] = 2   # attached small label must survive
+    first[20:23, 20:23, 20:23] = 2  # larger island of label 2 must be removed
+    first[2:4, 20:22, 2:4] = 3   # another group survives independently
+    first[10, 24, 10] = 3
+    second = np.zeros_like(first)
+    second[3:9, 2:8, 2:8] = 1
+    second[9:11, 3:5, 3:5] = 2
+    second[20:23, 20:23, 20:23] = 2
+    second[first == 3] = 3
+    ws.segmask_raw = np.stack([first, second], axis=3)
+    ws.flow_raw = np.zeros(first.shape + (2, 3), dtype=np.float32)
+    ws.skeleton_params.label_groups = {"mixed": {"labels": [1, 2]}, "other": {"labels": [3]}}
+    ws.skeleton_params.do_closing = False
+    ws.skeleton_params.gaussian_enabled = False
+    assert ws.skeleton_params.remove_small_cc and ws.skeleton_params.cc_filter_mode == "largest"
+    engine = PipelineEngine()
+    assert engine.preprocess(ws)
+    assert np.any(ws.segmask_labels_3d == 2)
+    assert not ws.multilabel_groups["mixed"]["clean_mask_3d"][21, 21, 21]
+    assert ws.multilabel_groups["other"]["clean_mask_3d"].sum() == 8
+    assert not ws.multilabel_groups["other"]["clean_mask_3d"][10, 24, 10]
+    assert ws.multilabel_groups["mixed"]["segmask_binary"][10, 3, 3, 1]
+    assert not ws.multilabel_groups["mixed"]["segmask_binary"][10, 3, 3, 0]
+    assert not ws.multilabel_groups["mixed"]["segmask_binary"][21, 21, 21].any()
+    assert not np.any(ws.segmask_raw != np.stack([first, second], axis=3))
+    qc = {item["label"]: item for item in ws.segmentation_preprocess_qc["labels"]}
+    assert qc[2]["voted_voxels"] > qc[2]["retained_group_voxels"] > 0
+    assert qc[2]["component_removed_voxels"] == 27
+    assert qc[2]["component_removed_fraction"] == pytest.approx(27 / qc[2]["voted_voxels"])
+    assert qc[2]["phases"][0]["temporal_group_removed_fraction"] == pytest.approx(27 / 35)
+
+
+@pytest.mark.parametrize("rule", [
+    {"plane_count": -2}, {"plane_count": True}, {"spacing_ratio": float("nan")},
+    {"plane_count": 3, "spacing_ratio": 1.7}, {"main_path": "both"},
+    {"main_path": []}, {"unknown": True},
+    {"plane_mode": "by_label"}, {"anchor": "unknown"}, {"inter_time": 0},
+    {"fov_boundary_max_fraction": 1.1}, {"position_shift_mm": 1},
+])
+def test_label_plane_phantom_rejects_invalid_rules(rule):
+    from autoflow.plane_rules import normalize_label_plane_rules
+    with pytest.raises(ValueError):
+        normalize_label_plane_rules({"AAO": rule})
+
+
+@pytest.mark.parametrize("mode,extra,expected", [
+    ("uniform", {"plane_count": 4, "start_distance": 3, "end_distance": 3}, [3, 11, 19, 27]),
+    ("count", {"plane_count": 1, "start_distance": 4, "end_distance": 2}, [16]),
+    ("distance", {"plane_count": -1, "cross_section_distance": 10}, [0, 10, 20, 30]),
+    ("fixed_step", {"plane_count": 3, "anchor": "start", "direction": "toward_end",
+                    "spacing_mode": "distance", "cross_section_distance": 7}, [0, 7, 14]),
+    ("anchored_offset", {"plane_count": 3, "anchor_offset_mm": 4, "cross_section_distance": 6}, [4, 10, 16]),
+])
+@pytest.mark.parametrize("sign", [1, -1])
+def test_label_plane_layout_phantom_matches_global_modes_in_flow_coordinates(mode, extra, expected, sign):
+    from autoflow.algorithms.label_planes import generate_label_planes
+    labels = np.ones((35, 5, 5), dtype=np.int16)
+    path = np.column_stack((np.arange(1., 32.), np.full(31, 2.), np.full(31, 2.)))
+    flow = np.zeros(labels.shape + (1, 3))
+    flow[..., 0] = 20 * sign
+    fork = path[[0 if sign == 1 else -1]]
+    planes, _, _, qc = generate_label_planes([path], labels, {"AAO": 1},
+        {"AAO": {"plane_mode": mode, **extra}}, flow_xyzt3=flow,
+        fork_points=fork.tolist(), smoothing_window=3, inter_time=1)
+    actual = [(plane.center[0] - 1) if sign == 1 else (31 - plane.center[0]) for plane in planes]
+    assert actual == pytest.approx(expected, abs=1e-8)
+    assert all(plane.normal[0] * sign > 0 for plane in planes)
+    assert qc[0]["requested_plane_count"] == len(expected)
+
+
+def test_group_preprocessing_phantom_filters_after_morphology_and_keeps_bilateral_lumens():
+    from autoflow.algorithms.preprocess import preprocess_mask_for_skeleton
+    from autoflow.core.models import SkeletonParams
+    source = np.zeros((35, 35, 35), dtype=bool)
+    source[3:8, 3:8, 3:8] = True
+    source[15:31, 20, 20] = True  # Below 50 mm3 before dilation, above it after.
+    params = SkeletonParams(gaussian_enabled=False, dilation_iters=1)
+    result, details = preprocess_mask_for_skeleton(source, params, return_details=True)
+    assert np.all(result[source])
+    assert np.array_equal(details["retained_source_mask"], source)
+
+    ws = build_workspace(AutoFlowConfig.from_config_dir())
+    assert not ws.skeleton_params.do_closing
+    assert all(ws.skeleton_params.params_for_group(name).closing_iters == 0
+               for name in ws.skeleton_params.label_groups)
+    assert ws.skeleton_params.cc_filter_mode == "hybrid"
+    assert ws.skeleton_params.cc_rel_min_ratio == .1
+    labels = np.zeros((35, 35, 35), dtype=np.int16)
+    labels[2:10, 2:10, 2:10] = 17
+    labels[20:26, 20:26, 20:26] = 20
+    labels[12:15, 12:15, 12:15] = 17
+    ws.segmask_raw = labels
+    ws.skeleton_params.gaussian_enabled = False
+    PipelineEngine().preprocess(ws)
+    assert np.count_nonzero(ws.segmask_labels_3d == 17) == 512
+    assert np.count_nonzero(ws.segmask_labels_3d == 20) == 216
+    assert not ws.segmask_3d[13, 13, 13]
+    qc = ws.segmentation_preprocess_qc
+    assert qc["preprocessing_order"].index("connected_component_filter") > qc["preprocessing_order"].index("morphology_and_gaussian")
+
+
+def test_label_plane_phantom_short_renal_count_needs_no_note():
+    from autoflow.plane_rules import normalize_label_plane_rules
+    rule = normalize_label_plane_rules({"LRA": 2})["LRA"]
+    assert rule["spacing_ratio"] == pytest.approx(1 / 3)
+    assert "reason" not in rule
+    assert normalize_label_plane_rules({"LICA": 0})["LICA"]["plane_count"] == 0
+    assert "reason" not in normalize_label_plane_rules({"LRA": {"plane_count": 2, "reason": "old note"}})["LRA"]
+
+
+def test_label_plane_phantom_gui_configures_root_side(tmp_path, monkeypatch):
+    from PySide6 import QtWidgets
+    from autoflow.ui.action_settings import ActionSettingsDialog, action_sections
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    ws = Workspace()
+    ws.skeleton_params.label_map = {"AAO": 1}
+    ws.segmask_labels_3d = np.zeros((35, 14, 5), dtype=np.int16)
+    ws.centerline_paths = []
+    for y in (3., 10.):
+        ws.segmask_labels_3d[1:32, int(y) - 1:int(y) + 2, 1:4] = 1
+        ws.centerline_paths.append(np.column_stack((np.arange(1., 32.), np.full(31, y), np.full(31, 2.))))
+    ws.plane_gen_params.label_rules = {"AAO": {"plane_count": 3}, "LICA": {"plane_count": 0}, "LPCA": {"plane_count": 1}}
+    dialog = ActionSettingsDialog("Planes", action_sections(StepId.GENERATE_PLANES, ws), ws, ws)
+    try:
+        table = dialog.controls["plane_gen_params.label_rules"]
+        assert table.rowCount() == 3 and table.columnCount() == 7
+        combo = table.cellWidget(0, 3)
+        assert combo.count() == 3
+        assert combo.currentData() == "inflow"
+        combo.setCurrentIndex(combo.findData("outflow"))
+        table.cellWidget(0, 1).setValue(2)
+        ratio = table.cellWidget(0, 2)
+        ratio.interpretText()
+        assert abs(ratio.value() - 1 / 3) < 1e-12
+        values = dialog.values()
+        rule = values["plane_gen_params.label_rules"]["AAO"]
+        assert rule["main_path"] == "outflow"
+        assert not {"path_index", "segment_index", "require_pv_connection"} & set(rule)
+        assert rule["plane_count"] == 2 and rule["spacing_ratio"] == pytest.approx(1 / 3)
+        assert dialog.rows["plane_gen_params.plane_count"].isHidden()
+        assert dialog.values()["plane_gen_params.label_rules"]["LICA"]["plane_count"] == 0
+        from autoflow.plane_rules import load_plane_rules_file, save_plane_rules_file
+        shared = tmp_path / "shared.json"
+        monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName", lambda *args: (str(shared), "JSON"))
+        dialog._save_plane_config()
+        shared_rules = load_plane_rules_file(shared)
+        assert shared_rules["AAO"]["main_path"] == "outflow"
+        assert shared_rules["AAO"]["plane_count"] == 2
+        assert not any("reason" in value for value in shared_rules.values())
+        assert build_workspace(AutoFlowConfig(plane_config=str(shared))).plane_gen_params.label_rules == shared_rules
+        other = tmp_path / "only_aao.json"
+        save_plane_rules_file(other, {"AAO": 1})
+        monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", lambda *args: (str(other), "JSON"))
+        dialog._load_plane_config()
+        assert table.rowCount() == 1
+        assert set(dialog.values()["plane_gen_params.label_rules"]) == {"AAO"}
+        assert dialog.values()["plane_gen_params.label_rules_file"] == str(other)
+        def edit_parameters(child):
+            mode = child.controls["plane_gen_params.plane_mode"]
+            assert {mode.itemData(i) for i in range(mode.count())} == {"fixed_step", "uniform", "anchored_offset", "count", "distance"}
+            mode.setCurrentIndex(mode.findData("fixed_step"))
+            anchor = child.controls["plane_gen_params.anchor"]
+            anchor.setCurrentIndex(anchor.findData("start"))
+            spacing = child.controls["plane_gen_params.spacing_mode"]
+            spacing.setCurrentIndex(spacing.findData("distance"))
+            child.controls["plane_gen_params.cross_section_distance"].setValue(7)
+            child.controls["plane_gen_params.fov_boundary_filter"].setChecked(False)
+            child.controls["plane_gen_params.smoothing_window"].setValue(5)
+            child.accept()
+            return child.result()
+        monkeypatch.setattr(ActionSettingsDialog, "exec", edit_parameters)
+        table.cellWidget(0, 4).setCurrentIndex(table.cellWidget(0, 4).findData("uniform"))
+        dialog._edit_label_rule(table, 0)
+        rule = dialog.values()["plane_gen_params.label_rules"]["AAO"]
+        assert rule["plane_mode"] == "fixed_step" and rule["anchor"] == "start"
+        assert rule["spacing_mode"] == "distance" and rule["cross_section_distance"] == 7
+        assert rule["fov_boundary_filter"] is False and rule["smoothing_window"] == 5
+        ws.skeleton_params.label_map["DAO"] = 4
+        dialog._populate_plane_rules(table, {"AAO": rule})
+        assert table.rowCount() == 2
+        assert dialog.values()["plane_gen_params.label_rules"]["DAO"]["plane_count"] == 0
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        app.processEvents()
+
+
+def test_label_plane_config_phantom_cli_and_inline_replace_defaults(tmp_path, monkeypatch):
+    import autoflow.cli as cli
+    from autoflow.plane_rules import load_plane_rules_file, save_plane_rules_file
+
+    bundle_dir = tmp_path / "bundle"
+    bundle_dir.mkdir()
+    (bundle_dir / "planes.json").write_text(json.dumps({"label_rules": {"AAO": 1}}))
+    inline = AutoFlowConfig.from_config_dir(str(bundle_dir))
+    assert set(build_workspace(inline).plane_gen_params.label_rules) == {"AAO"}
+    assert build_workspace(inline).plane_gen_params.fov_boundary_max_fraction == 0.25
+
+    shared = tmp_path / "shared.json"
+    save_plane_rules_file(shared, {"BA": 2})
+    assert set(load_plane_rules_file(shared)) == {"BA"}
+    received = []
+    def capture(config):
+        received.append(build_workspace(config).plane_gen_params)
+        return [{"status": "ok"}], str(tmp_path)
+    monkeypatch.setattr(cli, "run_batch", capture)
+    import sys
+    monkeypatch.setattr(sys, "argv", ["autoflow-run", "case.h5", "--config-dir", str(bundle_dir), "--plane-config", str(shared),
+                                     "--fov-boundary-max-fraction", "0.3", "--no-fov-boundary-filter"])
+    assert cli.main() == 0
+    assert set(received[0].label_rules) == {"BA"}  # no AAO or other defaults are merged in
+    assert received[0].label_rules_file == str(shared)
+    assert received[0].fov_boundary_max_fraction == 0.3 and not received[0].fov_boundary_filter
+    assert not list(tmp_path.glob(".plane_rules_*.tmp"))
+
+    # Loading a replacement config never generates planes for omitted labels.
+    from autoflow.algorithms.label_planes import generate_label_planes
+    labels = np.zeros((40, 8, 5), dtype=np.int16)
+    labels[1:31, 1:4, 1:4] = 1
+    labels[1:31, 5:8, 1:4] = 4
+    paths = [np.column_stack((np.arange(1., 31.), np.full(30, y), np.full(30, 2.))) for y in (2., 6.)]
+    planes, _, _, qc = generate_label_planes(paths, labels, {"AAO": 1, "DAO": 4},
+                                             {"AAO": 1}, smoothing_window=3, inter_time=1)
+    assert len(planes) == 1 and planes[0].segmentation_label == 1
+    assert [entry["label_name"] for entry in qc] == ["AAO", "DAO"]
+    assert qc[1]["status"] == "not_configured" and qc[1]["reason"] == "not_in_plane_config"
 
 
 def test_plane_modes_support_junction_spacing_count_and_all_count():
@@ -1030,9 +2565,841 @@ def test_streamline_velocity_scalar_matches_interpolated_vector_magnitude():
     assert np.asarray(streamlines.point_data["Velocity"]) == pytest.approx(expected)
 
 
+def test_planar_streamline_phantom_respects_anisotropic_spacing_and_mask_gaps():
+    from autoflow.algorithms.slice_streamlines import trace_planar_streamlines, limit_polyline_length
+
+    vectors = np.zeros((32, 18, 2))
+    vectors[..., 0] = 20.0
+    mask = np.zeros(vectors.shape[:2], dtype=bool)
+    mask[2:14, 3:15] = True
+    mask[18:30, 3:15] = True
+    spacing, offset = np.array([2.0, 0.75]), np.array([-10.0, 4.0])
+    curves = trace_planar_streamlines(vectors, spacing, mask=mask, offset=offset)
+    assert curves
+    for curve in curves:
+        assert np.all(np.isfinite(curve))
+        assert np.all(np.diff(curve[:, 0]) > 0.0)
+        np.testing.assert_allclose(curve[:, 1], curve[0, 1])
+        indices = np.rint((curve - offset) / spacing).astype(int)
+        assert np.all(mask[indices[:, 0], indices[:, 1]])
+        assert np.all(indices[:, 0] < 14) or np.all(indices[:, 0] >= 18)
+        trimmed = limit_polyline_length(curve, 0.1)
+        assert np.sum(np.linalg.norm(np.diff(trimmed, axis=0), axis=1)) == pytest.approx(0.1)
+    assert trace_planar_streamlines(np.zeros_like(vectors), spacing) == []
+    assert trace_planar_streamlines(vectors, spacing, mask=np.zeros_like(mask)) == []
+    assert trace_planar_streamlines(vectors * np.nan, spacing) == []
+    assert trace_planar_streamlines(vectors, spacing, terminal_speed=30.0) == []
+
+
+def test_planar_streamline_vortex_phantom_follows_circular_in_plane_velocity():
+    from autoflow.algorithms.slice_streamlines import trace_planar_streamlines
+
+    x, y = np.meshgrid(np.arange(41) - 20.0, np.arange(41) - 20.0, indexing="ij")
+    radius = np.hypot(x, y)
+    curves = trace_planar_streamlines(
+        np.stack((-y, x), axis=-1), (1.0, 1.0),
+        mask=(radius > 8.0) & (radius < 16.0), offset=(-20.0, -20.0), max_steps=120,
+    )
+    assert curves
+    for curve in curves:
+        if len(curve) < 15:
+            continue
+        radii = np.linalg.norm(curve, axis=1)
+        assert np.ptp(radii) < 0.15
+        tangent = np.diff(curve, axis=0)
+        assert np.all(curve[:-1, 0] * tangent[:, 1] - curve[:-1, 1] * tangent[:, 0] > 0)
+
+
+def test_streamline_slab_phantom_clips_crossings_without_joining_exits_or_lines():
+    import pyvista as pv
+    from autoflow.algorithms.slice_streamlines import project_streamline_slab
+
+    origin = np.array([11.0, -23.0, 31.0])
+    u = np.array([1.0, 1.0, 0.0]) / np.sqrt(2.0)
+    v = np.array([0.0, 0.0, 1.0])
+    n = np.cross(u, v)
+    # Each crossing has both endpoints outside the slab. The return trip
+    # creates a separate visible piece; the parallel outside line disappears.
+    local = np.array([[-3, 0, -3], [3, 0, 3], [9, 0, -3],
+                      [0, 4, 0], [2, 4, 0], [0, 8, 4], [2, 8, 4]], dtype=float)
+    mesh = pv.PolyData(origin + local @ np.stack((u, v, n)))
+    mesh.lines = np.array([3, 0, 1, 2, 2, 3, 4, 2, 5, 6])
+    curves = project_streamline_slab(mesh, origin, u, v, thickness=2.0)
+    assert len(curves) == 3
+    np.testing.assert_allclose(curves[0], [[-1, 0], [1, 0]], atol=1e-10)
+    np.testing.assert_allclose(curves[1], [[5, 0], [7, 0]], atol=1e-10)
+    np.testing.assert_allclose(curves[2], [[0, 4], [2, 4]], atol=1e-10)
+    # Cached VTK backward integrations have the opposite point ordering.
+    # Arrow direction must still agree with the vector used by the tracer.
+    mesh.point_data["vector"] = np.tile(-u, (mesh.n_points, 1))
+    oriented = project_streamline_slab(mesh, origin, u, v, thickness=2.0)
+    for curve in oriented:
+        assert np.all(np.diff(curve[:, 0]) < 0.0)
+    assert project_streamline_slab(None, origin, u, v, 2.0) == []
+
+
+def test_streamline_slab_phantom_generated_backward_traces_follow_velocity():
+    from autoflow.algorithms.slice_streamlines import project_streamline_slab
+
+    flow = np.zeros((18, 18, 18, 1, 3), dtype=np.float32)
+    flow[..., 2] = 30.0
+    spacing, origin = np.array([1.0, 1.5, 2.0]), np.array([10.0, -20.0, 30.0])
+    seed = origin + np.array([8.5, 8.5, 8.5]) * spacing
+    mesh = generate_streamlines_at_t(
+        flow, 0, seed[None, :], spacing, origin,
+        mask_3d=np.ones(flow.shape[:3], dtype=bool), max_steps=40,
+    )
+    assert mesh is not None
+    curves = project_streamline_slab(mesh, seed, [1, 0, 0], [0, 0, 1], 2.0)
+    assert len(curves) >= 2
+    for curve in curves:
+        assert np.all(np.diff(curve[:, 1]) > 0.0)
+
+
+@pytest.mark.parametrize("selected_plane", [False, True])
+def test_slice_streamline_phantom_modes_time_geometry_and_reset(monkeypatch, selected_plane):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    import pyvista as pv
+    from PySide6 import QtWidgets
+    from autoflow.ui.ortho_viewer import OrthoViewer
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    ws = Workspace()
+    ws.mag_raw = np.ones((18, 18, 18, 2), dtype=np.float32)
+    ws.flow_raw = np.zeros(ws.mag_raw.shape + (3,), dtype=np.float32)
+    ws.flow_raw[..., 0, :] = [20.0, 15.0, 10.0]
+    ws.segmask_raw = np.ones(ws.mag_raw.shape, dtype=np.int16)
+    ws.segmask_raw[..., 1] = 0
+    ws.resolution = np.array([1.0, 1.5, 2.0])
+    ws.origin = np.array([10.0, -20.0, 30.0])
+    center = np.array([8.0, 12.0, 16.0])
+    ws.planes = [PlaneData(center=center, normal=np.array([0.2, 0.3, 1.0]), label=1)]
+    mesh = pv.PolyData(ws.origin + np.array([[2, 3, 4], [14, 21, 28]], dtype=float))
+    mesh.lines = np.array([2, 0, 1])
+    ws.streamline_active = True
+    ws.streamline_cache = {0: mesh, 1: None}
+    viewer = OrthoViewer(ws)
+    try:
+        viewer.update_slider_ranges()
+        for slider in (viewer.slider_x, viewer.slider_y, viewer.slider_z):
+            slider.setValue(8)
+        viewer._apply_pending_cursor()
+        if selected_plane:
+            viewer.set_selected_plane(0)
+        assert not viewer.check_planar_streamlines.isChecked()
+        assert not viewer.check_projected_streamlines.isChecked()
+        viewer.check_planar_streamlines.setChecked(True)
+        viewer.check_projected_streamlines.setChecked(True)
+        for view in viewer.slice_views.values():
+            for items in view.streamline_items.values():
+                assert items[0].isVisible()
+                x, y = items[0].getData()
+                assert len(x) >= 2 and len(x) == len(y)
+                assert np.all(np.isfinite(x)) and np.all(np.isfinite(y))
+                assert items[0].zValue() > view.noise_overlay_item.zValue()
+                assert items[0].zValue() < view.vertical_line.zValue()
+        if selected_plane:
+            # Nonzero world origin must not move local plane sampling outside
+            # an otherwise uniform image/segmentation volume.
+            view = viewer.slice_views["axial"]
+            mid = tuple(np.array(view.image_item.image.shape) // 2)
+            assert view.image_item.image[mid] == pytest.approx(1.0)
+            assert view.overlay_item.image[mid][3] > 0
+        current = viewer.slice_views["axial"]
+        persistent_items = current.streamline_items["planar"]
+        geometry = current._streamline_geometry["planar"]
+        viewer.refresh(update_plane=False)
+        assert current._streamline_geometry["planar"] is geometry
+        viewer.slider_streamline_opacity.setValue(40)
+        assert persistent_items[0].opacity() == pytest.approx(0.4)
+        viewer.spin_streamline_slab.setValue(6.0)
+        viewer.set_playback_active(True)
+        ws.current_t = 1
+        viewer.refresh(update_plane=False)
+        assert all(not items[0].isVisible() for view in viewer.slice_views.values()
+                   for items in view.streamline_items.values())
+        assert current.streamline_items["planar"] == persistent_items
+        ws.current_t = 0
+        viewer.refresh(update_plane=False)
+        viewer.check_planar_streamlines.setChecked(False)
+        assert not current.streamline_items["planar"][0].isVisible()
+        assert current.streamline_items["projection"][0].isVisible()
+        ws.streamline_active = False
+        viewer.refresh(update_plane=False)
+        assert "Generate Streamlines" in viewer.label_streamline_status.text()
+        assert not current.streamline_items["projection"][0].isVisible()
+        viewer.reset_state()
+        assert not viewer.check_projected_streamlines.isChecked()
+        assert not viewer._streamline_cache
+        assert not current.streamline_items["projection"][0].isVisible()
+    finally:
+        viewer.close()
+        viewer.deleteLater()
+        app.processEvents()
+
+
+def test_viewer_display_phantom_speed_colors_layer_styles_and_workspace_roundtrip(monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    import copy
+    import pyvista as pv
+    from PySide6 import QtWidgets
+    from autoflow.ui.ortho_viewer import OrthoViewer
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    ws = Workspace()
+    ws.mag_raw = np.ones((14, 14, 14, 2), dtype=np.float32)
+    ws.flow_raw = np.zeros(ws.mag_raw.shape + (3,), dtype=np.float32)
+    ws.flow_raw[..., 0, 0] = np.linspace(10, 50, 14)[:, None, None]
+    ws.flow_raw[..., 1, 0] = ws.flow_raw[..., 0, 0] * 2
+    ws.segmask_raw = np.ones(ws.mag_raw.shape, dtype=np.int16)
+    ws.segmask_raw[7:, ..., :] = 2
+    ws.origin = np.array([10.0, -20.0, 30.0])
+    points = np.column_stack((np.arange(2, 11), np.full(9, 2.5), np.full(9, 2.5)))
+    mesh = pv.PolyData(points + ws.origin)
+    mesh.lines = np.r_[9, np.arange(9)]
+    mesh.point_data["vector"] = np.column_stack((np.linspace(0.1, 0.5, 9), np.zeros((9, 2))))
+    ws.streamline_active = True
+    ws.streamline_cache = {0: mesh, 1: mesh.copy()}
+    viewer = OrthoViewer(ws)
+    try:
+        viewer.update_slider_ranges()
+        viewer.slider_z.setValue(2)
+        viewer._apply_pending_cursor()
+        state = copy.deepcopy(ws.render_settings["viewer_display"])
+        state["planar"].update(enabled=True, range_mode="manual", low=0, high=100, arrows=False)
+        state["projection"].update(enabled=True, range_mode="manual", low=0, high=100, cmap="viridis", opacity=0.4)
+        state["images"]["3"] = dict(cmap="gray", range_mode="manual", low=0, high=3)
+        state["segmentation"].update(labels="1", colors={"1": "#00ff00"}, opacity=0.6)
+        state["views"]["coronal"] = dict(guides=dict(crosshairs=False, orientation=False))
+        viewer.apply_display_settings(state)
+        view = viewer.slice_views["axial"]
+        assert len(np.unique(view.streamline_items["planar"][0].segment_colors, axis=0)) > 1
+        assert len(np.unique(view.streamline_items["projection"][0].segment_colors, axis=0)) > 1
+        assert not view.streamline_items["planar"][1].isVisible()
+        assert view.streamline_items["projection"][0].opacity() == pytest.approx(0.4)
+        assert len(viewer._velocity_bars) == 2
+        assert not viewer.slice_views["coronal"].vertical_line.isVisible()
+        assert not viewer.slice_views["coronal"].orientation_items["h0"].isVisible()
+        np.testing.assert_allclose(view.image_item.levels, [0, 3])
+        assert not np.any(view.overlay_item.image[:, 7:, 3])
+        original = ws.mag_raw.copy(), ws.flow_raw.copy(), ws.segmask_raw.copy()
+        ws.current_t = 1
+        viewer.refresh(update_plane=False)
+        assert view._flow_clims["planar"] == (0, 100)
+        state["planar"].update(color_mode="fixed", color="#ff00ff")
+        state["segmentation"]["mode"] = "outline"
+        viewer.apply_display_settings(state)
+        assert len(np.unique(view.streamline_items["planar"][0].segment_colors, axis=0)) == 1
+        assert not view.overlay_item.isVisible() and view.segmentation_boundaries
+        assert len(viewer._velocity_bars) == 1
+        for array, before in zip((ws.mag_raw, ws.flow_raw, ws.segmask_raw), original):
+            np.testing.assert_array_equal(array, before)
+        restored = Workspace()
+        restored.restore_dict(ws.snapshot_dict())
+        assert restored.render_settings["viewer_display"] == ws.render_settings["viewer_display"]
+        viewer.open_display_settings()
+        assert [viewer._display_panel.tabs.tabText(i) for i in range(4)] == ["Image", "Overlays", "Flow", "View"]
+        assert viewer._display_panel.tabs.count() == 4
+        viewer._display_panel._controls[("planar", "density")][0].setValue(0.5)
+        assert ws.render_settings["viewer_display"]["planar"]["density"] == 0.5
+        panel = viewer._display_panel
+        panel.target.setCurrentIndex(panel.target.findData("coronal"))
+        panel._controls[("planar", "density")][0].setValue(0.75)
+        assert ws.render_settings["viewer_display"]["views"]["coronal"]["planar"]["density"] == 0.75
+        assert ws.render_settings["viewer_display"]["planar"]["density"] == 0.5
+        panel._controls[("contours", "snap_distance")][0].setValue(1.25)
+        assert ws.render_settings["viewer_display"]["contours"]["snap_distance"] == 1.25
+        assert viewer._contour_snap_distance_mm == 1.25
+    finally:
+        if viewer._display_dock:
+            viewer._display_dock.close()
+        viewer.close()
+        viewer.deleteLater()
+        app.processEvents()
+
+
+@pytest.mark.parametrize("content", [0, 3, 4, 5])
+@pytest.mark.parametrize("mode", ["composite", "maximum", "slices"])
+def test_content_render_phantom_sources_modes_geometry_phase_and_axis_drag(content, mode):
+    import pyvista as pv
+    from autoflow.ui.viewer import SceneController
+
+    ws = Workspace()
+    values = np.arange(8 * 10 * 12, dtype=np.float32).reshape(8, 10, 12) + 1
+    ws.mag_raw = np.stack((values, values * 2), axis=3)
+    ws.pcmra_array = ws.mag_raw * 0.5
+    ws.flow_raw = np.zeros(ws.mag_raw.shape + (3,), dtype=np.float32)
+    ws.flow_raw[..., 0] = ws.mag_raw - values.max() / 2
+    ws.resolution = np.array([1.0, 1.5, 2.0])
+    ws.origin = np.array([10.0, -20.0, 30.0])
+    original_mag, original_pcmra, original_flow = ws.mag_raw.copy(), ws.pcmra_array.copy(), ws.flow_raw.copy()
+    errors = []
+    plotter = pv.Plotter(off_screen=True)
+    scene = SceneController(plotter, ws, errors.append)
+    try:
+        obj = scene.add_content_render(content)
+        assert obj is not None and obj.actor is not None
+        scene.update_content_render(obj.uid, mode=mode, positions=[0.5, 0.25, 0.5], planes=[False, True, False])
+        data = scene._build_dataset(obj.data_key)
+        assert obj.actor is not None and obj.show_scalar_bar is False
+        if mode == "slices":
+            expected = ws.origin[1] + (0.5 + 0.25 * 9) * ws.resolution[1]
+            np.testing.assert_allclose(data.points[:, 1], expected)
+            assert not scene._is_volume_object(obj)
+            assert np.max(obj.actor.mapper.lookup_table.values[:, 3]) == 255
+            from scipy.ndimage import map_coordinates
+            raw, _, _ = scene._content_source.scalar_volume(0, content)
+            coordinates = ((data.points - (ws.origin - 0.5 * ws.resolution)) / ws.resolution).T
+            expected_values = map_coordinates(np.pad(raw, 1), coordinates, order=1, mode="constant", cval=0)
+            np.testing.assert_allclose(data.point_data[obj.scalars], expected_values, rtol=1e-5, atol=1e-5)
+            scene.update_content_render(obj.uid, planes=[True, True, True])
+            assert len(scene._content_widgets) == 3
+            # Exercise the real VTK interaction callback with a constrained axis handle.
+            widget, rep, axis = scene._content_widgets[1]
+            endpoint = scene.display_to_world_point(rep.GetWorldPosition())
+            endpoint[1] += ws.resolution[1] * 9 * 0.25
+            rep.SetWorldPosition(scene.world_to_display_point(endpoint))
+            widget.InvokeEvent("InteractionEvent")
+            np.testing.assert_allclose(scene.content_render_settings(obj.data_key)["positions"], [0.5, 0.5, 0.5])
+            assert len(scene._content_widgets) == 3
+            scene.set_display_axis_directions(["RL", "AP", "HF"])
+            widget, rep, axis = scene._content_widgets[0]
+            endpoint = scene.display_to_world_point(rep.GetWorldPosition())
+            endpoint[0] -= ws.resolution[0] * 7 * 0.25
+            rep.SetWorldPosition(scene.world_to_display_point(endpoint))
+            widget.InvokeEvent("InteractionEvent")
+            assert scene.content_render_settings(obj.data_key)["positions"][0] == pytest.approx(0.25)
+        else:
+            assert scene._is_volume_object(obj)
+            assert tuple(data.dimensions) == (10, 12, 14)
+            assert obj.actor.GetProperty().GetScalarOpacity().GetValue(0) == 0
+            if content == 0:
+                assert obj.actor.GetProperty().GetScalarOpacity().GetValue(-300) > 0
+        actor = obj.actor
+        scene.update_time(1)
+        assert obj.actor is actor
+        obj.visible = False
+        scene.apply_object_properties(obj)
+        assert not obj.actor.GetVisibility() and not scene._content_widgets
+        assert scene.add_content_render(content) is obj
+        assert len(ws.scene_objects) == 1
+        scene.update_content_render(obj.uid, mode=mode)
+        restored = Workspace()
+        restored.restore_dict(ws.snapshot_dict())
+        assert restored.render_settings["content_renders"] == ws.render_settings["content_renders"]
+        scene.remove_object(obj.uid)
+        assert not scene._content_widgets and not ws.scene_objects
+        assert not errors
+        np.testing.assert_array_equal(ws.mag_raw, original_mag)
+        np.testing.assert_array_equal(ws.pcmra_array, original_pcmra)
+        np.testing.assert_array_equal(ws.flow_raw, original_flow)
+    finally:
+        scene._clear_content_widgets()
+        plotter.close()
+
+
+def test_content_render_phantom_static_magnitude_and_missing_pcmra():
+    import pyvista as pv
+    from autoflow.ui.viewer import SceneController
+
+    ws = Workspace()
+    ws.mag_raw = np.ones((5, 6, 7), dtype=np.float32)
+    plotter = pv.Plotter(off_screen=True)
+    scene = SceneController(plotter, ws, lambda _: None)
+    try:
+        obj = scene.add_content_render(3)
+        assert obj is not None and obj.actor is not None
+        assert scene.add_content_render(4) is None
+        assert ws.pcmra_array is None
+        assert not any(o.data_key == "pcmra_volume" for o in ws.scene_objects.values())
+    finally:
+        scene._clear_content_widgets()
+        plotter.close()
+
+
+def test_content_render_phantom_every_available_scalar_matches_slice_source(monkeypatch):
+    _smoke_qt_application(monkeypatch)
+    import pyvista as pv
+    from autoflow.ui.viewer import SceneController
+    from autoflow.ui.ortho_viewer import OrthoViewer
+
+    ws = Workspace()
+    values = np.arange(5 * 6 * 7 * 2, dtype=np.float32).reshape(5, 6, 7, 2) / 100 + 1
+    ws.mag_raw = values
+    ws.flow_raw = np.stack((values - 2, values, -values), axis=-1)
+    ws.pcmra_array = values * 3
+    ws.segmask_binary = np.ones(values.shape, dtype=bool)
+    ws.derived.wss_volume = values
+    ws.derived.tke_array = values * 2
+    ws.derived.pressure_gradient_array = ws.flow_raw.copy()
+    ws.derived.pressure_gradient_magnitude = np.linalg.norm(ws.flow_raw, axis=-1)
+    ws.derived.pressure_gradient_support_mask = ws.segmask_binary
+    ws.derived.relative_pressure_array = values - 2
+    ws.derived.vorticity_magnitude = values
+    ws.derived.q_criterion_array = values - 2
+    ws.derived.swirling_strength_array = values
+    ws.derived.vortex_support_mask = ws.segmask_binary
+    ws.correction_raw = ws.flow_raw * 0.1
+    ws.correction_high_raw = ws.flow_raw * 0.2
+    ws.phase_unwrap_result = dict(wrap_mask=np.ones(ws.flow_raw.shape, dtype=bool),
+                                 wrap_count=np.ones(ws.flow_raw.shape, dtype=np.int8),
+                                 flow_wrapped=ws.flow_raw, flow_unwrapped=ws.flow_raw * 1.1)
+    ws.planes = [PlaneData(center=np.array([2., 3., 4.]), normal=np.array([1., 0., 0.]))]
+    viewer = OrthoViewer(ws)
+    viewer.set_selected_plane(0)
+    plotter = pv.Plotter(off_screen=True)
+    errors = []
+    scene = SceneController(plotter, ws, errors.append)
+    try:
+        assert viewer._available_content_keys() == list(range(28))
+        for content in range(28):
+            viewer.combo_content.setCurrentIndex(viewer.combo_content.findData(content))
+            expected, title, _ = viewer._get_scalar_slice(0)
+            obj = scene.add_content_render(content, plane_index=0)
+            assert obj is not None and obj.actor is not None, (content, errors)
+            grid = scene._build_dataset(obj.data_key)
+            actual = np.asarray(grid.point_data[obj.scalars]).reshape(grid.dimensions, order="F")[1:-1, 1:-1, 1:-1]
+            np.testing.assert_allclose(actual, expected, err_msg=title)
+            scene.remove_object(obj.uid)
+        assert not errors
+    finally:
+        scene._clear_content_widgets()
+        plotter.close()
+        viewer.close()
+
+
+@pytest.mark.parametrize("layout,mode", [("normalized", "dv"), ("complex", "dv"),
+                                         ("dual", "lv"), ("dual", "hv"), ("dual", "dv")])
+def test_gui_input_reload_phantom_applies_edited_calibration(monkeypatch, tmp_path, layout, mode):
+    _smoke_qt_application(monkeypatch)
+    monkeypatch.setenv("AUTOFLOW_SSH_RENDERING", "1")
+    from PySide6 import QtCore, QtTest
+    from autoflow.case_types import InputCase
+    import autoflow.ui.app as ui_app
+    from autoflow.ui.remote_plotter import RemotePlotter
+    monkeypatch.setattr(ui_app, "RemotePlotter", RemotePlotter, raising=False)
+    shape = (3, 4, 5, 2)
+    phase = np.array([0.2, 0.3, 0.4], dtype=np.float32)
+    path = tmp_path / f"reload_{layout}_{mode}.h5"
+    with h5py.File(path, "w") as handle:
+        if layout == "normalized":
+            handle["mag"] = np.ones(shape, dtype=np.float32)
+            handle["flow"] = np.broadcast_to(phase * 100 / np.pi, shape + (3,))
+        else:
+            img = np.ones(shape + (7 if layout == "dual" else 4,), dtype=np.complex64)
+            img[..., 1:4] = np.exp(1j * phase)
+            if layout == "dual":
+                img[..., 4:7] = np.exp(1j * phase / 2)
+            handle["img"] = img
+        handle["VENC"] = [100., 100., 100., 200., 200., 200.] if layout == "dual" else [100., 100., 100.]
+        handle["Resolution"] = [1., 1.5, 2.]
+        handle["SpatialOrder"] = np.array(["LR", "AP", "FH"], dtype="S4")
+        handle["VENCOrder"] = np.array(["LR", "AP", "FH"], dtype="S4")
+        labels = np.zeros(shape, dtype=np.int16)
+        labels[0, 1, 2, :] = 1
+        handle["seg"] = labels
+    source_bytes = path.read_bytes()
+    window = ui_app.MainWindow()
+    try:
+        assert window._load_selected_input_case(InputCase(str(path), "h5", metadata={"dual_venc_mode": mode}))
+        previous = window.workspace
+        old_flow = previous.flow_raw.copy()
+        previous.planes = [PlaneData(center=np.zeros(3), normal=np.array([1., 0., 0.]))]
+        window._publish_action_settings({
+            "input.resolution": "2, 3, 4", "input.venc": "150, 180, 210",
+            "input.spatial_order": "FH, AP, LR", "input.venc_order": "RL, AP, FH",
+        })
+        # Other processing actions must not silently change loaded calibration.
+        window._sync_params_to_ws()
+        np.testing.assert_allclose(previous.resolution, [1., 1.5, 2.])
+        np.testing.assert_array_equal(previous.flow_raw, old_flow)
+        assert previous.spatial_order == ["LR", "AP", "FH"]
+        QtTest.QTest.mouseClick(window.btn_reload_input, QtCore.Qt.LeftButton)
+        ws = window.workspace
+        assert ws is not previous, window.console.toPlainText()
+        np.testing.assert_allclose(ws.resolution, [2., 3., 4.])
+        np.testing.assert_allclose(ws.venc, [150., 180., 210.])
+        assert ws.spatial_order == ["FH", "AP", "LR"]
+        assert ws.venc_order == ["RL", "AP", "FH"]
+        assert ws.flow_raw.shape == (5, 4, 3, 2, 3)
+        np.testing.assert_array_equal(ws.segmask_raw, labels.transpose(2, 1, 0, 3))
+        if layout == "normalized":
+            expected = phase * np.array([-1., 1., 1.]) * 100 / np.pi
+        else:
+            expected = phase * np.array([-150., 180., 210.]) / np.pi
+            if layout == "dual" and mode in {"dv", "hv"}:
+                expected /= 2
+        np.testing.assert_allclose(ws.flow_raw, np.broadcast_to(expected, ws.flow_raw.shape), atol=3e-5)
+        assert window._input_parameters_from_ui() == {
+            "resolution": [2., 3., 4.], "venc": [150., 180., 210.],
+            "spatial_order": ["FH", "AP", "LR"], "venc_order": ["RL", "AP", "FH"],
+        }
+        assert not ws.planes
+        # A numeric formatting change does not reload or invalidate anything.
+        window._publish_action_settings({"input.resolution": "2.000, 3.0, 4", **{
+            "input." + key: value for key, value in window._input_parameters_from_ui().items() if key != "resolution"}})
+        window._reload_input_case()
+        assert window.workspace is ws
+        # Invalid input and cancelled/failed loads leave the loaded case intact.
+        with pytest.raises(ValueError):
+            window._publish_action_settings({"input.resolution": "2, 0, 4"})
+        assert window.workspace is ws
+        np.testing.assert_allclose(ws.resolution, [2., 3., 4.])
+        window._publish_action_settings({"input." + key: ("5, 6, 7" if key == "resolution" else value)
+                                         for key, value in window._input_parameters_from_ui().items()})
+        def cancel(*_args, **_kwargs):
+            raise ui_app.TaskCancelled()
+        with monkeypatch.context() as patch:
+            patch.setattr(window, "_run_modal_task", cancel)
+            window._reload_input_case()
+        assert window.workspace is ws
+        np.testing.assert_allclose(ws.resolution, [2., 3., 4.])
+        window._publish_action_settings({"input." + key: ([2., 3., 4.] if key == "resolution" else value)
+                                         for key, value in window._input_parameters_from_ui().items()})
+        # Correction must reopen the same source with the session calibration.
+        def fit(values, **_kwargs):
+            corr = np.zeros((3, 1) + values.shape[2:], dtype=np.float32)
+            return corr, np.ones(values.shape[2:], dtype=bool), {"applied": True}
+        monkeypatch.setattr("autoflow.algorithms.phase_correction.execute_wrls_arto", fit)
+        result = window.pipeline._step_background_correction(ws, force_recompute=True)
+        assert result.success, result.message
+        np.testing.assert_allclose(ws.flow_raw, np.broadcast_to(expected, ws.flow_raw.shape), atol=3e-5)
+        assert path.read_bytes() == source_bytes
+        # Opening a different case uses that file's metadata, not the edits.
+        assert window._load_selected_input_case(InputCase(str(path), "h5"))
+        np.testing.assert_allclose(window.workspace.resolution, [1., 1.5, 2.])
+        np.testing.assert_allclose(window.workspace.venc, [200., 200., 200.] if layout == "dual" else [100., 100., 100.])
+    finally:
+        window.close()
+
+
+def test_content_render_phantom_gui_open_input_then_render_and_switch_case(monkeypatch, tmp_path):
+    app = _smoke_qt_application(monkeypatch)
+    monkeypatch.setenv("AUTOFLOW_SSH_RENDERING", "1")
+    from PySide6 import QtCore, QtTest
+    from autoflow.case_types import InputCase
+    import autoflow.ui.app as ui_app
+    from autoflow.ui.remote_plotter import RemotePlotter
+    monkeypatch.setattr(ui_app, "RemotePlotter", RemotePlotter, raising=False)
+    window = ui_app.MainWindow()
+    window.show()
+    app.processEvents()
+    try:
+        startup_workspace = window.workspace
+        for case_index, shape in enumerate(((7, 8, 9, 2), (9, 6, 8, 2))):
+            path = tmp_path / f"content_case_{case_index}.h5"
+            signal = float(case_index + 1)
+            with h5py.File(path, "w") as handle:
+                handle.create_dataset("mag", data=np.full(shape, signal, dtype=np.float32))
+                handle.create_dataset("flow", data=np.full(shape + (3,), signal * 10, dtype=np.float32))
+                handle.create_dataset("Resolution", data=np.array([1., 1.5, 2.], dtype=np.float32))
+                handle.create_dataset("RR", data=1000.)
+                handle.create_dataset("VENC", data=np.full(3, 100., dtype=np.float32))
+                handle.create_dataset("SpatialOrder", data=np.asarray(["LR", "AP", "FH"], dtype="S4"))
+                handle.create_dataset("VENCOrder", data=np.asarray(["LR", "AP", "FH"], dtype="S4"))
+            window._load_selected_input_case(InputCase(str(path), "h5"))
+            ws = window.workspace
+            assert ws is not startup_workspace and ws.data_loaded, window.console.toPlainText()
+            window.ortho_viewer.combo_content.setCurrentIndex(window.ortho_viewer.combo_content.findData(3))
+            QtTest.QTest.mouseClick(window.ortho_viewer.btn_render_content, QtCore.Qt.LeftButton)
+            renders = [obj for obj in ws.scene_objects.values() if obj.data_key == "magnitude_volume"]
+            assert len(renders) == 1, window.console.toPlainText()
+            obj = renders[0]
+            assert obj.visible and obj.actor is not None
+            assert window._find_browser_item_by_uid(obj.uid) is not None
+            assert "3D volume shown:" in window.statusBar().currentMessage()
+            grid = window.scene._build_dataset(obj.data_key)
+            assert np.max(grid.point_data["Magnitude"]) == signal
+            window.content_render_controls.mode.setCurrentIndex(window.content_render_controls.mode.findData("slices"))
+            assert len(window.scene._content_widgets) == 3
+            assert window.scene._content_source.workspace is ws
+    finally:
+        window.scene._clear_content_widgets()
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+
+
+def test_content_render_phantom_gui_pcmra_handoff_and_browser_properties(monkeypatch, tmp_path):
+    app = _smoke_qt_application(monkeypatch)
+    monkeypatch.setenv("AUTOFLOW_SSH_RENDERING", "1")
+    from PySide6 import QtCore, QtTest
+    import autoflow.ui.app as ui_app
+    from autoflow.ui.remote_plotter import RemotePlotter
+    monkeypatch.setattr(ui_app, "RemotePlotter", RemotePlotter, raising=False)
+    window = ui_app.MainWindow()
+    try:
+        ws = window.workspace
+        ws.paths.output_dir = str(tmp_path)
+        ws.data_loaded = True
+        ws.mag_raw = np.ones((7, 8, 9, 2), dtype=np.float32)
+        ws.flow_raw = np.ones(ws.mag_raw.shape + (3,), dtype=np.float32) * 10
+        window.ortho_viewer.update_slider_ranges()
+        window.ortho_viewer.combo_content.setCurrentIndex(window.ortho_viewer.combo_content.findData(3))
+        window.ortho_viewer.btn_render_content.click()
+        mag = next(o for o in ws.scene_objects.values() if o.data_key == "magnitude_volume")
+        assert mag.actor is not None and mag.visible
+        result = PipelineEngine()._step_generate_pcmra(ws)
+        assert result.success
+        window._finish_pipeline_scene_refresh([StepId.GENERATE_PCMRA])
+        assert window.ortho_viewer.combo_content.currentData() == 4
+        pcmra = next(o for o in ws.scene_objects.values() if o.data_key == "pcmra_volume")
+        assert pcmra.actor is not None and pcmra.visible and mag.visible
+        window.ortho_viewer.btn_render_content.click()
+        assert len([o for o in ws.scene_objects.values() if o.data_key == "pcmra_volume"]) == 1
+        controls = window.content_render_controls
+        assert not controls.isHidden()
+        assert window._selected_uid() == pcmra.uid
+        assert window.chk_selection_on_top.isChecked()
+        assert window.scene._selection_renderer.HasViewProp(pcmra.actor)
+        window.chk_selection_on_top.setChecked(False)
+        assert ws.render_settings["selected_layer_on_top"] is False
+        assert window.plotter.renderer.HasViewProp(pcmra.actor)
+        window.chk_selection_on_top.setChecked(True)
+        assert window.scene._selection_renderer.HasViewProp(pcmra.actor)
+        assert controls.mode.currentData() == "composite"
+        assert all(check.isEnabled() for check in controls.planes)
+        assert all(slider.isEnabled() for slider in controls.positions)
+        QtTest.QTest.mouseClick(controls.planes[0], QtCore.Qt.LeftButton)
+        assert controls.mode.currentData() == "slices"
+        assert window.scene.content_render_settings(pcmra.data_key)["planes"] == [True, False, False]
+        assert len(window.scene._content_widgets) == 1
+        controls.mode.setCurrentIndex(controls.mode.findData("composite"))
+        controls.positions[2].setValue(650)
+        assert controls.mode.currentData() == "slices"
+        assert window.scene.content_render_settings(pcmra.data_key)["positions"][2] == 0.65
+        assert window.scene.content_render_settings(pcmra.data_key)["planes"] == [False, False, True]
+        controls.show_planes.click()
+        assert len(window.scene._content_widgets) == 3
+        controls.positions[1].setValue(750)
+        assert window.scene.content_render_settings(pcmra.data_key)["positions"][1] == 0.75
+        window.show()
+        app.processEvents()
+        window.plotter.view_isometric()
+        window.plotter.reset_camera()
+        window.plotter.render()
+        app.processEvents()
+        widget, rep, axis = window.scene._content_widgets[0]
+        endpoint = np.asarray(rep.GetWorldPosition())
+        target = endpoint + np.array([0.9, 0, 0])
+        renderer = window.plotter.renderer
+
+        def screen_point(point):
+            renderer.SetWorldPoint(*point, 1)
+            renderer.WorldToDisplay()
+            x, y, _ = renderer.GetDisplayPoint()
+            rw, rh = window.plotter.render_window.GetSize()
+            return QtCore.QPoint(round(x * window.plotter.width() / rw),
+                                 round((rh - 1 - y) * window.plotter.height() / rh))
+
+        start, end = screen_point(endpoint), screen_point(target)
+        camera = np.asarray(tuple(window.plotter.camera_position), dtype=float)
+        QtTest.QTest.mouseMove(window.plotter, start)
+        QtTest.QTest.mousePress(window.plotter, QtCore.Qt.LeftButton, pos=start)
+        assert window.scene._content_widget_dragging
+        QtTest.QTest.mouseMove(window.plotter, end)
+        QtTest.QTest.mouseRelease(window.plotter, QtCore.Qt.LeftButton, pos=end)
+        assert not window.scene._content_widget_dragging
+        assert window.scene.content_render_settings(pcmra.data_key)["positions"][0] > 0.55
+        np.testing.assert_allclose(tuple(window.plotter.camera_position), camera)
+        pcmra.opacity = 0.42
+        pcmra.clim = (2, 30)
+        assert PipelineEngine()._step_generate_pcmra(ws).success
+        window._finish_pipeline_scene_refresh([StepId.GENERATE_PCMRA])
+        assert ws.scene_objects[pcmra.uid] is pcmra
+        assert pcmra.opacity == 0.42 and pcmra.clim == (2, 30)
+        assert controls.mode.currentData() == "slices" and len(window.scene._content_widgets) == 3
+        assert window.ortho_viewer.combo_content.currentData() == 4
+        item = window._find_browser_item_by_uid(pcmra.uid)
+        item.setCheckState(0, QtCore.Qt.Unchecked)
+        assert not pcmra.actor.GetVisibility() and not window.scene._content_widgets
+        item.setCheckState(0, QtCore.Qt.Checked)
+        assert pcmra.actor.GetVisibility() and len(window.scene._content_widgets) == 3
+        window.scene.remove_object(pcmra.uid)
+        window._refresh_browser()
+        assert not window.scene._content_widgets
+    finally:
+        window.scene._clear_content_widgets()
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+
+
+@pytest.mark.parametrize("mapper_name", ["smart", "fixed_point"])
+def test_interaction_render_phantom_mouse_preview_restores_quality_and_coordinates(monkeypatch, mapper_name):
+    app = _smoke_qt_application(monkeypatch)
+    monkeypatch.setenv("AUTOFLOW_SSH_RENDERING", "1")
+    from PySide6 import QtCore, QtTest
+    from autoflow.ui.remote_plotter import RemotePlotter
+    from autoflow.ui.viewer import SceneController
+
+    ws = Workspace()
+    ws.mag_raw = np.arange(8 * 9 * 10, dtype=np.float32).reshape(8, 9, 10, 1) + 1
+    original = ws.mag_raw.copy()
+    plotter = RemotePlotter()
+    plotter.resize(1400, 900)
+    plotter.show()
+    app.processEvents()
+    scene = SceneController(plotter, ws, lambda _: None)
+    scene._volume_mapper_name = lambda: mapper_name
+    scene.initialize()
+    try:
+        obj = scene.add_content_render(3)
+        plotter.reset_camera()
+        plotter.render()
+        mapper = obj.actor.GetMapper()
+        names = [name for name in ("SampleDistance", "ImageSampleDistance", "AutoAdjustSampleDistances",
+                                  "InteractiveAdjustSampleDistances") if hasattr(mapper, "Get" + name)]
+        before = {name: getattr(mapper, "Get" + name)() for name in names}
+        dataset = mapper.dataset
+        render_pass = plotter.renderer.GetPass()
+        size = tuple(plotter.window_size)
+        QtTest.QTest.mousePress(plotter, QtCore.Qt.LeftButton, pos=QtCore.QPoint(400, 300))
+        assert scene._interaction_preview_active
+        assert max(plotter.window_size) <= 960
+        assert mapper.GetSampleDistance() >= 2.0
+        assert plotter.renderer.GetPass() is None
+        assert mapper.dataset is dataset
+        x, y = plotter.iren.GetEventPosition()
+        width, height = plotter.window_size
+        assert x == round(400 * width / plotter.width())
+        assert y == height - 1 - round(300 * height / plotter.height())
+        QtTest.QTest.mouseMove(plotter, QtCore.QPoint(460, 330))
+        QtTest.QTest.mouseRelease(plotter, QtCore.Qt.LeftButton, pos=QtCore.QPoint(460, 330))
+        assert not scene._interaction_preview_active
+        assert tuple(plotter.window_size) == size
+        assert plotter.renderer.GetPass() is render_pass
+        assert {name: getattr(mapper, "Get" + name)() for name in names} == before
+        assert mapper.dataset is dataset
+        scene.update_content_render(obj.uid, mode="slices")
+        plotter.render()
+        plotter._capture_frame()
+        widget, rep, _ = scene._content_widgets[0]
+        endpoint = np.asarray(rep.GetWorldPosition())
+        renderer = plotter.renderer
+
+        def screen_point(point):
+            renderer.SetWorldPoint(*point, 1)
+            renderer.WorldToDisplay()
+            x, y, _ = renderer.GetDisplayPoint()
+            width, height = plotter.window_size
+            return QtCore.QPoint(round(x * plotter.width() / width),
+                                 round((height - 1 - y) * plotter.height() / height))
+
+        start, end = screen_point(endpoint), screen_point(endpoint + [0.8, 0, 0])
+        QtTest.QTest.mouseMove(plotter, start)
+        QtTest.QTest.mousePress(plotter, QtCore.Qt.LeftButton, pos=start)
+        assert scene._content_widget_dragging and scene._interaction_preview_active
+        QtTest.QTest.mouseMove(plotter, end)
+        QtTest.QTest.mouseRelease(plotter, QtCore.Qt.LeftButton, pos=end)
+        assert not scene._content_widget_dragging and not scene._interaction_preview_active
+        assert tuple(plotter.window_size) == size
+        assert scene.content_render_settings(obj.data_key)["positions"][0] > 0.55
+        np.testing.assert_array_equal(ws.mag_raw, original)
+    finally:
+        scene._close_interaction_rendering()
+        plotter.close()
+        plotter.deleteLater()
+        app.processEvents()
+
+
+def test_browser_selection_phantom_draws_flow_above_opaque_cut_and_cleans_up():
+    import pyvista as pv
+    from autoflow.core.models import ObjectKind
+    from autoflow.ui.viewer import SceneController
+
+    ws = Workspace()
+    line = pv.Line((-3, 0, 0), (3, 0, 0))
+    line["Speed"] = np.ones(line.n_points)
+    meshes = {"phantom_cut": pv.Plane(center=(0, 0, 1), i_size=8, j_size=8),
+              "phantom_flow": line}
+    cut = ws.scene_objects[ws.add_object("Cut", ObjectKind.AUX, "phantom_cut", color="white")]
+    flow = ws.scene_objects[ws.add_object("Flow", ObjectKind.FLOW, "phantom_flow", color="red", line_width=12)]
+    errors = []
+    plotter = pv.Plotter(off_screen=True, window_size=(320, 320))
+    scene = SceneController(plotter, ws, errors.append)
+    scene._build_dataset = meshes.get
+    scene.initialize()
+    try:
+        scene.render_all()
+        plotter.camera_position = [(0, 0, 12), (0, 0, 0), (0, 1, 0)]
+        scene.reset_camera()
+
+        def red_pixels():
+            pixels = plotter.screenshot(return_img=True)[120:200, 80:240, :3].astype(int)
+            return np.count_nonzero((pixels[..., 0] > 100) & (pixels[..., 0] > 2 * pixels[..., 1])
+                                    & (pixels[..., 0] > 2 * pixels[..., 2]))
+
+        assert red_pixels() == 0
+        actor, mapper = flow.actor, flow.actor.mapper
+        scene.set_selected_layers([flow.uid])
+        assert red_pixels() > 300
+        assert scene._selection_renderer.HasViewProp(actor)
+        assert not plotter.renderer.HasViewProp(actor)
+        scene.update_time(0)
+        assert flow.actor is actor and actor.mapper is mapper
+        scene.set_selected_layers([flow.uid], on_top=False)
+        assert red_pixels() == 0
+        assert plotter.renderer.HasViewProp(actor)
+        restored = Workspace()
+        restored.restore_dict(ws.snapshot_dict())
+        assert restored.render_settings["selected_layer_on_top"] is False
+        flow.scalars, flow.cmap, flow.clim, flow.show_scalar_bar = "Speed", "Reds", (0, 2), True
+        scene.readd_object(flow)
+        scene.set_selected_layers([flow.uid], on_top=True)
+        assert len(scene._hud_props) == 1
+        assert scene._hud_renderer.HasViewProp(scene._hud_props[0])
+        scene.set_selected_layers([cut.uid, flow.uid])
+        scene.reset_camera()
+        assert np.all(np.isfinite(np.asarray(tuple(plotter.camera_position), dtype=float)))
+        scene.remove_object(flow.uid)
+        assert scene._selection_renderer.GetViewProps().GetNumberOfItems() == 1
+        scene.reset_scene()
+        assert not scene._front_props and not scene._hud_props
+        assert scene._selection_renderer.GetViewProps().GetNumberOfItems() == 0
+        assert not errors
+    finally:
+        plotter.close()
+
+
+def test_remote_drag_phantom_coalesces_moves_and_applies_final_position(monkeypatch):
+    app = _smoke_qt_application(monkeypatch)
+    from PySide6 import QtCore, QtGui
+    from autoflow.ui.remote_plotter import RemotePlotter
+
+    plotter = RemotePlotter()
+    plotter.resize(640, 480)
+    moves = []
+    plotter._autoflow_content_widget_dispatch = lambda kind: moves.append((kind, plotter.iren.GetEventPosition())) or True
+
+    def mouse(kind, x, button, buttons):
+        event = QtGui.QMouseEvent(kind, QtCore.QPointF(x, 200), QtCore.QPointF(x, 200),
+                                 button, buttons, QtCore.Qt.NoModifier)
+        QtCore.QCoreApplication.sendEvent(plotter, event)
+
+    try:
+        mouse(QtCore.QEvent.MouseButtonPress, 100, QtCore.Qt.LeftButton, QtCore.Qt.LeftButton)
+        # Keep the event burst within one preview interval, independent of CPU speed.
+        import time
+        plotter._last_motion_at = time.monotonic() + 3600
+        for x in range(101, 401):
+            mouse(QtCore.QEvent.MouseMove, x, QtCore.Qt.NoButton, QtCore.Qt.LeftButton)
+        assert not [kind for kind, _ in moves if kind == "move"]
+        mouse(QtCore.QEvent.MouseButtonRelease, 450, QtCore.Qt.LeftButton, QtCore.Qt.NoButton)
+        assert [kind for kind, _ in moves] == ["press", "move", "release"]
+        assert moves[-2][1] == (450, 279)
+        assert not plotter._motion_timer.isActive() and plotter._pending_mouse_payload is None
+        assert not plotter._mouse_buttons_active
+    finally:
+        plotter.close()
+        plotter.deleteLater()
+        app.processEvents()
+
+
 def _run_case(input_name: str, *, skip_derived: bool = False):
     output_root = Path(tempfile.mkdtemp(prefix=f"autoflow_{input_name}_", dir="/tmp"))
     cfg = AutoFlowConfig(
+        graph_connectivity=26,  # analytical phantom truth assumes a connected curved centerline
         inputs=[str(DATA_DIR / f"{input_name}.h5")],
         output_dir=str(output_root),
         skip_derived=skip_derived,
@@ -1333,6 +3700,13 @@ def test_run_case_segmentation_only_stops_before_skeleton(tmp_path, monkeypatch)
         raise AssertionError("segmentation-only must stop before skeleton")
 
     monkeypatch.setattr(PipelineEngine, "run_step", fail_run_step)
+    from autoflow import processing
+    original_save = processing.save_quality_report
+    def slow_save(*args, **kwargs):
+        import time
+        time.sleep(0.03)
+        return original_save(*args, **kwargs)
+    monkeypatch.setattr(processing, "save_quality_report", slow_save)
     out_dir = tmp_path / "out"
     summary = run_case(
         str(path),
@@ -1347,6 +3721,9 @@ def test_run_case_segmentation_only_stops_before_skeleton(tmp_path, monkeypatch)
     assert summary["quality_report_file"] == str(out_dir / "quality_report.json")
     assert (out_dir / "summary.json").is_file()
     assert (out_dir / "quality_report.json").is_file()
+    assert summary["total_time_sec"] >= summary["compute_time_sec"] + 0.03
+    assert summary["output_time_sec"] == pytest.approx(summary["total_time_sec"] - summary["compute_time_sec"])
+    assert json.loads((out_dir / "summary.json").read_text())["total_time_sec"] == summary["total_time_sec"]
 
 
 def test_load_h5_data_flattens_singleton_row_and_column_metadata_vectors(tmp_path):
@@ -2872,6 +5249,8 @@ def test_plane_video_label_style_uses_plane_render_config(monkeypatch, tmp_path)
 
     monkeypatch.setattr("autoflow.rendering.videos._build_union_surface", lambda ws, smoothing_iteration=200: (None, DummyPoly()))
     monkeypatch.setattr("autoflow.rendering.videos._make_plotter", lambda window_size=None, background=None, workspace=None: plotter)
+    monkeypatch.setattr("autoflow.rendering.videos.VideoOverlay",
+                        lambda *args: SimpleNamespace(update=lambda **kwargs: None))
     monkeypatch.setattr("autoflow.rendering.videos._plane_mesh", lambda center_world, normal, size: SimpleNamespace(n_points=4))
     monkeypatch.setattr("autoflow.rendering.videos._path_polydata", lambda path_world: SimpleNamespace(n_points=len(path_world)))
     monkeypatch.setattr("autoflow.rendering.videos._orbit_camera", lambda poly, azimuth_deg, elevation_deg=0.0, distance_scale=1.0: [tuple([0.0, 0.0, 0.0]), tuple([0.0, 0.0, 0.0]), (0.0, 0.0, 1.0)])
@@ -3659,6 +6038,90 @@ def test_dicom2h5_failed_conversion_never_publishes_or_replaces(tmp_path, monkey
     assert not list(tmp_path.glob(".dicom2h5-*"))
 
 
+def test_dicom2h5_gui_phantom_destination_feedback_and_worker_progress(monkeypatch, tmp_path):
+    app = _smoke_qt_application(monkeypatch)
+    monkeypatch.setenv("AUTOFLOW_SSH_RENDERING", "1")
+    from PySide6 import QtCore, QtTest, QtWidgets
+    import autoflow.ui.app as ui_app
+    from autoflow.ui.remote_plotter import RemotePlotter
+    monkeypatch.setattr(ui_app, "RemotePlotter", RemotePlotter, raising=False)
+    window = ui_app.MainWindow()
+    root, target = tmp_path / "dicom", tmp_path / "converted.h5"
+    root.mkdir()
+    warnings, progress, applied, calls = [], [], [], []
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *args: warnings.append(args[2]))
+
+    def choose_root(*args, **kwargs):
+        assert kwargs["options"] & QtWidgets.QFileDialog.Option.DontUseNativeDialog
+        return str(root)
+
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getExistingDirectory", choose_root)
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName", lambda *a, **k: ("", ""))
+    original_bind = window._bind_task_progress
+
+    class ProgressProbe(QtCore.QObject):
+        @QtCore.Slot(dict)
+        def record(self, payload):
+            progress.append(payload["message"])
+
+    probe = ProgressProbe()
+
+    def record_signals(dialog, worker):
+        original_bind(dialog, worker)
+        worker.progress.connect(probe.record, QtCore.Qt.QueuedConnection)
+
+    monkeypatch.setattr(window, "_bind_task_progress", record_signals)
+    monkeypatch.setattr(window, "_apply_dicom_conversion_cases", applied.append)
+
+    def convert(source, destination, progress_callback=None):
+        calls.append(QtCore.QThread.currentThread() is app.thread())
+        assert source == str(root) and destination == str(target)
+        progress_callback({"message": "Converting", "current": 0, "total": 0})
+        progress_callback({"message": "Validating", "current": 0, "total": 0})
+        return [SimpleNamespace(input_path=str(target))]
+
+    monkeypatch.setattr(ui_app, "convert_dicom_input", convert)
+    try:
+        window._on_load_dicom()
+        assert "no H5 destination" in window.statusBar().currentMessage()
+        assert not calls
+        target.write_bytes(b"preserved")
+        monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName", lambda *a, **k: (str(target), ""))
+        window._on_load_dicom()
+        assert warnings and "Destination exists" in warnings[-1]
+        assert target.read_bytes() == b"preserved" and not calls
+        target.unlink()
+        window._on_load_dicom()
+        assert window._dicom_conversion_progress.isVisible()
+        for _ in range(500):
+            app.processEvents()
+            if applied:
+                break
+            QtTest.QTest.qWait(10)
+        assert applied and progress == ["Converting", "Validating"]
+        assert calls == [False]
+        assert window._dicom_conversion_thread is None
+        assert window._dicom_conversion_progress is None
+
+        def fail_conversion(*args, **kwargs):
+            raise ValueError("phantom conversion failure")
+
+        monkeypatch.setattr(ui_app, "convert_dicom_input", fail_conversion)
+        window._on_load_dicom()
+        for _ in range(500):
+            app.processEvents()
+            if len(warnings) > 1:
+                break
+            QtTest.QTest.qWait(10)
+        assert "phantom conversion failure" in warnings[-1]
+        assert "failed" in window.statusBar().currentMessage()
+        assert window._dicom_conversion_thread is None
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+
+
 def test_dicom2h5_loader_config_and_cli_selection():
     from autoflow.cli import build_parser
     from autoflow.core.models import LoaderParams
@@ -3750,27 +6213,151 @@ def test_noise_removal_defaults_and_manual_configuration():
                 NoiseRemovalConfig(**{name: invalid})
 
 
-def test_noise_removal_phantom_gui_controls_have_no_explanation(monkeypatch):
-    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
-    from PySide6 import QtWidgets
-    from autoflow.ui.app import MainWindow
+def test_noise_removal_phantom_settings_hide_inactive_method_and_cancel(monkeypatch):
+    application = _smoke_qt_application(monkeypatch)
+    from autoflow.ui.action_settings import ActionSettingsDialog, action_sections
+    from autoflow.config import apply_config_bundle_to_workspace, load_config_bundle
 
-    application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    panel = QtWidgets.QWidget()
-    owner = SimpleNamespace(params_layout=QtWidgets.QVBoxLayout(panel), _reset_noise_removal=lambda: None)
+    ws = Workspace()
+    apply_config_bundle_to_workspace(ws, load_config_bundle("configs"))
+    panel = ActionSettingsDialog("Noise removal", action_sections(StepId.REMOVE_NOISE, ws), ws, ws)
     try:
-        MainWindow._build_noise_removal_params(owner)
-        assert owner.spin_noise_magnitude.value() == 0.05
-        assert owner.spin_noise_std_max.value() == 0.80
-        assert [label.text() for label in panel.findChildren(QtWidgets.QLabel)] == [
-            "Method", "Magnitude fraction of maximum", "Temporal SD fraction of maximum"]
-        owner.spin_noise_magnitude.setValue(0.03)
-        owner.spin_noise_std_max.setValue(0.90)
-        assert owner.spin_noise_magnitude.value() == 0.03
-        assert owner.spin_noise_std_max.value() == 0.90
+        key = "noise_removal_params."
+        assert panel.controls[key + "magnitude_fraction"].value() == .05
+        assert panel.controls[key + "velocity_std_max"].value() == .80
+        panel.controls[key + "magnitude_fraction"].setValue(.03)
+        panel.controls[key + "velocity_std_max"].setValue(.90)
+        method = panel.controls[key + "method"]
+        method.setCurrentIndex(method.findData("magnitude"))
+        assert panel.rows[key + "velocity_std_max"].isHidden()
+        assert panel.forms[key + "velocity_std_max"].labelForField(panel.rows[key + "velocity_std_max"]).isHidden()
+        assert panel.values()[key + "velocity_std_max"] == .80
+        panel.reject()
+        assert ws.noise_removal_params.magnitude_fraction == .05
+        assert ws.noise_removal_params.velocity_std_max == .80
     finally:
         panel.close()
         panel.deleteLater()
+        application.processEvents()
+
+
+def test_action_settings_phantom_context_save_run_and_conditional_rows(monkeypatch):
+    application = _smoke_qt_application(monkeypatch)
+    monkeypatch.setenv("AUTOFLOW_SSH_RENDERING", "1")
+    from PySide6 import QtCore, QtGui, QtWidgets, QtTest
+    import autoflow.ui.app as ui_app
+    from autoflow.ui.remote_plotter import RemotePlotter
+    from autoflow.ui.action_settings import ActionSettingsDialog, action_sections
+
+    monkeypatch.setattr(ui_app, "RemotePlotter", RemotePlotter, raising=False)
+    window = ui_app.MainWindow()
+    try:
+        ws = window.workspace
+        ws.data_loaded = True
+        ws.flow_raw = np.zeros((3, 3, 3, 2, 3), dtype=np.float32)
+        ws.mag_raw = np.ones((3, 3, 3, 2), dtype=np.float32)
+        window.show()
+        window.workflow_tabs.setCurrentIndex(1)
+        application.processEvents()
+        assert not hasattr(window, "btn_show_advanced")
+        assert window.review_panel.isHidden()
+        button = window.step_buttons[StepId.REMOVE_NOISE]
+        key = "noise_removal_params.magnitude_fraction"
+
+        def context_edit(cancel):
+            def edit():
+                dialog = application.activeModalWidget()
+                assert isinstance(dialog, ActionSettingsDialog)
+                dialog.controls[key].setValue(.07)
+                dialog.reject() if cancel else dialog.accept()
+            QtCore.QTimer.singleShot(0, edit)
+            application.sendEvent(button, QtGui.QContextMenuEvent(
+                QtGui.QContextMenuEvent.Mouse, QtCore.QPoint(4, 4), button.mapToGlobal(QtCore.QPoint(4, 4))))
+
+        context_edit(True)
+        assert ws.noise_removal_params.magnitude_fraction == .05
+        ws.pipeline.mark_done(StepId.REMOVE_NOISE)
+        context_edit(False)
+        assert ws.noise_removal_params.magnitude_fraction == .07
+        assert not ws.pipeline.is_done(StepId.REMOVE_NOISE)
+        assert "Settings changed" in button.toolTip()
+
+        ran = []
+        def save_and_run():
+            application.activeModalWidget()._save_and_run()
+        QtCore.QTimer.singleShot(0, save_and_run)
+        window._open_action_settings(StepId.REMOVE_NOISE, lambda: ran.append(ws.noise_removal_params.magnitude_fraction))
+        assert ran == [.07]
+
+        keyboard_dialogs = []
+        def close_keyboard_dialog():
+            dialog = application.activeModalWidget()
+            if isinstance(dialog, ActionSettingsDialog):
+                keyboard_dialogs.append(dialog.windowTitle())
+                dialog.reject()
+        window.activateWindow()
+        button.setFocus()
+        application.processEvents()
+        QtCore.QTimer.singleShot(0, close_keyboard_dialog)
+        QtTest.QTest.keyClick(button, QtCore.Qt.Key_F10, QtCore.Qt.ShiftModifier)
+        assert len(keyboard_dialogs) == 1
+
+        # A changed pathline setting must replace existing trajectories rather
+        # than taking the unchanged-request cache shortcut.
+        ws.segmask_3d = np.ones((3, 3, 3), dtype=bool)
+        ws.segmask_raw = ws.segmask_3d
+        ws.segmask_binary = ws.segmask_3d
+        ws.planes = [PlaneData(center=np.ones(3), normal=np.array([0., 0., 1.]))]
+        ws.active_pathline_plane_indices = [0]
+        window._mark_action_settings_pending((StepId.PLANE_STREAMLINES,))
+        requested = []
+        monkeypatch.setattr(window, "_find_uid_by_indexed_data_key", lambda *args: "existing")
+        monkeypatch.setattr(window, "_start_pathline_task", lambda indices, **kwargs: requested.append(indices))
+        window._trigger_pathlines([0], prepare_segmentation=False)
+        assert requested == [[0]]
+        window._close_progress_dialog(window._pathline_progress_dialog)
+        window._pathline_progress_dialog = None
+
+        dialogs = []
+        for action in (StepId.BACKGROUND_CORRECTION, StepId.UNWRAP_PHASE, StepId.GENERATE_SKELETON,
+                       StepId.GENERATE_PLANES, StepId.PLANE_STREAMLINES, StepId.COMPUTE_PWV):
+            dialog = ActionSettingsDialog(action.label, action_sections(action, ws), ws, ws)
+            dialogs.append(dialog)
+        bpc, unwrap, skeleton, planes, pathlines, pwv = dialogs
+        def choose(dialog, key, value):
+            control = dialog.controls[key]
+            control.setCurrentIndex(control.findData(value))
+        choose(bpc, "loader_params.background_phase_correction.method", "wrls_arto")
+        assert bpc.rows["loader_params.background_phase_correction.threshold"].isHidden()
+        choose(bpc, "loader_params.background_phase_correction.method", "msac")
+        assert not bpc.rows["loader_params.background_phase_correction.threshold"].isHidden()
+        choose(unwrap, "phase_unwrap_params.method", "nprs")
+        assert unwrap.rows["phase_unwrap_params.lap4d_ts"].isHidden()
+        assert not unwrap.rows["phase_unwrap_params.nprs_upsampling_factor"].isHidden()
+        choose(unwrap, "phase_unwrap_params.method", "gc3D")
+        assert unwrap.rows["phase_unwrap_params.nprs_upsampling_factor"].isHidden()
+        skeleton.controls["skeleton_params.remove_small_cc"].setChecked(True)
+        choose(skeleton, "skeleton_params.cc_filter_mode", "largest")
+        assert skeleton.rows["skeleton_params.min_cc_volume_mm3"].isHidden()
+        assert skeleton.rows["skeleton_params.cc_rel_min_ratio"].isHidden()
+        choose(planes, "plane_gen_params.plane_mode", "uniform")
+        assert planes.rows["plane_gen_params.anchor"].isHidden()
+        assert planes.rows["plane_gen_params.cross_section_distance"].isHidden()
+        choose(planes, "plane_gen_params.plane_mode", "fixed_step")
+        choose(planes, "plane_gen_params.spacing_mode", "fraction")
+        assert not planes.rows["plane_gen_params.spacing_ratio"].isHidden()
+        assert planes.rows["plane_gen_params.cross_section_distance"].isHidden()
+        choose(pathlines, "streamline_params.pathline_seed_mode", "fixed")
+        assert pathlines.rows["streamline_params.pathline_seed_ratio"].isHidden()
+        choose(pwv, "pwv_params.transit_time_method", "cross_correlation")
+        assert pwv.rows["pwv_params.foot_method"].isHidden()
+        assert not pwv.rows["pwv_params.xcorr_window"].isHidden()
+        for dialog in dialogs:
+            dialog.close()
+            dialog.deleteLater()
+    finally:
+        window.close()
+        window.deleteLater()
         application.processEvents()
 
 
@@ -3947,7 +6534,8 @@ def test_correction_cli_api_order_and_default_mask(monkeypatch, tmp_path):
     summary = run_case(InputCase(str(tmp_path / "case.h5"), "h5"), output_dir=str(tmp_path / "results"),
         config=AutoFlowConfig(correction_all=True, autoseg=True, segmentation_only=True,
                               background_phase_write_cache=False))
-    assert events == ["load", "background", "noise", "unwrap", "pcmra", "segmentation"]
+    assert events == ["background", "noise", "unwrap", "pcmra", "segmentation"]
+    assert "load_and_background_correction" in summary["stage_times_sec"]
     assert summary["phase_unwrap"]["mask_source"] == "none"
     with np.load(summary["pcmra_file"]) as saved:
         np.testing.assert_allclose(saved["pcmra"], 20 * np.sqrt(3), rtol=1e-6)
@@ -4683,3 +7271,549 @@ def test_geometry_phantom_reruns_replace_old_planes_and_clear_measurements(tmp_p
         assert not ws.pipeline.is_done(StepId.GENERATE_PLANES)
         assert not any(obj.kind == ObjectKind.PLANE for obj in ws.scene_objects.values())
     assert not errors
+
+
+def test_video_phase_schedule_repeats_every_phase_and_cycles_for_rotation():
+    from autoflow.rendering.videos import _time_index, _time_and_azimuth
+
+    expected = [0, 0, 1, 1, 2, 2, 3, 3]
+    assert [_time_index(i, 4, 2) for i in range(8)] == expected
+    rotating = [_time_and_azimuth(i, 12, 4, 2) for i in range(12)]
+    assert [phase for phase, _ in rotating] == expected + [0, 0, 1, 1]
+    assert [angle for _, angle in rotating] == list(range(0, 360, 30))
+    assert _time_index(0, 0, 0) == 0
+
+
+def test_plane_support_matches_all_fields_and_prepares_tke_once(monkeypatch):
+    from autoflow.algorithms.metrics import plane_derived
+    from autoflow.algorithms.branch import segment_vessels_from_graph_and_mask
+    from autoflow.algorithms.metrics.planes import compute_plane_metrics
+    from autoflow.algorithms.surfaces import create_uniform_field_grid
+    labels = np.zeros((20, 20, 20, 2), dtype=np.int16)
+    labels[4:8, 8:12, 4:16, :] = 1
+    labels[12:16, 8:12, 4:16, :] = 2
+    labels[8:12, 8:12, 14:16, :] = 2
+    # The binary vessel stays fixed while its selected label changes by phase.
+    labels[6:8, 8:12, 4:14, 1] = 2
+    mask = labels > 0
+    flow = np.zeros(labels.shape + (3,), dtype=np.float32)
+    flow[..., 2] = mask * 10
+    points = np.array([(6, 10, z) for z in range(4, 16)] + [(x, 10, 15) for x in range(7, 15)] + [(14, 10, z) for z in range(14, 3, -1)], dtype=float)
+    graph = GraphData(points=points, edges=np.column_stack((np.arange(len(points)-1), np.arange(1, len(points)))))
+    branches, paths, _, path_info, forks = segment_vessels_from_graph_and_mask(
+        np.any(mask, axis=3), graph, (1, 1, 1), flow_xyzt3=flow,
+        segmask_binary_4d=mask, segmentation_labels=labels[..., 0])
+    planes = [PlaneData(center=np.array([5., 10., 10.]), normal=np.array([0., 0., 1.]), label=1, segmentation_label=1) for _ in range(3)]
+    planes[1].roi_edit_operations = {"1": [{"mode": "replace", "polygon": [[-1, -1], [1, -1], [1, 1], [-1, 1]]}]}
+    base = compute_plane_metrics(flow, mask, (1, 1, 1), (0, 0, 0), planes,
+        branch_labels_3d=branches, segmentation_labels_3d=labels[..., 0],
+        segmentation_labels_4d=labels, paths=paths, path_info=path_info, forks=forks)
+    field = np.where(labels == 1, 1., 100.).astype(np.float32)
+    surface = create_uniform_field_grid(mask[..., 0].astype(np.uint8), (1, 1, 1), name="mask").threshold(0.5, scalars="mask").extract_surface(algorithm="dataset_surface")
+    surface.point_data["wss"] = np.where(surface.points[:, 0] < 9, 1., 100.)
+    calls = []
+    prepare = plane_derived._prepare_tke_array
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return prepare(*args, **kwargs)
+    monkeypatch.setattr(plane_derived, "_prepare_tke_array", counted)
+    derived, pixels = plane_derived.augment_plane_metrics_with_derived(base, planes, mask, (1, 1, 1), (0, 0, 0),
+        branch_labels_3d=branches, segmentation_labels_3d=labels[..., 0], segmentation_labels_4d=labels,
+        tke_array=field, pressure_gradient_array=np.repeat(field[..., None], 3, axis=-1),
+        relative_pressure_array=field * 3, wss_surfaces=[surface, surface])
+    assert len(calls) == 1
+    assert base[0]["area_mm2"][1] < base[0]["area_mm2"][0]
+    for basic, metric, payload in zip(base, derived, pixels):
+        areas = [float(np.sum(frame["cell_area_mm2"])) for frame in payload["timepoints"]]
+        np.testing.assert_allclose(areas, basic["area_mm2"])
+        np.testing.assert_allclose(metric["tke_mean_J_m3_t"], 1.)
+        np.testing.assert_allclose(metric["relative_pressure_mean_Pa_t"], 3.)
+        np.testing.assert_allclose(metric["wss_wall_mean_Pa_t"], 1.)
+
+
+@pytest.mark.parametrize("width_voxels,normal,min_points", [
+    (1, (0.0, 0.0, 1.0), 8),
+    (2, (0.0, 0.0, 1.0), 8),
+    (3, (0.0, 0.0, 1.0), 8),
+    (1, (0.2, 0.3, 1.0), 8),
+    (1, (0.0, 0.0, 1.0), 100),
+])
+def test_small_vessel_plane_contour_phantom_survives_display_filters(
+    monkeypatch, width_voxels, normal, min_points,
+):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtWidgets
+    from autoflow.ui.ortho_viewer import OrthoViewer
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    ws = Workspace()
+    ws.resolution = np.full(3, 0.5)
+    ws.origin = np.array([10.0, -20.0, 30.0])
+    ws.mag_raw = np.ones((24, 24, 24, 2), dtype=np.float32)
+    ws.segmask_binary = np.zeros(ws.mag_raw.shape, dtype=bool)
+    ws.segmask_binary[10:10 + width_voxels, 10:10 + width_voxels, :, 0] = True
+    # Another component must not become the selected vessel's cyan outline.
+    ws.segmask_binary[20:22, 20:22, :, 0] = True
+    ws.segmask_raw = ws.segmask_binary.astype(np.int16)
+    ws.segmask_labels = ws.segmask_raw.copy()
+    plane = PlaneData(
+        center=np.array([(10 + width_voxels / 2) * 0.5] * 2 + [6.0]),
+        normal=np.asarray(normal), label=1, segmentation_label=1,
+    )
+    ws.planes = [plane]
+    ws.derived.plane_metrics = [{"area_mm2": [width_voxels ** 2 * 0.25, 0.0]}]
+    original_mask = ws.segmask_binary.copy()
+    original_labels = ws.segmask_labels.copy()
+    original_metrics = json.dumps(ws.derived.plane_metrics)
+    viewer = OrthoViewer(ws)
+    try:
+        viewer._plane_display_smoothing_sigma = 0.8
+        viewer._plane_display_smoothing_points = min_points
+        viewer.set_selected_plane(0)
+        region = viewer._effective_plane_region(plane, 0)
+        sampled = viewer._sample_smooth_region_mask(region, plane, 8.0, 0.375)
+        assert sampled is not None and np.max(sampled[0]) > 0.5
+        view = viewer.slice_views["axial"]
+        assert len(view.contour_items) == 1
+        for item in view.contour_items:
+            x, y = item.getData()
+            points = np.column_stack((x, y))
+            assert len(points) >= 4
+            np.testing.assert_allclose(points[0], points[-1])
+            assert np.max(np.abs(points)) < width_voxels * 0.5
+            assert abs(polygon_area(points)) > 0.0
+
+        # Even a subpixel ROI in a wide FOV must retain its vector boundary.
+        wide_contours = viewer._selected_plane_contours(plane, 0, 512.0, 0.375)
+        assert wide_contours
+        assert all(abs(polygon_area(contour[0])) > 0.0 for contour in wide_contours)
+
+        ws.current_t = 1
+        viewer.refresh(update_plane=False)
+        assert len(view.contour_items) == 1
+        carried_region = viewer._effective_plane_region(plane, 1)
+        np.testing.assert_allclose(carried_region.points, region.points)
+        ws.current_t = 0
+        viewer.refresh(update_plane=False)
+        assert len(view.contour_items) == 1
+        np.testing.assert_array_equal(ws.segmask_binary, original_mask)
+        np.testing.assert_array_equal(ws.segmask_labels, original_labels)
+        assert json.dumps(ws.derived.plane_metrics) == original_metrics
+        assert not plane.roi_edit_operations and not plane.roi_polygon_uv_mm
+    finally:
+        viewer.close()
+        viewer.deleteLater()
+        app.processEvents()
+
+
+def test_missing_plane_roi_phantom_carries_geometry_and_samples_current_fields(tmp_path, monkeypatch):
+    from autoflow.algorithms.metrics import compute_plane_metrics, augment_plane_metrics_with_derived, save_plane_pixelwise_h5
+    from autoflow.algorithms.metrics.sampling import _build_mask_phase_lookup, _get_plane_metric_slice_spec
+    labels = np.zeros((18, 18, 12, 6), dtype=np.int16)
+    labels[1:3, 1:3, :, :] = 16  # A different vessel must never replace this plane's label.
+    labels[8:10, 8:10, :, 1] = 14
+    labels[7:10, 7:10, :, 4] = 14
+    mask = labels > 0
+    flow = np.zeros(labels.shape + (3,), dtype=np.float32)
+    flow[..., 2] = np.arange(1, 7) * 10
+    plane = PlaneData(center=np.array([8.5, 8.5, 6.3]), normal=np.array([0., 0., 1.]),
+                      segmentation_label=14)
+    original_labels = labels.copy()
+    metric = compute_plane_metrics(flow, mask, (1, 1, 1), (10, -20, 30), [plane],
+                                   segmentation_labels_4d=labels)[0]
+    assert metric["roi_source_frame_t"] == [None, 1, 1, 1, 4, 4]
+    assert metric["roi_carried_forward_t"] == [False, False, True, True, False, True]
+    np.testing.assert_allclose(metric["area_mm2"], [0, 4, 4, 4, 9, 9])
+    np.testing.assert_allclose(metric["flowrate_mL_s"], [0, .8, 1.2, 1.6, 4.5, 5.4])
+    lookup, cache = _build_mask_phase_lookup(mask), {}
+    for frame in (5, 2, 4, 1, 3, 0):
+        spec = _get_plane_metric_slice_spec(cache, mask, lookup, None, plane, frame, (1, 1, 1), (10, -20, 30),
+                                            segmentation_labels_4d=labels)
+        assert (None if spec is None else spec["roi_source_frame"]) == metric["roi_source_frame_t"][frame]
+    field = np.broadcast_to(np.arange(1, 7), labels.shape).copy().astype(np.float32)
+    derived, pixels = augment_plane_metrics_with_derived(
+        [metric], [plane], mask, (1, 1, 1), (10, -20, 30),
+        tke_array=field, relative_pressure_array=field * 3, segmentation_labels_4d=labels)
+    # The ROI is carried, while derived-field masks and validity stay unchanged.
+    np.testing.assert_allclose(derived[0]["tke_mean_J_m3_t"], [0, 2, 0, 0, 5, 0])
+    np.testing.assert_allclose(derived[0]["relative_pressure_mean_Pa_t"][1:], [6, 9, 12, 15, 18])
+    exported = tmp_path / "carried-roi.h5"
+    save_plane_pixelwise_h5(exported, pixels)
+    with h5py.File(exported) as h5:
+        assert h5["planes/000/timepoints/002/roi_source_frame"][0] == 1
+        assert h5["planes/000/timepoints/002/roi_carried_forward"][0] == 1
+        np.testing.assert_allclose(h5["planes/000/timepoints/002/relative_pressure_Pa"][:], 9)
+    np.testing.assert_array_equal(labels, original_labels)
+    assert not plane.roi_edit_operations
+
+    # Explicit deletion stays empty and stops forward filling until a real ROI returns.
+    plane.roi_edit_operations = {"2": [{"mode": "remove", "polygon": [[-30, -30], [30, -30], [30, 30], [-30, 30]]}]}
+    # Frame 2 has no observed ROI; an explicit empty edit is a propagation barrier.
+    deleted = compute_plane_metrics(flow, mask, (1, 1, 1), (10, -20, 30), [plane],
+                                   segmentation_labels_4d=labels)[0]
+    assert deleted["roi_source_frame_t"] == [None, 1, None, None, 4, 4]
+    plane.roi_edit_operations = {"0": [{"mode": "replace", "polygon": [[-1, -1], [1, -1], [1, 1], [-1, 1]]}]}
+    created = compute_plane_metrics(flow, mask, (1, 1, 1), (10, -20, 30), [plane],
+                                   segmentation_labels_4d=labels)[0]
+    assert created["area_mm2"][0] > 0 and created["roi_source_frame_t"][0] == 0
+
+    # Playback can jump directly to a missing frame. A previous manual vector
+    # contour must be displayed verbatim, matching its own source phase.
+    _smoke_qt_application(monkeypatch)
+    from autoflow.ui.ortho_viewer import OrthoViewer
+    polygon = [[-.75, -.75], [.75, -.75], [.75, .75], [-.75, .75]]
+    plane.roi_edit_operations = {"4": [{"mode": "replace", "polygon": polygon}]}
+    ws = Workspace()
+    ws.mag_raw = np.ones(labels.shape, dtype=np.float32)
+    ws.segmask_raw = labels
+    ws.segmask_labels = labels
+    ws.segmask_binary = mask
+    ws.flow_raw = flow
+    ws.origin = np.array([10., -20., 30.])
+    ws.planes = [plane]
+    ws.current_t = 5
+    viewer = OrthoViewer(ws)
+    try:
+        viewer.set_selected_plane(0)
+        region, source = viewer._effective_plane_region(plane, 5, return_source=True)
+        assert region is not None and source == 4
+        for frame in (5, 4):
+            contours = viewer._selected_plane_contours(plane, frame, 20., .75)
+            cyan = [contour for contour in contours if contour[1] == "#00f5d4"]
+            assert len(cyan) == 1
+            np.testing.assert_allclose(cyan[0][0], np.vstack((polygon, polygon[0])))
+        assert viewer._effective_plane_region(plane, 0) is None
+        plane.roi_edit_operations = {"1": [{"mode": "remove", "polygon": [[-30, -30], [30, -30], [30, 30], [-30, 30]]}]}
+        assert viewer._effective_plane_region(plane, 1) is None
+        assert not viewer._selected_plane_contours(plane, 1, 20., .75)
+        np.testing.assert_array_equal(ws.segmask_labels, original_labels)
+    finally:
+        viewer.close()
+        viewer.deleteLater()
+
+
+@pytest.mark.parametrize("sources,carried,frame_only", [
+    ([0, 1, 2, 3], [False] * 4, True),
+    ([0, 1, 1, 1], [False, False, True, True], False),
+    ([None, None, None, 3], [False] * 4, False),
+])
+def test_contour_edit_phantom_updates_dependent_carried_frames(sources, carried, frame_only):
+    from autoflow.ui.app import MainWindow
+    ws = Workspace()
+    ws.planes = [PlaneData(center=np.zeros(3), normal=np.array([0., 0., 1.]))]
+    ws.current_t = 1
+    ws.derived.plane_metrics = [{"roi_source_frame_t": sources, "roi_carried_forward_t": carried}]
+    calls = []
+    window = SimpleNamespace(workspace=ws, log=lambda *_: None,
+                             _recompute_dragged_plane_metrics=lambda **kwargs: calls.append(kwargs))
+    MainWindow._on_plane_roi_changed(window, 0)
+    assert calls == [{"persist": True, "frame_only": frame_only}]
+
+
+def test_ortho_case_history_and_time_refresh_use_correct_context(monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtWidgets
+    from autoflow.ui.ortho_viewer import OrthoViewer
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    ws = Workspace()
+    ws.mag_raw = np.stack([np.ones((4, 4, 4)), np.full((4, 4, 4), 7.)], axis=3).astype(np.float32)
+    ws.planes = [PlaneData(center=np.ones(3), normal=np.array([0., 0., 1.]), label=1)]
+    viewer = OrthoViewer(ws)
+    viewer.set_selected_plane(0)
+    snapshot = viewer._snapshot_plane_roi(ws.planes[0])
+    ws.planes[0].roi_polygon_uv_mm = [[0, 0], [1, 0], [0, 1]]
+    viewer._plane_roi_undo.append((0, snapshot))
+    viewer._undo_plane_roi()
+    assert ws.planes[0].roi_polygon_uv_mm == []
+    counts = {"set": 0, "update": 0}
+    for view in viewer.slice_views.values():
+        original_set, original_update = view.set_slice, view.update_image
+        def counted_set(*args, _method=original_set, **kwargs):
+            counts["set"] += 1; return _method(*args, **kwargs)
+        def counted_update(*args, _method=original_update, **kwargs):
+            counts["update"] += 1; return _method(*args, **kwargs)
+        monkeypatch.setattr(view, "set_slice", counted_set)
+        monkeypatch.setattr(view, "update_image", counted_update)
+    viewer.refresh(update_plane=False)
+    counts.update(set=0, update=0)
+    ws.current_t = 1
+    viewer.refresh(update_plane=False)
+    assert counts == {"set": 0, "update": 3}
+    assert float(viewer._current_volume.mean()) == 7.
+    old = ws.planes[0]
+    viewer._plane_roi_undo.append((0, snapshot))
+    ws.planes = [PlaneData(center=np.ones(3), normal=np.array([0., 0., 1.]), label=2)]
+    viewer._undo_plane_roi()
+    assert not viewer._plane_roi_undo and not viewer._plane_roi_redo
+    viewer._plane_roi_undo.append((0, snapshot))
+    new_case = Workspace(); new_case.planes = [old]
+    viewer.workspace = new_case
+    viewer._undo_plane_roi()
+    assert not viewer._plane_roi_undo and not viewer._plane_roi_redo
+    viewer.close()
+    app.processEvents()
+
+
+
+@pytest.mark.parametrize("statuses,expected", [(["ok"], 0), (["ok", "error"], 1), (["partial"], 1), ([], 1)])
+def test_cli_exit_status_matches_batch_result(monkeypatch, statuses, expected):
+    from autoflow import cli
+    monkeypatch.setattr('sys.argv', ['autoflow-run', 'phantom.h5'])
+    monkeypatch.setattr(cli, 'run_batch', lambda _config: ([{"status": status} for status in statuses], ''))
+    assert cli.main() == expected
+
+
+@pytest.mark.parametrize("video_fails", [False, True])
+def test_batch_accounts_for_video_output_and_partial_failure(tmp_path, monkeypatch, video_fails):
+    import time
+    from autoflow import processing
+    def render(_workspace, directory, **_kwargs):
+        time.sleep(0.03)
+        if video_fails:
+            raise RuntimeError("phantom encoder failure")
+        path = Path(directory) / "plane_rotate.mp4"
+        path.write_bytes(b"smoke export placeholder")
+        return str(path)
+    monkeypatch.setattr(processing, 'render_plane_rotation_video', render)
+    config = AutoFlowConfig(inputs=[str(DATA_DIR/'phantom_S.h5')], output_dir=str(tmp_path),
+        skip_derived=True, requested_videos=['plane'], use_multithread=False)
+    results, _ = run_batch(config)
+    assert len(results) == 1
+    assert results[0]['status'] == ('partial' if video_fails else 'ok')
+    summary = results[0]['summary']
+    assert summary['video_times_sec']['plane'] >= 0.03
+    assert summary['total_time_sec'] >= summary['compute_time_sec'] + summary['video_times_sec']['plane']
+    assert bool(summary['video_errors']) is video_fails
+    assert (tmp_path/'time_summary.txt').is_file()
+
+
+def test_fused_correction_preserves_source_sigma_without_second_decode(tmp_path, monkeypatch):
+    from autoflow.algorithms import load_input_data
+    from autoflow.algorithms.data import h5_loader
+    path = tmp_path / 'complex_sigma.h5'
+    image = np.full((3, 3, 3, 2, 4), 90+0j, dtype=np.complex64)
+    image[..., 0] = 100+0j
+    with h5py.File(path, 'w') as handle:
+        handle.create_dataset('img_complex', data=image)
+        handle.create_dataset('Resolution', data=np.ones(3))
+        handle.create_dataset('VENC', data=np.full(3, 100.))
+    def correction(image, config, **kwargs):
+        enabled = config.enabled
+        corrected = image.copy()
+        if enabled: corrected[..., 1:] *= np.complex64(0.8+0.1j)
+        return corrected, None, {'applied':enabled, 'enabled':enabled}
+    monkeypatch.setattr(h5_loader, 'apply_background_phase_correction_to_complex', correction)
+    raw = load_input_data(str(path), correction_config={'enabled':False})
+    corrected = load_input_data(str(path), correction_config={'enabled':True, 'write_cache':False})
+    assert not np.array_equal(raw.sigma, corrected.sigma)
+    count = []
+    original_load = h5_loader.load_h5_data
+    def counted(*args, **kwargs):
+        count.append(1)
+        return original_load(*args, **kwargs)
+    monkeypatch.setattr('autoflow.algorithms.inputs.load_h5_data', counted)
+    ws=Workspace();ws.paths.flow_path=ws.paths.segmask_path=str(path)
+    ws.loader_params.background_phase_correction.write_cache=False
+    PipelineEngine().load_data(ws, lambda _message:None, apply_background_correction=True)
+    assert len(count)==1
+    np.testing.assert_array_equal(ws.source_sigma, raw.sigma)
+    np.testing.assert_array_equal(ws.flow_raw, corrected.flow)
+    assert ws.pipeline.completed.get(StepId.BACKGROUND_CORRECTION.value)
+
+
+@pytest.mark.parametrize("target_size,dpr", [((225, 173), 1), ((950, 625), 1),
+                                            ((317, 211), 2), ((94, 71), 1)])
+def test_remote_frame_phantom_partial_repaint_matches_full(target_size, dpr):
+    """Dirty X11 updates must compose exactly like a complete Qt repaint."""
+    QtGui = pytest.importorskip("PySide6.QtGui")
+    from PySide6 import QtCore
+    from autoflow.ui.remote_plotter import _changed_frame_region
+
+    previous = np.zeros((173, 225, 3), dtype=np.uint8)
+    previous[30:75, 70:115] = [241, 76, 39]
+    current = previous.copy()
+    current[30:75, 70:115] = 0  # Previously drawn geometry must be erased.
+    current[48:83, 98:142] = [35, 172, 251]
+    current[165:, :7] = [71, 53, 19]  # Separate orientation marker at the edge.
+    region = _changed_frame_region(previous, current, target_size)
+    assert region is not None and not region.isEmpty()
+    assert sum(rect.width() * rect.height() for rect in region) < np.prod(target_size)
+    assert _changed_frame_region(current, current, target_size).isEmpty()
+    assert _changed_frame_region(None, current, target_size) is None
+    assert _changed_frame_region(previous[:10], current, target_size) is None
+    assert _changed_frame_region(np.zeros_like(current), np.full_like(current, 255), target_size) is None
+
+    def source_image(pixels):
+        return QtGui.QImage(pixels.data, pixels.shape[1], pixels.shape[0], pixels.strides[0],
+                            QtGui.QImage.Format_RGB888)
+
+    def canvas():
+        image = QtGui.QImage(target_size[0] * dpr, target_size[1] * dpr, QtGui.QImage.Format_RGB32)
+        image.setDevicePixelRatio(dpr)
+        return image
+
+    def draw(image, pixels, clip=None):
+        painter = QtGui.QPainter(image)
+        if clip is not None:
+            painter.setClipRegion(clip)
+        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, False)
+        painter.drawImage(QtCore.QRect(0, 0, *target_size), source_image(pixels))
+        painter.end()
+
+    partial, full = canvas(), canvas()
+    draw(partial, previous)
+    draw(partial, current, region)
+    draw(full, current)
+    np.testing.assert_array_equal(np.frombuffer(partial.constBits(), dtype=np.uint8),
+                                  np.frombuffer(full.constBits(), dtype=np.uint8))
+
+
+def test_portable_runtime_resolves_external_models_and_configs(monkeypatch, tmp_path):
+    from autoflow.config import default_config_dir, resolve_config_dir
+    from autoflow.algorithms.segmentation.models import (
+        bundled_nnunet_model_folder, default_nnunet_model_folder,
+        resolve_nnunet_model_folder, resolve_nnunet_4d_model_folder,
+    )
+
+    root = tmp_path / "portable folder"
+    models = tmp_path / "separate model drive"
+    for name in ("nnunet3d", "nnunet4d", "nnunet3d-bundled"):
+        (models / name).mkdir(parents=True)
+    monkeypatch.setenv("AUTOFLOW_PORTABLE_ROOT", str(root))
+    monkeypatch.setenv("AUTOFLOW_MODELS_DIR", str(models))
+    assert default_config_dir() == root / "configs"
+    assert resolve_config_dir(str(tmp_path)) == tmp_path
+    assert default_nnunet_model_folder() == models / "nnunet3d"
+    assert Path(resolve_nnunet_model_folder()) == models / "nnunet3d"
+    assert bundled_nnunet_model_folder() == models / "nnunet3d-bundled"
+    assert Path(resolve_nnunet_4d_model_folder()) == models / "nnunet4d"
+    assert Path(resolve_nnunet_4d_model_folder(str(models / "nnunet3d"))) == models / "nnunet3d"
+    from autoflow.algorithms.segmentation import runtime as segmentation_runtime
+    monkeypatch.setattr(segmentation_runtime.shutil, "which", lambda _name: "/unrelated/python/nnUNetv2_predict_from_modelfolder")
+    command = segmentation_runtime._nnunet_predict_command()
+    assert command[0] == segmentation_runtime.sys.executable
+    assert command[1] == "-c"
+    (models / "nnunet4d").rmdir()
+    with pytest.raises(FileNotFoundError, match="portable 4D nnUNet model folder"):
+        resolve_nnunet_4d_model_folder()
+
+
+@pytest.mark.parametrize("global_visible", [False, True])
+def test_group_segmentation_phantom_keeps_preview_after_metrics(monkeypatch, tmp_path, global_visible):
+    app = _smoke_qt_application(monkeypatch)
+    monkeypatch.setenv("AUTOFLOW_SSH_RENDERING", "1")
+    from PySide6 import QtCore
+    import autoflow.ui.app as ui_app
+    from autoflow.ui.remote_plotter import RemotePlotter
+    monkeypatch.setattr(ui_app, "RemotePlotter", RemotePlotter, raising=False)
+    window = ui_app.MainWindow()
+    try:
+        ws = window.workspace
+        ws.paths.output_dir = str(tmp_path)
+        ws.data_loaded = True
+        ws.flow_raw = np.zeros((12, 10, 10, 2, 3), dtype=np.float32)
+        ws.flow_raw[..., 2] = 20.0
+        ws.mag_raw = np.ones((12, 10, 10, 2), dtype=np.float32)
+        labels = np.zeros((12, 10, 10, 2), dtype=np.int16)
+        labels[1:5, 2:7, 2:7, :] = 1
+        labels[7:11, 2:7, 2:7, :] = 2
+        ws.set_segmentation_source("original", labels)
+        assert ws.activate_segmentation_source("original")
+        ws.skeleton_params = SkeletonParams(
+            label_groups={"left": {"labels": [1]}, "right": {"labels": [2]}},
+            remove_small_cc=False, do_closing=False, do_opening=False,
+            gaussian_enabled=False, dilation_iters=0, erosion_iters=0)
+        window.pipeline.preprocess(ws)
+        ws.derived_params.use_multithread = False
+        ws.planes = [PlaneData(center=np.array([2.5, 4., 4.]),
+                               normal=np.array([0., 0., 1.]), group_name="left")]
+        window._sync_segmentation_scene_object()
+        window.scene.sync_from_workspace()
+        window._refresh_browser()
+        window._refresh_segmentation_ui()
+        window.segmentation_panel.check_visible.setChecked(global_visible)
+        window._refresh_browser()
+        groups = [next(obj for obj in ws.scene_objects.values()
+                       if obj.data_key == f"segmask_group_{group}") for group in ("left", "right")]
+        for obj, visible in zip(groups, (True, False)):
+            window._find_browser_item_by_uid(obj.uid).setCheckState(
+                0, QtCore.Qt.Checked if visible else QtCore.Qt.Unchecked)
+        assert ws.segmentation.visible is global_visible
+        assert [obj.visible for obj in groups] == [True, False]
+        worker = ui_app._PipelineTaskWorker(window.pipeline, ws, [StepId.COMPUTE_PLANE_METRICS])
+        failures, finished = [], []
+        worker.failed.connect(failures.append)
+        worker.finished.connect(finished.append)
+        worker.run()
+        assert not failures, failures
+        assert len(finished) == 1 and len(ws.derived.plane_metrics) == 1
+        assert (tmp_path / "plane_metrics.json").is_file()
+        window._finish_pipeline_scene_refresh([StepId.COMPUTE_PLANE_METRICS])
+        app.processEvents()
+        for original, visible in zip(groups, (True, False)):
+            obj = ws.scene_objects[original.uid]
+            assert obj.visible is visible
+            assert bool(obj.actor.GetVisibility()) is visible
+            assert window._find_browser_item_by_uid(obj.uid).checkState(0) == (
+                QtCore.Qt.Checked if visible else QtCore.Qt.Unchecked)
+        window._on_segmentation_opacity_changed(42)
+        assert [ws.scene_objects[obj.uid].visible for obj in groups] == [True, False]
+        window.segmentation_panel.check_visible.setChecked(False)
+        window.segmentation_panel.check_visible.setChecked(True)
+        assert all(ws.scene_objects[obj.uid].visible for obj in groups)
+        window.segmentation_panel.check_visible.setChecked(False)
+        assert not any(ws.scene_objects[obj.uid].visible for obj in groups)
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize("mode", ["portable", "checkout", "online"])
+def test_docs_action_smoke_uses_local_pages_or_online_fallback(monkeypatch, tmp_path, mode):
+    app = _smoke_qt_application(monkeypatch)
+    monkeypatch.setenv("AUTOFLOW_SSH_RENDERING", "1")
+    from PySide6 import QtCore, QtGui, QtTest
+    import autoflow.runtime_paths as runtime_paths
+    import autoflow.ui.app as ui_app
+    from autoflow.ui.remote_plotter import RemotePlotter
+    monkeypatch.setattr(ui_app, "RemotePlotter", RemotePlotter, raising=False)
+    repository = tmp_path / "source checkout"
+    monkeypatch.setattr(runtime_paths, "__file__", str(repository / "autoflow/runtime_paths.py"))
+    monkeypatch.delenv("AUTOFLOW_PORTABLE_ROOT", raising=False)
+    expected = None
+    if mode in {"checkout", "portable"}:
+        expected = repository / "build/docs-offline/index.html"
+        expected.parent.mkdir(parents=True)
+        expected.write_text("<html><body>Source documentation</body></html>", encoding="utf-8")
+        (expected.parent / "offline-manifest.json").write_text('{"offline": true}', encoding="utf-8")
+    if mode == "portable":
+        portable = tmp_path / "portable app with spaces"
+        monkeypatch.setenv("AUTOFLOW_PORTABLE_ROOT", str(portable))
+        expected = portable / "docs/site/index.html"
+        expected.parent.mkdir(parents=True)
+        expected.write_text("<html><body>Packaged documentation</body></html>", encoding="utf-8")
+        (expected.parent / "offline-manifest.json").write_text('{"offline": true}', encoding="utf-8")
+    if mode == "online":
+        ordinary_site = repository / "site/index.html"
+        ordinary_site.parent.mkdir(parents=True)
+        ordinary_site.write_text("<html>Online-only build</html>", encoding="utf-8")
+    opened = []
+    monkeypatch.setattr(QtGui.QDesktopServices, "openUrl", lambda url: opened.append(QtCore.QUrl(url)) or True)
+    window = ui_app.MainWindow()
+    try:
+        window.show()
+        app.processEvents()
+        actions = window.menuBar().actions()
+        assert [action.text() for action in actions[:3]] == ["File", "Docs", "Export"]
+        assert actions[1] is window.action_docs
+        assert window.action_docs.shortcut().toString() == "F1"
+        QtTest.QTest.mouseClick(window.menuBar(), QtCore.Qt.LeftButton,
+                               pos=window.menuBar().actionGeometry(window.action_docs).center())
+        app.processEvents()
+        assert len(opened) == 1
+        if expected is None:
+            assert opened[0].toString() == runtime_paths.DOCUMENTATION_URL
+        else:
+            assert opened[0].isLocalFile()
+            assert Path(opened[0].toLocalFile()) == expected
+    finally:
+        window.close()

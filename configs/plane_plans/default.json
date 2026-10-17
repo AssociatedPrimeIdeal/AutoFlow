@@ -1,0 +1,1078 @@
+{
+  "label_rules": {
+    "AAO": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 3,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "fractions",
+          "fallback": {
+            "anchor": "label_level",
+            "level": 1,
+            "path_selection": "longest",
+            "position": "fractions",
+            "fractions": [
+              0.2,
+              0.5,
+              0.8
+            ]
+          },
+          "fractions": [
+            0.2,
+            0.5,
+            0.8
+          ]
+        }
+      ]
+    },
+    "MPA": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "fractions",
+          "fallback": {
+            "anchor": "label_level",
+            "level": 1,
+            "path_selection": "longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "fractions": [
+            0.5
+          ]
+        }
+      ]
+    },
+    "ARCH": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 0,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "offset_mm": 5.0
+        }
+      ]
+    },
+    "DAO": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 3,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "fractions",
+          "fallback": {
+            "anchor": "label_level",
+            "level": 1,
+            "path_selection": "longest",
+            "position": "fractions",
+            "fractions": [
+              0.2,
+              0.5,
+              0.8
+            ]
+          },
+          "fractions": [
+            0.2,
+            0.5,
+            0.8
+          ]
+        }
+      ]
+    },
+    "RBCT": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "fractions",
+          "fallback": {
+            "anchor": "label_level",
+            "level": 1,
+            "path_selection": "longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "fractions": [
+            0.5
+          ]
+        }
+      ]
+    },
+    "CCA": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "fractions",
+          "fallback": {
+            "anchor": "label_level",
+            "level": 1,
+            "path_selection": "longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "fractions": [
+            0.5
+          ]
+        }
+      ]
+    },
+    "LBCT": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "fractions",
+          "fallback": {
+            "anchor": "label_level",
+            "level": 1,
+            "path_selection": "longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "fractions": [
+            0.5
+          ]
+        }
+      ]
+    },
+    "RPA": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "fractions",
+          "fallback": {
+            "anchor": "label_longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "fractions": [
+            0.5
+          ]
+        }
+      ]
+    },
+    "LPA": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "fractions",
+          "fallback": {
+            "anchor": "label_longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "fractions": [
+            0.5
+          ]
+        }
+      ]
+    },
+    "HA": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 0,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "offset_mm": 5.0
+        }
+      ]
+    },
+    "SMA": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 0,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "offset_mm": 5.0
+        }
+      ]
+    },
+    "LRA": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "offset_mm": 5.0
+        }
+      ]
+    },
+    "RRA": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "offset_mm": 5.0
+        }
+      ]
+    },
+    "PV": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "offset_mm": 15.0
+        }
+      ]
+    },
+    "SMV": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "offset_mm": 15.0
+        }
+      ]
+    },
+    "SV": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "offset_mm": 15.0
+        }
+      ]
+    },
+    "LICA": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_level",
+            "level": 1,
+            "path_selection": "longest",
+            "position": "fractions",
+            "fractions": [
+              0.33,
+              0.66
+            ]
+          },
+          "offset_mm": 5.0
+        }
+      ]
+    },
+    "LVA": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_level",
+            "level": 1,
+            "path_selection": "longest",
+            "position": "fractions",
+            "fractions": [
+              0.33,
+              0.66
+            ]
+          },
+          "offset_mm": 5.0
+        }
+      ]
+    },
+    "RVA": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_level",
+            "level": 1,
+            "path_selection": "longest",
+            "position": "fractions",
+            "fractions": [
+              0.33,
+              0.66
+            ]
+          },
+          "offset_mm": 5.0
+        }
+      ]
+    },
+    "RICA": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_level",
+            "level": 1,
+            "path_selection": "longest",
+            "position": "fractions",
+            "fractions": [
+              0.33,
+              0.66
+            ]
+          },
+          "offset_mm": 5.0
+        }
+      ]
+    },
+    "BA": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_level",
+          "level": 2,
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.5
+          ],
+          "when_connected_to": [
+            "LVA",
+            "RVA"
+          ],
+          "otherwise_level": 1
+        }
+      ]
+    },
+    "LTS": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "offset_mm": 15.0
+        }
+      ]
+    },
+    "SSS": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "offset_mm": 15.0
+        }
+      ]
+    },
+    "RTS": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "offset_mm": 15.0
+        }
+      ]
+    },
+    "StrS": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "offset_mm": 15.0
+        }
+      ]
+    },
+    "LPCA": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "offset_mm": 5.0
+        }
+      ]
+    },
+    "RPCA": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "offset_mm": 5.0
+        }
+      ]
+    },
+    "LMCA": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_level",
+            "level": 1,
+            "path_selection": "longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "offset_mm": 5.0
+        }
+      ]
+    },
+    "RMCA": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_level",
+            "level": 1,
+            "path_selection": "longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "offset_mm": 5.0
+        }
+      ]
+    },
+    "ACA": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 1,
+      "spacing_ratio": 0.3,
+      "placements": [
+        {
+          "anchor": "label_connections",
+          "position": "near",
+          "fallback": {
+            "anchor": "label_longest",
+            "position": "fractions",
+            "fractions": [
+              0.5
+            ]
+          },
+          "offset_mm": 5.0
+        }
+      ]
+    },
+    "LIJV": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 2,
+      "spacing_ratio": 0.3333333333333333,
+      "placements": [
+        {
+          "anchor": "label_level",
+          "level": 1,
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.3333333333333333,
+            0.6666666666666666
+          ]
+        }
+      ]
+    },
+    "RIJV": {
+      "plane_mode": "landmark",
+      "cross_section_distance": 5.0,
+      "start_distance": 0.0,
+      "end_distance": 0.0,
+      "anchor": "center",
+      "anchor_offset_mm": 5.0,
+      "direction": "both",
+      "spacing_mode": "fraction",
+      "segmentation_filter": null,
+      "fov_boundary_filter": null,
+      "fov_boundary_max_fraction": null,
+      "smoothing_window": null,
+      "smoothing_polyorder": null,
+      "inter_time": null,
+      "plane_count": 2,
+      "spacing_ratio": 0.3333333333333333,
+      "placements": [
+        {
+          "anchor": "label_level",
+          "level": 1,
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.3333333333333333,
+            0.6666666666666666
+          ]
+        }
+      ]
+    }
+  }
+}

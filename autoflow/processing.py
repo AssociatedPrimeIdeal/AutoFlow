@@ -6,6 +6,7 @@ import time
 
 import numpy as np
 
+from .task_control import TaskCancelled
 from .core.models import StepId, Workspace
 from .core.pipeline import PipelineEngine
 from .algorithms import collect_input_cases, resolve_input_case
@@ -437,10 +438,12 @@ def process_single(
 
     print("[1/7] Loading data...")
     t_stage = _time.perf_counter()
-    engine.load_data(ws, logger, input_source=case)
+    fused_correction = bool(correction_all or ws.loader_params.background_phase_correction.enabled)
+    engine.load_data(ws, logger, input_source=case, apply_background_correction=fused_correction)
     elapsed = _time.perf_counter() - t_stage
-    _record_timing(stage_times, "load", elapsed)
-    print(f"  -> load={elapsed:.2f}s")
+    load_timing_key = "load_and_background_correction" if fused_correction else "load"
+    _record_timing(stage_times, load_timing_key, elapsed)
+    print(f"  -> {load_timing_key}={elapsed:.2f}s")
 
     def run_correction_step(step, timing_key):
         print(f"[Correction] {step.label}...")
@@ -451,8 +454,6 @@ def process_single(
         if not result.success:
             raise RuntimeError(result.message)
 
-    if correction_all or ws.loader_params.background_phase_correction.enabled:
-        run_correction_step(StepId.BACKGROUND_CORRECTION, "background_correction")
     if correction_all or noise_removal:
         run_correction_step(StepId.REMOVE_NOISE, "noise_removal")
     unwrap_enabled = str(ws.phase_unwrap_params.method).lower() not in {"", "none", "disabled"}
@@ -573,9 +574,8 @@ def process_single(
             "quality_report": quality_report,
         }
         summary_path = os.path.join(out_dir, "summary.json")
-        with open(summary_path, "w", encoding="utf-8") as f:
-            json.dump(summary, f, ensure_ascii=False, indent=2)
-        print(f"\nSegmentation-only run complete. Summary saved: {summary_path}")
+        _write_case_summary(summary, summary_path, t_total_start, total_time_sec)
+        print(f"\nSegmentation-only run complete ({summary['total_time_sec']:.2f}s). Summary saved: {summary_path}")
         return summary
 
     print("[2/7] Generate Skeleton...")
@@ -726,7 +726,7 @@ def process_single(
     timing_summary = _format_timing_parts([(name, seconds) for name, seconds in stage_times.items()])
     if timing_summary:
         print(f"  => Stage timing: {timing_summary}")
-    print(f"  => Total pipeline took {total_time_sec:.2f}s")
+    print(f"  => Compute stages took {total_time_sec:.2f}s")
 
     plane_positions_path = save_plane_positions(ws, os.path.join(out_dir, "plane_positions.json"), source_path=case.input_path)
     print(f"Plane positions saved: {plane_positions_path}")
@@ -736,6 +736,7 @@ def process_single(
         print(f"Plane coordinates exported: {exported_planes_path}")
 
     video_paths = {}
+    video_errors = {}
 
     def _run_video(name, enabled, runner, available=True):
         if not enabled:
@@ -752,8 +753,13 @@ def process_single(
             if video_paths[name]:
                 print(f"{name.capitalize()} video saved: {video_paths[name]} | time={elapsed_local:.2f}s")
             else:
+                video_errors[name] = "Renderer produced no output"
                 print(f"[WARN] {name} video produced no output | time={elapsed_local:.2f}s")
-        except Exception:
+        except TaskCancelled:
+            raise
+        except Exception as exc:
+            video_errors[name] = f"{type(exc).__name__}: {exc}"
+            _record_timing(video_times, name, _time.perf_counter() - t_video)
             print(f"[WARN] {name.capitalize()} video failed")
             print(traceback.format_exc())
             video_paths[name] = ""
@@ -975,6 +981,7 @@ def process_single(
         "requested_metrics": dict(metric_flags),
         "requested_videos": dict(video_flags),
         "total_time_sec": float(total_time_sec),
+        "video_errors": video_errors,
         "stage_times_sec": _timing_payload(stage_times),
         "video_times_sec": _timing_payload(video_times),
         "n_planes": len(ws.planes),
@@ -985,6 +992,7 @@ def process_single(
         "n_forks": len(ws.forks),
         "willis_ring": dict(getattr(ws, "willis_ring_status", {}) or {}),
         "path_info": ws.path_info,
+        "graph_hierarchy": ws.graph_hierarchy,
         "forks": ws.forks,
         "plane_metrics": ws.derived.plane_metrics,
         "plane_qc": ws.derived.plane_qc,
@@ -1016,10 +1024,23 @@ def process_single(
         "plane_pixelwise_file": ws.derived.plane_pixelwise_file,
     }
     summary_path = os.path.join(out_dir, "summary.json")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
+    _write_case_summary(summary, summary_path, t_total_start, total_time_sec)
+    print(f"  => Total case including outputs took {summary['total_time_sec']:.2f}s")
     print(f"\nSummary saved: {summary_path}")
     return summary
+
+
+def _write_case_summary(summary, summary_path, started, compute_time_sec):
+    summary["compute_time_sec"] = float(compute_time_sec)
+    summary["total_time_sec"] = time.perf_counter() - started
+    summary["output_time_sec"] = max(0.0, summary["total_time_sec"] - compute_time_sec)
+    with open(summary_path, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, ensure_ascii=False, indent=2)
+    # The final timing-field rewrite cannot include its own duration.
+    summary["total_time_sec"] = time.perf_counter() - started
+    summary["output_time_sec"] = max(0.0, summary["total_time_sec"] - compute_time_sec)
+    with open(summary_path, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, ensure_ascii=False, indent=2)
 
 
 def collect_h5_files(inputs):
@@ -1039,7 +1060,7 @@ def collect_input_items(inputs, dicom_backend="dicom2h5", dicom_h5_dir=""):
 
 def build_base_workspace():
     ws = Workspace()
-    ws.plane_gen_params.plane_mode = globals().get("PLANE_MODE", "fixed_step")
+    ws.plane_gen_params.plane_mode = globals().get("PLANE_MODE", "by_label")
     ws.plane_gen_params.plane_count = globals().get("PLANE_COUNT", 3)
     ws.plane_gen_params.cross_section_distance = globals().get("CROSS_SECTION_DIST", 5.0)
     ws.plane_gen_params.start_distance = globals().get("START_DIST", 0.0)
@@ -1050,6 +1071,8 @@ def build_base_workspace():
     ws.plane_gen_params.spacing_mode = globals().get("PLANE_SPACING_MODE", "fraction")
     ws.plane_gen_params.spacing_ratio = globals().get("PLANE_SPACING_RATIO", 0.25)
     ws.plane_gen_params.segmentation_filter = globals().get("SEGMENTATION_FILTER", True)
+    ws.plane_gen_params.fov_boundary_filter = globals().get("FOV_BOUNDARY_FILTER", True)
+    ws.plane_gen_params.fov_boundary_max_fraction = globals().get("FOV_BOUNDARY_MAX_FRACTION", 0.25)
     if globals().get("USE_CENTER_PLANE", None) is False:
         ws.plane_gen_params.plane_mode = "distance"
     elif globals().get("USE_CENTER_PLANE", None) is True:
@@ -1058,7 +1081,7 @@ def build_base_workspace():
     ws.skeleton_params.remove_small_cc = globals().get("REMOVE_SMALL_CC", True)
     ws.skeleton_params.min_cc_volume_mm3 = globals().get("MIN_CC_VOLUME", 50.0)
     ws.skeleton_params.cc_filter_mode = globals().get("CC_FILTER_MODE", "hybrid")
-    ws.skeleton_params.cc_rel_min_ratio = globals().get("CC_REL_MIN_RATIO", 0.01)
+    ws.skeleton_params.cc_rel_min_ratio = globals().get("CC_REL_MIN_RATIO", 0.10)
     ws.streamline_params.max_steps = globals().get("MAX_STEPS", 200)
     ws.streamline_params.min_seeds = globals().get("MIN_SEEDS", 50)
     ws.streamline_params.seed_ratio = globals().get("SEED_RATIO", 0.1)

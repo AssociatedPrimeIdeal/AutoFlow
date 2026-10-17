@@ -3,6 +3,7 @@ from scipy.spatial import cKDTree
 
 from .graph import graph_to_networkx
 from .paths import _vector_orientation_text, inter_points
+from .hierarchy import graph_edge_chains, analyze_group_graph, hierarchy_path_order
 
 
 def _orient_node_paths_by_flow(node_paths, graph_points, flow_xyzt3=None, segmask_binary_4d=None,
@@ -204,38 +205,7 @@ def segment_vessels_from_graph_and_mask(segmask_3d, graph, resolution, flow_xyzt
     if G.number_of_nodes() == 0:
         return mask3d.astype(np.int16), [], [], [], []
 
-    degree = dict(G.degree())
-    endpoints = [n for n, d in degree.items() if d == 1]
-    branch_nodes = [n for n, d in degree.items() if d >= 3]
-    keynodes = set(endpoints + branch_nodes)
-
-    node_paths = []
-    visited_edges = set()
-
-    for start in keynodes:
-        for curr in G.neighbors(start):
-            edge0 = tuple(sorted((start, curr)))
-            if edge0 in visited_edges:
-                continue
-
-            path = [start, curr]
-            visited_edges.add(edge0)
-            prev = start
-
-            while curr not in keynodes:
-                nbrs = list(G.neighbors(curr))
-                if len(nbrs) != 2:
-                    break
-                nxt = nbrs[0] if nbrs[0] != prev else nbrs[1]
-                edge = tuple(sorted((curr, nxt)))
-                if edge in visited_edges:
-                    break
-                path.append(nxt)
-                visited_edges.add(edge)
-                prev, curr = curr, nxt
-
-            if curr in keynodes:
-                node_paths.append(path)
+    node_paths = graph_edge_chains(graph)
     graph_points = np.asarray(graph.points, dtype=float)
     raw_point_paths = [graph_points[np.asarray(nodes, dtype=int)] for nodes in node_paths]
 
@@ -269,9 +239,20 @@ def segment_vessels_from_graph_and_mask(segmask_3d, graph, resolution, flow_xyzt
         flow_xyzt3=flow_xyzt3, segmask_binary_4d=segmask_binary_4d,
         spacing=resolution, origin=origin, sample_paths=filtered_paths,
     )
+    hierarchy = analyze_group_graph(graph, node_paths, flow=flow_xyzt3,
+        mask=segmask_binary_4d, spacing=resolution, segmentation_labels=segmentation_labels)
+    assignment_paths = [graph_points[np.asarray(nodes, dtype=int)] for nodes in node_paths]
+    order = hierarchy_path_order(hierarchy)
+    old_to_new = {old: new for new, old in enumerate(order)}
+    if order != list(range(len(node_paths))):
+        node_paths = [node_paths[index] for index in order]
+        hierarchy = analyze_group_graph(graph, node_paths, flow=flow_xyzt3,
+            mask=segmask_binary_4d, spacing=resolution, segmentation_labels=segmentation_labels)
     point_paths = [graph_points[np.asarray(nodes, dtype=int)] for nodes in node_paths]
     forks = find_path_forks(node_paths, graph_points, graph=graph)
     path_info = build_path_info(node_paths, graph_points, forks)
+    for info, record in zip(path_info, hierarchy["paths"]):
+        info["hierarchy"] = record
 
     labels = np.zeros(mask3d.shape, dtype=np.int16)
     if len(point_paths) == 0:
@@ -280,10 +261,12 @@ def segment_vessels_from_graph_and_mask(segmask_3d, graph, resolution, flow_xyzt
 
     all_pts_list = []
     all_ids_list = []
-    for i, p in enumerate(point_paths):
+    # Preserve nearest-point ties in the original traversal order. Numbering
+    # changes must relabel existing branch ownership, not move its boundaries.
+    for i, p in enumerate(assignment_paths):
         fine = inter_points(p, time=10)
         all_pts_list.append(fine)
-        all_ids_list.extend([i] * len(fine))
+        all_ids_list.extend([old_to_new[i]] * len(fine))
     tree = cKDTree(np.vstack(all_pts_list))
     all_ids = np.array(all_ids_list, dtype=int)
 

@@ -22,6 +22,18 @@ config = AutoFlowConfig(output_dir="./results/demo")
 summary = run_case("./data/demo_data.h5", config=config)
 ```
 
+Default plane generation uses `plane_mode="by_label"` with shared observed connections and per-label positions. Select a shared file with `AutoFlowConfig(plane_config="configs/plane_plans/brain.json")`. Alternatively supply a complete inline mapping such as `plane_label_rules={"MPA": {"plane_mode": "landmark", "plane_count": 1, "placements": [{"anchor": "label_connections", "position": "fractions", "fractions": [0.5]}]}}`. It replaces the file and enables only MPA. The example measures each observed connected MPA arm; add an explicit `fallback` placement to allow unconnected components. Unsupported sections are omitted with QC reasons. `plane_count` matches primary declared positions or is zero; topology and fallback determine actual counts. Null plane_label_rules inherits the selected file/module. See [Label plane rules](parameter-schemas.md#label-plane-rules).
+
+Default preprocessing merges group labels, leaves closing off, applies morphology, then retains components with volume at least `max(50 mm³, 0.10 × largest component volume)`. Temporal group frames use the same threshold without skeleton morphology. `cc_filter_mode="largest"` explicitly restores single-component selection; `remove_small_cc=False` disables the filter.
+
+Skeleton graph edges use `graph_connectivity=26` by default. Set `AutoFlowConfig(graph_connectivity=6)` for face-only neighbors. This is independent of preprocessing component filtering; diagonal skeletons can fragment with 6. Regenerate graph and planes after changing it. For neck-only scans, select `plane_config="configs/plane_plans/neck.json"`; ICA/VA use observed connected offsets, or longest L1 at 33%/66% without connections.
+
+After Generate Graph, `workspace.graph_hierarchy` exposes anatomical groups and connected `subgroups`, each graded independently, plus all parents/children, inlet/outlet ids, directed loops and label-relative depths. Path records carry `subgroup_id`, zero-based `subgroup_index`, and nullable `subgroup_level`; `group_level` remains an equal-valued compatibility alias. Native path records are also attached to `workspace.path_info[i]["hierarchy"]`. Joint anterior/posterior cerebral analysis appears under `graph_hierarchy["joint_systems"]` with its own connected subgroups, separate ids and geometry; it leaves ordinary paths/planes unchanged. Null grades represent unresolved direction/upstream topology or closed unrooted loops. See [Graph and paths](../features/graph-paths.md) for schema and usage.
+
+Generated planes also use `fov_boundary_filter=True` and `fov_boundary_max_fraction=0.25`: contact length on the image box faces divided by the outer ROI perimeter, measured on temporal-union geometry. Set `fov_boundary_filter=False` to keep these candidates. `summary["quality_report"]["exclusions"]` contains complete plane decisions and label/phase preprocessing provenance; direct workspaces retain `segmentation_preprocess_qc`. See [QC](../features/quality-control.md) for loss-fraction denominators and GUI details.
+
+Generated path ids follow group order, connected subgroup order, then ascending depth; unresolved paths follow their subgroup's ranked paths. Regenerate graphs and planes to apply this numbering to an older workspace. Plane sampling automatically carries missing ROI geometry forward from the latest valid earlier phase, with no backward/cyclic fill. Inspect `roi_source_frame_t` and `roi_carried_forward_t` in each metric. Velocity stays current-phase; raw volumes and derived-field validity are unchanged. Explicit empty ROI edits stop propagation.
+
 The whole Correction group is opt-in:
 
 ```python
@@ -62,6 +74,15 @@ config = AutoFlowConfig(
 )
 results, last_case_out = run_batch(config)
 ```
+
+`run_batch()` returns per-case `ok`, `error`, or `partial` statuses. `partial`
+means calculations completed but a requested available video failed; inspect
+`summary.video_errors`. `run_case()` returns that summary directly, while
+fatal processing errors still raise. Missing optional TKE is skipped.
+`total_time_sec` includes final outputs and videos; `compute_time_sec` preserves
+the former compute-stage endpoint. See [Outputs](outputs.md#case-timing-and-partial-video-output).
+
+Requested background correction runs during the first input decode.
 
 ### Build a workspace from config defaults
 

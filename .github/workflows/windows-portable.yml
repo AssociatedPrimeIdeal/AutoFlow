@@ -1,0 +1,133 @@
+name: Windows portable release
+
+on:
+  push:
+    branches: [dev]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish to GitHub Releases after verification
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-portable-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: regression
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PYTHONUTF8: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            packaging/windows/requirements.txt
+            packaging/windows/constraints.txt
+            packaging/docs/requirements.txt
+            packaging/docs/assets.lock.json
+      - name: Download locked inference models
+        shell: pwsh
+        run: |
+          $lock = Get-Content packaging/windows/models.lock.json -Raw | ConvertFrom-Json
+          New-Item -ItemType Directory -Path build/windows-models -Force | Out-Null
+          gh release download $lock.tag --repo $env:GITHUB_REPOSITORY --pattern $lock.asset --dir build/windows-models
+          if ($LASTEXITCODE -ne 0) { throw 'Inference model download failed' }
+          if ((Get-FileHash "build/windows-models/$($lock.asset)" -Algorithm SHA256).Hash.ToLowerInvariant() -ne $lock.sha256) { throw 'Inference model checksum mismatch' }
+      - name: Build and verify full portable folder
+        shell: pwsh
+        run: |
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { 'dev-' + $env:GITHUB_SHA.Substring(0,8) }
+          ./packaging/windows/build.ps1 -PythonBin python -EnvironmentDirectory "$env:RUNNER_TEMP/af-env" -OutputDirectory "$env:RUNNER_TEMP/af-release" -Version $version
+      - name: Select release assets
+        shell: pwsh
+        run: |
+          $artifacts = "$env:RUNNER_TEMP/af-release/artifacts"
+          $publish = "$env:RUNNER_TEMP/af-publish"
+          New-Item -ItemType Directory -Path $publish -Force | Out-Null
+          $manifest = Get-Content "$artifacts/release-manifest.json" -Raw | ConvertFrom-Json
+          $names = @('release-manifest.json', 'Join-Portable.ps1', "$($manifest.archive).sha256")
+          if ($manifest.parts.Count) { $names += @($manifest.parts | ForEach-Object { $_.file }) } else { $names += $manifest.archive }
+          foreach ($name in $names) { Move-Item -LiteralPath (Join-Path $artifacts $name) -Destination $publish }
+          Get-ChildItem "$env:RUNNER_TEMP/af-release/AutoFlow-*/build-check.json" | Copy-Item -Destination "$publish/build-check.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AutoFlow-windows-x64
+          path: ${{ runner.temp }}/af-publish/*
+          compression-level: 0
+          retention-days: 14
+
+  publish:
+    needs: build
+    if: github.event_name != 'workflow_dispatch' || inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: AutoFlow-windows-x64
+          path: assets
+      - name: Publish verified release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            tag="$GITHUB_REF_NAME"
+            title="AutoFlow $tag for Windows"
+            flags=()
+            [[ "$tag" != *-* ]] || flags+=(--prerelease)
+          else
+            tag=dev-windows
+            title="AutoFlow Windows development build"
+            flags=(--prerelease --latest=false)
+          fi
+          cat > notes.md <<'NOTES'
+          Full Windows x64 portable distribution, with the full GUI, DICOM, nnUNet 3D/4D inference, Labeler, PUDIP-Flow, GUST-Flow, video export, and searchable offline documentation opened from Docs.
+
+          Download the ZIP and extract the entire folder to a short ASCII/English path such as D:\AutoFlow, then double-click AutoFlow.exe. GUST's Windows CUDA compiler does not support Chinese/non-ASCII installation paths. If the download is split into .partNNN files, download every part plus release-manifest.json and Join-Portable.ps1, run the joiner in PowerShell, then extract the verified ZIP. Model files are under models/ and can be kept separately from the application code.
+
+          Windows 10/11 x64 and a current NVIDIA driver are required for GPU features. GUST requires CUDA-capable hardware; CPU processing remains available for the other supported CPU paths. No Python or Conda installation is required. See docs/en/user/windows-portable.md in the bundle for usage and diagnostics.
+          NOTES
+          printf '\nSource commit: `%s`\n' "$GITHUB_SHA" >> notes.md
+          existing=false
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            existing=true
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --title "$title" --notes-file notes.md "${flags[@]}"
+          fi
+          # Retain the previous working download until every new archive part
+          # is uploaded; replace the small download manifest only afterward.
+          gh release upload "$tag" assets/AutoFlow-* --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload "$tag" assets/build-check.json assets/Join-Portable.ps1 assets/release-manifest.json --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --title "$title" --notes-file notes.md "${flags[@]}"
+          if [[ "$tag" == dev-windows && "$existing" == true ]]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$tag" -f sha="$GITHUB_SHA" -F force=true >/dev/null
+            find assets -maxdepth 1 -type f -printf '%f\n' > new-assets.txt
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq '.assets[].name' > old-assets.txt
+            while IFS= read -r asset; do
+              if ! grep -Fxq "$asset" new-assets.txt; then
+                gh release delete-asset "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --yes
+              fi
+            done < old-assets.txt
+          fi

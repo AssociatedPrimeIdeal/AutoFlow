@@ -45,7 +45,7 @@ def export_videos_in_process(workspace, out_dir, config, requested, progress_cal
             process = subprocess.Popen([sys.executable, "-m", "autoflow.rendering.jobs", str(request)],
                                        env=env, stdout=output, stderr=subprocess.STDOUT,
                                        start_new_session=os.name != "nt",
-                                       creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
+                                       creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW) if os.name == "nt" else 0)
             offset = 0
             try:
                 while True:

@@ -34,7 +34,7 @@ For each PWV group, AutoFlow:
 
 ### GUI
 1. load a case with segmentation and flow
-2. open `PWV Parameters` in the main parameter panel
+2. right-click `Compute PWV` to open Groups, Path / planes, Transit time and Display / output settings. Only the selected timing method's controls appear
 3. define one or more groups, and adjust spacing or waveform settings if needed
 4. run `Calculate && Save Metrics`, then `Compute PWV`
 5. inspect `Analysis -> PWV` and the grouped `PWV planes` browser item

@@ -240,34 +240,71 @@ def _preprocess_single_component(mask_3d, params):
     return m.astype(bool)
 
 
-def preprocess_mask_for_skeleton(mask_3d, params=None, resolution=None):
+def preprocess_mask_for_skeleton(mask_3d, params=None, resolution=None, *, return_details=False,
+                                 post_morphology=None):
+    """Merge-group morphology first, connected-component selection last.
+
+    Source-label support is projected from the final component decision without
+    expanding the labels into voxels introduced by morphology.
+    """
     if params is None:
         params = SkeletonParams()
     m = np.asarray(mask_3d, dtype=bool).copy()
-    if not np.any(m):
-        return m
     if resolution is None:
         resolution = np.array([1.0, 1.0, 1.0])
     resolution = np.asarray(resolution, dtype=float).reshape(3)
+    # A padded group crop permits morphology across nearby source components
+    # and avoids treating each tight component bounding box as an image edge.
     out = np.zeros_like(m, dtype=bool)
-    filtered_mask = m
+    bbox = _component_bbox(m)
+    if bbox is not None:
+        halo = (1 + int(getattr(params, "dilation_iters", 0))
+                + int(getattr(params, "erosion_iters", 0))
+                + 2 * (int(bool(params.do_closing)) + int(bool(params.do_opening))
+                       + int(getattr(params, "closing_iters", 0))
+                       + int(getattr(params, "opening_iters", 0))))
+        if params.gaussian_enabled:
+            halo += int(np.ceil(4 * params.gaussian_sigma))
+        region = tuple(slice(max(0, sl.start - halo), min(m.shape[k], sl.stop + halo))
+                       for k, sl in enumerate(bbox))
+        padded = np.pad(m[region], halo)
+        local = _preprocess_single_component(padded, params)
+        out[region] = local[tuple(slice(halo, -halo) for _ in range(3))]
+    if post_morphology is not None:
+        out = np.asarray(post_morphology(out), dtype=bool)
+    morphology_mask = out.copy()
     if getattr(params, "remove_small_cc", False):
-        filtered_mask = filter_connected_components(
-            m,
+        out = filter_connected_components(
+            out,
             resolution,
             mode=getattr(params, "cc_filter_mode", "hybrid"),
             min_volume_mm3=getattr(params, "min_cc_volume_mm3", 50.0),
-            rel_min_ratio=getattr(params, "cc_rel_min_ratio", 0.01),
+            rel_min_ratio=getattr(params, "cc_rel_min_ratio", 0.10),
         )
-    component_labels, component_count = _label_components(filtered_mask)
-    for component_id, bbox in enumerate(find_objects(component_labels), start=1):
-        if component_id > int(component_count) or bbox is None:
+    if not return_details:
+        return out.astype(bool)
+    retained_source = np.zeros_like(m)
+    source_labels, _ = _label_components(m)
+    for component_id, region in enumerate(find_objects(source_labels), start=1):
+        if region is None:
             continue
-        local = component_labels[bbox] == int(component_id)
-        proc = _preprocess_single_component(local, params)
-        if np.any(proc):
-            out[bbox] |= proc
-    return out.astype(bool)
+        source = source_labels[region] == component_id
+        anchors = source & morphology_mask[region]
+        if not np.any(anchors):
+            continue
+        surviving = anchors & out[region]
+        if not np.any(surviving):
+            continue
+        if np.array_equal(anchors, surviving):
+            retained_source[region] |= source
+        else:
+            # Project erosion boundaries only within their original component;
+            # a distant survivor must never revive a removed source island.
+            nearest = distance_transform_edt(~anchors, sampling=resolution,
+                                             return_distances=False, return_indices=True)
+            retained_source[region] |= source & out[region][tuple(nearest)]
+    return out.astype(bool), {"morphology_mask": morphology_mask,
+                              "retained_source_mask": retained_source}
 
 
 def separate_longitudinal_label_contacts(mask_3d, label_mask_3d, label_values, resolution=None,

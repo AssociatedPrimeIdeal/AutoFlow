@@ -32,6 +32,13 @@ config = AutoFlowConfig.from_config_dir('./configs', requested_metrics=['tke'])
 summary = run_case('case.h5', config=config)
 ```
 
+Fused batch loading/correction retains the sigma derived from original
+single-VENC complex encodes, matching the former two-pass pipeline. Correction
+still updates velocity and phase. This avoids changing TKE because of
+floating-point magnitude changes during complex phase rotation. Derived plane
+sampling prepares the TKE array once per multi-plane call and uses the same
+label/branch/frame-ROI support as basic plane metrics.
+
 ## Inputs
 
 Optional `tke_array` or supported complex-derived sigma, segmentation for vessel/plane summaries, density in kg/m3 and spatial metadata.

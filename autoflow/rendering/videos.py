@@ -19,13 +19,14 @@ from ..algorithms import (
     generate_seed_points,
     generate_streamlines_at_t,
 )
-from ..config import DEFAULT_PLANE_VIDEO_CFG, BACKGROUND_COLOR, CONTEXT_COLOR
+from ..config import DEFAULT_PLANE_VIDEO_CFG, BACKGROUND_COLOR
 from .style import (
-    configure_plotter, foreground_color, plane_display_size,
+    configure_plotter, plane_display_size,
     metric_style, scalar_bar_args, scene_object, surface_style, configured_metric_style, render_style_settings,
     wss_display_surface, wss_scalar_range, metric_volume_kwargs, apply_metric_volume_opacity, metric_clim,
 )
 from .datasets import tke_display_mesh, display_support_surface, sample_display_field
+from .video_layout import VideoOverlay
 
 WINDOW_SIZE = (1600, 1200)
 _OFFSCREEN_BOOTSTRAPPED = False
@@ -273,12 +274,17 @@ def _camera_from_view(poly, view, distance_scale=1.0):
     return _camera_from_scene(poly, azimuth_deg, elevation_deg, distance_scale)
 
 
+def _time_index(frame_idx, n_time, time_repeat=1):
+    """Repeat each cardiac phase equally, cycling during longer rotations."""
+    return (int(frame_idx) // max(int(time_repeat), 1)) % max(int(n_time), 1)
+
+
 def _time_and_azimuth(frame_idx, rotation_frames, n_time, time_repeat=1):
     rotation_frames = int(max(rotation_frames, 1))
     n_time = int(max(n_time, 1))
     time_repeat = int(max(time_repeat, 1))
 
-    t = (frame_idx // time_repeat) % n_time
+    t = _time_index(frame_idx, n_time, time_repeat)
     azimuth_deg = 360.0 * (frame_idx % rotation_frames) / rotation_frames
     return t, azimuth_deg
 
@@ -666,26 +672,18 @@ def render_plane_rotation_video(
                 )
 
         total_frames = int(max(n_frames, 1))
+        overlay = VideoOverlay(plotter, ws, "Analysis planes")
         for frame_idx in range(total_frames):
             check_cancelled()
             azimuth_deg = 360.0 * frame_idx / max(n_frames, 1)
             plotter.camera_position = _orbit_camera(surf, azimuth_deg, elevation_deg, distance_scale)
-            plotter.add_text(
-                f"Rotating {frame_idx + 1}/{int(max(n_frames, 1))}",
-                position="upper_left",
-                font_size=14,
-                color=foreground_color(_video_background(ws), ws),
-                name="frame_text",
-            )
+            overlay.update(frame_index=frame_idx, total_frames=total_frames,
+                           azimuth_deg=azimuth_deg)
             plotter.render()
             check_cancelled()
             yield np.asarray(plotter.screenshot(return_img=True))
             report_progress({"stage": "video_frame", "current": frame_idx + 1, "total": total_frames,
                              "message": f"Rendered frame {frame_idx + 1}/{total_frames}"})
-            try:
-                plotter.remove_actor("frame_text")
-            except Exception:
-                pass
     finally:
         plotter.close()
 
@@ -734,8 +732,7 @@ def render_wss_video(
     try:
         wss_display_cache = {}
         wss_actor = None
-        text_actor = plotter.add_text("", position="upper_left", font_size=14,
-                                     color=foreground_color(_video_background(ws), ws))
+        overlay = VideoOverlay(plotter, ws, 'Wall shear stress')
         for frame_idx in range(total_frames):
             check_cancelled()
             if rotate:
@@ -747,7 +744,7 @@ def render_wss_video(
                 )
                 camera_position = _orbit_camera(context_surf, azimuth_deg, elevation_deg, distance_scale)
             else:
-                t = min(frame_idx, n_time - 1)
+                t = _time_index(frame_idx, n_time, time_repeat)
                 camera_position = _camera_from_view(context_surf, view, distance_scale)
 
             phase = min(max(0, t), len(ws.derived.wss_surfaces) - 1)
@@ -768,12 +765,9 @@ def render_wss_video(
             elif wss_actor is not None:
                 wss_actor.SetVisibility(0)
 
-            if rotate:
-                txt = f"t={t} | rot {frame_idx + 1}/{total_frames}"
-            else:
-                txt = f"t={t}"
-
-            text_actor.SetText(2, txt)
+            overlay.update(frame_index=frame_idx, total_frames=total_frames,
+                           phase_index=t, phase_count=n_time,
+                           azimuth_deg=azimuth_deg if rotate else None)
             plotter.camera_position = camera_position
             plotter.render()
             check_cancelled()
@@ -885,7 +879,7 @@ def render_streamlines_video(
     try:
         _add_context_surfaces(plotter, ws, surf, smoothing_iteration)
         streamline_actor = None
-        text_actor = plotter.add_text("", position="upper_left", font_size=14, color=foreground_color(_video_background(ws), ws))
+        overlay = VideoOverlay(plotter, ws, 'Velocity streamlines')
 
         for frame_idx in range(total_frames):
             check_cancelled()
@@ -898,7 +892,7 @@ def render_streamlines_video(
                 )
                 camera_position = _orbit_camera(surf, azimuth_deg, elevation_deg, distance_scale)
             else:
-                t = min(frame_idx, n_time - 1)
+                t = _time_index(frame_idx, n_time, time_repeat)
                 camera_position = _camera_from_view(surf, view, distance_scale)
 
             sl = streamline_cache[t]
@@ -924,18 +918,9 @@ def render_streamlines_video(
             elif streamline_actor is not None:
                 streamline_actor.SetVisibility(0)
 
-            if rotate:
-                txt = f"t={t} | rot {frame_idx + 1}/{total_frames}"
-            else:
-                txt = f"t={t}"
-
-            try:
-                text_actor.SetText(2, txt)
-            except Exception:
-                try:
-                    text_actor.SetInput(txt)
-                except Exception:
-                    pass
+            overlay.update(frame_index=frame_idx, total_frames=total_frames,
+                           phase_index=t, phase_count=n_time,
+                           azimuth_deg=azimuth_deg if rotate else None)
             plotter.camera_position = camera_position
             plotter.render()
             check_cancelled()
@@ -1005,8 +990,7 @@ def render_tke_video(
     try:
         tke_mesh_cache = {}
         tke_actor = None
-        text_actor = plotter.add_text("", position="upper_left", font_size=14,
-                                     color=foreground_color(_video_background(ws), ws))
+        overlay = VideoOverlay(plotter, ws, 'Turbulent kinetic energy')
 
         for frame_idx in range(total_frames):
             check_cancelled()
@@ -1019,7 +1003,7 @@ def render_tke_video(
                 )
                 camera_position = _orbit_camera(surf, azimuth_deg, elevation_deg, distance_scale)
             else:
-                t = min(frame_idx, n_time - 1)
+                t = _time_index(frame_idx, n_time, time_repeat)
                 camera_position = _camera_from_view(surf, view, distance_scale)
 
             if t not in tke_mesh_cache:
@@ -1041,12 +1025,9 @@ def render_tke_video(
             elif tke_actor is not None:
                 tke_actor.SetVisibility(0)
 
-            if rotate:
-                txt = f"t={t} | rot {frame_idx + 1}/{total_frames}"
-            else:
-                txt = f"t={t}"
-
-            text_actor.SetText(2, txt)
+            overlay.update(frame_index=frame_idx, total_frames=total_frames,
+                           phase_index=t, phase_count=n_time,
+                           azimuth_deg=azimuth_deg if rotate else None)
             plotter.camera_position = camera_position
             plotter.render()
             check_cancelled()
@@ -1135,7 +1116,7 @@ def render_pressure_gradient_video(
     try:
         pg_mesh_cache = {}
         pg_actor = None
-        text_actor = plotter.add_text("", position="upper_left", font_size=14, color=foreground_color(_video_background(ws), ws))
+        overlay = VideoOverlay(plotter, ws, 'Pressure gradient')
 
         for frame_idx in range(total_frames):
             check_cancelled()
@@ -1148,7 +1129,7 @@ def render_pressure_gradient_video(
                 )
                 camera_position = _orbit_camera(surf, azimuth_deg, elevation_deg, distance_scale)
             else:
-                t = min(frame_idx, n_time - 1)
+                t = _time_index(frame_idx, n_time, time_repeat)
                 camera_position = _camera_from_view(surf, view, distance_scale)
 
             tidx = min(max(0, t), pg_arr.shape[3] - 1) if pg_arr.ndim == 4 else 0
@@ -1179,14 +1160,9 @@ def render_pressure_gradient_video(
             elif pg_actor is not None:
                 pg_actor.SetVisibility(0)
 
-            txt = f"t={t} | rot {frame_idx + 1}/{total_frames}" if rotate else f"t={t}"
-            try:
-                text_actor.SetText(2, txt)
-            except Exception:
-                try:
-                    text_actor.SetInput(txt)
-                except Exception:
-                    pass
+            overlay.update(frame_index=frame_idx, total_frames=total_frames,
+                           phase_index=t, phase_count=n_time,
+                           azimuth_deg=azimuth_deg if rotate else None)
             plotter.camera_position = camera_position
             plotter.render()
             check_cancelled()
@@ -1249,7 +1225,7 @@ def render_relative_pressure_video(
     try:
         rp_mesh_cache = {}
         rp_actor = None
-        text_actor = plotter.add_text("", position="upper_left", font_size=14, color=foreground_color(_video_background(ws), ws))
+        overlay = VideoOverlay(plotter, ws, 'Relative pressure')
 
         for frame_idx in range(total_frames):
             check_cancelled()
@@ -1262,7 +1238,7 @@ def render_relative_pressure_video(
                 )
                 camera_position = _orbit_camera(surf, azimuth_deg, elevation_deg, distance_scale)
             else:
-                t = min(frame_idx, n_time - 1)
+                t = _time_index(frame_idx, n_time, time_repeat)
                 camera_position = _camera_from_view(surf, view, distance_scale)
 
             tidx = min(max(0, t), rp_arr.shape[3] - 1) if rp_arr.ndim == 4 else 0
@@ -1293,14 +1269,9 @@ def render_relative_pressure_video(
             elif rp_actor is not None:
                 rp_actor.SetVisibility(0)
 
-            txt = f"t={t} | rot {frame_idx + 1}/{total_frames}" if rotate else f"t={t}"
-            try:
-                text_actor.SetText(2, txt)
-            except Exception:
-                try:
-                    text_actor.SetInput(txt)
-                except Exception:
-                    pass
+            overlay.update(frame_index=frame_idx, total_frames=total_frames,
+                           phase_index=t, phase_count=n_time,
+                           azimuth_deg=azimuth_deg if rotate else None)
             plotter.camera_position = camera_position
             plotter.render()
             check_cancelled()

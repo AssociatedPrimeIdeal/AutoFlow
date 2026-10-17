@@ -93,6 +93,9 @@ def load_metrics_as_table(metrics_json_path, qc_json_path=None):
             row[f"flowrate_t{t}"] = m["flowrate_mL_s"][t]
         for t in range(len(m.get("area_mm2", []))):
             row[f"area_t{t}"] = m["area_mm2"][t]
+        for key in ("roi_source_frame_t", "roi_carried_forward_t"):
+            for t, value in enumerate(m.get(key, [])):
+                row[f"{key}{t}"] = value
         for t in range(len(m.get("meanv_cm_s_t", []))):
             row[f"meanv_t{t}"] = m["meanv_cm_s_t"][t]
         for t in range(len(m.get("flowrate_forward_mL_s", []))):

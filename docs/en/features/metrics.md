@@ -15,7 +15,22 @@ Plane metrics compute time-resolved cross-sectional measurements for each plane 
 
 For each unique segmentation phase, plane metrics build one thresholded VTK support mesh and reuse it across all planes. Each plane still has its own slice and connectivity selection, while repeated cardiac phases reuse the resulting slice specification. Large parallel jobs use independent loky worker processes with memory-mapped arrays because concurrently slicing a shared VTK dataset from Python threads is unsafe. Plane centers remain local physical coordinates and are shifted by `origin` only for VTK slicing.
 
+Basic flow/area/velocity and derived TKE/pressure now share the same label,
+branch, connected-section and frame-ROI selection. WSS uses wall samples
+belonging to that selected section. Dynamic labels are evaluated for each
+phase even when the binary mask is unchanged. Recompute older derived plane
+exports when multiple labelled vessels cross the same plane: their former
+summaries could include a different section from the basic metrics. This does
+not recompute the underlying TKE, WSS or pressure fields.
+
+TKE is masked and converted once per `augment_plane_metrics_with_derived()`
+call, then shared across planes and memory-mapped process workers.
+
 Support meshes are constructed inside the occupied mask's bounding box. They retain the full image's voxel identifiers and physical coordinates, so plane sampling and contour edits still address the original volume while avoiding background grid construction.
+
+If a plane's selected cross-section becomes empty at a cardiac phase, its ROI geometry is automatically carried forward from the most recent valid earlier phase. Consecutive missing phases use that same geometry; a real or manually drawn ROI takes precedence as soon as it returns. Leading empty phases remain empty: there is no backward fill or wrap from the cycle's final phase. Zero flow alone never triggers filling. An explicit frame edit that leaves an empty ROI is preserved and stops propagation until a valid ROI returns.
+
+Only the ROI geometry is reused. Velocity and available derived fields are sampled at the current phase. Original segmentation, velocity, TKE, WSS and pressure volumes are unchanged; their own masks and validity still apply. The GUI cyan contour and basic/derived plane sampling use the same temporal rule. Editing a contour with dependent missing phases updates that plane's time series; fully observed contours retain the one-frame update path.
 
 Generated planes are filtered before metric integration when their requested
 branch has no cells in the segmentation-filtered cross-section. The exclusion
@@ -37,10 +52,12 @@ than treating the missing path as zero flow.
 
 ### GUI
 1. generate planes
-2. click `Calculate && Save Metrics`
+2. right-click `Calculate && Save Metrics` to choose parallel computation, then Save and run. Configure shared fluid properties, WSS, pressure and vortex through the tabs of `WSS / TKE / Pressure / Vortex`
 3. inspect the selected plane in the selection panel, ortho viewer, and `Plane Curve` mode
 4. when plane geometry needs correction, use `Edit Plane`; releasing a handle recomputes only that plane and updates the metric and plane records
 5. click `Calculate && Save Metrics` after interactive edits when a fully regenerated `plane_metrics_pixelwise.h5` is required
+
+The completion refresh preserves each segmentation group's current Browser visibility. A group that was shown stays shown and a hidden group stays hidden. The Segmentation dock's visibility switch still applies to all segmentation groups when changed explicitly.
 
 ### CLI
 
@@ -78,9 +95,20 @@ Low-level Python users can call `augment_plane_metrics_with_derived(...)` with:
 | `progress_callback` | callable or None | `None` | function keyword | Receive completed-plane dictionaries on the calling thread | same |
 
 
+Low-level Python callers of `augment_plane_metrics_with_derived()` or
+`summarize_plane_derived_metrics()` should pass the same labels used by
+`compute_plane_metrics()`. GUI and pipeline callers supply these automatically.
+
+| Parameter | Type | Default | Where configured | Effect | Code owner |
+| --- | --- | --- | --- | --- | --- |
+| `segmentation_labels_3d` | Integer XYZ array or `None` | `None` | Python sampling call | Static label support when 4D labels are absent | `algorithms/metrics/sampling.py` |
+| `segmentation_labels_4d` | Integer XYZT array or `None` | `None` | Python sampling call | Phase-specific label support; preferred over 3D labels | `algorithms/metrics/sampling.py` |
+
 ## Outputs
 
 Plane pressure statistics use the valid pressure-derivative support, excluding zero padding outside it. Unavailable phases are JSON `null`; valid measured zero remains `0`. Cycle summaries average available phases, and `pressure_gradient_valid_cell_count_t` / `relative_pressure_valid_cell_count_t` expose per-phase sample counts. Plane pixelwise H5 adds `pressure_gradient_valid` and `relative_pressure_valid` flags; invalid pressure samples are NaN.
+
+Basic metrics include `roi_source_frame_t` (zero-based source phase or JSON `null` when unavailable) and `roi_carried_forward_t` (boolean per phase). A valid observed/edited ROI names its own phase; a filled ROI names its latest valid predecessor. Pixelwise H5 timepoints expose one-element `roi_source_frame` (`-1` when unavailable) and `roi_carried_forward` datasets. Metric-table exports expand the same metadata into per-phase columns. These fields describe ROI reuse, not copied flow values.
 
 
 | Output file or object | Created when | Meaning |

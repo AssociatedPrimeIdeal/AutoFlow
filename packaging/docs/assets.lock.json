@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "assets": [
+    {
+      "file": "assets/javascripts/vendor/mermaid.tiny.js",
+      "url": "https://registry.npmjs.org/@mermaid-js/tiny/-/tiny-12.2.0.tgz",
+      "sha256": "ea0cdf04eb31907eb20d956a34fe300095365c876887b54ffa29f1f847f56d00",
+      "member": "package/dist/mermaid.tiny.js"
+    },
+    {
+      "file": "assets/licenses/MERMAID-LICENSE.txt",
+      "url": "https://registry.npmjs.org/@mermaid-js/tiny/-/tiny-12.2.0.tgz",
+      "sha256": "ec9fb67dcb25eccc416ed56e1aab819222c805a2a4bfe4cb19e7556bf2ffde80",
+      "member": "package/LICENSE"
+    },
+    {
+      "file": "assets/javascripts/vendor/iframe-worker.js",
+      "url": "https://registry.npmjs.org/iframe-worker/-/iframe-worker-1.0.4.tgz",
+      "sha256": "e8e412dbcfea9b7e31b5ffa288d7b6035915e714c542f4176a0cdbe262fc9609",
+      "member": "package/shim/index.js"
+    },
+    {
+      "file": "assets/licenses/IFRAME-WORKER-LICENSE.txt",
+      "url": "https://registry.npmjs.org/iframe-worker/-/iframe-worker-1.0.4.tgz",
+      "sha256": "dd69737a4768aab9f934a5aed9efab9561ac4062d4fdbe490d44369a2cf48b6b",
+      "member": "package/LICENSE"
+    }
+  ]
+}

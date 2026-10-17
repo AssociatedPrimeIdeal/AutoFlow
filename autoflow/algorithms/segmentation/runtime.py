@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from tempfile import TemporaryFile
 from ...task_control import check_cancelled, stop_process
+from ...runtime_paths import portable_root
 
 from .models import _NNUNET_GPU_PREPROCESSING_ENV
 
@@ -98,11 +99,16 @@ def _prepare_nnunet_gpu_model_folder(model_path, target_path, folds, checkpoint_
 def _run_subprocess(command, *, env=None, cwd=None, runner=None, progress_callback=None,
                     output_dir=None, expected_predictions=1, progress_total=5):
     check_cancelled()
+    if portable_root() is not None and "-device" in command:
+        # The deployed Dataset7010/7020 resampler also runs in spawn workers.
+        # Keep an explicit CPU selection effective even on a CUDA workstation.
+        env = dict(os.environ if env is None else env)
+        env["AUTOFLOW_NNUNET_DEVICE"] = str(command[command.index("-device") + 1])
     if runner is not None:
         return runner(command, check=False, capture_output=True, text=True, env=env, cwd=cwd)
     started = time.perf_counter()
     options = {"start_new_session": True} if os.name != "nt" else {
-        "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP
+        "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
     }
     with TemporaryFile(mode="w+b") as stdout, TemporaryFile(mode="w+b") as stderr:
         process = subprocess.Popen(command, stdout=stdout, stderr=stderr, env=env, cwd=cwd, **options)
@@ -229,7 +235,7 @@ def _nnunet_predict_command(python_executable=None, bootstrap_resampler_path=Non
             "-c",
             code,
         ]
-    executable = shutil.which("nnUNetv2_predict_from_modelfolder")
+    executable = None if portable_root() is not None else shutil.which("nnUNetv2_predict_from_modelfolder")
     if executable:
         if bootstrap_resampler_path or optimize_transfers:
             # The console entry point cannot execute the bootstrap prelude;

@@ -184,6 +184,7 @@ def _plane_record(ws, plane_index, label_volume=None, path_info=None):
         "group_name": str(getattr(plane, "group_name", "") or ""),
         "roi_polygon_uv_mm": _json_safe(getattr(plane, "roi_polygon_uv_mm", []) or []),
         "roi_edit_operations": _json_safe(getattr(plane, "roi_edit_operations", {}) or {}),
+        "placement": _json_safe(getattr(plane, "placement", {}) or {}),
         "placement_mode": "manual" if int(plane.path_index) < 0 else "path",
     }
     if plane.metrics:
@@ -293,6 +294,7 @@ def _make_plane_payload(ws, source_path="", plane_indices=None):
             "group_name": str(getattr(plane, "group_name", "") or ""),
         "roi_polygon_uv_mm": _json_safe(getattr(plane, "roi_polygon_uv_mm", []) or []),
         "roi_edit_operations": _json_safe(getattr(plane, "roi_edit_operations", {}) or {}),
+        "placement": _json_safe(getattr(plane, "placement", {}) or {}),
             "placement_mode": "manual" if int(plane.path_index) < 0 else "path",
         }
         item.update(_plane_path_position(ws, plane))
@@ -640,6 +642,7 @@ def project_planes_to_workspace(plane_items, ws, mapping_mode="world", return_re
                 group_name=group_name,
                 roi_polygon_uv_mm=_json_safe(item.get("roi_polygon_uv_mm", []) or []),
                 roi_edit_operations=_json_safe(item.get("roi_edit_operations", {}) or {}),
+                placement=_json_safe(item.get("placement", {}) or {}),
             )
         )
         report["planes"].append(

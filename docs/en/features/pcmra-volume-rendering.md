@@ -1,136 +1,189 @@
-# PC-MRA Volume Rendering
+# Content volumes and PC-MRA
 
 ## Status
 
 | Entry point | Status | Notes |
 | --- | --- | --- |
-| GUI | Supported | A dynamic `PC-MRA (4D)` layer is created only by Correction > Generate PC-MRA, the fourth and final Run All action. |
-| CLI | Partial | `--generate-pcmra` or `--correction` creates `pcmra.npz`; interactive VTK rendering is GUI-only. |
-| Python API | Supported | `generate_pcmra=True` or `correction_all=True` computes/export arrays; workspace action supports later GUI rendering. |
+| GUI | Supported | Add any available scalar Content to Browser and show it as a volume, maximum-intensity projection or orthogonal planes. |
+| CLI | Partial | `--generate-pcmra` or `--correction` creates numerical PC-MRA; interactive Content rendering is GUI only. |
+| Python API | Partial | Numerical PC-MRA and workspace persistence are supported; the public API has no interactive renderer settings. |
 
 ## What it does
 
-The magnitude-weighted speed formula and distinction from static PC-MRA methods are recorded in [Scientific references: PC-MRA](../references/index.md#noise-masking-and-pc-mra).
+**3D Render** beside **Content** creates a checked **3D Volume** object in the
+left Browser. Each Content has its own object, visibility, opacity, colormap,
+window and rendering mode. Clicking again reveals/reuses that object. Magnitude,
+velocity components, speed and available derived/correction/unwrap fields share
+the same scalar source as the 2D viewer. No unavailable metric is synthesized.
+Through-plane Flow binds to the selected measurement plane when added.
+Opening another input binds all Content rendering to the new case. The button
+selects and scrolls to its Browser object; the status bar and Log report success
+or a rendering failure.
 
-The explicit generation action computes a phase-resolved phase-contrast MR angiography (PC-MRA) volume
-for every cardiac frame: `magnitude_t × ||velocity_t||`. It renders the current
-frame with VTK's grayscale composite volume mapper. The automatic display range
-uses the positive finite foreground values from that frame: `L=P5` and `H=P99`,
-then `WL=(L+H)/2` and `WW=H-L`. The timeline and playback update the 3-D volume
-actor in place. The cached image and its raw-frame display range are reused on
-later cycles; changing phase, opacity, or window/level keeps the same volume
-actor. Scene changes are batched into one render per timeline update.
+**Correction → Generate PC-MRA** computes `magnitude_t × ||velocity_t||` in every
+cardiac frame. After successful generation the GUI switches Content to PC-MRA,
+adds/selects its checked 3D layer, and preserves the visibility of other layers.
+Correction **Run All** performs the same handoff after its final generation
+stage. Regeneration replaces the numerical PC-MRA and keeps its render settings.
+The [scientific reference](../references/index.md#noise-masking-and-pc-mra)
+describes the formula and its distinction from static PC-MRA methods.
 
-The normal volume path uses VTK's smart mapper to select GPU rendering when
-supported. SSH-forwarded sessions probe EGL off-screen rendering at startup
-and use a software render window with the CPU fixed-point mapper if EGL is
-unavailable. A static 3-D magnitude image is used for every velocity phase.
-
-The VTK image stores the masked values directly at voxel centers, aligned with
-segmentation cells, with a zero-valued border. Nearest-neighbor rendering avoids
-cell-to-point averaging across the mask boundary. Rejected samples remain zero
-and transparent, including after manual window/level changes.
+For the selected Browser object, **Show 3 orthogonal planes** displays LR,
+AP and FH cuts. Clicking an axis checkbox or moving its slider from Volume/MIP
+mode switches directly to that single cut; the controls remain available.
+**Render → Orthogonal planes** also selects the cut display.
+Drag the colored axis handles in the 3D viewer to move them;
+each handle changes only its own coordinate. The matching sliders provide the
+same positioning. Uncheck individual axes to display a single anatomical cut
+with colored streamlines, as in a slice-plus-flow figure. Axis handles belong
+to the selected visible object and disappear when it is hidden or deleted.
+The timeline updates visible scalar layers while retaining their cut positions
+and the camera. Display changes leave intensity, velocity and metric arrays intact.
+Camera, window/level and slice drags use a temporary lower-cost display preview.
+Releasing the mouse restores the original sampling, antialiasing and image size.
+These preview settings never resample the stored source arrays or change metrics.
+Browser **Selection on top** is enabled by default. Select the streamline layer
+to draw it in front of the cuts. Uncheck the option to restore normal depth
+occlusion. Selecting a group brings its children forward; opacity and visibility
+still apply. Color legends stay above the 3D layers.
 
 ## When to use it
 
-Use it as a 3-D anatomical backdrop while reviewing segmentation, planes,
-streamlines, and pathlines. It is especially useful when a surface-only
-segmentation view hides nearby vessels.
-
-The GUI can show PC-MRA, segmentation, and planes together. When processed
-label-group surfaces exist, the original aggregate segmentation surface is
-hidden to avoid drawing the same segmentation twice. Group surfaces start at
-15% opacity. Plane actors use bright, unlit wireframes so they remain visible
-through the volume; selecting a plane adds a magenta highlight.
+Use a magnitude cut for anatomical context, PC-MRA for magnitude-weighted flow
+contrast, and scalar field volumes/cuts to inspect metric distributions. Keep
+streamlines visible to compare trajectories with anatomy. The slice display
+adds no velocity/time plot.
 
 ## Quick use
 
-1. Load an H5 or DICOM case with magnitude and flow. Loading leaves PC-MRA uncomputed.
-2. Open **Correction** and click **Generate PC-MRA**, or **Run All** to generate it after background correction, noise removal and unwrapping.
-3. In the left Browser, select the `PC-MRA (4D)` item under `Global → PC-MRA` and check or uncheck it.
-4. Adjust `Opacity` below the Browser (or use the item's right-click `Set Opacity…`).
-5. Keep the `Segmentation` and `Planes` Browser entries visible. Use the
-   segmentation dock or Browser opacity slider to make segmentation faint, and
-   select a plane to highlight the plane of interest.
-6. In the central 3-D view, hold `Shift` and the left mouse button and drag
-   horizontally to change window width and vertically to change window level.
-   All other camera gestures use VTK's default trackball-camera mapping.
-7. Use the `Window/Level` sliders below the 3-D view to adjust the range, or
-   use `Auto` / `Reset PC-MRA Window/Level` to restore the automatic range.
-   With no continuous scalar layer selected, these controls target visible
-   PC-MRA, including when segmentation or Noise Region is selected.
-   Without `Shift`, all three mouse buttons retain VTK's default camera
-   behavior regardless of PC-MRA visibility.
+GUI:
 
-The optional **Correction > Noise Removal** stage restricts this 3D layer to the `True` (retained) voxels in `Workspace.pcmra_render_mask`; its automatic range then uses retained positive values. The complementary red 3-D Noise Region is hidden by default and uses a binary maximum-intensity volume so its opacity does not saturate with thickness. Noise Removal, alone or in GUI Run All, enables the independent 2-D red overlay for review. Only excluded (`False`) voxels are painted above segmentation, without changing source slice values. Resetting that mask restores the full display region. It does not change segmentation features or quantitative data. See [Noise removal](noise-removal.md).
+1. Load an H5 or DICOM case, choose **Content**, and click **3D Render**.
+2. Select the resulting **3D Volume** item in Browser. Check/uncheck it to show/hide it.
+3. Below Browser, click **Show 3 orthogonal planes**, or click LR/AP/FH to open
+   one cut immediately. **Render** also selects Volume, Maximum intensity or
+   Orthogonal planes. Adjust colormap and opacity.
+4. Drag the red LR, green AP and blue FH handles in 3D, or move their sliders.
+   In cut mode the axis checkboxes choose which cuts remain visible.
+5. For a slice-plus-flow composition, keep one cut checked, generate streamlines,
+   select their Browser layer with **Selection on top** checked, and adjust
+   the 3D background and other Browser layers as desired.
+6. Use the existing **Window/Level** sliders below the 3D view. On visible volume
+   layers, Shift + left drag also changes window/level. Other mouse gestures
+   retain the normal camera controls.
 
-CLI: `autoflow-run case.h5 --generate-pcmra`, or `--correction` for all four actions. Normal batch segmentation prerequisites still apply. Python: `run_case("case.h5", config=AutoFlowConfig(generate_pcmra=True))`; for a loaded workspace, call `PipelineEngine().run_step(ws, StepId.GENERATE_PCMRA, print)`.
+To generate PC-MRA, use **Correction → Generate PC-MRA** or **Run All**. Loading
+alone does not compute PC-MRA. Its 2D Content and checked Browser layer are
+selected automatically on completion. See [Viewer display settings](viewer-display.md)
+for the independent slice-display controls.
+
+CLI: `autoflow-run case.h5 --generate-pcmra`, or `--correction` for all four
+correction actions. Normal batch segmentation prerequisites still apply.
+
+Python API: `run_case("case.h5", config=AutoFlowConfig(generate_pcmra=True))`;
+for a loaded workspace use
+`PipelineEngine().run_step(ws, StepId.GENERATE_PCMRA, print)`.
+Interactive rendering uses the GUI; snapshots retain its settings.
 
 ## Inputs
 
 | Input | Required | Meaning |
 | --- | --- | --- |
-| `mag_raw` | yes | magnitude volume, 3-D or 4-D |
-| `flow_raw` | yes | normalized `XYZT3` velocity in cm/s |
-| `resolution`, `origin` | yes | physical spacing and world origin for the VTK image |
+| Selected scalar Content | yes | The source must already exist; only available sources appear in the menu. |
+| `resolution`, `origin` | yes | Image geometry in mm; cuts use voxel centers and normalized LR/AP/FH axes. |
+| `mag_raw`, `flow_raw` | for PC-MRA generation | Static/4D magnitude and normalized XYZT3 velocity in cm/s. |
+| Selected measurement plane | for Through-plane Flow | Its index/normal defines the scalar projection. |
+| `pcmra_render_mask` | optional | Retained 3D/4D region for PC-MRA rendering only. |
 
 ## Parameters
 
-| Parameter | Type | Default | Where configured | Effect | Code owner |
+| Parameter / control | Type | Default | Where configured | Effect | Code owner |
 | --- | --- | --- | --- | --- | --- |
-| Browser `Opacity` | 0–100% slider | 85% for PC-MRA; 75% for planes | GUI, per `SceneObject` | scales the selected layer; for PC-MRA it scales the scalar-opacity transfer function | `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
-| segmentation opacity | 0–100% slider | 15% | Segmentation dock or Browser | controls the active segmentation surfaces; grouped surfaces replace the aggregate surface in the 3-D view | `autoflow/ui/app.py`, `autoflow/core/models.py` |
-| ortho `Noise mask` | checkbox and 0–100% slider | off before calculation; on at 35% after first Noise Removal | Ortho Viewer | overlays only excluded PC-MRA mask voxels in red; slider zero disables it, positive opacity enables it | `autoflow/ui/app.py`, `autoflow/ui/ortho_viewer.py`, `autoflow/ui/slice_view.py` |
-| `--generate-pcmra` / API `generate_pcmra` | bool | false | CLI/API; explicit GUI action | materialize PC-MRA after requested corrections; no calculation during input load | `autoflow/processing.py`, `autoflow/core/pipeline.py` |
-| automatic range | current frame positive finite values | `P5` to `P99` | GUI | derives `WL=(L+H)/2` and `WW=H-L` | `autoflow/ui/viewer.py` |
-| `Window` slider | normalized slider | automatic current-frame width | GUI | changes PC-MRA window width | `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
-| `Level` slider | normalized slider | automatic current-frame center | GUI | changes PC-MRA window level | `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
-| volume blend/shading | mapper options | composite, no shading | code | displays the raw grayscale volume without added surface lighting | `autoflow/ui/viewer.py` |
-| volume mapper | mapper name | smart; fixed-point on the software render window | automatic, based on VTK render window | selects GPU volume rendering when supported and retains CPU fallback | `autoflow/ui/viewer.py` |
-| `VTK_DEFAULT_OPENGL_WINDOW` | environment string | EGL probe with software fallback for SSH | environment before GUI startup | overrides automatic render-window selection, e.g. `vtkOSOpenGLRenderWindow` to force software | `autoflow/ui/launcher.py`, `autoflow/ui/remote_plotter.py` |
-| 3-D background color | color string | `#000000` | Settings → 3D Background Color | controls the backdrop independently of PC-MRA transfer functions | `autoflow/config.py`, `autoflow/ui/app.py`, `autoflow/ui/viewer.py` |
+| `mode` / Render | enum | composite | Selected Browser 3D Volume | Volume, maximum intensity, or orthogonal planes | `ui/content_controls.py`, `ui/content_rendering.py` |
+| `planes` / LR, AP, FH | three bools | all true | Selected Browser 3D Volume | Click in Volume/MIP to open a single cut; in cut mode toggles visibility; at least one remains checked | `ui/content_controls.py` |
+| Show 3 orthogonal planes | action | no change until clicked | Selected Browser 3D Volume | Enables all three cuts and 3D drag handles | `ui/content_controls.py` |
+| `positions` | three floats 0–1 | `[0.5, 0.5, 0.5]` | Colored 3D handles or axis sliders | From first to last voxel center along each axis; clamps at image limits | `ui/content_rendering.py` |
+| `handles` | bool | true | Drag colored axes in 3D | Handles for the selected visible orthogonal-plane object | `ui/content_rendering.py` |
+| `cmap` | enum | Content palette; gray for magnitude/PC-MRA | Selected Browser 3D Volume | Scalar palette; independent of 2D palette | `ui/content_controls.py`, `ui/viewer.py` |
+| Opacity | float 0–1 | 0.85 | Browser opacity slider / context menu | Plane transparency or volume transfer-function scale | `ui/app.py`, `ui/viewer.py` |
+| Window / Level | numeric range | automatic current-frame range; signed fields remain centered on zero | Sliders below 3D viewer / Shift-drag on volumes | Scalar window; Auto restores current-frame range | `ui/app.py`, `ui/viewer.py` |
+| `threshold` / Transparent below | float 0–0.99 | 0.05 | Selected Browser 3D Volume | Low-signal transparency; signed fields use absolute value around zero | `ui/viewer.py` |
+| `shade` | bool | false | Selected Browser 3D Volume | Volume lighting; orthogonal cuts stay unlit | `ui/viewer.py` |
+| `plane_index` | optional int | selected plane at creation | Through-plane Content binding | Plane-normal projection source for this layer | `rendering/content.py`, `ui/content_rendering.py` |
+| `--generate-pcmra` / `generate_pcmra` | bool | false | CLI / API; explicit GUI action | Generate after requested corrections | `processing.py`, `core/pipeline.py` |
+| PC-MRA automatic range | percentiles | positive finite P5 to P99 of current retained frame | automatic | Foreground window/level | `ui/viewer.py` |
+| Volume mapper | enum | smart; fixed-point for software render windows | automatic VTK selection | GPU rendering when supported, CPU fallback for SSH/software rendering | `ui/viewer.py`, `ui/remote_plotter.py` |
+| Interaction preview | automatic display policy | enabled during drags | live GUI only | Temporarily skips antialiasing and increases ray sample distance to at least twice the minimum voxel spacing; software mapper uses at least 3-pixel image sampling | `ui/interaction_rendering.py` |
+| SSH preview size | automatic pixel cap | longest side 960 pixels during drags | SSH rendering widget | Reduces render/readback/transfer cost; native size and pointer mapping are restored on release | `ui/remote_plotter.py` |
+| Selection on top / `selected_layer_on_top` | bool | true | Browser; workspace render settings | Selected layers draw above other layers; unchecked restores ordinary depth occlusion | `ui/scene_layers.py`, `ui/app.py` |
+| SSH motion updates | automatic interval | about 30 ms | SSH rendering widget | Coalesces pointer events and applies the final position on release | `ui/remote_plotter.py` |
 
 ## Outputs
 
-`Workspace.pcmra_array` stores the generated, unmasked `XYZT` array and is saved/restored with the workspace. CLI/API generation writes `pcmra.npz` with `pcmra`, `resolution` and `origin`, plus `summary.json.pcmra_file`. No PC-MRA is computed or written by input loading. The Browser stores a `SceneObject` with
-`data_key="pcmra_volume"`; workspace save/restore preserves its visibility and
-opacity. The 3-D actor is a VTK volume actor, not a polygon surface.
+Browser objects use `magnitude_volume`, `pcmra_volume`, or
+`content_volume_<Content ID>`. Their render mode, cut positions and axis
+visibility are stored under `render_settings.content_renders.<data_key>`;
+scene objects preserve visibility, palette, window and opacity in the existing
+workspace snapshot. No extra 4D source copy or numerical export is created by
+**3D Render**. Orthogonal modes use scalar-colored cut meshes; volume modes use
+VTK volumes. Source frames are cached for display and actors are reused across phases.
 
-Changes to working velocity do not automatically regenerate the stored PC-MRA; click Generate PC-MRA again after a correction rerun. Noise-mask changes affect the 3D display region without rewriting the generated data. The Content menu exposes PC-MRA only once this array exists.
+Generated, unmasked PC-MRA is stored in `Workspace.pcmra_array`. CLI/API export
+writes `pcmra.npz` containing `pcmra`, `resolution`, and `origin`, and records
+`summary.json.pcmra_file`. Noise Removal masks only PC-MRA's 3D display, not its
+stored scalar Content. It enables the independent 2D rejected-region overlay
+for review. See [Noise removal](noise-removal.md).
 
 ## Limitations
 
-- The volume is phase-resolved, but it uses the loaded temporal frames directly; no temporal interpolation is performed.
-- PC-MRA has no scalar bar by default because it is used as an anatomical backdrop.
-- Showing every generated plane at once can be visually dense; select one plane in the Browser for the magenta focus overlay, or hide individual plane objects.
-- GPU volume rendering support depends on the local VTK/OpenGL environment.
-- A retained region is not a vessel segmentation. Static tissue, coherent motion
-  and low-flow phases can leave peripheral signal brighter than small vessels.
-  Review the red slice mask and the current phase, and adjust PC-MRA window/level;
-  bright peripheral signal alone does not imply an inverted mask.
+- Changes to working velocity require explicit PC-MRA regeneration.
+- Content rendering and cut controls affect the live GUI, not offline video styles.
+- The timeline uses acquired frames without temporal interpolation.
+- Only the selected visible orthogonal-plane object has drag handles. Multiple
+  render objects can remain visible and retain independent positions.
+- WSS volume rendering uses its existing voxelized scalar representation; it
+  is not a replacement for the wall surface or quantitative wall analysis.
+- Through-plane Flow requires its referenced measurement plane to remain available.
+- PC-MRA/noise-mask contrast is not a vessel segmentation; review the mask,
+  phase and window before interpreting peripheral signal.
 
 ## Where to change code
 
-| Change you want | Edit here | Also check | Tests |
-| --- | --- | --- | --- |
-| PC-MRA calculation and VTK image | `autoflow/core/pipeline.py` generation and `autoflow/ui/viewer.py` (`_build_dataset`) | `autoflow/core/models.py` persistence | smoke test and GUI manual check |
-| GPU selection and SSH fallback | `autoflow/ui/launcher.py`, `autoflow/ui/remote_plotter.py`, `autoflow/ui/viewer.py` | forwarded X11 and off-screen OpenGL driver | GUI manual check |
-| Browser visibility/opacity controls | `autoflow/ui/app.py` | `autoflow/core/models.py` persistence | GUI manual check |
-| 2-D segmentation overlay opacity | `autoflow/ui/ortho_viewer.py` | `autoflow/ui/app.py` segmentation dock | GUI manual check |
+`autoflow/rendering/content.py` owns shared scalar sources;
+`autoflow/ui/ortho_viewer.py` owns Content and its render button;
+`autoflow/ui/content_controls.py` owns Browser controls;
+`autoflow/ui/content_rendering.py` owns per-object modes, slices and constrained
+VTK handles, with cached plane geometry and direct two-neighbor scalar sampling;
+`autoflow/ui/interaction_rendering.py` owns temporary drag quality;
+`autoflow/ui/scene_layers.py` owns selected-layer depth priority and foreground legends;
+`autoflow/ui/viewer.py` owns geometry, transfer functions and actor
+lifecycle. `autoflow/ui/app.py` connects Browser selection and the PC-MRA handoff;
+`autoflow/core/pipeline.py` generates the numerical PC-MRA.
 
 ## Tests
 
-- Activate the known working environment with `conda activate autoflow311`.
-- Run `pytest tests/test_smoke_phantoms.py tests/test_pressure_gradient_phantom.py -q`.
-- The PC-MRA phantom smoke check covers phase-dependent image values, actor reuse,
-  automatic and manual window/level, opacity after LUT range changes, and static
-  3-D magnitude input. Check camera interaction and combined volume/mesh display
-  manually in the GUI.
+Use `tests/test_smoke_phantoms.py` and `tests/test_pressure_gradient_phantom.py`.
+Content phantoms cover signed and unsigned scalar fields, all three render modes,
+anisotropic/nonzero-origin cuts, actual VTK drag callbacks, mirrored axes,
+phase actor reuse, static magnitude, missing PC-MRA, repeated creation,
+hide/delete cleanup, workspace persistence and the GUI PC-MRA handoff.
+The GUI input-loading regression opens two distinct H5 cases through the real
+load action and clicks 3D Render after each load, checking current-case values,
+Browser insertion, status feedback and orthogonal handles.
+Additional phantoms compare cut values with independent trilinear interpolation,
+exercise direct axis/slider activation, and verify mouse-release restoration of
+both smart and software volume mapper settings, image size and pointer coordinates.
+Review real-data rendering and mouse interaction in `autoflow311`.
 
 ## Common problems
 
-| Symptom | Likely cause | Fix |
-| --- | --- | --- |
-| `PC-MRA` is absent | magnitude or flow was not loaded | check the input case and loader metadata |
-| the backdrop is too faint or too strong | opacity is low or background intensity is high | select the Browser item and adjust `Opacity` |
-| volume rendering fails on a remote display | VTK/OpenGL volume support is unavailable | use the existing SSH off-screen renderer or hide `PC-MRA` and review surfaces |
+| Problem | Check |
+| --- | --- |
+| No PC-MRA Content | Run Generate PC-MRA successfully; loading alone leaves it uncomputed. |
+| No object after 3D Render | Check the status bar and Log for unavailable data or a render error. |
+| No colored handles | Select one checked 3D Volume, choose Orthogonal planes and enable Drag colored axes. |
+| LR/AP/FH controls are gray | Restart with the updated GUI, select one 3D Volume, and use Show 3 orthogonal planes; axis clicks now open cuts directly. |
+| Only one cut appears | Check the LR/AP/FH cut toggles and camera orientation. |
+| Volume obscures flow | Reduce Browser opacity or switch to one orthogonal cut. |
+| Dark or empty image | Check scalar window/level, threshold, current phase and PC-MRA retained mask. |
+| Metric Content missing | Compute the metric with supported inputs; unavailable TKE is never synthesized. |

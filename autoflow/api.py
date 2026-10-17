@@ -1,5 +1,6 @@
 from .config import BACKGROUND_COLOR
 from .case_types import normalize_dicom_backend
+from .plane_rules import load_plane_rules_file, normalize_label_plane_rules
 import copy
 from dataclasses import dataclass, field
 import json
@@ -22,7 +23,7 @@ from .config import (
     bundle_to_autoflow_kwargs,
     load_config_bundle,
 )
-from .core.models import Workspace
+from .core.models import Workspace, validate_graph_connectivity
 from .plane_io import resolve_reuse_plane_file
 from .processing import collect_input_items, process_single
 
@@ -79,7 +80,9 @@ class AutoFlowConfig:
     phase_unwrap_nprs_pi_unwrap: bool = True
     phase_unwrap_nprs_auto_crop: bool = True
 
-    plane_mode: str = "fixed_step"
+    plane_mode: str = "by_label"
+    plane_config: str = ""
+    plane_label_rules: Optional[Dict[str, Any]] = None
     plane_count: int = 3
     cross_section_dist: float = 5.0
     # Legacy distance/uniform modes historically trimmed 5 mm at the start;
@@ -92,6 +95,8 @@ class AutoFlowConfig:
     plane_spacing_mode: str = "fraction"
     plane_spacing_ratio: float = 0.25
     segmentation_filter: bool = True
+    fov_boundary_filter: bool = True
+    fov_boundary_max_fraction: float = 0.25
     use_center_plane: Optional[bool] = None
 
     remove_small_cc: bool = True
@@ -101,8 +106,9 @@ class AutoFlowConfig:
     special_contact_labels: Sequence[str] = field(default_factory=lambda: ["RBCT", "CCA", "LBCT"])
     min_cc_volume: float = 50.0
     cc_filter_mode: str = "hybrid"
-    cc_rel_min_ratio: float = 0.01
-    min_edge_points: int = 3
+    cc_rel_min_ratio: float = 0.10
+    min_edge_points: int = 5
+    graph_connectivity: int = 26
 
     seed_ratio: float = 0.1
     max_steps: int = 200
@@ -184,6 +190,8 @@ class AutoFlowConfig:
         kwargs = bundle_to_autoflow_kwargs(bundle)
         kwargs["config_dir"] = config_dir
         kwargs.update(overrides)
+        if overrides.get("plane_config") and "plane_label_rules" not in overrides:
+            kwargs["plane_label_rules"] = None
         return cls(**kwargs)
 
 
@@ -241,7 +249,13 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
     ws.segmentation.auto_folds = str(cfg.autoseg_folds or "single")
     ws.segmentation.auto_device = str(cfg.autoseg_device or "auto")
     ws.segmentation.auto_label_map = str(cfg.autoseg_label_map or "")
-    ws.plane_gen_params.plane_mode = str(getattr(cfg, "plane_mode", "fixed_step") or "fixed_step")
+    ws.plane_gen_params.plane_mode = str(getattr(cfg, "plane_mode", "by_label") or "by_label")
+    if cfg.plane_config:
+        ws.plane_gen_params.label_rules = load_plane_rules_file(cfg.plane_config)
+        ws.plane_gen_params.label_rules_file = os.path.abspath(os.path.expanduser(cfg.plane_config))
+    if cfg.plane_label_rules is not None:
+        ws.plane_gen_params.label_rules = normalize_label_plane_rules(cfg.plane_label_rules)
+        ws.plane_gen_params.label_rules_file = ""
     configured_plane_count = int(getattr(cfg, "plane_count", 3) or 3)
     ws.plane_gen_params.plane_count = configured_plane_count if configured_plane_count == -1 else max(1, configured_plane_count)
     ws.plane_gen_params.cross_section_distance = float(cfg.cross_section_dist)
@@ -258,6 +272,10 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
     ws.plane_gen_params.spacing_mode = str(getattr(cfg, "plane_spacing_mode", "fraction") or "fraction")
     ws.plane_gen_params.spacing_ratio = float(getattr(cfg, "plane_spacing_ratio", 0.25))
     ws.plane_gen_params.segmentation_filter = bool(getattr(cfg, "segmentation_filter", True))
+    ws.plane_gen_params.fov_boundary_filter = bool(cfg.fov_boundary_filter)
+    ws.plane_gen_params.fov_boundary_max_fraction = float(cfg.fov_boundary_max_fraction)
+    if not np.isfinite(ws.plane_gen_params.fov_boundary_max_fraction) or not 0 <= ws.plane_gen_params.fov_boundary_max_fraction <= 1:
+        raise ValueError("fov_boundary_max_fraction must be finite and between 0 and 1")
     if getattr(cfg, "use_center_plane", None) is not None:
         if bool(cfg.use_center_plane):
             ws.plane_gen_params.plane_mode = "count"
@@ -272,7 +290,8 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
     ws.skeleton_params.min_cc_volume_mm3 = float(cfg.min_cc_volume)
     ws.skeleton_params.cc_filter_mode = str(cfg.cc_filter_mode or "hybrid")
     ws.skeleton_params.cc_rel_min_ratio = float(cfg.cc_rel_min_ratio)
-    ws.skeleton_params.min_edge_points = max(0, int(getattr(cfg, "min_edge_points", 3)))
+    ws.skeleton_params.min_edge_points = max(0, int(getattr(cfg, "min_edge_points", 5)))
+    ws.skeleton_params.graph_connectivity = validate_graph_connectivity(cfg.graph_connectivity)
     ws.streamline_params.seed_ratio = float(cfg.seed_ratio)
     ws.streamline_params.max_steps = int(cfg.max_steps)
     ws.streamline_params.min_seeds = int(cfg.min_seeds)
@@ -478,6 +497,8 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 phase_unwrap_backend_params=copy.deepcopy(config.phase_unwrap_backend_params),
                 write_segmentation_cache=config.write_segmentation_cache,
                 plane_mode=config.plane_mode,
+                plane_label_rules=copy.deepcopy(config.plane_label_rules),
+                plane_config=config.plane_config,
                 plane_count=config.plane_count,
                 cross_section_dist=config.cross_section_dist,
                 start_dist=config.start_dist,
@@ -488,6 +509,8 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 plane_spacing_mode=config.plane_spacing_mode,
                 plane_spacing_ratio=config.plane_spacing_ratio,
                 segmentation_filter=config.segmentation_filter,
+                fov_boundary_filter=config.fov_boundary_filter,
+                fov_boundary_max_fraction=config.fov_boundary_max_fraction,
                 use_center_plane=config.use_center_plane,
                 remove_small_cc=config.remove_small_cc,
                 special_handling=config.special_handling,
@@ -498,6 +521,7 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 cc_filter_mode=config.cc_filter_mode,
                 cc_rel_min_ratio=config.cc_rel_min_ratio,
                 min_edge_points=config.min_edge_points,
+                graph_connectivity=config.graph_connectivity,
                 seed_ratio=config.seed_ratio,
                 max_steps=config.max_steps,
                 min_seeds=config.min_seeds,
@@ -570,7 +594,8 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 streamline_bar_cfg=dict(config.streamline_bar_cfg),
             )
             summary = run_case(case, output_dir=case_out, config=case_cfg, workspace=base_ws)
-            results.append({"file": case.input_path, "case": case.display_name, "status": "ok", "summary": summary})
+            status = "partial" if summary.get("video_errors") else "ok"
+            results.append({"file": case.input_path, "case": case.display_name, "status": status, "summary": summary})
             last_case_out = case_out
         except Exception:
             print(f"\n[ERROR] Failed: {case.display_name or case.input_path}")
@@ -585,7 +610,7 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
     n_ok = sum(1 for item in results if item.get("status") == "ok")
     times_sec = []
     for item in results:
-        if item.get("status") == "ok":
+        if item.get("status") in {"ok", "partial"}:
             val = item.get("summary", {}).get("total_time_sec")
             if val is not None:
                 times_sec.append(float(val))
