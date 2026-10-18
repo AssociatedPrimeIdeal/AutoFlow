@@ -357,16 +357,11 @@
       "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
-          "position": "near",
-          "fallback": {
-            "anchor": "label_level",
-            "level": 1,
-            "path_selection": "longest",
-            "position": "near",
-            "offset_mm": 15.0
-          },
-          "offset_mm": 15.0
+          "anchor": "label_terminal",
+          "scope": "label",
+          "path_selection": "longest",
+          "position": "after_start",
+          "offset_mm": 20.0
         }
       ]
     },
@@ -389,16 +384,11 @@
       "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
-          "position": "near",
-          "fallback": {
-            "anchor": "label_level",
-            "level": 1,
-            "path_selection": "longest",
-            "position": "near",
-            "offset_mm": 15.0
-          },
-          "offset_mm": 15.0
+          "anchor": "label_terminal",
+          "scope": "label",
+          "path_selection": "longest",
+          "position": "after_start",
+          "offset_mm": 20.0
         }
       ]
     },
@@ -421,16 +411,11 @@
       "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
-          "position": "near",
-          "fallback": {
-            "anchor": "label_level",
-            "level": 1,
-            "path_selection": "longest",
-            "position": "near",
-            "offset_mm": 15.0
-          },
-          "offset_mm": 15.0
+          "anchor": "label_terminal",
+          "scope": "label",
+          "path_selection": "longest",
+          "position": "after_start",
+          "offset_mm": 20.0
         }
       ]
     },
@@ -453,16 +438,12 @@
       "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
-          "position": "near",
-          "fallback": {
-            "anchor": "label_level",
-            "level": 1,
-            "path_selection": "longest",
-            "position": "near",
-            "offset_mm": 15.0
-          },
-          "offset_mm": 15.0
+          "anchor": "label_level",
+          "scope": "label",
+          "level": 1,
+          "path_selection": "longest",
+          "position": "before_end",
+          "offset_mm": 20.0
         }
       ]
     }

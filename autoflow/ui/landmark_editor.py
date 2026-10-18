@@ -33,9 +33,13 @@ def placement_summary(rule):
             title += f" L{spec.get('level', 1)}"
         if spec["anchor"] in {"label_level", "label_terminal"}:
             title += "; " + dict((value, label) for label, value in PATH_CHOICES)[spec.get("path_selection", "unique")]
-        position = ("inside label +" + f"{spec.get('offset_mm', 5):g} mm" if spec["position"] == "near" else
+        position = ("before flow-oriented end " + f"{spec.get('offset_mm',5):g} mm" if spec["position"]=="before_end" else
+                    "after flow-oriented start " + f"{spec.get('offset_mm',5):g} mm" if spec["position"]=="after_start" else
+                    "inside label +" + f"{spec.get('offset_mm', 5):g} mm" if spec["position"] == "near" else
                     ", ".join(f"{100 * float(x):.6g}%" for x in spec["fractions"]))
         rows.append(title + " → " + position)
+        if spec.get("scope")=="label":
+            rows[-1] += "; whole label"
         if spec.get("when_connected_to"):
             rows[-1] += "; when connected to " + ", ".join(spec["when_connected_to"]) + f"; otherwise L{spec['otherwise_level']}"
         if spec.get("fallback"):
@@ -62,9 +66,9 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
             "Observed connections retain every real arm. Fallback applies only when no connection exists; unsupported sections are skipped.")
         explanation.setWordWrap(True)
         layout.addWidget(explanation)
-        self.table = QtWidgets.QTableWidget(0, 8)
+        self.table = QtWidgets.QTableWidget(0, 9)
         self.table.setObjectName("landmark_placements")
-        self.table.setHorizontalHeaderLabels(["Anchor", "Label level", "Paths at level", "Position", "Offset (mm)", "Positions (%)", "No connection", "Level condition"])
+        self.table.setHorizontalHeaderLabels(["Anchor", "Label level", "Paths at level", "Position", "Offset (mm)", "Positions (%)", "No connection", "Level condition", "Scope"])
         self.table.setColumnHidden(6, not allow_fallback)
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.Stretch)
@@ -149,6 +153,8 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
         position = QtWidgets.QComboBox()
         position.addItem("Offset inside label", "near")
         position.addItem("Fractions of label interval", "fractions")
+        position.addItem("Before flow-oriented end", "before_end")
+        position.addItem("After flow-oriented start", "after_start")
         position.setCurrentIndex(position.findData(spec["position"]))
         offset = QtWidgets.QDoubleSpinBox()
         offset.setDecimals(3)
@@ -172,6 +178,12 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
         condition.setProperty("otherwise_level", spec.get("otherwise_level", 1))
         condition.clicked.connect(lambda *_args, widget=condition: self.edit_condition(widget))
         self.table.setCellWidget(row, 7, condition)
+        scope=QtWidgets.QComboBox()
+        scope.addItem("Each component","component")
+        scope.addItem("Whole label","label")
+        scope.setCurrentIndex(scope.findData(spec.get("scope","component")))
+        self.table.setCellWidget(row,8,scope)
+        scope.currentIndexChanged.connect(self.refresh)
         self.table.selectRow(row)
         self.refresh()
 
@@ -236,6 +248,9 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
                 choice = paths.currentData()
                 if choice != "unique":
                     spec["path_selection"] = choice
+            scope=self.table.cellWidget(row,8)
+            if spec["anchor"] in {"label_level","label_terminal","label_longest"} and scope.currentData()=="label":
+                spec["scope"]="label"
             fallback = self.table.cellWidget(row, 6)
             if self.allow_fallback and spec["anchor"] == "label_connections" and fallback.property("fallback_spec"):
                 spec["fallback"] = copy.deepcopy(fallback.property("fallback_spec"))
@@ -243,7 +258,7 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
             if spec["anchor"] == "label_level" and condition.property("connected_labels"):
                 spec["when_connected_to"] = list(condition.property("connected_labels"))
                 spec["otherwise_level"] = int(condition.property("otherwise_level"))
-            if spec["position"] == "near":
+            if spec["position"] in {"near","before_end","after_start"}:
                 spec["offset_mm"] = offset.value()
             else:
                 text = fractions.text().strip()
@@ -263,11 +278,14 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
             paths.setEnabled(anchor.currentData() in {"label_level", "label_terminal"})
             fallback = self.table.cellWidget(row, 6)
             condition = self.table.cellWidget(row, 7)
+            scope=self.table.cellWidget(row,8)
+            if scope is not None:
+                scope.setEnabled(anchor.currentData() in {"label_level","label_terminal","label_longest"})
             if fallback is not None:
                 fallback.setEnabled(self.allow_fallback and anchor.currentData() == "label_connections")
             if condition is not None:
                 condition.setEnabled(anchor.currentData() == "label_level")
-            offset.setEnabled(position.currentData() == "near")
+            offset.setEnabled(position.currentData() in {"near","before_end","after_start"})
             fractions.setEnabled(position.currentData() == "fractions")
         try:
             placements = self.placements()

@@ -41,7 +41,7 @@ This page explains where the major runtime responsibilities live so maintainers 
 1. DICOM directories convert through Dicom2H5; the H5 loader returns `LoadedCase`
 2. workspace stores normalized source arrays and metadata
 3. optional Correction runs background correction → display noise mask → phase unwrap → PC-MRA generation before segmentation; segmentation availability then controls downstream eligibility
-4. skeleton feeds graph and paths
+4. skeleton feeds adjacency/special-branch contact exclusion → triangle contraction → compact junction routing → Flow-C filtering → short terminal pruning → path extraction/grading. `graph_junctions.py` owns detection and local same-label shortest-path routing; native groups, joint cerebral and Willis views share it. Skeleton/source labels remain available, and each graph stage has its own audit
 5. graph and paths feed planes
 6. planes feed metrics
 7. segmentation and flow feed derived metrics

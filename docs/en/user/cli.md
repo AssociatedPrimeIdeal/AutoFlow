@@ -13,7 +13,7 @@ autoflow-run case.h5 --plane-config configs/plane_plans/brain.json --output-dir 
 autoflow-run case.h5 --plane-config configs/plane_plans/neck.json --output-dir results/neck
 ```
 
-These files declare 12, 3, 2, 14 and 8 primary positions respectively, rather than fixed output totals. Every actual connected arm can be measured; unconnected components use their declared fallback, whose position count may differ. Brain includes ICA, PCA and ACA; neck uses connected ICA/VA offsets or longest-L1 33%/66% positions without connections. IJV always uses longest L1 at 1/3 and 2/3. Missing levels and unsupported sections are reported in QC. Labels omitted from the file receive no planes. GUI Load/Save uses the same files. See [Label plane rules](parameter-schemas.md#label-plane-rules).
+These files declare 12, 5, 6, 14 and 8 primary positions respectively, rather than fixed output totals. Every actual connected arm can be measured; unconnected components use their declared fallback. Brain includes ICA, PCA and ACA; neck uses connected ICA/VA offsets or longest-L1 33%/66% without connections. IJV uses the longest highest-level interval at 1/3 and 2/3. DAO uses the globally longest label interval at 10/30/50%; MPA uses 20% of its selected interval; renal connected arms use 25/50/75%. PV uses connected 20/50/80% from the connection side, with the same fractions on its highest-level longest fallback; SMV/SV retain their connected 15 mm offsets. Missing levels, unavailable flow direction for end offsets, and unsupported sections are reported in QC. GUI Load/Save uses the same files. See [Label plane rules](parameter-schemas.md#label-plane-rules).
 
 Skeleton graph adjacency defaults to 26 face/edge/corner neighbors. Use `--graph-connectivity 6` for face-only connections. For example: `autoflow-run neck.h5 --plane-config configs/plane_plans/neck.json --graph-connectivity 26`. With 6, diagonal skeletons can split into more components, each receiving its own per-component measurements.
 
@@ -194,6 +194,8 @@ Behavior details:
 - PWV requires `--with pwv`, at least one configured PWV group, and (for CLI/API batch compatibility) `configs/pwv.json -> enabled=true`
 - each selected stage and each rendered video writes elapsed seconds into `summary.json`
 
+Junction-cluster routing runs between triangle contraction and Flow-C filtering. Defaults are enabled, maximum extent 8 voxels per axis and minimum cycle rank 2. Use `--no-junction-cluster-cleanup`, `--junction-cluster-max-extent-voxels` and `--junction-cluster-min-cycle-rank` to override them; omission inherits the config. These controls do not enable optional metrics or videos.
+
 ## Parameter Tables
 
 Use `--min-edge-points N` (alias `--min-edge-count N`) to control short
@@ -290,7 +292,7 @@ WSS, TKE, and pressure-analysis compute defaults are now split by metric:
 | --- | --- | --- | --- | --- | --- |
 | `--remove-small-cc` | bool | `True` in config defaults | `configs/skeleton.json` | remove small connected components before skeletonization | `autoflow/algorithms/preprocess.py` |
 | `--special-handling {three_pass_merge,contact_surface}` | string | `three_pass_merge` | `configs/skeleton.json` | select the three-pass merge or legacy contact-surface handling for configured special-label groups | `autoflow/core/pipeline.py` |
-| `--separate-special-label-contacts` / `--no-separate-special-label-contacts` | bool | `True` | `configs/skeleton.json` | enable/disable contact separation for the configured special labels (default: `RBCT`, `CCA`, `LBCT`) | `autoflow/algorithms/preprocess.py` |
+| `--separate-special-label-contacts` / `--no-separate-special-label-contacts` | bool | `True` | `configs/skeleton.json` | enable/disable contact separation for the configured special labels (default: `RBCT`, `CCA`, `LBCT`, `HA`, `SMA`, `LRA`, `RRA`) | `autoflow/algorithms/preprocess.py` |
 | `--min-cc-volume` | float mm^3 | `50.0` | `configs/skeleton.json` | component-volume threshold | `autoflow/algorithms/preprocess.py` |
 | `--cc-filter-mode` | string | `hybrid` | `configs/skeleton.json` | choose `absolute`, `relative`, `hybrid`, or `largest` component filtering | `autoflow/algorithms/preprocess.py` |
 | `--cc-rel-min-ratio` | float | `0.1` | `configs/skeleton.json` | relative threshold against the largest component for `relative` and `hybrid` filtering | `autoflow/algorithms/preprocess.py` |
@@ -380,3 +382,5 @@ error, a completed case with a failed requested video (`partial`), or no
 supported cases. Argument parsing errors return `2`. Review `batch_report.json`
 for per-case details. Missing optional TKE remains a clean skip. Case timing
 includes output generation; see [Outputs](outputs.md#case-timing-and-partial-video-output).
+
+Graph path filtering uses `--cycle-flow-threshold 0.3 --cycle-preserve-connectivity` by default. The cutoff is in [0, 1] and strict: only C below it is eligible. Use 0 to disable deletions, or `--no-cycle-preserve-connectivity` to allow low-C paths to split/remove same-label components. Both flags inherit `configs/skeleton.json` when omitted. See [Graph and paths](../features/graph-paths.md) for scope and QC.

@@ -492,6 +492,300 @@ def test_skeleton_graph_connectivity_phantom_rejects_invalid_values(connectivity
         build_workspace(AutoFlowConfig(graph_connectivity=connectivity))
 
 
+def _cycle_cleanup_phantom():
+    points = np.array([[4, 4, 2], [14, 4, 2], [14, 14, 2], [4, 14, 2], [6, 5, 2], [5, 7, 2]], dtype=float)
+    graph = GraphData(points=points, edges=np.array([[0, 1], [1, 2], [2, 3], [3, 0], [0, 4], [4, 5], [5, 0]]))
+    labels = np.ones((20, 20, 5), dtype=np.int16) * 17
+    labels[13:16, 3:6] = 30
+    labels[13:16, 13:16] = 20
+    labels[3:6, 13:16] = 26
+    return graph, labels
+
+
+def _uniform_cycle_flow(labels, vector=(1., 0., 0.)):
+    return np.broadcast_to(np.asarray(vector), labels.shape + (1, 3)).copy()
+
+
+@pytest.mark.parametrize("permuted", [False, True])
+def test_intralabel_cycle_phantom_preserves_cross_label_ring_and_interfaces(permuted):
+    import networkx as nx
+    from autoflow.algorithms.graph import graph_to_networkx
+    from autoflow.algorithms.graph_cycles import remove_intralabel_cycles
+    graph, labels = _cycle_cleanup_phantom()
+    if permuted:
+        order = np.array([5, 2, 0, 4, 1, 3])
+        graph = GraphData(points=graph.points[order], edges=np.argsort(order)[graph.edges[::-1, ::-1]])
+    original_points, original_edges = graph.points.copy(), graph.edges.copy()
+    cleaned, qc = remove_intralabel_cycles(graph, labels, flow=_uniform_cycle_flow(labels))
+    assert len(nx.cycle_basis(graph_to_networkx(graph))) == 2
+    assert len(nx.cycle_basis(graph_to_networkx(cleaned))) == 1
+    assert qc['cycle_rank_before'] == 2 and qc['cycle_rank_after'] == 1
+    assert qc['protected_edge_count'] == 4 and qc['stage'] == 'before_terminal_pruning'
+    assert all(row['cycle_rank_after'] == 0 for row in qc['labels'])
+    assert qc['interface_ports_preserved'] and qc['label_component_connectivity_preserved']
+    remaining = {tuple(point) for point in cleaned.points}
+    assert {(4., 4., 2.), (14., 4., 2.), (14., 14., 2.), (4., 14., 2.)} <= remaining
+    for left, right in cleaned.edges:
+        assert not np.array_equal(cleaned.points[left], cleaned.points[right])
+    np.testing.assert_array_equal(graph.points, original_points)
+    np.testing.assert_array_equal(graph.edges, original_edges)
+
+
+@pytest.mark.parametrize('unknown', [False, True])
+def test_intralabel_cycle_phantom_isolated_ring_and_unknown_label_policy(unknown):
+    import networkx as nx
+    from autoflow.algorithms.graph import graph_to_networkx
+    from autoflow.algorithms.graph_cycles import remove_intralabel_cycles
+    graph = GraphData(points=np.array([[3, 3, 2], [8, 3, 2], [8, 8, 2], [3, 8, 2]], dtype=float),
+        edges=np.array([[0, 1], [1, 2], [2, 3], [3, 0]]))
+    labels = np.full((12, 12, 5), 0 if unknown else 31, dtype=np.int16)
+    cleaned, qc = remove_intralabel_cycles(graph, labels, flow=_uniform_cycle_flow(labels))
+    if unknown:
+        assert cleaned is graph and qc['protected_edge_count'] == 4
+        assert qc['unknown_node_count'] == 4 and not qc['removed_paths']
+    else:
+        # Removing its only complete path would erase the whole component.
+        assert cleaned is graph and len(cleaned.points) == 4
+        assert qc['cycle_rank_after'] == 1 and qc['removed_edge_count'] == 0
+        assert qc['rejected_paths'][0]['reason'] == 'preserve_label_component_or_interface'
+
+
+def test_intralabel_cycle_phantom_does_not_cut_edge_crossing_another_label():
+    from autoflow.algorithms.graph_cycles import remove_intralabel_cycles
+    graph = GraphData(points=np.array([[2, 2, 2], [8, 2, 2], [5, 8, 2]], dtype=float),
+        edges=np.array([[0, 1], [1, 2], [2, 0]]))
+    labels = np.ones((11, 11, 5), dtype=np.int16)
+    labels[5, 2, 2] = 2  # Endpoints alone would miss this interface.
+    cleaned, qc = remove_intralabel_cycles(graph, labels, flow=_uniform_cycle_flow(labels))
+    assert cleaned is graph and qc['protected_edge_count'] == 1
+    assert qc['cycle_rank_after'] == 1
+
+
+def test_intralabel_cycle_phantom_retains_component_of_two_rings_sharing_one_junction():
+    import networkx as nx
+    from autoflow.algorithms.graph import graph_to_networkx
+    from autoflow.algorithms.graph_cycles import remove_intralabel_cycles
+    graph = GraphData(points=np.array([[5, 5, 2], [7, 5, 2], [6, 7, 2], [3, 5, 2], [4, 7, 2]], dtype=float),
+        edges=np.array([[0, 1], [1, 2], [2, 0], [0, 3], [3, 4], [4, 0]]))
+    labels = np.ones((12, 12, 5), dtype=np.int16)
+    cleaned, qc = remove_intralabel_cycles(graph, labels, flow=_uniform_cycle_flow(labels))
+    assert nx.is_connected(graph_to_networkx(cleaned))
+    assert qc['cycle_rank_before'] == 2 and qc['cycle_rank_after'] == 1
+    assert len(qc['removed_paths']) == len(qc['rejected_paths']) == 1
+
+
+def test_intralabel_cycle_phantom_respects_spacing_origin_and_input_permutation():
+    from autoflow.algorithms.graph_cycles import remove_intralabel_cycles
+    graph, labels = _cycle_cleanup_phantom()
+    spacing, origin = np.array([1.2, 2., 3.]), np.array([40., -20., 10.])
+    graph.points = graph.points * spacing + origin
+    first, qc = remove_intralabel_cycles(graph, labels, spacing, origin=origin, flow=_uniform_cycle_flow(labels))
+    order = np.array([5, 2, 0, 4, 1, 3])
+    shuffled = GraphData(points=graph.points[order], edges=np.argsort(order)[graph.edges[::-1, ::-1]])
+    second, other = remove_intralabel_cycles(shuffled, labels, spacing, origin=origin, flow=_uniform_cycle_flow(labels))
+    def physical_edges(g):
+        return {tuple(sorted((tuple(g.points[a]), tuple(g.points[b])))) for a, b in g.edges}
+    assert physical_edges(first) == physical_edges(second)
+    assert qc['cycle_rank_after'] == other['cycle_rank_after'] == 1
+
+
+def test_intralabel_cycle_phantom_keeps_diagonal_edge_ownership_across_background_samples():
+    import networkx as nx
+    from autoflow.algorithms.graph import graph_to_networkx
+    from autoflow.algorithms.graph_cycles import remove_intralabel_cycles
+    graph = GraphData(points=np.array([[2.1, 2.4, 2], [3, 3, 2], [1, 2, 2], [2, 1, 2]], dtype=float),
+        edges=np.array([[0, 1], [1, 2], [2, 0], [0, 3]]))
+    labels = np.zeros((6, 6, 5), dtype=np.int16)
+    for point in np.rint(graph.points).astype(int):
+        labels[tuple(point)] = 17
+    # A 26-neighbor edge can traverse background in its interior. It remains
+    # an existing same-label edge; introducing another positive label protects it.
+    cleaned, qc = remove_intralabel_cycles(graph, labels, flow=_uniform_cycle_flow(labels))
+    assert nx.is_tree(graph_to_networkx(cleaned)) and qc['cycle_rank_after'] == 0
+    assert qc['protected_edge_count'] == 0
+
+
+def test_triangle_junction_phantom_contracts_across_label_interfaces():
+    from autoflow.algorithms.graph import remove_triangle_cycles
+    graph = GraphData(points=np.array([[3, 3, 2], [4, 3, 2], [3, 4, 2],
+        [2, 2, 2], [5, 2, 2], [2, 5, 2]], dtype=float),
+        edges=np.array([[0, 1], [0, 2], [1, 2], [0, 3], [1, 4], [2, 5]]))
+    labels = np.ones((8, 8, 5), dtype=np.int16)
+    labels[4, 3, 2] = 2
+    contracted = remove_triangle_cycles(graph, segmentation_labels=labels)
+    assert len(contracted.points) == len(graph.points) - 2
+    labels[4, 3, 2] = 1
+    contracted = remove_triangle_cycles(graph, segmentation_labels=labels)
+    assert len(contracted.points) == len(graph.points) - 2
+
+
+def test_intralabel_cycle_phantom_pipeline_cleans_before_short_pruning_and_persists(tmp_path, monkeypatch):
+    import networkx as nx
+    import autoflow.core.pipeline as pipeline_module
+    from autoflow.algorithms.graph import graph_to_networkx
+    points = np.array([[x, 3, 2] for x in range(1, 9)] + [[4, 15, 2], [5, 15, 2]], dtype=float)
+    graph = GraphData(points=points, edges=np.array([[i, i + 1] for i in range(7)] + [[2, 8], [8, 9], [9, 5]]))
+    ws = Workspace()
+    ws.paths.output_dir = str(tmp_path)
+    ws.skeleton_params.label_map = {'vessel': 1}
+    ws.skeleton_params.label_groups = {'phantom': {'labels': [1]}}
+    ws.skeleton_params.min_edge_points = 5
+    ws.segmask_labels_3d = np.ones((12, 20, 5), dtype=np.int16)
+    ws.segmask_raw = ws.segmask_labels_3d.copy()
+    ws.segmask_3d = ws.segmask_labels_3d > 0
+    ws.flow_raw = np.zeros(ws.segmask_3d.shape + (1, 3))
+    ws.flow_raw[..., 0] = 20
+    ws.group_order = ['phantom']
+    ws.skeleton_points = points.copy()
+    ws.multilabel_groups = {'phantom': {'labels': [1], 'skeleton_points': points.copy(),
+        'segmask_3d': ws.segmask_3d.copy(), 'segmask_binary': ws.segmask_3d[..., None]}}
+    monkeypatch.setattr(pipeline_module, 'build_graph_from_points', lambda *a, **k: graph)
+    called = []
+    def check_order(cleaned, **kwargs):
+        assert nx.is_forest(graph_to_networkx(cleaned))
+        called.append(True)
+        return remove_short_terminal_branches(cleaned, **kwargs)
+    monkeypatch.setattr(pipeline_module, 'remove_short_terminal_branches', check_order)
+    assert PipelineEngine()._step_generate_graph(ws).success
+    assert called == [True]
+    assert {(1., 3., 2.), (8., 3., 2.)} <= {tuple(p) for p in ws.graph.points}
+    qc = ws.graph_hierarchy['groups'][0]['cycle_cleanup']
+    assert qc['stage'] == 'before_terminal_pruning' and qc['cycle_rank_after'] == 0
+    restored = Workspace()
+    restored.restore_dict(ws.snapshot_dict())
+    assert restored.multilabel_groups['phantom']['cycle_cleanup'] == qc
+    assert restored.graph_hierarchy['groups'][0]['cycle_cleanup'] == qc
+    exported = json.loads((tmp_path / 'graph_hierarchy.json').read_text())
+    assert exported['groups'][0]['cycle_cleanup'] == qc
+
+
+def _flow_detour_phantom():
+    points = np.array([[2, 4, 2], [4, 4, 2], [12, 4, 2], [14, 4, 2],
+                       [4, 16, 2], [12, 16, 2]], dtype=float)
+    graph = GraphData(points=points, edges=np.array([[0, 1], [1, 2], [2, 3], [1, 4], [4, 5], [5, 2]]))
+    return graph, np.ones((18, 25, 5), dtype=np.int16)
+
+
+@pytest.mark.parametrize("sign", [1, -1])
+@pytest.mark.parametrize("threshold,expected_cycles", [(.2, 1), (.25, 1), (.3, 0)])
+def test_flow_cycle_phantom_threshold_is_strict_and_reverse_alignment_is_kept(sign, threshold, expected_cycles):
+    from autoflow.algorithms.graph_cycles import remove_intralabel_cycles
+    graph, labels = _flow_detour_phantom()
+    cleaned, qc = remove_intralabel_cycles(graph, labels, flow=_uniform_cycle_flow(labels, (sign, 0., 0.)),
+                                           flow_threshold=threshold)
+    assert qc['cycle_rank_after'] == expected_cycles
+    assert qc['algorithm'] == 'flow_alignment_filter' and qc['flow_threshold'] == threshold
+    assert qc['preserve_connectivity'] and qc['original_endpoints_preserved']
+    assert {(2., 4., 2.), (4., 4., 2.), (12., 4., 2.), (14., 4., 2.)} <= {tuple(p) for p in cleaned.points}
+    if expected_cycles == 0:
+        assert len(qc['removed_paths']) == 1
+        # Uniform resampling approximates the two corners of the detour.
+        assert .25 < qc['removed_paths'][0]['direction_confidence'] < .27
+        assert qc['removed_paths'][0]['length_mm'] == pytest.approx(32.)
+        assert 'mean_radius_mm' not in qc['removed_paths'][0]
+
+
+@pytest.mark.parametrize('threshold,vector,deleted', [(.6,(3.,4.,0.),False),(.60001,(3.,4.,0.),True),(0.,(0.,1.,0.),False)])
+def test_flow_cycle_phantom_exact_alignment_threshold_and_zero_disable(threshold, vector, deleted):
+    from autoflow.algorithms.graph_cycles import remove_intralabel_cycles
+    graph = GraphData(points=np.array([[3.,3.,2.],[8.,3.,2.]]),edges=np.array([[0,1]]))
+    labels = np.ones((12,8,5),dtype=np.int16)
+    cleaned,qc=remove_intralabel_cycles(graph,labels,flow=_uniform_cycle_flow(labels,vector),
+        flow_threshold=threshold,preserve_connectivity=False)
+    assert bool(qc['removed_paths']) == deleted
+    assert len(cleaned.edges) == (0 if deleted else 1)
+
+
+@pytest.mark.parametrize("kind", ["missing", "zero", "invalid_mask", "nan"])
+def test_flow_cycle_phantom_skips_unavailable_valid_signal(kind):
+    from autoflow.algorithms.graph_cycles import remove_intralabel_cycles
+    graph, labels = _flow_detour_phantom()
+    flow = None if kind == 'missing' else _uniform_cycle_flow(labels, (0., 0., 0.) if kind == 'zero' else (1., 0., 0.))
+    mask = np.zeros(labels.shape + (1,), dtype=bool) if kind == 'invalid_mask' else None
+    if kind == 'nan':
+        flow[:] = np.nan
+    cleaned, qc = remove_intralabel_cycles(graph, labels, flow=flow, temporal_mask=mask)
+    assert cleaned is graph and qc['cycle_rank_after'] == 1
+    assert qc['status'] == 'skipped' and qc['reason'] == 'flow_signal_unavailable'
+    assert qc['flow_unavailable_path_count'] == qc['evaluated_path_count']
+
+
+@pytest.mark.parametrize("preserve", [True, False])
+def test_flow_cycle_phantom_connectivity_toggle_controls_terminal_path_removal(preserve):
+    from autoflow.algorithms.graph_cycles import remove_intralabel_cycles
+    graph, labels = _flow_detour_phantom()
+    graph.points = np.vstack([graph.points, [4, 1, 2]])
+    graph.edges = np.vstack([graph.edges, [1, 6]])
+    cleaned, qc = remove_intralabel_cycles(graph, labels, flow=_uniform_cycle_flow(labels), preserve_connectivity=preserve)
+    remaining = {tuple(p) for p in cleaned.points}
+    assert ((4., 1., 2.) in remaining) == preserve
+    assert qc['cycle_rank_after'] == 0
+    assert qc['original_endpoints_preserved'] == preserve
+    assert bool(qc['rejected_paths']) == preserve
+    assert all(r['direction_confidence'] < .3 for r in qc['removed_paths'])
+
+
+def test_flow_cycle_phantom_config_group_gui_cli_and_snapshot_roundtrip():
+    from PySide6 import QtWidgets
+    from autoflow.cli import build_parser
+    from autoflow.ui.action_settings import ActionSettingsDialog, action_sections
+    default = AutoFlowConfig.from_config_dir()
+    assert default.cycle_flow_threshold == .3 and default.cycle_preserve_connectivity
+    ws = build_workspace(AutoFlowConfig.from_config_dir(cycle_flow_threshold=.2, cycle_preserve_connectivity=False))
+    ws.skeleton_params.label_groups['custom'] = {'labels': [1], 'preprocess': {'cycle_flow_threshold': .7, 'cycle_preserve_connectivity': True}}
+    inherited = ws.skeleton_params.params_for_group('custom')
+    assert inherited.cycle_flow_threshold == .7 and inherited.cycle_preserve_connectivity
+    restored = Workspace();restored.restore_dict(ws.snapshot_dict())
+    assert restored.skeleton_params.cycle_flow_threshold == .2 and not restored.skeleton_params.cycle_preserve_connectivity
+    args = build_parser().parse_args(['case.h5', '--cycle-flow-threshold', '.4', '--no-cycle-preserve-connectivity'])
+    assert args.cycle_flow_threshold == .4 and not args.cycle_preserve_connectivity
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    dialog = ActionSettingsDialog('Graph', action_sections(StepId.GENERATE_GRAPH, ws), ws, ws)
+    try:
+        dialog.controls['skeleton_params.cycle_flow_threshold'].setValue(.45)
+        dialog.controls['skeleton_params.cycle_preserve_connectivity'].setChecked(True)
+        values = dialog.values()
+        assert values['skeleton_params.cycle_flow_threshold'] == .45
+        assert values['skeleton_params.cycle_preserve_connectivity'] is True
+    finally:
+        dialog.close();dialog.deleteLater();app.processEvents()
+
+
+@pytest.mark.parametrize('threshold', [-.1, 1.1, np.nan, np.inf, True])
+def test_flow_cycle_phantom_rejects_invalid_thresholds(threshold):
+    from autoflow.algorithms.graph_cycles import remove_intralabel_cycles
+    graph, labels = _flow_detour_phantom()
+    with pytest.raises(ValueError, match='cycle_flow_threshold'):
+        remove_intralabel_cycles(graph, labels, flow_threshold=threshold)
+    with pytest.raises(ValueError, match='cycle_flow_threshold'):
+        build_workspace(AutoFlowConfig(cycle_flow_threshold=threshold))
+
+
+def test_flow_cycle_phantom_requires_boolean_connectivity_parameter():
+    with pytest.raises(ValueError, match='cycle_preserve_connectivity'):
+        SkeletonParams.from_dict({'cycle_preserve_connectivity': 'false'})
+
+
+def test_special_branch_phantom_protects_abdominal_contacts_and_retains_trunk_interfaces():
+    from autoflow.algorithms.graph import build_graph_from_points, _sample_graph_labels
+    expected = {'RBCT', 'CCA', 'LBCT', 'HA', 'SMA', 'LRA', 'RRA'}
+    cfg = AutoFlowConfig.from_config_dir()
+    ws = build_workspace(cfg)
+    assert set(cfg.special_contact_labels) == set(SkeletonParams.from_dict({}).special_contact_labels) == expected
+    names = ['DAO', 'HA', 'SMA', 'LRA', 'RRA']
+    values = [ws.skeleton_params.label_map[n] for n in names]
+    voxels = np.array([[4, 4, 2], [5, 4, 2], [5, 5, 2], [4, 5, 2], [4, 4, 3]])
+    labels = np.zeros((9, 9, 6), dtype=np.int16)
+    for p, value in zip(voxels, values):labels[tuple(p)] = value
+    spacing = np.full(3, 2.4)
+    raw = build_graph_from_points(voxels * spacing, spacing, segmentation_labels=labels)
+    protected = build_graph_from_points(voxels * spacing, spacing, segmentation_labels=labels, separated_label_values=values[1:])
+    assert len(raw.edges) > len(protected.edges) == 4
+    node_values = _sample_graph_labels(protected.points, labels, spacing)
+    assert all(values[0] in node_values[[a,b]] for a,b in protected.edges)
+    assert {int(v) for edge in protected.edges for v in node_values[edge]} == set(values)
+
+
 def test_triangle_junction_phantom_uses_centroid_and_existing_external_edges():
     from autoflow.algorithms.graph import build_graph_from_points, graph_to_networkx
 
@@ -577,22 +871,18 @@ def test_short_terminal_graph_branches_use_minimum_edge_points():
 
     filtered = remove_short_terminal_branches(graph, min_edge_points=3)
     assert {tuple(edge) for edge in filtered.edges.tolist()} == {(0, 1), (1, 2), (2, 3)}
-    assert SkeletonParams.from_dict({}).min_edge_points == 5
+    assert SkeletonParams.from_dict({}).min_edge_points == 3
     assert SkeletonParams.from_dict({"min_edge_points": 0}).min_edge_points == 0
     assert SkeletonParams.from_dict({"min_edge_count": 4}).min_edge_points == 4
 
-    # The default keeps a five-edge arm and removes four-edge and one-edge
-    # terminal arms. It is a branch-length threshold, not a deletion quota.
-    default_graph = GraphData(
-        points=np.arange(11 * 3, dtype=float).reshape(11, 3),
-        edges=np.asarray([[0, 1], [1, 2], [2, 3], [3, 4], [4, 5],
-                          [0, 6], [6, 7], [7, 8], [8, 9], [0, 10]], dtype=int),
-    )
-    default_filtered = remove_short_terminal_branches(default_graph)
-    assert len(default_filtered.edges) == 5
-    assert np.array_equal(default_filtered.points, default_graph.points[:6])
-    assert AutoFlowConfig().min_edge_points == 5
-    assert AutoFlowConfig.from_config_dir().min_edge_points == 5
+    # The default retains the three-edge arm and removes the one- and
+    # two-edge terminal arms. This is a length threshold, not a deletion quota.
+    default_filtered = remove_short_terminal_branches(graph)
+    assert {tuple(edge) for edge in default_filtered.edges.tolist()} == {(0, 1), (1, 2), (2, 3)}
+    np.testing.assert_array_equal(default_filtered.points, graph.points[:4])
+    assert AutoFlowConfig().min_edge_points == 3
+    assert AutoFlowConfig.from_config_dir().min_edge_points == 3
+
 
 
 def test_separate_longitudinal_label_contacts_preserves_end_to_end_transition():
@@ -1085,6 +1375,7 @@ def test_label_plane_phantom_default_connections_and_explicit_fallbacks():
     rules = default_label_plane_rules()
     counts = {name: rule["plane_count"] for name, rule in rules.items()}
     counts.update(dict.fromkeys(["LICA", "RICA", "LVA", "RVA"], 2))
+    counts.update(dict.fromkeys(["LRA","RRA"],1))
     label_map = {name: i + 1 for i, name in enumerate(counts)}
     labels = np.zeros((35, len(counts) * 4 + 5, 5), dtype=np.int16)
     paths = []
@@ -1098,10 +1389,11 @@ def test_label_plane_phantom_default_connections_and_explicit_fallbacks():
     planes, smooth, _, qc = generate_label_planes(
         paths, labels, label_map, rules, path_info=infos, smoothing_window=3, inter_time=1)
     # Each isolated physical component uses its declared no-connection plan.
-    assert len(planes) == sum(counts.values()) == 39
+    assert len(planes) == sum(counts.values()) == 41
     for name, count in counts.items():
         selected = [p for p in planes if p.segmentation_label == label_map[name]]
-        expected = ([] if not count else [.2, .5, .8] if name in {"AAO", "DAO"}
+        expected = ([] if not count else [.2, .5, .8] if name in {"AAO", "PV"}
+                    else [.1, .3, .5] if name == "DAO" else [.2] if name == "MPA"
                     else [1 / 3, 2 / 3] if name in {"LIJV", "RIJV"}
                     else [.33, .66] if name in {"LICA", "RICA", "LVA", "RVA"} else [.5])
         assert len(selected) == len(expected) == count
@@ -1120,7 +1412,7 @@ def test_label_plane_phantom_default_connections_and_explicit_fallbacks():
     assert build_workspace(config).plane_gen_params.label_rules == default_label_plane_rules()
     from autoflow.plane_rules import load_plane_rules_file
     plan_dir = DATA_DIR.parent / "configs" / "plane_plans"
-    for name, total in [("cardiopulmonary", 12), ("portal", 3), ("renal", 2), ("brain", 14), ("neck", 8)]:
+    for name, total in [("cardiopulmonary", 12), ("portal", 5), ("renal", 6), ("brain", 14), ("neck", 8)]:
         source = plan_dir / f"{name}.json"
         case_config = AutoFlowConfig.from_config_dir(plane_config=str(source))
         regional_rules = build_workspace(case_config).plane_gen_params.label_rules
@@ -1172,17 +1464,20 @@ def test_connection_default_phantom_retains_two_same_label_renal_arms():
         path_info=infos, smoothing_window=1, inter_time=1)
     renal = [plane for plane in planes if plane.segmentation_label == 12]
     aorta = [plane for plane in planes if plane.segmentation_label == 4]
-    assert {plane.path_index for plane in renal} == {1, 2} and len(renal) == 2
+    assert {plane.path_index for plane in renal} == {1, 2} and len(renal) == 6
+    for index in (1,2):
+        assert sorted(p.placement["fraction"] for p in renal if p.path_index==index)==[.25,.5,.75]
     assert len(aorta) == 3 and {plane.path_index for plane in aorta} == {0}
-    assert sorted(plane.placement["fraction"] for plane in aorta) == [.2, .5, .8]
-    assert all(not plane.placement["connection_fallback"] for plane in planes)
-    assert len({plane.placement["connection_id"] for plane in planes}) == 1
-    assert all(row["selection_source"] == "observed_label_connections" for row in qc)
+    assert sorted(plane.placement["fraction"] for plane in aorta) == [.1, .3, .5]
+    assert all(not plane.placement["connection_fallback"] for plane in renal)
+    assert len({plane.placement["connection_id"] for plane in renal}) == 1
+    assert all(p.placement["anchor"]=="label_longest" for p in aorta)
+    assert {row["selection_source"] for row in qc} == {"observed_label_connections","label_path_properties"}
 
 
-@pytest.mark.parametrize("name", ["PV", "SMV", "SV", "StrS", "LTS", "RTS", "SSS"])
+@pytest.mark.parametrize("name", ["PV", "SMV", "SV", "RBCT", "CCA", "LBCT", "RPA", "LPA"])
 @pytest.mark.parametrize("length", [12, 40])
-def test_connection_default_phantom_offsets_stay_inside_short_label(name, length):
+def test_connection_default_phantom_positions_stay_inside_short_label(name, length):
     from autoflow.algorithms.label_planes import generate_label_planes
     from autoflow.plane_rules import default_label_plane_rules
     path = np.column_stack((np.arange(5., 56.), np.full(51, 20.), np.full(51, 10.)))
@@ -1191,6 +1486,13 @@ def test_connection_default_phantom_offsets_stay_inside_short_label(name, length
     volume, infos = _landmark_phantom([path], [values], [(0, 1)], {name: 101, "other": 102})
     planes, _, _, _ = generate_label_planes([path], volume, {name: 101, "other": 102},
         {name: default_label_plane_rules()[name]}, path_info=infos, smoothing_window=1, inter_time=1)
+    if name == "PV":
+        assert len(planes) == 3
+        assert [p.placement["fraction"] for p in planes] == pytest.approx([.2, .5, .8])
+        assert [p.center[0] for p in planes] == pytest.approx([5 + length * (1 - f) for f in (.2, .5, .8)])
+        assert all(p.placement["anchor"] == "label_connections" and p.placement["near_end"] for p in planes)
+        assert all(not p.placement["connection_fallback"] and not p.placement["short_interval_midpoint"] for p in planes)
+        return
     assert len(planes) == 1
     placement = planes[0].placement
     assert placement["anchor"] == "label_connections" and placement["near_end"]
@@ -1201,7 +1503,7 @@ def test_connection_default_phantom_offsets_stay_inside_short_label(name, length
 
 @pytest.mark.parametrize("name", ["StrS", "LTS", "RTS", "SSS"])
 @pytest.mark.parametrize("length,flow_sign", [(12, 1), (40, 1), (40, -1)])
-def test_connection_sinus_phantom_unconnected_fallback_is_longest_l1_offset(name, length, flow_sign):
+def test_connection_explicit_sinus_phantom_saved_l1_offset(name, length, flow_sign):
     from autoflow.algorithms.label_planes import generate_label_planes
     from autoflow.plane_rules import default_label_plane_rules
     # A longer L2 branch must not replace the requested L1 interval.
@@ -1212,7 +1514,9 @@ def test_connection_sinus_phantom_unconnected_fallback_is_longest_l1_offset(name
     hierarchy = [{"label_local_levels": {"23": level}, "flow_sign": flow_sign} for level in (0, 1, 1)]
     volume, infos = _landmark_phantom(paths, [np.full(len(p), 23) for p in paths],
                                     [(0, 1), (1, 2), (1, 3)], {name: 23}, hierarchy)
-    rule = default_label_plane_rules()[name]
+    rule = {"plane_mode":"landmark","plane_count":1,"placements":[{"anchor":"label_connections",
+        "position":"near","offset_mm":15.,"fallback":{"anchor":"label_level","level":1,
+        "path_selection":"longest","position":"near","offset_mm":15.}}]}
     planes, _, _, qc = generate_label_planes(paths, volume, {name: 23}, {name: rule},
         path_info=infos, smoothing_window=1, inter_time=1)
     assert len(planes) == 1 and planes[0].path_index == 0
@@ -1230,6 +1534,105 @@ def test_connection_sinus_phantom_unconnected_fallback_is_longest_l1_offset(name
     omitted, _, _, qc = generate_label_planes(paths, volume, {name: 23}, {name: rule},
         path_info=infos, smoothing_window=1, inter_time=1)
     assert not omitted and qc[0]["selection_warnings"] == ["label_level_unavailable"]
+
+
+@pytest.mark.parametrize("name", ["StrS","LTS","RTS","SSS","PV","SMV","SV"])
+@pytest.mark.parametrize("length,sign", [(24,1),(60,1),(60,-1)])
+def test_label_offset_phantom_uses_requested_level_and_flow_reference(name,length,sign):
+    from autoflow.algorithms.label_planes import generate_label_planes
+    from autoflow.plane_rules import default_label_plane_rules
+    paths=[np.column_stack((np.arange(2.,63.),np.full(61,2.),np.full(61,10.))),
+           np.column_stack((np.full(length+1,62.),np.arange(2.,length+3.),np.full(length+1,10.))),
+           np.column_stack((np.arange(62.,41.,-1),np.full(21,2.),np.full(21,10.)))]
+    # Avoid overlapping the root with the shorter daughter in the sampled volume.
+    paths[2][:,1]=np.linspace(2,15,21)
+    hierarchy=[{"label_local_levels":{"23":level},"flow_sign":sign} for level in (0,2,2)]
+    volume,infos=_landmark_phantom(paths,[np.full(len(p),23) for p in paths],[(0,1),(1,2),(1,3)],{name:23},hierarchy)
+    # A connection is absent; PV/SMV/SV must use only their declared fallback.
+    planes,_,_,qc=generate_label_planes(paths,volume,{name:23},{name:default_label_plane_rules()[name]},
+        path_info=infos,smoothing_window=1,inter_time=1)
+    chosen=0 if name=="SSS" else 1
+    assert len(planes)==(3 if name=="PV" else 1) and all(p.path_index==chosen for p in planes)
+    if name=="PV":
+        assert [p.placement["fraction"] for p in planes]==pytest.approx([.2,.5,.8])
+        assert [p.center[1] for p in planes]==pytest.approx([2+length*(f if sign==1 else 1-f) for f in (.2,.5,.8)])
+        assert all(p.placement["connection_fallback"] and p.placement["label_level"]==3 for p in planes)
+        return
+    placement=planes[0].placement
+    selected_length=60 if chosen==0 else length
+    from_start=name in {"StrS","LTS","RTS"}
+    distance=selected_length/2 if selected_length<40 else 20 if from_start else selected_length-20
+    assert placement["position"]==("after_start" if from_start else "before_end")
+    assert placement["offset_reference"]==("flow_start" if from_start else "flow_end")
+    assert placement["requested_offset_mm"]==20 and placement["label_level"]==(1 if name=="SSS" else 3)
+    assert placement["nominal_distance_in_interval_mm"]==pytest.approx(distance)
+    axis=0 if chosen==0 else 1
+    assert planes[0].center[axis]==pytest.approx(2+(distance if sign==1 else selected_length-distance))
+    infos[chosen]["hierarchy"]["flow_sign"]=None
+    omitted,_,_,qc=generate_label_planes(paths,volume,{name:23},{name:default_label_plane_rules()[name]},
+        path_info=infos,smoothing_window=1,inter_time=1)
+    assert not omitted and qc[0]["omitted_positions"][0]["reason"]=="flow_direction_unavailable"
+
+
+@pytest.mark.parametrize("policy,expected",[("unique",[]),("all",[0,1]),("longest",[1])])
+def test_label_scope_phantom_honors_selection_policy_across_components(policy,expected):
+    from autoflow.algorithms.label_planes import generate_label_planes
+    paths=[np.column_stack((np.arange(5.,26.),np.full(21,10.),np.full(21,10.))),
+           np.column_stack((np.arange(5.,56.),np.full(51,30.),np.full(51,10.)))]
+    hierarchy=[{"label_local_levels":{"4":0},"flow_sign":1} for _ in paths]
+    volume,infos=_landmark_phantom(paths,[np.full(len(p),4) for p in paths],[(0,1),(2,3)],{"DAO":4},hierarchy)
+    rule={"plane_mode":"landmark","plane_count":1,"placements":[{"anchor":"label_level","level":1,
+          "scope":"label","path_selection":policy,"position":"fractions","fractions":[.5]}]}
+    planes,_,_,_=generate_label_planes(paths,volume,{"DAO":4},{"DAO":rule},path_info=infos,smoothing_window=1,inter_time=1)
+    assert sorted(p.path_index for p in planes)==expected
+
+
+def test_dao_phantom_longest_interval_is_global_without_connection_requirement():
+    from autoflow.algorithms.label_planes import generate_label_planes
+    from autoflow.plane_rules import default_label_plane_rules
+    paths=[np.column_stack((np.arange(5.,26.),np.full(21,10.),np.full(21,10.))),
+           np.column_stack((np.arange(5.,56.),np.full(51,30.),np.full(51,10.)))]
+    volume,infos=_landmark_phantom(paths,[np.full(len(p),4) for p in paths],[(0,1),(2,3)],{"DAO":4})
+    planes,_,_,_=generate_label_planes(paths,volume,{"DAO":4},{"DAO":default_label_plane_rules()["DAO"]},
+        path_info=infos,smoothing_window=1,inter_time=1)
+    assert len(planes)==3 and {p.path_index for p in planes}=={1}
+    assert [p.center[0] for p in planes]==pytest.approx([10,20,30])
+    assert all(p.placement["selection_scope"]=="label" for p in planes)
+
+
+@pytest.mark.parametrize("connected", [True, False])
+def test_mpa_phantom_default_twenty_percent_for_connection_and_fallback(connected):
+    from autoflow.algorithms.label_planes import generate_label_planes
+    from autoflow.plane_rules import default_label_plane_rules
+    path = np.column_stack((np.arange(5., 56.), np.full(51, 20.), np.full(51, 10.)))
+    values = np.where(np.arange(51) < 41, 2, 9) if connected else np.full(51, 2)
+    hierarchy = [{"label_local_levels": {"2": 0}, "flow_sign": 1}]
+    volume, infos = _landmark_phantom([path], [values], [(0, 1)], {"MPA": 2, "LPA": 9}, hierarchy)
+    planes, _, _, _ = generate_label_planes([path], volume, {"MPA": 2, "LPA": 9},
+        {"MPA": default_label_plane_rules()["MPA"]}, path_info=infos, smoothing_window=1, inter_time=1)
+    assert len(planes) == 1
+    plane = planes[0]
+    placement = plane.placement
+    lo, hi = placement["label_interval_mm"]
+    assert placement["fraction"] == pytest.approx(.2)
+    assert placement["nominal_distance_in_interval_mm"] == pytest.approx((hi - lo) * .2)
+    assert bool(placement.get("connection_fallback")) == (not connected)
+    assert plane.distance == pytest.approx(hi - (hi - lo) * .2 if connected else lo + (hi - lo) * .2)
+
+
+@pytest.mark.parametrize("name",["LIJV","RIJV"])
+def test_jugular_phantom_highest_level_wins_over_longer_low_level(name):
+    from autoflow.algorithms.label_planes import generate_label_planes
+    from autoflow.plane_rules import default_label_plane_rules
+    paths=[np.column_stack((np.arange(5.,56.),np.full(51,10.),np.full(51,10.))),
+           np.column_stack((np.arange(5.,21.),np.full(16,30.),np.full(16,10.)))]
+    hierarchy=[{"label_local_levels":{"32":level},"flow_sign":1} for level in (0,3)]
+    volume,infos=_landmark_phantom(paths,[np.full(len(p),32) for p in paths],[(0,1),(2,3)],{name:32},hierarchy)
+    planes,_,_,_=generate_label_planes(paths,volume,{name:32},{name:default_label_plane_rules()[name]},
+        path_info=infos,smoothing_window=1,inter_time=1)
+    assert len(planes)==2 and {p.path_index for p in planes}=={1}
+    assert all(p.placement["label_level"]==4 for p in planes)
+    assert [p.center[0] for p in planes]==pytest.approx([10,15])
 
 
 def test_connection_phantom_background_gap_uses_only_declared_fallback():
@@ -6975,6 +7378,106 @@ def test_streaming_video_cancellation_preserves_existing_mp4(monkeypatch, tmp_pa
 _qt_smoke_application = None
 
 
+@pytest.mark.parametrize("mirrored", [False, True])
+def test_manual_plane_phantom_handles_selection_lock_and_deferred_metrics(monkeypatch, tmp_path, mirrored):
+    app = _smoke_qt_application(monkeypatch)
+    monkeypatch.setenv("AUTOFLOW_SSH_RENDERING", "1")
+    from PySide6 import QtCore, QtTest
+    import autoflow.ui.app as ui_app
+    from autoflow.ui.remote_plotter import RemotePlotter
+    monkeypatch.setattr(ui_app, "RemotePlotter", RemotePlotter, raising=False)
+    window = ui_app.MainWindow()
+    try:
+        ws = window.workspace
+        ws.paths.output_dir = str(tmp_path)
+        ws.data_loaded = True
+        ws.mag_raw = np.ones((20, 20, 20, 2), dtype=np.float32)
+        ws.flow_raw = np.zeros((20, 20, 20, 2, 3), dtype=np.float32)
+        ws.segmask_binary = np.ones((20, 20, 20, 2), dtype=bool)
+        ws.resolution = np.ones(3)
+        ws.origin = np.array([11., -7., 23.])
+        ws.ortho_cursor = np.array([10, 10, 10])
+        ws.planes = [PlaneData(center=np.array([8., 8., 8.]), normal=np.array([0., 0., 1.]))]
+        window._rebuild_plane_objects()
+        first_uid = window._find_uid_by_indexed_data_key("plane", 0)
+        first_actor = ws.scene_objects[first_uid].actor
+        ws.pathline_cache[0] = "keep existing pathline"
+        if mirrored:
+            window.scene._display_axis_signs = np.array([-1., 1., 1.])
+            window.scene.reset_display_reference()
+        window.show()
+        app.processEvents()
+        window._add_manual_plane()
+        assert ws.scene_objects[first_uid].actor is first_actor
+        assert ws.pathline_cache[0] == "keep existing pathline"
+        assert window._plane_edit_enabled and window.scene._plane_selection_locked
+        handles = window._plane_handles
+        assert [widget.GetEnabled() for widget, _ in handles.handles] == [1, 1, 1]
+        assert "left-drag" in handles.help.GetInput()
+        writes, recomputes = [], []
+        monkeypatch.setattr(window, "_persist_plane_outputs", lambda **kw: writes.append(kw))
+        monkeypatch.setattr(window, "_recompute_dragged_plane_metrics", lambda **kw: recomputes.append(kw))
+        window._on_3d_plane_picked(None, None)
+        window._on_3d_path_picked("accidental path", 0)
+        assert window._selected_plane_index == 1 and window._plane_handles is handles
+        app.processEvents()
+        window.plotter.view_isometric()
+        window.scene.reset_camera()
+        window.plotter.render()
+        camera = np.asarray(tuple(window.plotter.camera_position), dtype=float)
+
+        def screen_point(point):
+            renderer = window.plotter.renderer
+            renderer.SetWorldPoint(*point, 1)
+            renderer.WorldToDisplay()
+            x, y, _ = renderer.GetDisplayPoint()
+            rw, rh = window.plotter.render_window.GetSize()
+            return QtCore.QPoint(round(x * window.plotter.width() / rw),
+                                 round((rh - 1 - y) * window.plotter.height() / rh))
+
+        def drag(index, target):
+            start = screen_point(handles.handles[index][1].GetWorldPosition())
+            end = screen_point(target)
+            QtTest.QTest.mouseMove(window.plotter, start)
+            QtTest.QTest.mousePress(window.plotter, QtCore.Qt.LeftButton, pos=start)
+            assert handles.dragging
+            QtTest.QTest.mouseMove(window.plotter, end)
+            QtTest.QTest.mouseRelease(window.plotter, QtCore.Qt.LeftButton, pos=end)
+            assert not handles.dragging and not window.scene._interaction_preview_active
+            np.testing.assert_allclose(tuple(window.plotter.camera_position), camera)
+            assert not writes and not recomputes
+
+        before = ws.planes[1].center.copy()
+        drag(0, np.asarray(handles.handles[0][1].GetWorldPosition()) + [1., 0., 1.])
+        assert np.linalg.norm(ws.planes[1].center - before) > 0.2
+        for index in (1, 2):
+            plane = ws.planes[1]
+            before_normal = plane.normal.copy()
+            axis = window._plane_axis_u if index == 1 else window._plane_axis_v
+            target = plane.center + ws.origin + window._plane_widget_distance() * (0.866 * axis + 0.5 * plane.normal)
+            drag(index, window.scene.world_to_display_point(target))
+            assert np.linalg.norm(plane.normal - before_normal) > 0.01
+            np.testing.assert_allclose(np.dot(window._plane_axis_u, window._plane_axis_v), 0., atol=1e-10)
+            np.testing.assert_allclose(np.cross(window._plane_axis_u, window._plane_axis_v), plane.normal, atol=1e-10)
+        assert "pending" in window.ortho_viewer.label_plane_metric.text()
+        window._toggle_selected_plane_edit()
+        assert len(writes) == 1 and not recomputes  # A new plane has no existing metrics to refresh.
+        assert not window.scene._plane_selection_locked and window._plane_handles is None
+        assert not window.scene._hud_renderer.HasViewProp(handles.help)
+
+        # Existing measurements refresh once on Finish, never at each release.
+        ws.planes[1].metrics = {"area_mm2": [1., 1.]}
+        window._activate_plane_drag_widgets(1)
+        window._update_plane_from_drag(1, center=ws.planes[1].center + [0.5, 0., 0.])
+        assert not ws.planes[1].metrics
+        window._toggle_selected_plane_edit()
+        assert recomputes == [{"persist": True}]
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+
+
 def _smoke_qt_application(monkeypatch):
     global _qt_smoke_application
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -7902,3 +8405,156 @@ def test_streamline_phantom_background_keeps_geometry_and_rejects_obsolete_input
     assert set(actual.point_data) == set(expected.point_data)
     for name in expected.point_data:
         np.testing.assert_array_equal(actual.point_data[name], expected.point_data[name])
+
+
+def _junction_cluster_phantom():
+    from itertools import combinations
+    points = np.array([[4, 4, 4], [5, 4, 4], [4, 5, 4], [4, 4, 5],
+                       [1, 4, 4], [4, 4, 8]], dtype=float)
+    edges = np.array(list(combinations(range(4), 2)) + [(0, 4), (3, 5)], dtype=int)
+    return GraphData(points=points, edges=edges), np.ones((12, 12, 12), dtype=np.int16)
+
+
+def _junction_edge_geometry(graph):
+    return {tuple(sorted((tuple(graph.points[a]), tuple(graph.points[b])))) for a, b in graph.edges}
+
+
+@pytest.mark.parametrize('permuted', [False, True])
+def test_junction_cluster_phantom_routes_interfaces_and_preserves_existing_geometry(permuted):
+    import networkx as nx
+    from autoflow.algorithms.graph import graph_to_networkx
+    from autoflow.algorithms.graph_junctions import simplify_junction_clusters
+    graph, labels = _junction_cluster_phantom()
+    spacing, origin = np.array([1.2, 2.1, .8]), np.array([10., -5., 3.])
+    graph.points = graph.points * spacing + origin
+    before_points, before_edges = graph.points.copy(), graph.edges.copy()
+    expected_endpoints = {tuple(graph.points[4]), tuple(graph.points[5])}
+    if permuted:
+        order = np.array([5, 1, 3, 4, 0, 2])
+        graph = GraphData(points=graph.points[order], edges=np.argsort(order)[graph.edges[::-1, ::-1]])
+        before_points, before_edges = graph.points.copy(), graph.edges.copy()
+    cleaned, qc = simplify_junction_clusters(graph, labels, spacing, origin=origin)
+    assert nx.is_tree(graph_to_networkx(cleaned)) and len(cleaned.points) == 4
+    assert _junction_edge_geometry(cleaned).issubset(_junction_edge_geometry(graph))
+    assert {tuple(p) for p in cleaned.points}.issubset({tuple(p) for p in graph.points})
+    assert expected_endpoints == {tuple(cleaned.points[n]) for n, d in graph_to_networkx(cleaned).degree() if d == 1}
+    assert qc['candidate_count'] == qc['simplified_cluster_count'] == 1
+    assert qc['cycle_rank_before'] == 3 and qc['cycle_rank_after'] == 0
+    assert qc['removed_edge_count'] == 5 and qc['removed_node_count'] == 2
+    assert qc['stage'] == 'after_triangle_contraction_before_flow_filter'
+    assert all(qc[k] for k in ['original_endpoints_preserved', 'interface_ports_preserved',
+        'component_connectivity_preserved', 'label_component_connectivity_preserved'])
+    np.testing.assert_array_equal(graph.points, before_points)
+    np.testing.assert_array_equal(graph.edges, before_edges)
+
+
+def test_junction_cluster_phantom_preserves_mixed_label_interfaces_and_cross_label_cycles():
+    from itertools import combinations
+    import networkx as nx
+    from autoflow.algorithms.graph import graph_to_networkx
+    from autoflow.algorithms.graph_junctions import simplify_junction_clusters
+    points = np.array([[4, 4, 4], [5, 4, 4], [4, 5, 4], [4, 4, 5], [7, 7, 7]], dtype=float)
+    graph = GraphData(points=points, edges=np.array(list(combinations(range(5), 2))))
+    labels = np.ones((12, 12, 12), dtype=np.int16);labels[7, 7, 7] = 2
+    original_interfaces = {tuple(sorted((tuple(points[i]), tuple(points[4])))) for i in range(4)}
+    cleaned, qc = simplify_junction_clusters(graph, labels)
+    assert original_interfaces.issubset(_junction_edge_geometry(cleaned))
+    assert len(cleaned.points) == 5 and len(cleaned.edges) == 7
+    assert nx.is_connected(graph_to_networkx(cleaned))
+    assert qc['cycle_rank_before'] == 6 and qc['cycle_rank_after'] == 3
+    assert qc['protected_edge_count'] == 4 and qc['interface_ports_preserved']
+    assert qc['clusters'][0]['source_labels'] == {'1': 4, '2': 1}
+    assert qc['clusters'][0]['label_patches'][0]['cycle_rank_after'] == 0
+
+
+@pytest.mark.parametrize('kind', ['disabled', 'oversized', 'minimum_cycles', 'closed_patch', 'unknown', 'simple_ring'])
+def test_junction_cluster_phantom_keeps_ineligible_regions(kind):
+    from autoflow.algorithms.graph_junctions import simplify_junction_clusters
+    graph, labels = _junction_cluster_phantom();kwargs = {}
+    if kind == 'disabled':kwargs['enabled'] = False
+    elif kind == 'oversized':
+        graph.points[1, 0] = 13;labels = np.ones((20, 20, 20), dtype=np.int16)
+    elif kind == 'minimum_cycles':kwargs['min_cycle_rank'] = 4
+    elif kind == 'closed_patch':graph = GraphData(points=graph.points[:4], edges=graph.edges[:6])
+    elif kind == 'unknown':labels[:] = 0
+    elif kind == 'simple_ring':
+        graph = GraphData(points=np.array([[4, 4, 4], [5, 4, 4], [5, 5, 4], [4, 5, 4], [2, 4, 4], [7, 5, 4]], dtype=float),
+            edges=np.array([[0, 1], [1, 2], [2, 3], [3, 0], [0, 4], [2, 5]]))
+    cleaned, qc = simplify_junction_clusters(graph, labels, **kwargs)
+    assert cleaned is graph and qc['removed_edge_count'] == 0
+    if kind == 'oversized':assert qc['clusters'][0]['reason'] == 'extent_exceeds_limit'
+    if kind == 'closed_patch':assert qc['clusters'][0]['label_patches'][0]['reason'] == 'fewer_than_two_preserved_ports'
+    if kind == 'simple_ring':assert qc['detected_cluster_count'] == 0
+
+
+def test_junction_cluster_phantom_pipeline_order_and_audit_persistence(tmp_path, monkeypatch):
+    import networkx as nx
+    import autoflow.core.pipeline as module
+    from autoflow.algorithms.graph import graph_to_networkx
+    graph, labels = _junction_cluster_phantom();calls = []
+    ws = Workspace();ws.paths.output_dir = str(tmp_path)
+    ws.skeleton_params.label_map = {'vessel': 1};ws.skeleton_params.label_groups = {'phantom': {'labels': [1]}}
+    ws.skeleton_params.min_edge_points = 0
+    ws.segmask_raw = labels.copy();ws.segmask_labels_3d = labels.copy();ws.segmask_3d = labels > 0
+    ws.segmask_binary = ws.segmask_3d[..., None]
+    ws.flow_raw = np.zeros(labels.shape + (1, 3));ws.flow_raw[..., 2] = 20
+    ws.group_order = ['phantom'];ws.skeleton_points = graph.points.copy()
+    ws.multilabel_groups = {'phantom': {'labels': [1], 'skeleton_points': graph.points.copy(),
+        'segmask_3d': ws.segmask_3d.copy(), 'segmask_binary': ws.segmask_binary.copy()}}
+    junction, flow, terminal = module.simplify_junction_clusters, module.remove_intralabel_cycles, module.remove_short_terminal_branches
+    def build(*args, **kwargs):calls.append('triangle');return graph
+    def route(*args, **kwargs):calls.append('junction');return junction(*args, **kwargs)
+    def filter_flow(cleaned, *args, **kwargs):
+        calls.append('flow');assert nx.is_tree(graph_to_networkx(cleaned));return flow(cleaned, *args, **kwargs)
+    def prune(*args, **kwargs):calls.append('terminal');return terminal(*args, **kwargs)
+    monkeypatch.setattr(module, 'build_graph_from_points', build)
+    monkeypatch.setattr(module, 'simplify_junction_clusters', route)
+    monkeypatch.setattr(module, 'remove_intralabel_cycles', filter_flow)
+    monkeypatch.setattr(module, 'remove_short_terminal_branches', prune)
+    assert PipelineEngine()._step_generate_graph(ws).success
+    assert calls == ['triangle', 'junction', 'flow', 'terminal']
+    audit = ws.multilabel_groups['phantom']['junction_cluster_cleanup']
+    assert audit['simplified_cluster_count'] == 1
+    assert ws.graph_hierarchy['groups'][0]['junction_cluster_cleanup'] == audit
+    restored = Workspace();restored.restore_dict(ws.snapshot_dict())
+    assert restored.multilabel_groups['phantom']['junction_cluster_cleanup'] == audit
+    assert restored.graph_hierarchy['groups'][0]['junction_cluster_cleanup'] == audit
+    exported = json.loads((tmp_path / 'graph_hierarchy.json').read_text())
+    assert exported['groups'][0]['junction_cluster_cleanup'] == audit
+
+
+def test_junction_cluster_phantom_config_group_gui_cli_roundtrip():
+    from PySide6 import QtWidgets
+    from autoflow.cli import build_parser
+    from autoflow.ui.action_settings import ActionSettingsDialog, action_sections
+    cfg = AutoFlowConfig.from_config_dir()
+    assert cfg.junction_cluster_enabled and cfg.junction_cluster_max_extent_voxels == 8 and cfg.junction_cluster_min_cycle_rank == 2
+    ws = build_workspace(AutoFlowConfig(junction_cluster_enabled=False, junction_cluster_max_extent_voxels=6, junction_cluster_min_cycle_rank=3))
+    ws.skeleton_params.label_groups['custom'] = {'labels': [1], 'preprocess': {'junction_cluster_enabled': True, 'junction_cluster_max_extent_voxels': 4}}
+    group = ws.skeleton_params.params_for_group('custom')
+    assert group.junction_cluster_enabled and group.junction_cluster_max_extent_voxels == 4 and group.junction_cluster_min_cycle_rank == 3
+    restored = Workspace();restored.restore_dict(ws.snapshot_dict())
+    assert restored.skeleton_params.to_dict() == ws.skeleton_params.to_dict()
+    args = build_parser().parse_args(['case.h5', '--no-junction-cluster-cleanup', '--junction-cluster-max-extent-voxels', '5', '--junction-cluster-min-cycle-rank', '4'])
+    assert not args.junction_cluster_enabled and args.junction_cluster_max_extent_voxels == 5 and args.junction_cluster_min_cycle_rank == 4
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    dialog = ActionSettingsDialog('Graph', action_sections(StepId.GENERATE_GRAPH, ws), ws, ws)
+    try:
+        dialog.controls['skeleton_params.junction_cluster_enabled'].setChecked(True)
+        dialog.controls['skeleton_params.junction_cluster_max_extent_voxels'].setValue(7)
+        dialog.controls['skeleton_params.junction_cluster_min_cycle_rank'].setValue(2)
+        values = dialog.values()
+        assert values['skeleton_params.junction_cluster_enabled'] is True
+        assert values['skeleton_params.junction_cluster_max_extent_voxels'] == 7
+        assert values['skeleton_params.junction_cluster_min_cycle_rank'] == 2
+    finally:
+        dialog.close();dialog.deleteLater();app.processEvents()
+
+
+@pytest.mark.parametrize(('name', 'value'), [('junction_cluster_enabled', 1),
+    ('junction_cluster_max_extent_voxels', .5), ('junction_cluster_max_extent_voxels', np.inf),
+    ('junction_cluster_max_extent_voxels', True), ('junction_cluster_min_cycle_rank', 0),
+    ('junction_cluster_min_cycle_rank', 1.5), ('junction_cluster_min_cycle_rank', True)])
+def test_junction_cluster_phantom_rejects_invalid_parameters(name, value):
+    with pytest.raises(ValueError, match=name):SkeletonParams.from_dict({name: value})
+    with pytest.raises(ValueError, match=name):build_workspace(AutoFlowConfig(**{name: value}))

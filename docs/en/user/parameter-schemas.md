@@ -71,6 +71,8 @@ Keys under `labels.label_groups` are arbitrary group names. Their defaults are:
 | `preprocess.opening_iters` | int | inherited | same | Remove small foreground projections with opening | same |
 | `preprocess.closing_iters` | int | inherited | same | Close small gaps with closing | same |
 
+Compact junction controls `junction_cluster_enabled`, `junction_cluster_max_extent_voxels` and `junction_cluster_min_cycle_rank` may be written on a label-group entry or in its `preprocess` mapping. The mapping takes precedence; unspecified values inherit global skeleton settings. Defaults are true, 8.0 voxels per axis and 2 independent cycles. Joint cerebral and Willis views use the global settings. See [Graph and paths](../features/graph-paths.md) for detection, routing and interface protection.
+
 ## Learned phase-unwrapping adapters
 
 Put keys inside `phase_unwrapping.backend_params.pudip` or `.gust`. AutoFlow passes the following supported constructor controls; unsupported keys are not forwarded blindly. Input VENC/device come from the case and selected top-level method/device.
@@ -136,7 +138,7 @@ A compact connection plan is:
     },
     "MPA": {
       "plane_mode": "landmark", "plane_count": 1,
-      "placements": [{"anchor": "label_connections", "position": "fractions", "fractions": [0.5]}]
+      "placements": [{"anchor": "label_connections", "position": "fractions", "fractions": [0.2]}]
     }
   }
 }
@@ -170,10 +172,11 @@ This BA rule uses L2 only when BA actually connects to both VA labels in the sam
 | `<label>.plane_mode` | enum | `landmark` in shipped plans | detailed JSON / GUI Mode | Execute connection/path placements; explicitly saved old global-layout plans remain compatible | `autoflow/algorithms/landmark_planes.py` |
 | `<label>.placements` | non-empty array | label-specific shipped list | JSON / GUI structured Edit dialog | Declared connection/path and position specifications | `autoflow/plane_rules.py` |
 | `placements[].anchor` | enum | required | same | label_connections, label_longest, label_level, label_terminal; legacy named anchors pulmonary_split, portal_confluence, pv_first_split, portal_trunk, vertebral_confluence, pca_split, left_carotid_split, right_carotid_split, sinus_confluence, aortic_origin, arch_route remain supported | `autoflow/algorithms/landmark_planes.py` |
-| `placements[].position` | enum | required | same | near or fractions | same |
+| `placements[].position` | enum | required | same | near, fractions, after_start or before_end; start/end offsets require a path-property anchor and reliable flow orientation | same |
 | `placements[].offset_mm` | nonnegative finite float | 5 | same | near-boundary offset inside the target label; configurable engineering distance | same |
 | `placements[].fractions` | non-empty array of finite floats in (0,1) | required for fractions | same | Positions within the selected label interval or route | same |
 | `placements[].level` | positive int | 1 | same | One-based label-local path level for label_level | same |
+| `placements[].scope` | enum | component; DAO/sinuses/IJV use label | JSON / GUI Scope | component selects independently in physical components; label selects over the whole target label. Applies to label_level, label_terminal and label_longest | `autoflow/algorithms/landmark_planes.py` |
 | `placements[].path_selection` | enum | unique for explicit legacy level plans; default level plans specify longest | JSON / GUI Paths at level | unique requires one path; longest chooses the longest target-label interval and omits exact ties; all measures each matching path. Applied independently per physical component. label_longest always uses longest interval | `autoflow/algorithms/landmark_planes.py` |
 | `placements[].fallback` | placement object | explicitly declared in default connection plans | JSON / GUI No connection | One non-connection placement for each component lacking a connection; cannot nest fallbacks or refer to label_connections | same |
 | `placements[].when_connected_to` | non-empty list[string] | BA: [LVA, RVA]; otherwise absent | JSON / GUI Level condition | Use the selected label_level only if all listed labels actually connect to the target in this component | same |
@@ -193,7 +196,7 @@ This BA rule uses L2 only when BA actually connects to both VA labels in the sam
 | `<label>.inter_time` | positive int or null | null, inherit global 10 | same | Path interpolation factor for this label's geometry | same |
 | `<label>.main_path` | legacy enum | absent from landmark plans | explicitly saved old plans only | Discarded for landmark plans; never used as a fallback | `autoflow/plane_rules.py` |
 
-The five regional files are `cardiopulmonary.json` (12 primary positions), `portal.json` (3), `renal.json` (2), `brain.json` (14) and `neck.json` (8). These are configuration counts, not fixed output totals: connected arms, per-component fallbacks and section QC determine actual counts. Brain includes ICA, PCA and ACA. Neck ICA/VA use connected offsets, or longest L1 at 33%/66% without connections. IJV always uses longest L1 at 1/3 and 2/3, without radius weighting. PV/SMV/SV use connected 15 mm offsets or longest-interval midpoint when unconnected. StrS/LTS/RTS/SSS use connected 15 mm offsets; without a connection, select the longest L1 interval and place 15 mm from its flow-oriented start. Either 15 mm rule uses the midpoint below 30 mm; missing L1 is omitted with QC. The combined default lists all 32 labels and disables only ARCH, HA and SMA; their paths still participate in topology.
+The five regional files declare 12, 5, 6, 14 and 8 primary positions respectively (cardiopulmonary, portal, renal, brain and neck); actual counts depend on connected arms, explicit fallbacks and section QC. DAO always uses the globally longest label interval at 10/30/50%. MPA uses 20% of each selected connected interval, with the same percentage on its longest-L1 fallback. RBCT/CCA/LBCT/RPA/LPA use connected 15 mm offsets. LRA/RRA use connected 25/50/75%. IJV uses the longest interval at the highest available level, at 1/3 and 2/3. StrS/LTS/RTS use the longest highest-level interval, 20 mm after its flow-oriented start. SSS keeps longest L1, 20 mm before its flow-oriented end. PV uses 20/50/80% along each selected connected interval from its connection side; unconnected components use the same fractions on their highest-level longest interval. SMV/SV keep connected 15 mm offsets; without connections, use the highest-level longest interval 20 mm before its end. Short offsets use the midpoint below twice the requested distance; unavailable flow orientation or levels are omitted with QC. The combined default lists all 32 labels, disabling only ARCH/HA/SMA. See the complete [per-label table](../features/planes.md#default-label-measurements).
 
 GUI Load replaces the whole table. GUI file Save writes the displayed table in the same format used by CLI; the settings dialog's bottom Save applies it to the workspace. File edits outside a running GUI take effect after Load or restart. Older `path_index`, `segment_index`, `require_pv_connection` and `reason` fields are accepted on read but discarded; they cannot override automatic selection and are not saved again.
 

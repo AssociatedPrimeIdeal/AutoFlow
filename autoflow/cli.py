@@ -152,13 +152,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cc-rel-min-ratio", type=float, default=None, help="Relative component threshold ratio against the largest connected component when using relative or hybrid filtering.")
     parser.add_argument("--graph-connectivity", type=int, choices=[6, 26], default=None,
                         help="Skeleton graph neighbors: 26 including edges/corners (default), or 6 face neighbors.")
+    junction_group = parser.add_mutually_exclusive_group()
+    junction_group.add_argument("--junction-cluster-cleanup", dest="junction_cluster_enabled", action="store_true",
+        help="Simplify compact junction clusters after triangle contraction and before Flow filtering (default).")
+    junction_group.add_argument("--no-junction-cluster-cleanup", dest="junction_cluster_enabled", action="store_false",
+        help="Disable compact junction-cluster routing.")
+    parser.set_defaults(junction_cluster_enabled=None)
+    parser.add_argument("--junction-cluster-max-extent-voxels", type=float, default=None,
+        help="Maximum junction-cluster extent along each voxel axis (default: 8).")
+    parser.add_argument("--junction-cluster-min-cycle-rank", type=int, default=None,
+        help="Minimum independent-cycle count for a junction-cluster candidate (default: 2).")
+    parser.add_argument("--cycle-flow-threshold", type=float, default=None,
+                        help="Delete same-label paths with Flow C strictly below this value in [0, 1] (default: 0.3); zero disables deletions.")
+    cycle_guard = parser.add_mutually_exclusive_group()
+    cycle_guard.add_argument("--cycle-preserve-connectivity", dest="cycle_preserve_connectivity", action="store_true",
+                             help="Protect each original label component, its interfaces and endpoints during Flow filtering (default).")
+    cycle_guard.add_argument("--no-cycle-preserve-connectivity", dest="cycle_preserve_connectivity", action="store_false",
+                             help="Allow Flow filtering to split/remove same-label components and terminal paths; cross-label edges stay protected.")
+    parser.set_defaults(cycle_preserve_connectivity=None)
     parser.add_argument(
         "--min-edge-points",
         "--min-edge-count",
         dest="min_edge_points",
         type=int,
         default=None,
-        help="Minimum number of graph edge segments in a terminal branch; shorter endpoint spurs are removed (default: 5).",
+        help="Minimum number of graph edge segments in a terminal branch; shorter endpoint spurs are removed (default: 3).",
     )
 
     parser.add_argument("--seed-ratio", type=float, default=None, help="Seed ratio for streamline rendering.")
@@ -304,6 +322,11 @@ def main() -> int:
         "cc_rel_min_ratio": args.cc_rel_min_ratio,
         "min_edge_points": args.min_edge_points,
         "graph_connectivity": args.graph_connectivity,
+        "cycle_flow_threshold": args.cycle_flow_threshold,
+        "cycle_preserve_connectivity": args.cycle_preserve_connectivity,
+        "junction_cluster_enabled": args.junction_cluster_enabled,
+        "junction_cluster_max_extent_voxels": args.junction_cluster_max_extent_voxels,
+        "junction_cluster_min_cycle_rank": args.junction_cluster_min_cycle_rank,
         "seed_ratio": args.seed_ratio,
         "tube_radius": args.tube_radius,
         "pressure_method": args.pressure_method,

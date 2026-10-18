@@ -44,21 +44,31 @@ def default_label_placements(name, profile="default"):
                 "fallback": copy.deepcopy(fallback or midpoint)}
         spec.update(fractions=fractions) if fractions is not None else spec.update(offset_mm=offset)
         return [spec]
-    if name in {"AAO", "DAO"}:
+    if name == "DAO":
+        return [{"anchor":"label_longest", "scope":"label", "position":"fractions", "fractions":[.1,.3,.5]}]
+    if name == "AAO":
         return connected(fractions=[.2,.5,.8], fallback=level([.2,.5,.8]))
-    if name in {"MPA", "RBCT", "CCA", "LBCT"}:
-        return connected(fractions=[.5], fallback=level([.5]))
-    if name in {"RPA", "LPA"}:
-        return connected(fractions=[.5])
-    if name in {"StrS", "LTS", "RTS", "SSS"}:
-        return connected(offset=15., fallback={"anchor": "label_level", "level": 1,
-                         "path_selection": "longest", "position": "near", "offset_mm": 15.})
-    if name in {"PV", "SMV", "SV"}:
+    if name == "MPA":
+        return connected(fractions=[.2], fallback=level([.2]))
+    if name in {"RBCT", "CCA", "LBCT", "RPA", "LPA"}:
         return connected(offset=15.)
+    if name in {"StrS", "LTS", "RTS", "SSS"}:
+        return [{"anchor":"label_level" if name=="SSS" else "label_terminal", "scope":"label",
+                 **({"level":1} if name=="SSS" else {}), "path_selection":"longest",
+                 "position":"before_end" if name=="SSS" else "after_start", "offset_mm":20.}]
+    if name == "PV":
+        return connected(fractions=[.2,.5,.8], fallback={"anchor":"label_terminal", "path_selection":"longest",
+                                                        "position":"fractions", "fractions":[.2,.5,.8]})
+    if name in {"SMV", "SV"}:
+        return connected(offset=15., fallback={"anchor":"label_terminal", "path_selection":"longest",
+                                               "position":"before_end", "offset_mm":20.})
     if name == "BA":
         return [level([.5], 2, when_connected_to=["LVA","RVA"], otherwise_level=1)]
     if name in {"LIJV", "RIJV"}:
-        return [level([1/3,2/3])]
+        return [{"anchor":"label_terminal", "scope":"label", "path_selection":"longest",
+                 "position":"fractions", "fractions":[1/3,2/3]}]
+    if name in {"LRA", "RRA"}:
+        return connected(fractions=[.25,.5,.75])
     if name in {"LICA", "RICA", "LVA", "RVA"}:
         return connected(fallback=level([.33,.66]))
     if name in {"LMCA", "RMCA"}:
@@ -81,7 +91,7 @@ def default_label_plane_rules():
 
 
 def _validate_placement(name, placement, *, allow_fallback=True):
-    fields = {"anchor","position","offset_mm","fractions","level","path_selection",
+    fields = {"anchor","position","offset_mm","fractions","level","path_selection","scope",
               "fallback","when_connected_to","otherwise_level"}
     if not isinstance(placement,dict) or set(placement)-fields:
         raise ValueError(f"Invalid placement fields for {name}")
@@ -94,8 +104,14 @@ def _validate_placement(name, placement, *, allow_fallback=True):
     if "path_selection" in placement and anchor not in {"label_level","label_terminal"}:
         raise ValueError(f"{name} path_selection applies only to label-level/interval anchors")
     position=placement.get("position")
-    if not isinstance(position,str) or position not in {"near","fractions"}:
-        raise ValueError(f"{name} placement position must be near or fractions")
+    if not isinstance(position,str) or position not in {"near","fractions","before_end","after_start"}:
+        raise ValueError(f"{name} placement position must be near, fractions, before_end or after_start")
+    if position in {"before_end","after_start"} and anchor not in {"label_level","label_terminal","label_longest"}:
+        raise ValueError(f"{name} {position} requires a label path-property anchor")
+    if "scope" in placement and (anchor not in {"label_level","label_terminal","label_longest"}
+                                  or not isinstance(placement["scope"],str)
+                                  or placement["scope"] not in {"component","label"}):
+        raise ValueError(f"{name} scope must be component or label for path-property anchors")
     if position=="fractions":
         values=placement.get("fractions")
         if not isinstance(values,list) or not values or any(isinstance(x,bool) or not isinstance(x,(int,float))

@@ -11,6 +11,7 @@ import numpy as np
 
 from .graph import graph_to_networkx, build_graph_from_points
 from .paths import inter_points
+from .graph_junctions import simplify_junction_clusters
 
 
 def graph_edge_chains(graph):
@@ -243,7 +244,7 @@ def analyze_group_graph(graph, node_chains, *, flow=None, mask=None, spacing=(1,
             "undirected_cycle_rank": network.number_of_edges() - network.number_of_nodes() + nx.number_connected_components(network)}
 
 
-def joint_mask_graph(mask, spacing, connectivity=26):
+def joint_mask_graph(mask, spacing, connectivity=26, *, segmentation_labels=None):
     """Reskeletonize actual connected mask components; never bridge near misses."""
     from scipy.ndimage import label
     from .skeleton import generate_skeleton_from_mask3d
@@ -252,7 +253,8 @@ def joint_mask_graph(mask, spacing, connectivity=26):
     points, edges, offset = [], [], 0
     for index in range(1, count + 1):
         nodes, _ = generate_skeleton_from_mask3d(labels == index, spacing)
-        graph = build_graph_from_points(nodes, spacing, connectivity=connectivity)
+        graph = build_graph_from_points(nodes, spacing, connectivity=connectivity,
+            segmentation_labels=segmentation_labels)
         points.append(graph.points)
         edges.append(np.asarray(graph.edges, dtype=int).reshape(-1, 2) + offset)
         offset += len(graph.points)
@@ -273,6 +275,8 @@ def build_workspace_hierarchy(workspace):
             mask=state.get("segmask_binary"), spacing=ws.resolution, segmentation_labels=ws.segmask_labels_3d,
             label_map=ws.skeleton_params.label_map, group_name=group_name, path_indices=indices)
         report["graph_connectivity"] = ws.skeleton_params.params_for_group(group_name).graph_connectivity
+        report["cycle_cleanup"] = state.get("cycle_cleanup", {})
+        report["junction_cluster_cleanup"] = state.get("junction_cluster_cleanup", {})
         groups.append(report)
         all_paths.extend(report["paths"])
     joint_systems = []
@@ -284,9 +288,19 @@ def build_workspace_hierarchy(workspace):
     if len(roles) == 2:
         names = [roles[role] for role in ("anterior", "posterior")]
         union = np.logical_or.reduce([ws.multilabel_groups[name]["segmask_3d"] for name in names])
-        graph = joint_mask_graph(union, ws.resolution, connectivity=ws.skeleton_params.graph_connectivity)
-        chains = graph_edge_chains(graph)
         temporal = np.logical_or.reduce([ws.multilabel_groups[name]["segmask_binary"] for name in names])
+        graph = joint_mask_graph(union, ws.resolution, connectivity=ws.skeleton_params.graph_connectivity,
+            segmentation_labels=ws.segmask_labels_3d)
+        graph, junction_cleanup = simplify_junction_clusters(graph, ws.segmask_labels_3d, ws.resolution,
+            enabled=ws.skeleton_params.junction_cluster_enabled,
+            max_extent_voxels=ws.skeleton_params.junction_cluster_max_extent_voxels,
+            min_cycle_rank=ws.skeleton_params.junction_cluster_min_cycle_rank)
+        from .graph_cycles import remove_intralabel_cycles
+        graph, cycle_cleanup = remove_intralabel_cycles(graph, ws.segmask_labels_3d, ws.resolution,
+            support_mask=union, flow=ws.flow_raw, temporal_mask=temporal,
+            flow_threshold=ws.skeleton_params.cycle_flow_threshold,
+            preserve_connectivity=ws.skeleton_params.cycle_preserve_connectivity)
+        chains = graph_edge_chains(graph)
         report = analyze_group_graph(graph, chains, flow=ws.flow_raw, mask=temporal, spacing=ws.resolution,
             segmentation_labels=ws.segmask_labels_3d, label_map=ws.skeleton_params.label_map,
             group_name="cerebral_arterial_system")
@@ -296,7 +310,8 @@ def build_workspace_hierarchy(workspace):
             report = analyze_group_graph(graph, chains, flow=ws.flow_raw, mask=temporal, spacing=ws.resolution,
                 segmentation_labels=ws.segmask_labels_3d, label_map=ws.skeleton_params.label_map,
                 group_name="cerebral_arterial_system")
-        report.update(source_group_names=names, graph={"points": graph.points.tolist(), "edges": graph.edges.tolist()},
+        report.update(source_group_names=names, cycle_cleanup=cycle_cleanup, junction_cluster_cleanup=junction_cleanup,
+                      graph={"points": graph.points.tolist(), "edges": graph.edges.tolist()},
                       node_chains=chains, view_only=True)
         joint_systems.append(report)
     by_index = {record["path_index"]: record for record in all_paths}

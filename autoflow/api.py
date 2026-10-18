@@ -13,6 +13,7 @@ import numpy as np
 from .case_types import InputCase
 from .config import (
     DEFAULT_PRESSURE_GRADIENT_BAR_CFG,
+    DEFAULT_SPECIAL_CONTACT_LABELS,
     DEFAULT_PLANE_VIDEO_CFG,
     DEFAULT_RELATIVE_PRESSURE_BAR_CFG,
     DEFAULT_SHARED_COLORBAR_CFG,
@@ -23,7 +24,7 @@ from .config import (
     bundle_to_autoflow_kwargs,
     load_config_bundle,
 )
-from .core.models import Workspace, validate_graph_connectivity
+from .core.models import Workspace, validate_graph_connectivity, validate_cycle_cleanup_parameters, validate_junction_cluster_parameters
 from .plane_io import resolve_reuse_plane_file
 from .processing import collect_input_items, process_single
 
@@ -103,12 +104,17 @@ class AutoFlowConfig:
     special_handling: str = "three_pass_merge"
     special_merge_radius_mm: float = 1.5
     separate_special_label_contacts: bool = True
-    special_contact_labels: Sequence[str] = field(default_factory=lambda: ["RBCT", "CCA", "LBCT"])
+    special_contact_labels: Sequence[str] = field(default_factory=lambda: list(DEFAULT_SPECIAL_CONTACT_LABELS))
     min_cc_volume: float = 50.0
     cc_filter_mode: str = "hybrid"
     cc_rel_min_ratio: float = 0.10
-    min_edge_points: int = 5
+    min_edge_points: int = 3
     graph_connectivity: int = 26
+    cycle_flow_threshold: float = 0.3
+    cycle_preserve_connectivity: bool = True
+    junction_cluster_enabled: bool = True
+    junction_cluster_max_extent_voxels: float = 8.0
+    junction_cluster_min_cycle_rank: int = 2
 
     seed_ratio: float = 0.1
     max_steps: int = 200
@@ -286,12 +292,16 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
     ws.skeleton_params.special_handling = str(getattr(cfg, "special_handling", "three_pass_merge") or "three_pass_merge")
     ws.skeleton_params.special_merge_radius_mm = max(0.0, float(getattr(cfg, "special_merge_radius_mm", 1.5)))
     ws.skeleton_params.separate_special_label_contacts = bool(getattr(cfg, "separate_special_label_contacts", True))
-    ws.skeleton_params.special_contact_labels = [str(value).strip() for value in (getattr(cfg, "special_contact_labels", None) or ["RBCT", "CCA", "LBCT"]) if str(value).strip()]
+    ws.skeleton_params.special_contact_labels = [str(value).strip() for value in (getattr(cfg, "special_contact_labels", None) or DEFAULT_SPECIAL_CONTACT_LABELS) if str(value).strip()]
     ws.skeleton_params.min_cc_volume_mm3 = float(cfg.min_cc_volume)
     ws.skeleton_params.cc_filter_mode = str(cfg.cc_filter_mode or "hybrid")
     ws.skeleton_params.cc_rel_min_ratio = float(cfg.cc_rel_min_ratio)
-    ws.skeleton_params.min_edge_points = max(0, int(getattr(cfg, "min_edge_points", 5)))
+    ws.skeleton_params.min_edge_points = max(0, int(getattr(cfg, "min_edge_points", 3)))
     ws.skeleton_params.graph_connectivity = validate_graph_connectivity(cfg.graph_connectivity)
+    ws.skeleton_params.cycle_flow_threshold, ws.skeleton_params.cycle_preserve_connectivity = validate_cycle_cleanup_parameters(
+        cfg.cycle_flow_threshold, cfg.cycle_preserve_connectivity)
+    ws.skeleton_params.junction_cluster_enabled, ws.skeleton_params.junction_cluster_max_extent_voxels, ws.skeleton_params.junction_cluster_min_cycle_rank = validate_junction_cluster_parameters(
+        cfg.junction_cluster_enabled, cfg.junction_cluster_max_extent_voxels, cfg.junction_cluster_min_cycle_rank)
     ws.streamline_params.seed_ratio = float(cfg.seed_ratio)
     ws.streamline_params.max_steps = int(cfg.max_steps)
     ws.streamline_params.min_seeds = int(cfg.min_seeds)
@@ -522,6 +532,11 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 cc_rel_min_ratio=config.cc_rel_min_ratio,
                 min_edge_points=config.min_edge_points,
                 graph_connectivity=config.graph_connectivity,
+                cycle_flow_threshold=config.cycle_flow_threshold,
+                cycle_preserve_connectivity=config.cycle_preserve_connectivity,
+                junction_cluster_enabled=config.junction_cluster_enabled,
+                junction_cluster_max_extent_voxels=config.junction_cluster_max_extent_voxels,
+                junction_cluster_min_cycle_rank=config.junction_cluster_min_cycle_rank,
                 seed_ratio=config.seed_ratio,
                 max_steps=config.max_steps,
                 min_seeds=config.min_seeds,

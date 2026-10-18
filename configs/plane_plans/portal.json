@@ -15,20 +15,27 @@
       "smoothing_window": null,
       "smoothing_polyorder": null,
       "inter_time": null,
-      "plane_count": 1,
+      "plane_count": 3,
       "spacing_ratio": 0.3,
       "placements": [
         {
           "anchor": "label_connections",
-          "position": "near",
+          "position": "fractions",
           "fallback": {
-            "anchor": "label_longest",
+            "anchor": "label_terminal",
+            "path_selection": "longest",
             "position": "fractions",
             "fractions": [
-              0.5
+              0.2,
+              0.5,
+              0.8
             ]
           },
-          "offset_mm": 15.0
+          "fractions": [
+            0.2,
+            0.5,
+            0.8
+          ]
         }
       ]
     },
@@ -54,11 +61,10 @@
           "anchor": "label_connections",
           "position": "near",
           "fallback": {
-            "anchor": "label_longest",
-            "position": "fractions",
-            "fractions": [
-              0.5
-            ]
+            "anchor": "label_terminal",
+            "path_selection": "longest",
+            "position": "before_end",
+            "offset_mm": 20.0
           },
           "offset_mm": 15.0
         }
@@ -86,11 +92,10 @@
           "anchor": "label_connections",
           "position": "near",
           "fallback": {
-            "anchor": "label_longest",
-            "position": "fractions",
-            "fractions": [
-              0.5
-            ]
+            "anchor": "label_terminal",
+            "path_selection": "longest",
+            "position": "before_end",
+            "offset_mm": 20.0
           },
           "offset_mm": 15.0
         }

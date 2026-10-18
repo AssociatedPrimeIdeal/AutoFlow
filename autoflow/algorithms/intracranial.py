@@ -15,6 +15,9 @@ from scipy.ndimage import label as ndi_label
 from scipy.spatial import cKDTree
 
 from .graph import build_graph_from_points
+from .graph_cycles import remove_intralabel_cycles
+from .graph_junctions import simplify_junction_clusters
+from ..core.models import GraphData
 from .skeleton import generate_skeleton_from_mask3d
 
 
@@ -48,6 +51,13 @@ def detect_willis_ring(
     posterior_label_values=(),
     candidate_mask=None,
     connectivity=26,
+    flow=None,
+    temporal_mask=None,
+    cycle_flow_threshold=0.3,
+    cycle_preserve_connectivity=True,
+    junction_cluster_enabled=True,
+    junction_cluster_max_extent_voxels=8.0,
+    junction_cluster_min_cycle_rank=2,
 ):
     """Return a conservative topology report for a Willis ring candidate.
 
@@ -77,15 +87,23 @@ def detect_willis_ring(
         component_points, _ = generate_skeleton_from_mask3d(component_mask, spacing)
         if len(component_points) == 0:
             continue
-        component_graph = build_graph_from_points(component_points, spacing, connectivity=connectivity)
-        point_chunks.append(np.asarray(component_points, dtype=float))
+        component_graph = build_graph_from_points(component_points, spacing, connectivity=connectivity,
+            segmentation_labels=labels)
+        point_chunks.append(np.asarray(component_graph.points, dtype=float))
         if len(component_graph.edges):
             edge_chunks.append(np.asarray(component_graph.edges, dtype=int) + int(point_offset))
-        point_offset += len(component_points)
+        point_offset += len(component_graph.points)
     points = np.vstack(point_chunks) if point_chunks else np.empty((0, 3), dtype=float)
     if len(points) < 3:
         return {"status": "not_detected", "reason": "insufficient_skeleton", "points": points, "edges": np.empty((0, 2), dtype=int), "cycle_rank": 0}
     edges = np.vstack(edge_chunks) if edge_chunks else np.empty((0, 2), dtype=int)
+    junction_graph, junction_cleanup = simplify_junction_clusters(GraphData(points=points, edges=edges), labels, spacing,
+        enabled=junction_cluster_enabled, max_extent_voxels=junction_cluster_max_extent_voxels,
+        min_cycle_rank=junction_cluster_min_cycle_rank)
+    cleaned, cycle_cleanup = remove_intralabel_cycles(junction_graph, labels, spacing,
+        support_mask=mask, flow=flow, temporal_mask=temporal_mask,
+        flow_threshold=cycle_flow_threshold, preserve_connectivity=cycle_preserve_connectivity)
+    points, edges = cleaned.points, cleaned.edges
     network = nx.Graph()
     network.add_nodes_from(range(len(points)))
     network.add_edges_from((int(left), int(right)) for left, right in edges)
@@ -120,6 +138,8 @@ def detect_willis_ring(
             "cycle_rank": int(cycle_rank),
             "member_labels": member_labels,
             "component_reports": component_reports,
+            "cycle_cleanup": cycle_cleanup,
+            "junction_cluster_cleanup": junction_cleanup,
             "points": np.asarray(points, dtype=float),
             "edges": np.asarray(ring_edges, dtype=int).reshape(-1, 2),
         }
@@ -130,6 +150,8 @@ def detect_willis_ring(
         "cycle_rank": 0,
         "member_labels": [],
         "component_reports": component_reports,
+        "cycle_cleanup": cycle_cleanup,
+        "junction_cluster_cleanup": junction_cleanup,
         "points": np.asarray(points, dtype=float),
         "edges": np.empty((0, 2), dtype=int),
     }

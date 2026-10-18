@@ -70,19 +70,27 @@ class ConnectionGraph:
             if label != value or index not in self.edges:
                 continue
             component = self.components[self.edges[index][0]]
+            if spec.get("_components") is not None and component not in spec["_components"]:
+                continue
+            component = -1 if spec.get("scope") == "label" else component
             hierarchy = self.infos[index].get("hierarchy", {}) if index < len(self.infos) else {}
             for span in spans:
                 by_component.setdefault(component, []).append((span, hierarchy))
         selections, omissions = [], []
         for component, rows in sorted(by_component.items()):
-            if spec.get("_components") is not None and component not in spec["_components"]:
-                continue
             level = None if spec["anchor"] == "label_longest" else spec.get("level", 1) - 1
+            if spec["anchor"] == "label_terminal":
+                levels = [hierarchy.get("label_local_levels", {}).get(str(value)) for _, hierarchy in rows]
+                levels = [item for item in levels if item is not None]
+                if not levels:
+                    omissions.append("label_level_unavailable")
+                    continue
+                level = max(levels)
             neighbours = set()
             if spec.get("when_connected_to"):
                 for event in self.observed_connections()[0]:
                     for span, _ in event["selected"].get(value, []):
-                        if self.components[self.edges[span["path_index"]][0]] == component:
+                        if component == -1 or self.components[self.edges[span["path_index"]][0]] == component:
                             neighbours.update(event["labels"])
                 required = {int(self.labels.get(token, int(token) if token.isdigit() else 0))
                             for token in spec["when_connected_to"]}
@@ -107,7 +115,8 @@ class ConnectionGraph:
                                    "anchor_nodes": [], "boundary_path_indices": [], "path_selection": policy,
                                    "paths_at_level": sorted({row[0]["path_index"] for row in eligible}),
                                    "label_level": None if level is None else level + 1,
-                                   "component_index": component, "connected_labels": sorted(neighbours),
+                                   "component_index": component, "selection_scope":spec.get("scope","component"),
+                                   "connected_labels": sorted(neighbours),
                                    "conditional_level": bool(spec.get("when_connected_to"))})
         return selections, (omissions[0] if omissions else "" if selections else "no_label_path")
 
@@ -271,8 +280,8 @@ class ConnectionGraph:
         anchor = spec["anchor"]
         if anchor == "label_connections":
             return self.connection_choices(name, spec)
-        if anchor == "label_longest" or (anchor == "label_level" and
-                (spec.get("path_selection") == "longest" or spec.get("when_connected_to"))):
+        if anchor == "label_longest" or (anchor in {"label_level","label_terminal"} and
+                (spec.get("path_selection") == "longest" or spec.get("when_connected_to") or spec.get("scope")=="label")):
             return self.interval_choices(name, spec)
         if anchor in {"label_level", "label_terminal"}:
             by_component = {}
@@ -422,9 +431,17 @@ def generate_landmark_label_planes(context, name, value, rule, smooth_paths, seg
             if not spans or total <= 1e-8:
                 qc.setdefault("omitted_positions", []).append({"reason": "empty_landmark_interval", "placement_index": placement_index})
                 continue
-            short = spec["position"] == "near" and total < 2 * float(spec.get("offset_mm", 5.))
+            if spec["position"] in {"before_end","after_start"} and any(
+                    arm["path_index"] >= len(context.infos) or
+                    context.infos[arm["path_index"]].get("hierarchy",{}).get("flow_sign") not in (-1,1)
+                    for arm in spans):
+                qc.setdefault("omitted_positions", []).append({"reason":"flow_direction_unavailable",
+                    "placement_index":placement_index,"anchor":spec["anchor"]})
+                continue
+            short = spec["position"] in {"near","before_end","after_start"} and total < 2 * float(spec.get("offset_mm", 5.))
             distances = [total * fraction for fraction in spec["fractions"]] if spec["position"] == "fractions" else [
-                total / 2 if short else float(spec.get("offset_mm", 5.))]
+                total / 2 if short else total-float(spec.get("offset_mm",5.)) if spec["position"]=="before_end"
+                else float(spec.get("offset_mm", 5.))]
             for nominal in distances:
                 # Search from the nominal position into the SAME label interval.
                 arm, local = spans[-1], nominal
@@ -444,8 +461,10 @@ def generate_landmark_label_planes(context, name, value, rule, smooth_paths, seg
                     "main_path_index": main_index, "placement_index": placement_index, "anchor": spec["anchor"]})
                 step = .5 * float(np.min(spacing))
                 trials = [local]
-                if spec["position"] == "near":
+                if spec["position"] in {"near","after_start"}:
                     trials.extend(np.arange(local + step, arm["length"] - .5 * step, step).tolist())
+                elif spec["position"] == "before_end":
+                    trials.extend(np.arange(local-step,.5*step,-step).tolist())
                 else:
                     # Fractions keep their nominal coordinate unless geometry
                     # rejects it; search nearest alternatives without crossing a fork.
@@ -493,7 +512,12 @@ def generate_landmark_label_planes(context, name, value, rule, smooth_paths, seg
                         "nominal_distance_in_interval_mm": float(local), "distance_in_interval_mm": float(distance),
                         "search_shift_mm": float(distance - local), "short_interval_midpoint": bool(short),
                         "direction_status": hierarchy.get("direction_status", "unavailable"),
-                        "label_level": selection.get("label_level")}
+                        "label_level": selection.get("label_level"),
+                        "selection_scope":selection.get("selection_scope", "component")}
+                    if spec["position"] in {"near","before_end","after_start"}:
+                        plane.placement.update(requested_offset_mm=float(spec.get("offset_mm",5.)),
+                            offset_reference=("flow_end" if spec["position"]=="before_end" else
+                                              "flow_start" if spec["position"]=="after_start" else "anchor_side"))
                     if "path_selection" in selection:
                         plane.placement.update(path_selection=selection["path_selection"],
                                                paths_at_level=selection["paths_at_level"])

@@ -69,7 +69,7 @@ def build_label_plane_candidates(paths, segmentation_labels, label_map, *,
 def _flow_direction(points, flow, mask, spacing, origin):
     """Signed tangent alignment integrated over path length and cardiac phases."""
     result = {"flow_sign": 1, "flow_confidence": None, "flow_alignment": None,
-              "flow_direction_status": "flow_unavailable"}
+              "flow_direction_status": "flow_unavailable", "flow_signal_available": False}
     if flow is None:
         return result
     velocity = np.asarray(flow)
@@ -98,7 +98,8 @@ def _flow_direction(points, flow, mask, spacing, origin):
     reliable = denominator > 1e-12 and abs(alignment) >= .05
     result.update(flow_sign=-1 if alignment < 0 else 1,
                   flow_confidence=abs(alignment), flow_alignment=alignment,
-                  flow_direction_status="reliable" if reliable else "flow_direction_unreliable")
+                  flow_direction_status="reliable" if reliable else "flow_direction_unreliable",
+                  flow_signal_available=bool(np.isfinite(denominator) and denominator > 1e-12))
     return result
 
 

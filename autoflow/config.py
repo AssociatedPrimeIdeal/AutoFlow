@@ -223,7 +223,7 @@ DEFAULT_SKELETON_LABEL_MAP = {
     "RIJV": 32,
 }
 
-DEFAULT_SPECIAL_CONTACT_LABELS = ["RBCT", "CCA", "LBCT"]
+DEFAULT_SPECIAL_CONTACT_LABELS = ["RBCT", "CCA", "LBCT", "HA", "SMA", "LRA", "RRA"]
 
 DEFAULT_SKELETON_LABEL_GROUPS = {
     "aorta_systemic_branches": {
@@ -353,8 +353,13 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "min_cc_volume_mm3": 50.0,
         "cc_filter_mode": "hybrid",
         "cc_rel_min_ratio": 0.10,
-        "min_edge_points": 5,
+        "min_edge_points": 3,
         "graph_connectivity": 26,
+        "cycle_flow_threshold": 0.3,
+        "cycle_preserve_connectivity": True,
+        "junction_cluster_enabled": True,
+        "junction_cluster_max_extent_voxels": 8.0,
+        "junction_cluster_min_cycle_rank": 2,
         "do_closing": False,
         "do_opening": False,
         "gaussian_sigma": 0.5,
@@ -1093,8 +1098,13 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
         "min_cc_volume": float(skeleton_cfg.get("min_cc_volume_mm3", 50.0)),
         "cc_filter_mode": str(skeleton_cfg.get("cc_filter_mode", "hybrid") or "hybrid"),
         "cc_rel_min_ratio": float(skeleton_cfg.get("cc_rel_min_ratio", 0.10)),
-        "min_edge_points": max(0, int(skeleton_cfg.get("min_edge_points", skeleton_cfg.get("min_edge_count", 5)) or 0)),
+        "min_edge_points": max(0, int(skeleton_cfg.get("min_edge_points", skeleton_cfg.get("min_edge_count", 3)) or 0)),
         "graph_connectivity": skeleton_cfg.get("graph_connectivity", 26),
+        "cycle_flow_threshold": skeleton_cfg.get("cycle_flow_threshold", 0.3),
+        "cycle_preserve_connectivity": skeleton_cfg.get("cycle_preserve_connectivity", True),
+        "junction_cluster_enabled": skeleton_cfg.get("junction_cluster_enabled", True),
+        "junction_cluster_max_extent_voxels": skeleton_cfg.get("junction_cluster_max_extent_voxels", 8.0),
+        "junction_cluster_min_cycle_rank": skeleton_cfg.get("junction_cluster_min_cycle_rank", 2),
         "seed_ratio": float(streamline_cfg.get("seed_ratio", 0.1)),
         "max_steps": int(streamline_cfg.get("max_steps", 200)),
         "min_seeds": int(streamline_cfg.get("min_seeds", 50)),

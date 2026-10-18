@@ -35,6 +35,8 @@ labels are organized as `intracranial_anterior_arteries` (`LICA`, `RICA`,
 `LPCA`, `RPCA`), `intracranial_veins` (`LTS`, `SSS`, `RTS`, `StrS`), and
 `jugular_veins` (`LIJV`, `RIJV`).
 
+Graph generation applies compact junction-cluster routing after isolated triangle contraction, then configurable Flow-C path filtering inside one positive source label, then short terminal-branch pruning. Junction routing preserves original point coordinates and uses only existing same-label edges; compact mixed clusters retain protected cross-label interfaces. Cross-label and unknown-node edges are excluded from this filter; the default connectivity guard retains each label component, its endpoints and interface connectivity. Source segmentation and skeleton masks/points are unchanged; inspect the graph and `graph_hierarchy.json` cleanup provenance after regeneration. See [Graph and paths](graph-paths.md) for the exact policy and limits.
+
 After graph generation, AutoFlow performs a conservative Willis-ring check on
 the two arterial masks. A detected cycle containing labels from both arterial
 groups is exposed as a derived `willis_ring` graph overlay. The overlay does
@@ -43,13 +45,13 @@ a reliable mixed arterial cycle are reported as `not_detected` and keep their
 anterior and vertebrobasilar graphs separate.
 
 `special_handling` selects the special-label strategy. `three_pass_merge` (the
-default) skeletonizes `A+B`, `A+C`, and so on, then merges nearby points.
+default) skeletonizes `A+B`, `A+C`, and so on, then merges nearby points. The legacy strategy name remains `three_pass_merge` even when more than three branches are configured. Its default protected list is `RBCT`, `CCA`, `LBCT`, `HA`, `SMA`, `LRA`, `RRA`; the shared base normally contains `AAO`, `ARCH`, `DAO`.
 Each pass excludes the other configured special labels after morphology and
 before its final component filter. This prevents closing or dilation from growing back into a
 neighbouring special branch and creating false loops, short tails, or a lost
 branch endpoint during graph cleanup. Morphology still applies to the shared
 trunk and background; the original segmentation labels remain unchanged.
-`contact_surface` keeps the previous contact-surface separation algorithm.
+`contact_surface` keeps the previous contact-surface separation algorithm. Graph construction also excludes direct contacts sampling two different configured independent branch labels, so merging the skeleton point sets cannot reconnect HA/SMA/LRA/RRA to each other through those contacts. Trunk-to-branch connections remain eligible. This filter is active for `three_pass_merge`, and for `contact_surface` when contact separation is enabled.
 
 Graph paths derived from the skeleton are split at graph nodes with degree
 `>= 3`, so fork existence does not depend on noisy or locally ambiguous flow
@@ -59,7 +61,8 @@ established.
 
 Before path extraction, an isolated triangular junction with at least three
 distinct external neighbors is contracted to the physical-coordinate centroid
-of its three graph points. Existing external edges are remapped to that point;
+of its three graph points, regardless of their source labels. Mixed-label or
+unknown-label triangles are not excluded. Existing external edges are remapped to that point;
 there is no new neighbor search. This replaces the earlier triangle-edge
 deletion that could create a local gap despite a long alternate route. Original
 skeleton points and masks are preserved. Overlapping triangles, closed rings
@@ -67,8 +70,8 @@ and contractions that would merge distinct external edges are retained; see
 [Graph and paths](graph-paths.md) for the scope and centroid limitations.
 
 During graph generation, terminal branches shorter than `min_edge_points` graph
-edge segments are removed. The default is `5`: arms with one to four edges
-are removed, while a five-edge arm is retained. Set it to `0` or `1` to disable
+edge segments are removed. The default is `3`: arms with one or two edges
+are removed, while a three-edge arm is retained. Set it to `0` or `1` to disable
 this cleanup. This filters graph edges and derived paths while leaving the
 original skeleton mask and points available for inspection.
 

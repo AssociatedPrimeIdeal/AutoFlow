@@ -91,23 +91,13 @@
       "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
+          "anchor": "label_longest",
+          "scope": "label",
           "position": "fractions",
-          "fallback": {
-            "anchor": "label_level",
-            "level": 1,
-            "path_selection": "longest",
-            "position": "fractions",
-            "fractions": [
-              0.2,
-              0.5,
-              0.8
-            ]
-          },
           "fractions": [
-            0.2,
-            0.5,
-            0.8
+            0.1,
+            0.3,
+            0.5
           ]
         }
       ]
@@ -132,19 +122,15 @@
       "placements": [
         {
           "anchor": "label_connections",
-          "position": "fractions",
+          "position": "near",
           "fallback": {
-            "anchor": "label_level",
-            "level": 1,
-            "path_selection": "longest",
+            "anchor": "label_longest",
             "position": "fractions",
             "fractions": [
               0.5
             ]
           },
-          "fractions": [
-            0.5
-          ]
+          "offset_mm": 15.0
         }
       ]
     },
@@ -168,19 +154,15 @@
       "placements": [
         {
           "anchor": "label_connections",
-          "position": "fractions",
+          "position": "near",
           "fallback": {
-            "anchor": "label_level",
-            "level": 1,
-            "path_selection": "longest",
+            "anchor": "label_longest",
             "position": "fractions",
             "fractions": [
               0.5
             ]
           },
-          "fractions": [
-            0.5
-          ]
+          "offset_mm": 15.0
         }
       ]
     },
@@ -204,19 +186,15 @@
       "placements": [
         {
           "anchor": "label_connections",
-          "position": "fractions",
+          "position": "near",
           "fallback": {
-            "anchor": "label_level",
-            "level": 1,
-            "path_selection": "longest",
+            "anchor": "label_longest",
             "position": "fractions",
             "fractions": [
               0.5
             ]
           },
-          "fractions": [
-            0.5
-          ]
+          "offset_mm": 15.0
         }
       ]
     },
@@ -247,11 +225,11 @@
             "path_selection": "longest",
             "position": "fractions",
             "fractions": [
-              0.5
+              0.2
             ]
           },
           "fractions": [
-            0.5
+            0.2
           ]
         }
       ]
@@ -276,7 +254,7 @@
       "placements": [
         {
           "anchor": "label_connections",
-          "position": "fractions",
+          "position": "near",
           "fallback": {
             "anchor": "label_longest",
             "position": "fractions",
@@ -284,9 +262,7 @@
               0.5
             ]
           },
-          "fractions": [
-            0.5
-          ]
+          "offset_mm": 15.0
         }
       ]
     },
@@ -310,7 +286,7 @@
       "placements": [
         {
           "anchor": "label_connections",
-          "position": "fractions",
+          "position": "near",
           "fallback": {
             "anchor": "label_longest",
             "position": "fractions",
@@ -318,9 +294,7 @@
               0.5
             ]
           },
-          "fractions": [
-            0.5
-          ]
+          "offset_mm": 15.0
         }
       ]
     }

@@ -119,6 +119,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         self._plane_pick_callback = None
         self._path_pick_callback = None
         self._shared_pick_obs_id = None
+        self._plane_selection_locked = False
         self._active_scalar_bar_uid = None
         self._volume_range_cache = {}
         self._volume_wl_observer_ids = []
@@ -2358,10 +2359,17 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
                 renderer.WorldToDisplay()
                 projected.append(np.asarray(renderer.GetDisplayPoint(), dtype=float))
             polygon = np.asarray(projected, dtype=float)
+            if not np.all(np.isfinite(polygon)) or np.any((polygon[:, 2] < 0) | (polygon[:, 2] > 1)):
+                continue
             edge = np.roll(polygon[:, :2], -1, axis=0) - polygon[:, :2]
             offset = target.reshape(1, 2) - polygon[:, :2]
             cross = edge[:, 0] * offset[:, 1] - edge[:, 1] * offset[:, 0]
-            if not (np.all(cross >= -1e-6) or np.all(cross <= 1e-6)):
+            area = abs(np.sum(polygon[:, 0] * np.roll(polygon[:, 1], -1)
+                              - polygon[:, 1] * np.roll(polygon[:, 0], -1))) * 0.5
+            inside = area > 1.0 and (np.all(cross >= -1e-6) or np.all(cross <= 1e-6))
+            fraction = np.clip(np.sum(offset * edge, axis=1) / np.maximum(np.sum(edge * edge, axis=1), 1e-12), 0, 1)
+            near_edge = np.min(np.linalg.norm(offset - fraction[:, None] * edge, axis=1)) <= 6.0
+            if not (inside or near_edge):
                 continue
             center_display = self.world_to_display_point(center)
             renderer.SetWorldPoint(*center_display.tolist(), 1.0)
@@ -2407,12 +2415,21 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         picker.SetTolerance(0.005)
 
         def _on_right_click(obj=None, ev=None):
+            if self._plane_selection_locked:
+                return
             try:
                 x, y = iren.GetEventPosition()
             except Exception:
                 return
             ren = self.plotter.renderer
             pos = None
+            # Test the full displayed plane before path actors. Thin outlines
+            # should not make an underlying path steal a plane-face click.
+            screen_plane_uid, screen_plane_idx = self._plane_uid_at_display_position(x, y)
+            if screen_plane_uid is not None and screen_plane_idx is not None:
+                if self._plane_pick_callback is not None:
+                    self._plane_pick_callback(screen_plane_uid, screen_plane_idx)
+                return
             for overlay in (self._selection_renderer, self._plane_overlay_renderer):
                 if overlay is None:
                     continue
@@ -2437,11 +2454,6 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
                     if path_uid is not None and path_idx is not None and self._path_pick_callback is not None:
                         self._path_pick_callback(path_uid, path_idx)
                         return
-            screen_plane_uid, screen_plane_idx = self._plane_uid_at_display_position(x, y)
-            if screen_plane_uid is not None and screen_plane_idx is not None:
-                if self._plane_pick_callback is not None:
-                    self._plane_pick_callback(screen_plane_uid, screen_plane_idx)
-                return
             if pos is None:
                 ok = picker.Pick(float(x), float(y), 0.0, ren)
                 pos = picker.GetPickPosition() if ok else None

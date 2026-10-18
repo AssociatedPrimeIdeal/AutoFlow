@@ -32,6 +32,8 @@ from ..task_control import TaskCancelled, check_cancelled, report_progress
 from ..plane_io import build_plane_records, save_planes_h5, save_planes_json, save_pwv_h5
 from ..algorithms.label_planes import generate_label_planes
 from ..algorithms.hierarchy import build_workspace_hierarchy
+from ..algorithms.graph_cycles import remove_intralabel_cycles
+from ..algorithms.graph_junctions import simplify_junction_clusters
 
 
 _DERIVED_ALGORITHM_VERSIONS = {
@@ -138,6 +140,12 @@ class PipelineEngine:
             posterior_label_values=posterior_values,
             candidate_mask=candidate_mask,
             connectivity=ws.skeleton_params.graph_connectivity,
+            flow=ws.flow_raw,
+            cycle_flow_threshold=ws.skeleton_params.cycle_flow_threshold,
+            cycle_preserve_connectivity=ws.skeleton_params.cycle_preserve_connectivity,
+            junction_cluster_enabled=ws.skeleton_params.junction_cluster_enabled,
+            junction_cluster_max_extent_voxels=ws.skeleton_params.junction_cluster_max_extent_voxels,
+            junction_cluster_min_cycle_rank=ws.skeleton_params.junction_cluster_min_cycle_rank,
         )
         ws.willis_ring_status = {
             str(key): value
@@ -1252,8 +1260,22 @@ class PipelineEngine:
             group_state = ws.multilabel_groups.get(group_name, {})
             group_params = ws.skeleton_params.params_for_group(group_name)
             local_points = np.asarray(group_state.get("skeleton_points"), dtype=float).reshape(-1, 3) if group_state.get("skeleton_points") is not None else np.empty((0, 3), dtype=float)
-            local_graph = build_graph_from_points(local_points, ws.resolution, connectivity=group_params.graph_connectivity)
-            min_edge_points = max(0, int(getattr(group_params, "min_edge_points", 5)))
+            protect_contacts = (group_params.special_handling == "three_pass_merge" or
+                                group_params.separate_special_label_contacts)
+            separated_values = self._special_label_values(ws, group_params, group_state.get("labels", [])) if protect_contacts else []
+            local_graph = build_graph_from_points(local_points, ws.resolution, connectivity=group_params.graph_connectivity,
+                segmentation_labels=ws.segmask_labels_3d, separated_label_values=separated_values)
+            local_graph, junction_cleanup = simplify_junction_clusters(local_graph, ws.segmask_labels_3d,
+                ws.resolution, enabled=group_params.junction_cluster_enabled,
+                max_extent_voxels=group_params.junction_cluster_max_extent_voxels,
+                min_cycle_rank=group_params.junction_cluster_min_cycle_rank)
+            group_state["junction_cluster_cleanup"] = junction_cleanup
+            local_graph, cycle_cleanup = remove_intralabel_cycles(local_graph, ws.segmask_labels_3d,
+                ws.resolution, support_mask=group_state.get("segmask_3d"), flow=ws.flow_raw,
+                temporal_mask=group_state.get("segmask_binary"), flow_threshold=group_params.cycle_flow_threshold,
+                preserve_connectivity=group_params.cycle_preserve_connectivity)
+            group_state["cycle_cleanup"] = cycle_cleanup
+            min_edge_points = max(0, int(getattr(group_params, "min_edge_points", 3)))
             local_graph = remove_short_terminal_branches(local_graph, min_edge_points=min_edge_points)
             group_state["graph"] = local_graph
             local_binary = np.asarray(group_state.get("segmask_binary"), dtype=bool)

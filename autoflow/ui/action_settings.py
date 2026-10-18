@@ -145,6 +145,11 @@ def action_sections(action, ws):
     if action == StepId.GENERATE_GRAPH:
         return [("Graph", [option(s + "graph_connectivity", "Skeleton graph connectivity",
                                   ("6 — face neighbors", 6), ("26 — face, edge and corner neighbors", 26)),
+                           flag(s + "junction_cluster_enabled", "Simplify compact junction clusters"),
+                           number(s + "junction_cluster_max_extent_voxels", "Maximum cluster extent per axis (voxels)", 1, 10000),
+                           number(s + "junction_cluster_min_cycle_rank", "Minimum cluster cycle rank", 1, 1000000, integer=True),
+                           number(s + "cycle_flow_threshold", "Flow C threshold (delete paths below)", 0, 1),
+                           flag(s + "cycle_preserve_connectivity", "Protect label connectivity and endpoints"),
                            number(s + "min_edge_points", "Minimum terminal edge count", 0, 100000, integer=True)])]
     if action == StepId.GENERATE_PLANES:
         fixed = lambda v: v[p + "plane_mode"] == "fixed_step"

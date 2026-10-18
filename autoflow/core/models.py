@@ -121,6 +121,37 @@ def validate_graph_connectivity(value):
     return int(value)
 
 
+def validate_cycle_cleanup_parameters(threshold, preserve_connectivity):
+    if isinstance(threshold, (bool, np.bool_)):
+        raise ValueError("cycle_flow_threshold must be finite and between 0 and 1")
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError):
+        raise ValueError("cycle_flow_threshold must be finite and between 0 and 1") from None
+    if not np.isfinite(threshold) or not 0 <= threshold <= 1:
+        raise ValueError("cycle_flow_threshold must be finite and between 0 and 1")
+    if not isinstance(preserve_connectivity, (bool, np.bool_)):
+        raise ValueError("cycle_preserve_connectivity must be a boolean")
+    return threshold, bool(preserve_connectivity)
+
+
+def validate_junction_cluster_parameters(enabled, max_extent_voxels, min_cycle_rank):
+    if not isinstance(enabled, (bool, np.bool_)):
+        raise ValueError("junction_cluster_enabled must be a boolean")
+    if isinstance(max_extent_voxels, (bool, np.bool_)):
+        raise ValueError("junction_cluster_max_extent_voxels must be finite and at least 1")
+    try:
+        extent = float(max_extent_voxels)
+    except (TypeError, ValueError):
+        raise ValueError("junction_cluster_max_extent_voxels must be finite and at least 1") from None
+    if not np.isfinite(extent) or extent < 1:
+        raise ValueError("junction_cluster_max_extent_voxels must be finite and at least 1")
+    if (isinstance(min_cycle_rank, (bool, np.bool_))
+            or not isinstance(min_cycle_rank, (int, np.integer)) or min_cycle_rank < 1):
+        raise ValueError("junction_cluster_min_cycle_rank must be a positive integer")
+    return bool(enabled), extent, int(min_cycle_rank)
+
+
 @dataclass
 class SkeletonParams:
     remove_small_cc: bool = True
@@ -130,14 +161,19 @@ class SkeletonParams:
     special_handling: str = "three_pass_merge"
     special_merge_radius_mm: float = 1.5
     separate_special_label_contacts: bool = True
-    special_contact_labels: List[str] = field(default_factory=lambda: ["RBCT", "CCA", "LBCT"])
+    special_contact_labels: List[str] = field(default_factory=lambda: ["RBCT", "CCA", "LBCT", "HA", "SMA", "LRA", "RRA"])
     min_cc_volume_mm3: float = 50.0
     cc_filter_mode: str = "hybrid"
     cc_rel_min_ratio: float = 0.10
     # Minimum number of graph edge segments retained in a terminal branch.
     # Short endpoint-to-junction spurs are removed during graph generation.
-    min_edge_points: int = 5
+    min_edge_points: int = 3
     graph_connectivity: int = 26
+    cycle_flow_threshold: float = 0.3
+    cycle_preserve_connectivity: bool = True
+    junction_cluster_enabled: bool = True
+    junction_cluster_max_extent_voxels: float = 8.0
+    junction_cluster_min_cycle_rank: int = 2
     do_closing: bool = False
     do_opening: bool = False
     gaussian_sigma: float = 0.5
@@ -153,6 +189,9 @@ class SkeletonParams:
     default_group_browser_color: str = "#1c7ed6"
 
     def to_dict(self):
+        threshold, preserve = validate_cycle_cleanup_parameters(self.cycle_flow_threshold, self.cycle_preserve_connectivity)
+        junction_enabled, junction_extent, junction_rank = validate_junction_cluster_parameters(
+            self.junction_cluster_enabled, self.junction_cluster_max_extent_voxels, self.junction_cluster_min_cycle_rank)
         return {
             "remove_small_cc": self.remove_small_cc,
             "special_handling": str(self.special_handling or "three_pass_merge"),
@@ -164,6 +203,11 @@ class SkeletonParams:
             "cc_rel_min_ratio": float(self.cc_rel_min_ratio),
             "min_edge_points": int(self.min_edge_points),
             "graph_connectivity": validate_graph_connectivity(self.graph_connectivity),
+            "cycle_flow_threshold": threshold,
+            "cycle_preserve_connectivity": preserve,
+            "junction_cluster_enabled": junction_enabled,
+            "junction_cluster_max_extent_voxels": junction_extent,
+            "junction_cluster_min_cycle_rank": junction_rank,
             "do_closing": self.do_closing,
             "do_opening": self.do_opening,
             "gaussian_sigma": self.gaussian_sigma,
@@ -214,7 +258,7 @@ class SkeletonParams:
             preprocess = cfg.get("preprocess", {})
             cfg["preprocess"] = copy.deepcopy(preprocess) if isinstance(preprocess, dict) else {}
             label_groups[str(group_name)] = cfg
-        raw_special_labels = payload.get("special_contact_labels", ["RBCT", "CCA", "LBCT"])
+        raw_special_labels = payload.get("special_contact_labels", ["RBCT", "CCA", "LBCT", "HA", "SMA", "LRA", "RRA"])
         if not isinstance(raw_special_labels, (list, tuple)):
             raw_special_labels = [raw_special_labels]
         special_labels = [str(value).strip() for value in raw_special_labels if str(value).strip()]
@@ -233,6 +277,11 @@ class SkeletonParams:
                 "special_handling must be one of 'three_pass_merge' or 'contact_surface', "
                 f"got {raw_special_handling!r}"
             )
+        threshold, preserve = validate_cycle_cleanup_parameters(payload.get("cycle_flow_threshold", .3),
+                                                               payload.get("cycle_preserve_connectivity", True))
+        junction_enabled, junction_extent, junction_rank = validate_junction_cluster_parameters(
+            payload.get("junction_cluster_enabled", True), payload.get("junction_cluster_max_extent_voxels", 8.0),
+            payload.get("junction_cluster_min_cycle_rank", 2))
         return SkeletonParams(
             remove_small_cc=bool(payload.get("remove_small_cc", True)),
             special_handling=special_handling,
@@ -242,8 +291,13 @@ class SkeletonParams:
             min_cc_volume_mm3=float(payload.get("min_cc_volume_mm3", 50.0)),
             cc_filter_mode=str(payload.get("cc_filter_mode", "hybrid") or "hybrid"),
             cc_rel_min_ratio=float(payload.get("cc_rel_min_ratio", 0.10)),
-            min_edge_points=max(0, int(payload.get("min_edge_points", payload.get("min_edge_count", 5)) or 0)),
+            min_edge_points=max(0, int(payload.get("min_edge_points", payload.get("min_edge_count", 3)) or 0)),
             graph_connectivity=validate_graph_connectivity(payload.get("graph_connectivity", 26)),
+            cycle_flow_threshold=threshold,
+            cycle_preserve_connectivity=preserve,
+            junction_cluster_enabled=junction_enabled,
+            junction_cluster_max_extent_voxels=junction_extent,
+            junction_cluster_min_cycle_rank=junction_rank,
             do_closing=bool(payload.get("do_closing", False)),
             do_opening=bool(payload.get("do_opening", False)),
             gaussian_sigma=float(payload.get("gaussian_sigma", 0.5)),
@@ -295,6 +349,11 @@ class SkeletonParams:
             "special_contact_labels",
             "min_edge_points",
             "graph_connectivity",
+            "cycle_flow_threshold",
+            "cycle_preserve_connectivity",
+            "junction_cluster_enabled",
+            "junction_cluster_max_extent_voxels",
+            "junction_cluster_min_cycle_rank",
         ):
             if key in cfg and key not in overrides:
                 overrides[key] = cfg[key]
@@ -309,6 +368,11 @@ class SkeletonParams:
             cc_rel_min_ratio=self.cc_rel_min_ratio,
             min_edge_points=self.min_edge_points,
             graph_connectivity=self.graph_connectivity,
+            cycle_flow_threshold=self.cycle_flow_threshold,
+            cycle_preserve_connectivity=self.cycle_preserve_connectivity,
+            junction_cluster_enabled=self.junction_cluster_enabled,
+            junction_cluster_max_extent_voxels=self.junction_cluster_max_extent_voxels,
+            junction_cluster_min_cycle_rank=self.junction_cluster_min_cycle_rank,
             do_closing=self.do_closing,
             do_opening=self.do_opening,
             gaussian_sigma=self.gaussian_sigma,
@@ -329,6 +393,11 @@ class SkeletonParams:
             "cc_rel_min_ratio",
             "min_edge_points",
             "graph_connectivity",
+            "cycle_flow_threshold",
+            "cycle_preserve_connectivity",
+            "junction_cluster_enabled",
+            "junction_cluster_max_extent_voxels",
+            "junction_cluster_min_cycle_rank",
             "do_closing",
             "do_opening",
             "gaussian_sigma",
@@ -353,6 +422,10 @@ class SkeletonParams:
         params.special_merge_radius_mm = max(0.0, float(params.special_merge_radius_mm))
         params.min_edge_points = max(0, int(params.min_edge_points))
         params.graph_connectivity = validate_graph_connectivity(params.graph_connectivity)
+        params.cycle_flow_threshold, params.cycle_preserve_connectivity = validate_cycle_cleanup_parameters(
+            params.cycle_flow_threshold, params.cycle_preserve_connectivity)
+        params.junction_cluster_enabled, params.junction_cluster_max_extent_voxels, params.junction_cluster_min_cycle_rank = validate_junction_cluster_parameters(
+            params.junction_cluster_enabled, params.junction_cluster_max_extent_voxels, params.junction_cluster_min_cycle_rank)
         # Group-level configs written before the rename remain readable.
         if "separate_special_label_contacts" not in overrides and "separate_label_contacts" in overrides:
             params.separate_special_label_contacts = bool(overrides.get("separate_label_contacts"))
@@ -1594,6 +1667,8 @@ class Workspace:
                 "centerline_node_paths": [list(map(int, x)) for x in state.get("centerline_node_paths", [])],
                 "centerline_paths_smooth": [arr(x) for x in state.get("centerline_paths_smooth", [])],
                 "path_info": copy.deepcopy(state.get("path_info", [])),
+                "cycle_cleanup": copy.deepcopy(state.get("cycle_cleanup", {})),
+                "junction_cluster_cleanup": copy.deepcopy(state.get("junction_cluster_cleanup", {})),
                 "forks": copy.deepcopy(state.get("forks", [])),
                 "planes": [{"center": arr(p.center), "normal": arr(p.normal), "label": int(p.label),
                             "segmentation_label": int(getattr(p, "segmentation_label", 0) or 0),
@@ -1784,6 +1859,8 @@ class Workspace:
                 "centerline_node_paths": [list(map(int, x)) for x in state.get("centerline_node_paths", [])],
                 "centerline_paths_smooth": [np.asarray(x, dtype=float) for x in state.get("centerline_paths_smooth", [])],
                 "path_info": copy.deepcopy(state.get("path_info", [])),
+                "cycle_cleanup": copy.deepcopy(state.get("cycle_cleanup", {})),
+                "junction_cluster_cleanup": copy.deepcopy(state.get("junction_cluster_cleanup", {})),
                 "forks": copy.deepcopy(state.get("forks", [])),
                 "planes": planes,
                 "path_index_offset": int(state.get("path_index_offset", 0)),

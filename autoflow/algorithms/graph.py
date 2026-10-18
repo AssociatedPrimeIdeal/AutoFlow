@@ -6,7 +6,35 @@ from scipy.spatial import cKDTree
 from ..core.models import GraphData, validate_graph_connectivity
 
 
-def build_graph_from_points(points, spacing, connectivity=26):
+def _sample_graph_labels(points, segmentation_labels, spacing, origin=(0, 0, 0)):
+    """Sample known source labels; outside/background stays unknown (zero)."""
+    points = np.asarray(points, dtype=float).reshape(-1, 3)
+    labels = np.asarray(segmentation_labels)
+    if labels.ndim != 3:
+        raise ValueError("Graph label attribution requires a 3-D label volume")
+    voxels = np.rint((points - np.asarray(origin)) / np.asarray(spacing)).astype(int)
+    inside = np.all((voxels >= 0) & (voxels < np.asarray(labels.shape)), axis=1)
+    result = np.zeros(len(points), dtype=np.int64)
+    result[inside] = labels[tuple(voxels[inside].T)]
+    return result
+
+
+def _edge_is_in_label(points, label, segmentation_labels, spacing, origin=(0, 0, 0)):
+    """Reject another positive label along an existing graph connection.
+
+    Callers require positive, equal endpoint labels. Background sampled between
+    diagonal voxel neighbors does not turn that existing digital edge into a
+    new label interface; no edge is added across a gap by this attribution.
+    """
+    points = np.asarray(points, dtype=float)
+    count = max(3, int(np.ceil(np.max(np.abs((points[1] - points[0]) / spacing)) * 4)) + 1)
+    samples = points[0] + np.linspace(0., 1., count)[:, None] * (points[1] - points[0])
+    values = _sample_graph_labels(samples, segmentation_labels, spacing, origin)
+    return bool(np.all((values <= 0) | (values == label)))
+
+
+def build_graph_from_points(points, spacing, connectivity=26, *, segmentation_labels=None, origin=(0, 0, 0),
+                            separated_label_values=()):
     """Connect voxel-center skeleton points by face (6) or face/edge/corner (26)."""
     connectivity = validate_graph_connectivity(connectivity)
     points = np.asarray(points, dtype=float).reshape(-1, 3)
@@ -21,17 +49,33 @@ def build_graph_from_points(points, spacing, connectivity=26):
         pairs = pairs[(np.count_nonzero(delta > 1e-7, axis=1) == 1)
                       & np.isclose(np.max(delta, axis=1), 1., rtol=0, atol=1e-7)]
     edges = np.asarray(pairs, dtype=int).reshape(-1, 2) if len(pairs) > 0 else np.empty((0, 2), dtype=int)
+    separated = {int(value) for value in separated_label_values if int(value) > 0}
+    if segmentation_labels is not None and len(separated) > 1 and len(edges):
+        # Separate skeleton passes must not acquire direct branch-to-branch
+        # contacts when the merged point set is searched for voxel neighbors.
+        # Trunk interfaces are retained: only two distinct configured branch
+        # labels on the same candidate edge make it ineligible.
+        keep = []
+        for left, right in edges:
+            ends = points[[left, right]]
+            count = max(3, int(np.ceil(np.max(np.abs((ends[1] - ends[0]) / spacing)) * 4)) + 1)
+            samples = ends[0] + np.linspace(0., 1., count)[:, None] * (ends[1] - ends[0])
+            values = set(_sample_graph_labels(samples, segmentation_labels, spacing, origin))
+            keep.append(len(values & separated) < 2)
+        edges = edges[np.asarray(keep, dtype=bool)]
     graph = GraphData(points=points, edges=edges)
-    graph = remove_triangle_cycles(graph)
+    graph = remove_triangle_cycles(graph, segmentation_labels=segmentation_labels, spacing=spacing, origin=origin)
     return graph
 
 
-def remove_triangle_cycles(graph):
+def remove_triangle_cycles(graph, *, segmentation_labels=None, spacing=(1, 1, 1), origin=(0, 0, 0)):
     """Contract isolated triangle junctions to their physical-coordinate centroid.
 
     Keep external edges by remapping their endpoints, without another spatial
     neighbor search. Overlapping triangles, closed triangular rings and patches
     whose contraction would merge distinct external edges are left unchanged.
+    Contraction depends only on geometry and topology, regardless of source
+    labels. Label, spacing and origin keywords remain accepted for compatibility.
     The historical function name is retained for existing callers.
     """
     if len(graph.edges) == 0:
@@ -87,7 +131,7 @@ def remove_triangle_cycles(graph):
     return GraphData(points=points[keep], edges=np.unique(new_edges, axis=0))
 
 
-def remove_short_terminal_branches(graph, min_edge_points=5, *, min_edge_count=None):
+def remove_short_terminal_branches(graph, min_edge_points=3, *, min_edge_count=None):
     """Remove short terminal branches from a skeleton graph.
 
     The graph built from voxel skeleton points contains one graph edge per
@@ -105,7 +149,7 @@ def remove_short_terminal_branches(graph, min_edge_points=5, *, min_edge_count=N
     try:
         threshold = int(min_edge_points)
     except (TypeError, ValueError):
-        threshold = 5
+        threshold = 3
     threshold = max(0, threshold)
     if threshold <= 1 or len(getattr(graph, "edges", [])) == 0:
         return graph

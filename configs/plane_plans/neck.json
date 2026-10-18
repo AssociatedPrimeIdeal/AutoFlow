@@ -159,8 +159,8 @@
       "spacing_ratio": 0.3333333333333333,
       "placements": [
         {
-          "anchor": "label_level",
-          "level": 1,
+          "anchor": "label_terminal",
+          "scope": "label",
           "path_selection": "longest",
           "position": "fractions",
           "fractions": [
@@ -189,8 +189,8 @@
       "spacing_ratio": 0.3333333333333333,
       "placements": [
         {
-          "anchor": "label_level",
-          "level": 1,
+          "anchor": "label_terminal",
+          "scope": "label",
           "path_selection": "longest",
           "position": "fractions",
           "fractions": [

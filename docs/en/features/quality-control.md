@@ -20,6 +20,10 @@ The report contains the topology computed during Generate Graph. Each group is d
 
 The report is for engineering review prioritization. It does not establish clinical validity and must not be interpreted as a diagnostic conclusion.
 
+`graph_hierarchy.groups[].cycle_cleanup` and `joint_systems[].cycle_cleanup` record the automatic positive-single-label cleanup before short-terminal pruning. The v2 audit includes the Flow-C cutoff and connectivity guard, pre/post cycle ranks, protected-edge and unknown-node counts, per-label decisions, removed/rejected path geometry and C values, and input-node indices. Missing or zero valid flow produces `flow_signal_unavailable`; it is not treated as evidence for path deletion. Radius is not used. Cross-label/unknown-node edges are protected; the default connectivity guard retains label-interface reachability and original endpoints. Disabling the guard permits component/path loss and is recorded explicitly. `L?` can remain after cleanup when velocity direction or an upstream relationship is still unresolved. Cleanup provenance is preserved in workspace saves and the canonical topology exports; these removals do not edit the segmentation or source skeleton.
+
+`graph_hierarchy.groups[].junction_cluster_cleanup`, `joint_systems[].junction_cluster_cleanup` and the Willis report record the earlier junction stage as `autoflow.junction_cluster_cleanup.v1`. They include the enabled/extent/cycle settings, detected and eligible cluster counts, bounds and input geometry, source-label composition, boundary ports, same-label routing decisions, removed-edge geometry, pre/post cycle ranks and explicit skip reasons. Input-node ids refer to this stage before compaction, not final Graph ids. Mixed-label clusters can retain protected cross-label cycles. The subsequent Flow audit starts from the routed graph; read the two stages in order.
+
 ## When To Use It
 
 - refresh QC after loading to review input and segmentation checks

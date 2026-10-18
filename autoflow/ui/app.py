@@ -23,6 +23,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from pyvista import _vtk
+from scipy.interpolate import make_interp_spline
 from scipy.ndimage import label as ndi_label
 
 if os.environ.get("AUTOFLOW_SSH_RENDERING") == "1":
@@ -55,6 +56,7 @@ from ..core.pipeline import PipelineEngine
 from ..task_control import CancellationToken, TaskCancelled, check_cancelled, task_scope
 from ..runtime_paths import DOCUMENTATION_URL, documentation_index
 from .progress import TaskProgressDialog
+from .plane_handles import PlaneDragHandles
 from ..config import apply_config_bundle_to_workspace, bundle_to_autoflow_kwargs, load_config_bundle
 from ..plane_io import load_plane_position_payload, project_planes_to_workspace, save_plane_positions
 from ..quality import build_quality_report, save_quality_report
@@ -173,6 +175,29 @@ _PLANE_CURVE_SERIES_OPTIONS = [
     ("wss_wall_peak_Pa_t", "WSS Peak (Pa)"),
     ("wss_wall_p95_Pa_t", "WSS P95 (Pa)"),
 ]
+
+
+def _flowrate_display_curve(values, order=3):
+    """Interpolate finite runs for display without changing measured samples."""
+    values = np.asarray(values, dtype=float).reshape(-1)
+    phases = np.arange(values.size, dtype=float)
+    if values.size < 2 or int(order) <= 1:
+        return phases, values
+    # Include every measured phase exactly, and keep missing phases as gaps.
+    dense_phases = np.linspace(0.0, values.size - 1, (values.size - 1) * 16 + 1)
+    dense_values = np.full(dense_phases.shape, np.nan)
+    finite_indices = np.flatnonzero(np.isfinite(values))
+    for run in np.split(finite_indices, np.flatnonzero(np.diff(finite_indices) > 1) + 1):
+        if run.size == 0:
+            continue
+        start, stop = int(run[0]) * 16, int(run[-1]) * 16 + 1
+        if run.size == 1:
+            dense_values[start] = values[run[0]]
+            continue
+        degree = min(max(1, int(order)), 3, run.size - 1)
+        spline = make_interp_spline(phases[run], values[run], k=degree)
+        dense_values[start:stop] = spline(dense_phases[start:stop])
+    return dense_phases, dense_values
 
 
 _WORKFLOW_STAGES = [
@@ -662,6 +687,8 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self._plane_widget_initializing = False
         self._plane_drag_metrics_dirty = False
         self._plane_edit_enabled = False
+        self._plane_handles = None
+        self._plane_edit_had_metrics = False
         self._plane_center_widget = None
         self._plane_axis_u_widget = None
         self._plane_axis_v_widget = None
@@ -1380,17 +1407,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             self.scene.set_plane_display_settings(size_mm=float(size_mm), render=False)
         self._sync_plane_display_controls()
         if self._plane_edit_enabled and 0 <= int(self._selected_plane_index) < len(self.workspace.planes):
-            plane = self.workspace.planes[int(self._selected_plane_index)]
-            center = self.scene.world_to_display_point(np.asarray(plane.center) + self.workspace.origin)
-            distance = self._plane_widget_distance()
-            self._plane_widget_initializing = True
-            try:
-                for widget, axis in ((self._plane_axis_u_widget, self._plane_axis_u),
-                                     (self._plane_axis_v_widget, self._plane_axis_v)):
-                    if widget is not None and axis is not None:
-                        widget.SetCenter(*(center + self.scene.world_to_display_vector(axis) * distance).tolist())
-            finally:
-                self._plane_widget_initializing = False
+            self._position_plane_handles()
         if self.scene is not None:
             self.plotter.render()
 
@@ -1470,12 +1487,28 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self.analysis_controls_stack.addWidget(pwv_controls)
 
         curve_controls = QtWidgets.QWidget(self)
-        curve_row = QtWidgets.QHBoxLayout(curve_controls)
-        curve_row.setContentsMargins(0, 0, 0, 0)
+        curve_layout = QtWidgets.QVBoxLayout(curve_controls)
+        curve_layout.setContentsMargins(0, 0, 0, 0)
+        curve_row = QtWidgets.QHBoxLayout()
         curve_row.addWidget(QtWidgets.QLabel("Plane Metric"))
         self.combo_plane_curve_metric = QtWidgets.QComboBox()
         self.combo_plane_curve_metric.currentIndexChanged.connect(self._on_plane_curve_metric_changed)
         curve_row.addWidget(self.combo_plane_curve_metric, 1)
+        curve_layout.addLayout(curve_row)
+        smoothing_row = QtWidgets.QHBoxLayout()
+        smoothing_row.addWidget(QtWidgets.QLabel("Flowrate spline order"))
+        self.spin_flowrate_spline_order = QtWidgets.QSpinBox()
+        self.spin_flowrate_spline_order.setRange(1, 3)
+        self.spin_flowrate_spline_order.setValue(3)
+        self.spin_flowrate_spline_order.setToolTip(
+            "1: straight lines; 2: quadratic; 3: cubic (default). "
+            "Only the flowrate display curve changes; original samples and metrics are preserved. "
+            "Short series use the highest order supported by their sample count."
+        )
+        self.spin_flowrate_spline_order.valueChanged.connect(self._on_plane_curve_metric_changed)
+        smoothing_row.addWidget(self.spin_flowrate_spline_order)
+        smoothing_row.addStretch(1)
+        curve_layout.addLayout(smoothing_row)
         self.analysis_controls_stack.addWidget(curve_controls)
 
         pressure_controls = QtWidgets.QWidget(self)
@@ -1689,6 +1722,9 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
                     break
             self.combo_plane_curve_metric.setCurrentIndex(target_idx)
         self.combo_plane_curve_metric.blockSignals(False)
+        self.spin_flowrate_spline_order.setEnabled(
+            str(self.combo_plane_curve_metric.currentData() or "").startswith("flowrate_")
+        )
         return options
 
     def _clear_pwv_axes(self, message="No analysis available.", title="Analysis"):
@@ -1771,7 +1807,15 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self.fig_pwv.clear()
         ax = self.fig_pwv.add_subplot(111)
         phases = np.arange(values.size, dtype=float)
-        ax.plot(phases, values, color="#1f77b4", marker="o", linewidth=2.0, markersize=4)
+        if str(series_key).startswith("flowrate_"):
+            curve_phases, curve_values = _flowrate_display_curve(
+                values, order=self.spin_flowrate_spline_order.value()
+            )
+            ax.plot(curve_phases, curve_values, color="#1f77b4", linewidth=2.0)
+            ax.plot(phases, values, color="#1f77b4", marker="o", linestyle="none",
+                    markersize=4, zorder=3)
+        else:
+            ax.plot(phases, values, color="#1f77b4", marker="o", linewidth=2.0, markersize=4)
         current_t = int(np.clip(self.workspace.current_t, 0, max(0, values.size - 1)))
         ax.axvline(current_t, color="#f08c00", linestyle="--", linewidth=1.2, alpha=0.8, label="Current Phase")
         ax.scatter([current_t], [values[current_t]], color="#f08c00", zorder=4)
@@ -3582,7 +3626,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self._refresh_segmentation_preview()
 
     def _on_3d_plane_picked(self, uid, plane_idx):
-        if self._edit_mode is not None:
+        if self._edit_mode is not None or self._plane_edit_enabled:
             return
         if uid is None or plane_idx is None:
             self.workspace.selected_path_index = -1
@@ -3610,7 +3654,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self._refresh_analysis_panel()
 
     def _on_3d_path_picked(self, uid, path_idx):
-        if self._edit_mode is not None:
+        if self._edit_mode is not None or self._plane_edit_enabled:
             return
         if uid is None or path_idx is None:
             self.workspace.selected_path_index = -1
@@ -4091,6 +4135,15 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             self.btn_edit_plane.setEnabled(selected)
             self.btn_edit_plane.setText("Finish Plane Edit" if editing else "Edit Plane")
 
+    def _position_plane_handles(self):
+        if self._plane_handles is None or self._plane_drag_index is None:
+            return
+        plane = self.workspace.planes[int(self._plane_drag_index)]
+        self._plane_handles.update(
+            self.scene.world_to_display_point(np.asarray(plane.center) + self.workspace.origin),
+            self.scene.world_to_display_vector(self._plane_axis_u),
+            self.scene.world_to_display_vector(self._plane_axis_v), self._plane_widget_distance())
+
     def _add_manual_plane(self):
         if self._pipeline_running_guard("adding a plane") or self._autoseg_running_guard("adding a plane"):
             return
@@ -4118,7 +4171,14 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         else:
             self.workspace.derived.plane_metrics = []
         self.workspace.derived.plane_qc = {}
-        self._rebuild_plane_objects()
+        # Append only the new actor. Rebuilding all planes also discarded
+        # unrelated pathlines and recreated every existing scene actor.
+        cfg = self.workspace.render_settings.get("plane_render_cfg", {}).get("default", {}) or {}
+        self.workspace.add_object(
+            name=f"plane {old_count}", kind=ObjectKind.PLANE, data_key=f"plane_{old_count}",
+            visible=True, opacity=float(cfg.get("plane_opacity", 0.75)),
+            color=str(cfg.get("plane_color") or "yellow"), line_width=2)
+        self.scene.sync_from_workspace(rebuild_prefixes=())
         self._refresh_browser()
 
         plane_idx = len(self.workspace.planes) - 1
@@ -4153,24 +4213,23 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             self.log(f"Editing plane {plane_idx}")
 
     def _clear_plane_drag_widgets(self):
+        if self._plane_handles is not None:
+            self._plane_handles.close()
+            self._plane_handles = None
+        if self.scene is not None:
+            self.scene._plane_selection_locked = False
         self._plane_drag_active = False
         self._plane_drag_index = None
         self._plane_widget_initializing = False
         self._plane_drag_metrics_dirty = False
         self._plane_edit_enabled = False
+        self._plane_edit_had_metrics = False
         self._plane_center_widget = None
         self._plane_axis_u_widget = None
         self._plane_axis_v_widget = None
         self._plane_axis_u = None
         self._plane_axis_v = None
         self._refresh_plane_edit_controls()
-        if self._edit_mode is not None:
-            return
-        try:
-            if hasattr(self.plotter, "clear_sphere_widgets"):
-                self.plotter.clear_sphere_widgets()
-        except Exception:
-            pass
 
     def _update_plane_from_drag(self, plane_idx, center=None, normal=None):
         if self._plane_widget_initializing:
@@ -4207,6 +4266,13 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         if not changed:
             return
         self._last_quality_report = None
+        if not self._plane_drag_metrics_dirty:
+            # Geometry no longer matches the previously calculated values.
+            plane.metrics = {}
+            if len(self.workspace.derived.plane_metrics) == len(self.workspace.planes):
+                self.workspace.derived.plane_metrics[int(plane_idx)] = {}
+            self.workspace.derived.plane_qc = {}
+            self.workspace.derived.plane_pixelwise_file = ""
         uid = self._find_uid_by_indexed_data_key("plane", int(plane_idx))
         if uid is not None:
             self.scene.update_plane_geometry(uid, render=False)
@@ -4217,30 +4283,13 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         if self._plane_edit_enabled:
             self._plane_widget_initializing = True
             try:
-                current_center = (
-                    np.asarray(plane.center, dtype=float).reshape(3)
-                    + np.asarray(self.workspace.origin, dtype=float).reshape(3)
-                )
-                current_center = self.scene.world_to_display_point(current_center)
-                current_normal = np.asarray(plane.normal, dtype=float).reshape(3)
-                current_normal = current_normal / (np.linalg.norm(current_normal) + 1e-12)
                 if self._plane_axis_u is None or self._plane_axis_v is None:
-                    self._plane_axis_u, self._plane_axis_v = _plane_in_plane_axes(current_normal)
-                axis_u = np.asarray(self._plane_axis_u, dtype=float).reshape(3)
-                axis_v = np.asarray(self._plane_axis_v, dtype=float).reshape(3)
-                distance = self._plane_widget_distance()
-                if self._plane_center_widget is not None:
-                    self._plane_center_widget.SetCenter(*current_center.tolist())
-                if self._plane_axis_u_widget is not None:
-                    self._plane_axis_u_widget.SetCenter(*(current_center + axis_u * distance).tolist())
-                if self._plane_axis_v_widget is not None:
-                    self._plane_axis_v_widget.SetCenter(*(current_center + axis_v * distance).tolist())
+                    self._plane_axis_u, self._plane_axis_v = _plane_in_plane_axes(plane.normal)
+                self._position_plane_handles()
             finally:
                 self._plane_widget_initializing = False
-        try:
-            self.plotter.render()
-        except Exception:
-            pass
+        # vtkHandleWidget renders after its InteractionEvent. Rendering here
+        # would draw the same volume twice for every mouse movement.
 
     def _persist_plane_outputs(self, include_pixelwise=True):
         out_dir = self.pipeline._output_dir(self.workspace)
@@ -4281,6 +4330,8 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
     def _finalize_plane_drag(self, plane_idx):
         if not (0 <= int(plane_idx) < len(self.workspace.planes)):
             return
+        if self._plane_edit_enabled and not self._plane_drag_metrics_dirty:
+            return
         self._plane_drag_index = int(plane_idx)
         uid = self._find_uid_by_indexed_data_key("plane", int(plane_idx))
         if uid is not None:
@@ -4294,6 +4345,11 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
                 if pathline_obj is not None:
                     self.scene.readd_object(pathline_obj, refresh_scalar_bar=False)
         self.ortho_viewer.set_selected_plane(int(plane_idx))
+        if self._plane_edit_enabled and not self._plane_edit_had_metrics:
+            self._persist_plane_outputs(include_pixelwise=False)
+            self._plane_drag_metrics_dirty = False
+            self._refresh_selection_info()
+            return
         if self.workspace.flow_raw is None or self.workspace.segmask_binary is None:
             self._persist_plane_outputs(include_pixelwise=False)
             self._plane_drag_metrics_dirty = False
@@ -4339,6 +4395,8 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             return
         if self._plane_drag_active and int(self._plane_drag_index) == int(plane_idx):
             return
+        if self._play_timer.isActive():
+            self._on_pause()
         self._clear_plane_drag_widgets()
         plane = self.workspace.planes[int(plane_idx)]
         origin = np.asarray(self.workspace.origin, dtype=float).reshape(3)
@@ -4348,15 +4406,11 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             normal = np.array([1.0, 0.0, 0.0], dtype=float)
         normal = normal / np.linalg.norm(normal)
         axis_u, axis_v = _plane_in_plane_axes(normal)
-        display_center = self.scene.world_to_display_point(center)
-        display_axis_u = self.scene.world_to_display_vector(axis_u)
-        display_axis_v = self.scene.world_to_display_vector(axis_v)
         self._plane_axis_u = axis_u
         self._plane_axis_v = axis_v
-        distance = self._plane_widget_distance()
-        tip_u = display_center + display_axis_u * distance
-        tip_v = display_center + display_axis_v * distance
-        radius = self._edit_widget_radius()
+        metrics = self.workspace.derived.plane_metrics
+        self._plane_edit_had_metrics = bool(plane.metrics) or (
+            len(metrics) == len(self.workspace.planes) and bool(metrics[int(plane_idx)]))
 
         def _center_cb(new_center):
             self._update_plane_from_drag(
@@ -4368,68 +4422,53 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             if self._plane_axis_v is None:
                 return
             c = self.scene.world_to_display_point(np.asarray(self.workspace.planes[int(plane_idx)].center, dtype=float).reshape(3) + origin)
-            proposed = np.asarray(new_tip, dtype=float).reshape(3) - c
-            current_v = self.scene.world_to_display_vector(self._plane_axis_v)
+            proposed = self.scene.display_to_world_vector(np.asarray(new_tip, dtype=float).reshape(3) - c)
+            current_v = self._plane_axis_v
             proposed = proposed - np.dot(proposed, current_v) * current_v
             if np.linalg.norm(proposed) <= 1e-12:
                 return
             self._plane_axis_u = proposed / np.linalg.norm(proposed)
             new_normal = np.cross(self._plane_axis_u, current_v)
-            self._update_plane_from_drag(plane_idx, normal=self.scene.display_to_world_vector(new_normal))
+            self._update_plane_from_drag(plane_idx, normal=new_normal)
 
         def _axis_v_cb(new_tip):
             if self._plane_axis_u is None:
                 return
             c = self.scene.world_to_display_point(np.asarray(self.workspace.planes[int(plane_idx)].center, dtype=float).reshape(3) + origin)
-            proposed = np.asarray(new_tip, dtype=float).reshape(3) - c
-            current_u = self.scene.world_to_display_vector(self._plane_axis_u)
+            proposed = self.scene.display_to_world_vector(np.asarray(new_tip, dtype=float).reshape(3) - c)
+            current_u = self._plane_axis_u
             proposed = proposed - np.dot(proposed, current_u) * current_u
             if np.linalg.norm(proposed) <= 1e-12:
                 return
             self._plane_axis_v = proposed / np.linalg.norm(proposed)
             new_normal = np.cross(current_u, self._plane_axis_v)
-            self._update_plane_from_drag(plane_idx, normal=self.scene.display_to_world_vector(new_normal))
+            self._update_plane_from_drag(plane_idx, normal=new_normal)
 
-        def _end_cb(_widget, _event):
-            self._finalize_plane_drag(plane_idx)
+        def _end_cb():
+            # Preview only: no time-series metrics, pathlines or disk writes.
+            if self._plane_drag_metrics_dirty:
+                self.ortho_viewer.set_selected_plane(int(plane_idx))
+                self.ortho_viewer.label_plane_metric.setText("Plane metrics: pending — Finish Plane Edit")
+                self._set_plane_info_text(f"Plane {plane_idx} · geometry changed\nMetrics update on Finish Plane Edit.")
+            self.plotter.render()
 
         try:
             self._plane_widget_initializing = True
-            center_widget = self.plotter.add_sphere_widget(
-                callback=_center_cb,
-                center=tuple(display_center.tolist()),
-                radius=radius,
-                color="cyan",
-                interaction_event="always",
-            )
-            axis_u_widget = self.plotter.add_sphere_widget(
-                callback=_axis_u_cb,
-                center=tuple(tip_u.tolist()),
-                radius=radius,
-                color="orange",
-                interaction_event="always",
-            )
-            axis_v_widget = self.plotter.add_sphere_widget(
-                callback=_axis_v_cb,
-                center=tuple(tip_v.tolist()),
-                radius=radius,
-                color="yellow",
-                interaction_event="always",
-            )
-            center_widget.AddObserver(_vtk.vtkCommand.EndInteractionEvent, _end_cb)
-            axis_u_widget.AddObserver(_vtk.vtkCommand.EndInteractionEvent, _end_cb)
-            axis_v_widget.AddObserver(_vtk.vtkCommand.EndInteractionEvent, _end_cb)
-            self._plane_center_widget = center_widget
-            self._plane_axis_u_widget = axis_u_widget
-            self._plane_axis_v_widget = axis_v_widget
-            self._plane_axis_u = axis_u
-            self._plane_axis_v = axis_v
+            self._plane_handles = PlaneDragHandles(
+                self.plotter, self.scene, (_center_cb, _axis_u_cb, _axis_v_cb),
+                on_start=lambda: self._on_pause() if self._play_timer.isActive() else None,
+                on_end=_end_cb)
+            (self._plane_center_widget, self._plane_axis_u_widget, self._plane_axis_v_widget) = (
+                rep for _, rep in self._plane_handles.handles)
             self._plane_drag_active = True
             self._plane_drag_index = int(plane_idx)
             self._plane_edit_enabled = True
+            self.scene._plane_selection_locked = True
+            self._position_plane_handles()
+            self._plane_handles.enable()
+            self.plotter.render()
         except Exception as e:
-            self._plane_drag_active = False
-            self._plane_drag_index = None
+            self._clear_plane_drag_widgets()
             self.log(f"Plane drag widget error: {type(e).__name__}: {e}")
         finally:
             self._plane_widget_initializing = False
@@ -5437,6 +5476,15 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self.scene.set_selected_layers([obj.uid for obj in self._browser_selected_objects()], on_top=checked)
 
     def _on_browser_select(self):
+        if self._plane_edit_enabled:
+            # Browser navigation is deliberate; finish the old plane before
+            # changing the selected index. Stray 3D clicks stay locked out.
+            objects = self._browser_selected_objects()
+            current_uid = self._find_uid_by_indexed_data_key("plane", self._plane_drag_index)
+            if len(objects) == 1 and objects[0].uid == current_uid:
+                return
+            self._finalize_plane_drag(int(self._plane_drag_index))
+            self._clear_plane_drag_widgets()
         self.scene.set_selected_layers([obj.uid for obj in self._browser_selected_objects()], render=False)
         self._refresh_content_render_controls()
         self._refresh_browser_opacity_control()

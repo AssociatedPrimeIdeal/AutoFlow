@@ -65,6 +65,8 @@ from .graph import (
     graph_to_polydata,
 )
 
+from .graph_junctions import simplify_junction_clusters
+
 from .paths import (
     _vector_orientation_text,
     _path_cumulative_distance,
@@ -196,6 +198,7 @@ __all__ = [
     "generate_three_pass_special_skeleton",
     "build_graph_from_points",
     "remove_triangle_cycles",
+    "simplify_junction_clusters",
     "remove_short_terminal_branches",
     "graph_to_networkx",
     "graph_to_polydata",

@@ -1,4 +1,5 @@
 # Configuration system
+Plane path-property specifications support `scope=label` for a single selection over all physical components, and `position=after_start` / `position=before_end` for offsets from the reliable flow-oriented interval start/end. Defaults and the full label table are documented in [Planes](../features/planes.md#default-label-measurements); global layout fields do not override these positions.
 
 AutoFlow keeps defaults in per-module JSON files. The complete key/type/default/effect/owner tables are maintained in [Configuration parameters](../user/parameters.md); nested groups and learned-backend options are in [Structured parameters](../user/parameter-schemas.md).
 
@@ -94,3 +95,7 @@ successful integration; failed/cancelled reruns retain the old visible result.
 
 Validate through the existing smoke/phantom suite in
 `tests/test_smoke_phantoms.py`; do not introduce a separate GUI test file.
+
+Graph filtering defaults live in `skeleton.cycle_flow_threshold=0.3` and `skeleton.cycle_preserve_connectivity=true`, with API fields and CLI flags of the same names (CLI uses hyphens). Native group `preprocess` overrides inherit these values; joint cerebral/Willis analysis uses the globals. `SkeletonParams` validates ranges/types and persists both fields. No radius-priority cleanup runs as a fallback. The protected systemic branch default is RBCT/CCA/LBCT/HA/SMA/LRA/RRA. StrS/LTS/RTS use `position=after_start` +20 mm; SSS and the unconnected SMV/SV fallbacks use end references. PV uses connected `fractions=[0.2,0.5,0.8]` with `plane_count=3`; its unconnected fallback keeps highest-level/longest selection and uses those same fractions. Code defaults and both combined/portal presets agree.
+
+Compact junction routing uses `skeleton.junction_cluster_enabled=true`, `junction_cluster_max_extent_voxels=8.0` and `junction_cluster_min_cycle_rank=2`. `SkeletonParams` strictly validates and round-trips these fields; group entries and their preprocess mappings may override them. The API, CLI, Generate Graph dialog and batch config copies use the same fields. Native groups apply routing after the triangle pass; joint cerebral/Willis apply the same global settings before their Flow filter. Workspace group snapshots and hierarchy JSON preserve the independent `junction_cluster_cleanup` audit.

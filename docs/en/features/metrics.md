@@ -57,6 +57,15 @@ than treating the missing path as zero flow.
 4. when plane geometry needs correction, use `Edit Plane`; releasing a handle recomputes only that plane and updates the metric and plane records
 5. click `Calculate && Save Metrics` after interactive edits when a fully regenerated `plane_metrics_pixelwise.h5` is required
 
+In the right-side `Analysis` dock, select `Display -> Plane Curve` and a flowrate
+metric. `Flowrate spline order` defaults to **3 (cubic)**; choose **2 (quadratic)**
+or **1 (straight lines)** to change the curve immediately. All four flowrate
+series use this control. Original cardiac-phase samples remain visible as dots,
+and the interpolated line passes through them. The orange current-phase point
+and the numeric summaries still use the original samples. The setting lasts for
+the current GUI session and is shared when switching planes or flowrate series.
+Other metric curves retain their existing display.
+
 The completion refresh preserves each segmentation group's current Browser visibility. A group that was shown stays shown and a hidden group stays hidden. The Segmentation dock's visibility switch still applies to all segmentation groups when changed explicitly.
 
 ### CLI
@@ -83,6 +92,13 @@ Use the standard `run_case()` or `run_batch()` flow. Plane metrics run unless `s
 ## Parameters
 
 See [batch parameters](../user/parameters.md#batch), [planes parameters](../user/parameters.md#planes), [CLI flags](../user/cli-parameters.md), and [API fields](../user/api-parameters.md) for complete type/default/unit/effect/owner tables. Dictionary controls are expanded in [Structured parameters](../user/parameter-schemas.md).
+
+| Parameter | Type | Default | Where configured | Effect | Code owner |
+| --- | --- | --- | --- | --- | --- |
+| `Flowrate spline order` | integer, 1–3 | `3` | GUI `Analysis -> Plane Curve`; current session only | Interpolate the displayed flowrate line; 1 restores straight segments. Raw samples, calculations and exported data are unchanged | `autoflow/ui/app.py` |
+
+The spline display is **GUI only**. CLI and Python metric calculations continue
+to return the original per-phase flowrate arrays without display interpolation.
 
 Derived plane sampling reuses a slice only for the same support phase and ROI state. Each timepoint uses its own contour edits, including when the volume mask is unchanged. Label-specific support meshes also share geometry across phases when that label's filtered mask is identical.
 
@@ -178,6 +194,8 @@ trilinear terms in float64 before float32 assignment. Connected components are
 computed once per phase per call and reused across paths.
 
 ## Limitations
+- flowrate display interpolation changes the line between samples rather than denoising measurements; quadratic/cubic splines can overshoot between samples
+- short finite runs automatically use at most `sample count - 1` as the spline order; missing phases remain gaps and the final phase is not joined to the first
 - segmentation is required
 - plane metrics depend on valid plane placement
 - derived summaries attached to planes depend on opting in to the corresponding derived metrics

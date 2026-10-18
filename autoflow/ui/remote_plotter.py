@@ -294,6 +294,10 @@ class RemotePlotter(QtWidgets.QWidget):
             and bool(event.modifiers() & QtCore.Qt.ShiftModifier)
         )
         if event.button() == QtCore.Qt.LeftButton:
+            dispatch_plane = getattr(self, "_autoflow_plane_widget_dispatch", None)
+            if not shift_left and callable(dispatch_plane) and dispatch_plane("press"):
+                event.accept()
+                return
             dispatch_handle = getattr(self, "_autoflow_content_widget_dispatch", None)
             if not shift_left and callable(dispatch_handle) and dispatch_handle("press"):
                 event.accept()
@@ -343,6 +347,9 @@ class RemotePlotter(QtWidgets.QWidget):
             return
         self._set_mouse_payload(payload)
         self._last_motion_at = time.monotonic()
+        dispatch_plane = getattr(self, "_autoflow_plane_widget_dispatch", None)
+        if callable(dispatch_plane) and dispatch_plane("move"):
+            return
         dispatch_handle = getattr(self, "_autoflow_content_widget_dispatch", None)
         if callable(dispatch_handle) and dispatch_handle("move"):
             return
@@ -364,6 +371,13 @@ class RemotePlotter(QtWidgets.QWidget):
         self._flush_mouse_move()
         self._mouse_buttons_active = bool(event.buttons())
         self._set_mouse_event(event)
+        dispatch_plane = getattr(self, "_autoflow_plane_widget_dispatch", None)
+        if event.button() == QtCore.Qt.LeftButton and callable(dispatch_plane) and dispatch_plane("release"):
+            preview = getattr(self, "_autoflow_interaction_preview", None)
+            if callable(preview):
+                preview(False)
+            event.accept()
+            return
         dispatch_handle = getattr(self, "_autoflow_content_widget_dispatch", None)
         if event.button() == QtCore.Qt.LeftButton and callable(dispatch_handle) and dispatch_handle("release"):
             preview = getattr(self, "_autoflow_interaction_preview", None)

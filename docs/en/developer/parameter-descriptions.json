@@ -56,7 +56,7 @@
       "min_cc_volume_mm3": "Absolute connected-component volume threshold in cubic millimetres.",
       "cc_filter_mode": "Component retention after group morphology: hybrid (default) keeps volumes at least max(50 mm3, 10% of the largest); largest explicitly keeps one. Temporal group masks are filtered per frame.",
       "cc_rel_min_ratio": "Smallest retained component as a fraction of the largest in relative/hybrid filtering; default 0.10.",
-      "min_edge_points": "Minimum retained terminal-branch length in graph edges; default 5 removes one-to-four-edge endpoint arms.",
+      "min_edge_points": "Minimum retained terminal-branch length in graph edges; default 3 removes one- or two-edge endpoint arms.",
       "graph_connectivity": "Skeleton graph neighbors: 26 including edges and corners (default), or 6 face neighbors. Separate from preprocessing component filtering.",
       "do_closing": "Boolean binary-closing switch, off by default; explicit closing_iters also defaults to zero.",
       "do_opening": "Legacy Boolean binary-opening switch used in default preprocessing.",
@@ -65,7 +65,12 @@
       "dilation_iters": "Number of binary dilation iterations; expands support and can connect nearby vessels. Zero disables this operation.",
       "erosion_iters": "Number of binary erosion iterations; shrinks support and can remove narrow structures.",
       "opening_iters": "Number of explicit binary opening iterations; removes small protrusions/components.",
-      "closing_iters": "Number of explicit binary closing iterations; fills small gaps and holes."
+      "closing_iters": "Number of explicit binary closing iterations; fills small gaps and holes.",
+      "cycle_flow_threshold": "Flow C cutoff in [0, 1]: delete only paths strictly below it; 0 disables deletions. Missing/zero valid flow is skipped; radius is not used.",
+      "cycle_preserve_connectivity": "Protect each original within-label component, label interfaces and endpoints. False allows low-C paths to split/remove components; cross-label/unknown edges remain excluded from removal.",
+      "junction_cluster_enabled": "Enable compact junction routing after triangle contraction and before Flow filtering; preserve existing interfaces, original endpoints and label connectivity.",
+      "junction_cluster_max_extent_voxels": "Maximum candidate extent along each voxel axis; default 8, finite and at least 1. Long clusters are reported and retained.",
+      "junction_cluster_min_cycle_rank": "Minimum internal independent-cycle count E-V+1 for a junction-cluster candidate; default 2, positive integer."
     },
     "labels": {
       "single_label_group_name": "Group name for a binary/single-label input in the GUI browser and grouped analysis.",
@@ -579,7 +584,7 @@
     },
     "min_edge_points": {
       "path": "skeleton.min_edge_points",
-      "effect": "Minimum retained terminal-branch length in graph edges; default 5 removes one-to-four-edge endpoint arms. Junction-to-junction links are retained."
+      "effect": "Minimum retained terminal-branch length in graph edges; default 3 removes one- or two-edge endpoint arms. Junction-to-junction links are retained."
     },
     "graph_connectivity": {
       "path": "skeleton.graph_connectivity",
@@ -882,6 +887,26 @@
     "render_background_color": {
       "path": "ui.background_color",
       "effect": "Shared GUI viewport and offline-video background, as a VTK colour name or hexadecimal RGB. Text contrast follows the background; changes display only."
+    },
+    "cycle_flow_threshold": {
+      "path": "skeleton.cycle_flow_threshold",
+      "effect": "Flow C cutoff in [0, 1]: delete only paths strictly below it; 0 disables deletions. Missing/zero valid flow is skipped; radius is not used."
+    },
+    "cycle_preserve_connectivity": {
+      "path": "skeleton.cycle_preserve_connectivity",
+      "effect": "Protect each original within-label component, label interfaces and endpoints. False allows low-C paths to split/remove components; cross-label/unknown edges remain excluded from removal."
+    },
+    "junction_cluster_enabled": {
+      "path": "skeleton.junction_cluster_enabled",
+      "effect": "Enable compact junction routing after triangle contraction and before Flow filtering; preserve existing interfaces, original endpoints and label connectivity."
+    },
+    "junction_cluster_max_extent_voxels": {
+      "path": "skeleton.junction_cluster_max_extent_voxels",
+      "effect": "Maximum candidate extent along each voxel axis; default 8, finite and at least 1. Long clusters are reported and retained."
+    },
+    "junction_cluster_min_cycle_rank": {
+      "path": "skeleton.junction_cluster_min_cycle_rank",
+      "effect": "Minimum internal independent-cycle count E-V+1 for a junction-cluster candidate; default 2, positive integer."
     }
   }
 }
