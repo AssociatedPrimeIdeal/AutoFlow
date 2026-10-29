@@ -1,15 +1,24 @@
 {
+  "integration_backend": "auto",
   "seed_ratio": 0.1,
   "max_steps": 200,
   "min_seeds": 50,
   "terminal_speed": 0.01,
   "rng_seed": 0,
   "tube_radius": 0.05,
+  "seed_region": "segmentation",
+  "seed_distribution": "uniform",
+  "seed_mode": "ratio",
+  "seed_count": 1000,
+  "grid_spacing_mm": 0.0,
+  "integration_step_mm": null,
+  "display_style": "lines",
+  "display_min_speed_cm_s": 0.0,
   "render": {
-    "cmap": "turbo",
+    "cmap": "jet",
     "opacity": 1.0,
     "clim": null,
     "show_scalar_bar": true,
-    "line_width": 2.0
+    "line_width": 1.0
   }
 }

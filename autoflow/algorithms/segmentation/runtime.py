@@ -119,7 +119,7 @@ def _run_subprocess(command, *, env=None, cwd=None, runner=None, progress_callba
                 now = time.perf_counter()
                 if progress_callback is not None and now >= next_update:
                     completed = sum(
-                        path.name.endswith((".nii", ".nii.gz"))
+                        path.name.endswith((".nii", ".nii.gz")) and ".geometry1mm." not in path.name
                         for path in Path(output_dir).iterdir()
                     ) if output_dir is not None else 0
                     _emit_progress(
@@ -229,19 +229,18 @@ def _nnunet_predict_command(python_executable=None, bootstrap_resampler_path=Non
             "from autoflow.nnunet_runtime import configure_exact_inference_runtime; "
             "configure_exact_inference_runtime(); main()"
         )
+    runtime_root = repr(str(Path(__file__).resolve().parents[3]))
+    code = code[:-6] + (
+        f"import sys; sys.path.insert(0, {runtime_root}); "
+        "from autoflow.algorithms.segmentation.model_grid import configure_geometry_export_runtime; "
+        "configure_geometry_export_runtime(); main()"
+    )
     if python_executable and Path(str(python_executable)).is_file():
         return [
             str(python_executable),
             "-c",
             code,
         ]
-    executable = None if portable_root() is not None else shutil.which("nnUNetv2_predict_from_modelfolder")
-    if executable:
-        if bootstrap_resampler_path or optimize_transfers:
-            # The console entry point cannot execute the bootstrap prelude;
-            # use the active interpreter so the child can install the helper.
-            return [sys.executable, "-c", code]
-        return [executable]
     return [
         sys.executable,
         "-c",

@@ -24,6 +24,10 @@
       "plane_opacity": 0.75
     },
     "groups": {
+      "single_label": {
+        "plane_color": "#75acb2",
+        "plane_opacity": 0.75
+      },
       "aorta_systemic_branches": {
         "plane_color": "#ffd43b",
         "plane_opacity": 0.75
@@ -53,5 +57,11 @@
         "plane_opacity": 0.75
       }
     }
-  }
+  },
+  "smoothing_method": "radius_adaptive",
+  "smoothing_radius_factor": 2.0,
+  "smoothing_max_displacement_ratio": 0.15,
+  "smoothing_sample_step_mm": 0.5,
+  "smoothing_radius_sigma_mm": 3.0,
+  "smoothing_backend": "auto"
 }

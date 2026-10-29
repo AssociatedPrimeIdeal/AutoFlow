@@ -81,6 +81,19 @@ def load_segmentation_file(path, spatial_shape=None, time_count=1):
         "dataset": dataset_name,
         "created_at": segmentation_timestamp(),
     }
+    # Carry physical-grid metadata for portable 1-mm segmentation sidecars.
+    if ext in (".nii", ".nii.gz"):
+        provenance.update(resolution=np.linalg.norm(image.affine[:3, :3], axis=0).tolist(),
+                          origin=image.affine[:3, 3].tolist())
+    elif ext in (".h5", ".hdf5"):
+        with h5py.File(path, "r") as handle:
+            for key, dest in (("Resolution", "resolution"), ("Origin", "origin")):
+                if key in handle:
+                    provenance[dest] = np.asarray(handle[key]).reshape(3).tolist()
+            if "provenance_json" in handle.attrs:
+                saved = json.loads(handle.attrs["provenance_json"])
+                if saved.get("grid"):
+                    provenance["grid"] = saved["grid"]
     return seg, provenance
 
 
@@ -138,7 +151,8 @@ def save_nifti_volume(path, volume, resolution=None, origin=None):
 
 
 def save_segmentation_to_source_h5(path, segmentation, resolution=None, origin=None, provenance=None, dataset_name="segmask", source_spatial_order=None, source_group=None):
-    arr = np.asarray(segmentation, dtype=np.int16)
+    native_internal = np.asarray(segmentation, dtype=np.int16)
+    arr = native_internal
     source_order = tuple(str(x).upper() for x in (source_spatial_order or ()))
     if source_order and source_order != _AUTOFLOW_INTERNAL_SPATIAL_ORDER:
         arr = _reorient_spatial_only(
@@ -167,6 +181,25 @@ def save_segmentation_to_source_h5(path, segmentation, resolution=None, origin=N
                 del target_group[actual]
                 target_name = actual
         ds = target_group.create_dataset(target_name, data=arr, compression="gzip")
+        geometry_name = target_name + "_geometry1mm"
+        if geometry_name in target_group:
+            del target_group[geometry_name]
+        if geometry_name+"_4d" in target_group:
+            del target_group[geometry_name+"_4d"]
+        geometry_path = (provenance or {}).get("geometry_cache_path")
+        if geometry_path:
+            from ..geometry_grid import read_geometry_cache, segmentation_digest
+            try:
+                labels, info = read_geometry_cache(geometry_path)
+                if info.get("native_sha256") == segmentation_digest(native_internal):
+                    info["origin_mm"] = np.asarray(origin if origin is not None else (0, 0, 0)).tolist()
+                    geometry = target_group.create_dataset(geometry_name, data=labels, compression="gzip")
+                    geometry.attrs["geometry_json"] = json.dumps(info)
+                    temporal, _ = read_geometry_cache(geometry_path, temporal=True)
+                    if temporal.ndim == 4:
+                        target_group.create_dataset(geometry_name+"_4d", data=temporal, compression="gzip")
+            except (OSError, KeyError, ValueError) as error:
+                ds.attrs["geometry_cache_status"] = f"not_embedded: {error}"
         ds.attrs["autoflow_source"] = "auto_segmentation"
         ds.attrs["autoflow_created_at"] = segmentation_timestamp()
         if group_name is not None:

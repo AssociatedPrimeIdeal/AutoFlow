@@ -1,6 +1,6 @@
 {
   "single_label_group_name": "single_label",
-  "single_label_browser_color": "#d9480f",
+  "single_label_browser_color": "#8eb6c7",
   "default_group_browser_color": "#1c7ed6",
   "label_map": {
     "background": 0,
@@ -38,15 +38,31 @@
     "RIJV": 32
   },
   "label_groups": {
+    "single_label": {
+      "labels": [],
+      "path_color": "#6bb5cb",
+      "plane_color": "#75acb2"
+    },
     "aorta_systemic_branches": {
-      "labels": ["AAO", "ARCH", "DAO", "RBCT", "CCA", "LBCT", "HA", "SMA", "LRA", "RRA"],
+      "labels": [
+        "AAO",
+        "ARCH",
+        "DAO",
+        "RBCT",
+        "CCA",
+        "LBCT",
+        "HA",
+        "SMA",
+        "LRA",
+        "RRA"
+      ],
       "browser_color": "#c92a2a",
       "skeleton_color": "#c92a2a",
       "graph_color": "#e03131",
       "path_color": "#f76707",
       "plane_color": "#ffd43b",
       "preprocess": {
-        "gaussian_enabled": true,
+        "gaussian_enabled": false,
         "gaussian_sigma": 0.5,
         "dilation_iters": 0,
         "erosion_iters": 0,
@@ -55,7 +71,11 @@
       }
     },
     "pulmonary_arteries": {
-      "labels": ["MPA", "RPA", "LPA"],
+      "labels": [
+        "MPA",
+        "RPA",
+        "LPA"
+      ],
       "browser_color": "#1971c2",
       "skeleton_color": "#1971c2",
       "graph_color": "#1c7ed6",
@@ -64,7 +84,11 @@
       "preprocess": {}
     },
     "portal_splenic_venous": {
-      "labels": ["PV", "SMV", "SV"],
+      "labels": [
+        "PV",
+        "SMV",
+        "SV"
+      ],
       "browser_color": "#2b8a3e",
       "skeleton_color": "#2b8a3e",
       "graph_color": "#37b24d",
@@ -73,7 +97,13 @@
       "preprocess": {}
     },
     "intracranial_anterior_arteries": {
-      "labels": ["LICA", "RICA", "LMCA", "RMCA", "ACA"],
+      "labels": [
+        "LICA",
+        "RICA",
+        "LMCA",
+        "RMCA",
+        "ACA"
+      ],
       "browser_color": "#862e9c",
       "skeleton_color": "#862e9c",
       "graph_color": "#9c36b5",
@@ -83,7 +113,13 @@
       "willis_ring_role": "anterior"
     },
     "vertebrobasilar_arteries": {
-      "labels": ["LVA", "RVA", "BA", "LPCA", "RPCA"],
+      "labels": [
+        "LVA",
+        "RVA",
+        "BA",
+        "LPCA",
+        "RPCA"
+      ],
       "browser_color": "#5f3dc4",
       "skeleton_color": "#5f3dc4",
       "graph_color": "#7048e8",
@@ -93,7 +129,12 @@
       "willis_ring_role": "posterior"
     },
     "intracranial_veins": {
-      "labels": ["StrS", "RTS", "SSS", "LTS"],
+      "labels": [
+        "StrS",
+        "RTS",
+        "SSS",
+        "LTS"
+      ],
       "browser_color": "#0b7285",
       "skeleton_color": "#0b7285",
       "graph_color": "#1098ad",
@@ -102,7 +143,10 @@
       "preprocess": {}
     },
     "jugular_veins": {
-      "labels": ["LIJV", "RIJV"],
+      "labels": [
+        "LIJV",
+        "RIJV"
+      ],
       "browser_color": "#495057",
       "skeleton_color": "#495057",
       "graph_color": "#868e96",

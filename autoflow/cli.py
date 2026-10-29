@@ -106,6 +106,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.set_defaults(background_phase_correction=None)
     parser.set_defaults(background_phase_write_cache=None)
 
+    parser.add_argument("--path-smoothing", dest="path_smoothing_method", choices=["radius_adaptive", "savgol", "none"], default=None, help="Centerline smoothing; default radius_adaptive uses a 2r window, 0.15r movement cap and lumen containment.")
+    parser.add_argument("--path-smoothing-radius-factor", type=float, default=None, help="Half-window in local lumen radii; default 2.")
+    parser.add_argument("--path-smoothing-max-displacement-ratio", type=float, default=None, help="Maximum centerline displacement / local radius; default 0.15.")
+    parser.add_argument("--path-smoothing-step-mm", dest="path_smoothing_sample_step_mm", type=float, default=None, help="Physical centerline sample spacing; default 0.5 mm.")
+    parser.add_argument("--path-smoothing-radius-sigma-mm", type=float, default=None, help="Arc-length smoothing scale for lumen radius; default 3 mm.")
+    parser.add_argument("--path-smoothing-backend", choices=["auto", "cpu", "gpu"], default=None, help="Local fit backend. Auto uses vectorized CPU for small host-resident paths; GPU is optional with CPU fallback.")
     parser.add_argument("--plane-mode", choices=["by_label", "uniform", "fixed_step", "count", "distance", "anchored_offset"], default=None, help="Plane placement mode. Default by_label uses one selected label-contained segment per label.")
     parser.add_argument("--plane-config", default=None, help="Standalone per-label plane JSON shared with the GUI. Missing labels are disabled.")
     parser.add_argument("--plane-count", type=int, default=None, help="Global plane modes only: plane count; -1 places every position that fits. By-label counts come from planes.label_rules.")
@@ -152,6 +158,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cc-rel-min-ratio", type=float, default=None, help="Relative component threshold ratio against the largest connected component when using relative or hybrid filtering.")
     parser.add_argument("--graph-connectivity", type=int, choices=[6, 26], default=None,
                         help="Skeleton graph neighbors: 26 including edges/corners (default), or 6 face neighbors.")
+    parser.add_argument("--radius-tree-policy", choices=["auto", "forest", "preserve"], default=None,
+        help="Endpoint/radius cycle routing: auto preserves observed cerebral arterial groups, including ICA/VA; forest routes all eligible groups; preserve disables tree routing.")
     junction_group = parser.add_mutually_exclusive_group()
     junction_group.add_argument("--junction-cluster-cleanup", dest="junction_cluster_enabled", action="store_true",
         help="Simplify compact junction clusters after triangle contraction and before Flow filtering (default).")
@@ -159,16 +167,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable compact junction-cluster routing.")
     parser.set_defaults(junction_cluster_enabled=None)
     parser.add_argument("--junction-cluster-max-extent-voxels", type=float, default=None,
-        help="Maximum junction-cluster extent along each voxel axis (default: 8).")
+        help="Optional maximum junction-cluster extent per voxel axis; 0 means unlimited (default: 0).")
     parser.add_argument("--junction-cluster-min-cycle-rank", type=int, default=None,
         help="Minimum independent-cycle count for a junction-cluster candidate (default: 2).")
     parser.add_argument("--cycle-flow-threshold", type=float, default=None,
-                        help="Delete same-label paths with Flow C strictly below this value in [0, 1] (default: 0.3); zero disables deletions.")
+                        help="Delete positive-label paths, including cross-label paths, with Flow C strictly below this value in [0, 1] (default: 0.3); zero disables deletions.")
     cycle_guard = parser.add_mutually_exclusive_group()
     cycle_guard.add_argument("--cycle-preserve-connectivity", dest="cycle_preserve_connectivity", action="store_true",
-                             help="Protect each original label component, its interfaces and endpoints during Flow filtering (default).")
+                             help="Protect physical components, endpoints and positive-label coverage during Flow filtering (default).")
     cycle_guard.add_argument("--no-cycle-preserve-connectivity", dest="cycle_preserve_connectivity", action="store_false",
-                             help="Allow Flow filtering to split/remove same-label components and terminal paths; cross-label edges stay protected.")
+                             help="Allow Flow filtering to split/remove components and terminal paths; unknown-label edges remain outside filtering.")
     parser.set_defaults(cycle_preserve_connectivity=None)
     parser.add_argument(
         "--min-edge-points",
@@ -176,7 +184,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="min_edge_points",
         type=int,
         default=None,
-        help="Minimum number of graph edge segments in a terminal branch; shorter endpoint spurs are removed (default: 3).",
+        help="Minimum retained graph-edge count in a terminal branch (default: 9, removes up to 8 edges); 0 or 1 disables pruning.",
     )
 
     parser.add_argument("--seed-ratio", type=float, default=None, help="Seed ratio for streamline rendering.")
@@ -300,6 +308,12 @@ def main() -> int:
         ),
         "dicom_backend": args.dicom_backend,
         "dicom_h5_dir": args.dicom_h5_dir,
+        "path_smoothing_method": args.path_smoothing_method,
+        "path_smoothing_radius_factor": args.path_smoothing_radius_factor,
+        "path_smoothing_max_displacement_ratio": args.path_smoothing_max_displacement_ratio,
+        "path_smoothing_sample_step_mm": args.path_smoothing_sample_step_mm,
+        "path_smoothing_radius_sigma_mm": args.path_smoothing_radius_sigma_mm,
+        "path_smoothing_backend": args.path_smoothing_backend,
         "plane_mode": args.plane_mode,
         "plane_config": args.plane_config,
         "plane_count": args.plane_count,
@@ -324,6 +338,7 @@ def main() -> int:
         "graph_connectivity": args.graph_connectivity,
         "cycle_flow_threshold": args.cycle_flow_threshold,
         "cycle_preserve_connectivity": args.cycle_preserve_connectivity,
+        "radius_tree_policy": args.radius_tree_policy,
         "junction_cluster_enabled": args.junction_cluster_enabled,
         "junction_cluster_max_extent_voxels": args.junction_cluster_max_extent_voxels,
         "junction_cluster_min_cycle_rank": args.junction_cluster_min_cycle_rank,

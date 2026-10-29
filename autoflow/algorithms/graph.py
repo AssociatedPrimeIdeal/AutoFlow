@@ -131,14 +131,15 @@ def remove_triangle_cycles(graph, *, segmentation_labels=None, spacing=(1, 1, 1)
     return GraphData(points=points[keep], edges=np.unique(new_edges, axis=0))
 
 
-def remove_short_terminal_branches(graph, min_edge_points=3, *, min_edge_count=None):
+def remove_short_terminal_branches(graph, min_edge_points=9, *, min_edge_count=None):
     """Remove short terminal branches from a skeleton graph.
 
     The graph built from voxel skeleton points contains one graph edge per
     pair of neighbouring skeleton points.  This helper therefore measures a
     terminal branch by the number of consecutive graph edges from a degree-1
     endpoint to the next junction (or to the other endpoint of a simple
-    component).  Junction-to-junction links are preserved.  ``min_edge_count``
+    component). The default removes arms with up to eight edges and retains
+    nine-edge arms. Junction-to-junction links are preserved. ``min_edge_count``
     is accepted as a descriptive alias for callers that use edge terminology.
 
     After removal, retained nodes are compacted and reindexed.  The original
@@ -149,7 +150,7 @@ def remove_short_terminal_branches(graph, min_edge_points=3, *, min_edge_count=N
     try:
         threshold = int(min_edge_points)
     except (TypeError, ValueError):
-        threshold = 3
+        threshold = 9
     threshold = max(0, threshold)
     if threshold <= 1 or len(getattr(graph, "edges", [])) == 0:
         return graph

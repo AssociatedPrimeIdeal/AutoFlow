@@ -39,6 +39,37 @@ PLANE_SPECS = {
 }
 
 
+def anatomical_direction_label(vector):
+    """Approximate direction in the loaded LR/AP/FH frame, dominant first."""
+    vector = np.asarray(vector, dtype=float).reshape(3)
+    weights = np.abs(vector)
+    if not np.all(np.isfinite(weights)) or np.max(weights) < 1e-12:
+        return "?"
+    positive, negative = ("R", "P", "H"), ("L", "A", "F")
+    return "".join((positive[index] if vector[index] > 0 else negative[index])
+                   for index in np.argsort(-weights, kind="stable")
+                   if weights[index] >= .2*np.max(weights))
+
+
+def plane_orientation_labels(horizontal, vertical, horizontal_name=None, vertical_name=None):
+    """Anatomical edge labels; legacy local-axis names are not displayed."""
+    def ends(vector):
+        return tuple(anatomical_direction_label(sign*np.asarray(vector)) for sign in (-1, 1))
+    return ends(horizontal), ends(vertical)
+
+
+def anatomical_plane_title(horizontal, vertical):
+    """Name the actual displayed axes without exposing local U/V/N notation."""
+    def axis(vector):
+        weights = np.abs(np.asarray(vector, dtype=float).reshape(3))
+        if not np.all(np.isfinite(weights)) or np.max(weights) < 1e-12:
+            return "?"
+        names = ("LR", "AP", "HF")
+        return "/".join(names[index] for index in np.argsort(-weights, kind="stable")
+                        if weights[index] >= .2*np.max(weights))
+    return f"{axis(horizontal)} × {axis(vertical)}"
+
+
 @lru_cache(maxsize=16)
 def make_colormap(name: str) -> pg.ColorMap:
     try:
@@ -133,7 +164,8 @@ class ColoredStreamlineItem(pg.GraphicsObject):
         return self._data[:, 0], self._data[:, 1]
 
     def clear(self):
-        self.set_segments(np.empty((0, 2)), np.empty((0, 4)), 1.0)
+        if self._data.size:
+            self.set_segments(np.empty((0, 2)), np.empty((0, 4)), 1.0)
 
     def boundingRect(self):
         return self._bounds
@@ -143,6 +175,12 @@ class ColoredStreamlineItem(pg.GraphicsObject):
 
 
 class SliceViewBox(pg.ViewBox):
+    planeTranslationStarted = QtCore.Signal(str)
+    planeTranslationChanged = QtCore.Signal(str, float, float)
+    planeTranslationFinished = QtCore.Signal(str)
+    planeRotationStarted = QtCore.Signal(str)
+    planeRotationChanged = QtCore.Signal(str, float)
+    planeRotationFinished = QtCore.Signal(str)
     cursorRequested = QtCore.Signal(str, int, int)
     strokeStarted = QtCore.Signal(str, int, int, bool)
     strokeMoved = QtCore.Signal(str, int, int, bool)
@@ -160,6 +198,11 @@ class SliceViewBox(pg.ViewBox):
         self.plane = str(plane)
         self.editable = False
         self.contour_editable = False
+        self.plane_rotation_enabled = False
+        self.plane_translation_enabled = False
+        self._translating_plane = False
+        self._rotating_plane = False
+        self._rotation_angle = 0.0
         self.spacing = (1.0, 1.0)
         self._image_shape = (0, 0)
         self._sample_origin = (0.0, 0.0)
@@ -226,7 +269,56 @@ class SliceViewBox(pg.ViewBox):
             return
         event.ignore()
 
+    def _rotation_hit(self, scene_position):
+        point = self.mapSceneToView(scene_position)
+        center = self.mapViewToScene(QtCore.QPointF(0, 0))
+        horizontal = self.mapViewToScene(QtCore.QPointF(point.x(), 0))
+        vertical = self.mapViewToScene(QtCore.QPointF(0, point.y()))
+        radius = np.hypot(scene_position.x()-center.x(), scene_position.y()-center.y())
+        return radius > 18 and min(abs(scene_position.y()-horizontal.y()),
+                                  abs(scene_position.x()-vertical.x())) <= 10
+
     def mouseDragEvent(self, event, axis=None):
+        if (self._translating_plane or (self.plane_translation_enabled and not self.contour_editable
+                and not self.editable and event.button() == QtCore.Qt.MouseButton.LeftButton
+                and not event.modifiers())):
+            if event.isStart():
+                center = self.mapViewToScene(QtCore.QPointF(0, 0))
+                pressed = event.buttonDownScenePos()
+                if np.hypot(pressed.x()-center.x(), pressed.y()-center.y()) <= 16:
+                    self._translation_origin = self.mapSceneToView(pressed)
+                    self._translating_plane = True
+                    self.planeTranslationStarted.emit(self.plane)
+            if self._translating_plane:
+                point = self.mapSceneToView(event.scenePos())-self._translation_origin
+                self.planeTranslationChanged.emit(self.plane, float(point.x()), float(point.y()))
+                if event.isFinish():
+                    self._translating_plane = False
+                    self.planeTranslationFinished.emit(self.plane)
+                event.accept()
+                return
+        if (self._rotating_plane or (self.plane_rotation_enabled and not self.contour_editable and not self.editable
+                and event.button() == QtCore.Qt.MouseButton.LeftButton and not event.modifiers())):
+            if event.isStart() and self._rotation_hit(event.buttonDownScenePos()):
+                point = self.mapSceneToView(event.buttonDownScenePos())
+                self._rotation_previous = np.arctan2(point.y(), point.x())
+                self._rotation_angle = 0.0
+                self._rotating_plane = True
+                self.planeRotationStarted.emit(self.plane)
+            if self._rotating_plane:
+                point = self.mapSceneToView(event.scenePos())
+                # Keep the previous angle when the pointer crosses the pivot.
+                if np.hypot(point.x(), point.y()) > 1e-6:
+                    angle = np.arctan2(point.y(), point.x())
+                    delta = angle-self._rotation_previous
+                    self._rotation_angle += np.arctan2(np.sin(delta), np.cos(delta))
+                    self._rotation_previous = angle
+                    self.planeRotationChanged.emit(self.plane, float(self._rotation_angle))
+                if event.isFinish():
+                    self._rotating_plane = False
+                    self.planeRotationFinished.emit(self.plane)
+                event.accept()
+                return
         if (
             self.contour_editable
             and event.button() == QtCore.Qt.MouseButton.LeftButton
@@ -415,6 +507,21 @@ class SliceView(QtWidgets.QFrame):
         self.plane_line.setZValue(35)
         self.plane_line.hide()
         self.view_box.addItem(self.plane_line)
+        self.plane_center_item = pg.ScatterPlotItem([0], [0], symbol="o", size=14,
+            pen=pg.mkPen("#e0ffff", width=1.5), brush=pg.mkBrush(0, 210, 225, 210))
+        self.plane_center_item.setZValue(48)
+        self.plane_center_item.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
+        self.plane_center_item.hide()
+        self.view_box.addItem(self.plane_center_item, ignoreBounds=True)
+        self.rotation_axes = []
+        for angle in (0, 90):
+            line = pg.InfiniteLine(pos=(0, 0), angle=angle, movable=False,
+                                   pen=pg.mkPen("#ffb347", width=2))
+            line.setZValue(38)
+            line.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
+            line.hide()
+            self.view_box.addItem(line, ignoreBounds=True)
+            self.rotation_axes.append(line)
 
         self.brush_item = QtWidgets.QGraphicsEllipseItem()
         self.brush_item.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
@@ -423,14 +530,19 @@ class SliceView(QtWidgets.QFrame):
         self.view_box.addItem(self.brush_item)
 
         self.orientation_items = {
-            "h0": pg.TextItem(anchor=(0.0, 0.5), color="#d7e0e3"),
-            "h1": pg.TextItem(anchor=(1.0, 0.5), color="#d7e0e3"),
-            "v0": pg.TextItem(anchor=(0.5, 0.0), color="#d7e0e3"),
-            "v1": pg.TextItem(anchor=(0.5, 1.0), color="#d7e0e3"),
+            "h0": pg.TextItem(anchor=(0.0, 0.5), color="#d8dbe0", fill=(11, 12, 14, 180)),
+            "h1": pg.TextItem(anchor=(1.0, 0.5), color="#d8dbe0", fill=(11, 12, 14, 180)),
+            "v0": pg.TextItem(anchor=(0.5, 1.0), color="#d8dbe0", fill=(11, 12, 14, 180)),
+            "v1": pg.TextItem(anchor=(0.5, 0.0), color="#d8dbe0", fill=(11, 12, 14, 180)),
         }
+        orientation_font = QtGui.QFont(self.font())
+        orientation_font.setPointSizeF(9.)
+        orientation_font.setBold(False)
         for item in self.orientation_items.values():
-            item.setZValue(40)
-            self.view_box.addItem(item)
+            item.setZValue(70)
+            item.setFont(orientation_font)
+            item.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
+            self.view_box.addItem(item, ignoreBounds=True)
         self.orientation_items["h0"].setText(self.spec.horizontal_ends[0])
         self.orientation_items["h1"].setText(self.spec.horizontal_ends[1])
         self.orientation_items["v0"].setText(self.spec.vertical_ends[0])
@@ -448,6 +560,8 @@ class SliceView(QtWidgets.QFrame):
         self.view_box.contourStrokeMoved.connect(self.contourStrokeMoved)
         self.view_box.contourStrokeFinished.connect(self.contourStrokeFinished)
         self.plot.scene().sigMouseMoved.connect(self._scene_mouse_moved)
+        self.view_box.sigRangeChanged.connect(self._update_orientation_positions)
+        self.view_box.sigResized.connect(self._update_orientation_positions)
 
     def set_editable(self, enabled: bool):
         self.view_box.editable = bool(enabled)
@@ -460,6 +574,44 @@ class SliceView(QtWidgets.QFrame):
         self._brush_color = parsed if parsed.isValid() else QtGui.QColor("#39d5c5")
         self._brush_visible = bool(visible)
         self._update_brush_item()
+
+    def set_plane_translation(self, enabled):
+        enabled = bool(enabled)
+        previously_enabled = self.view_box.plane_translation_enabled
+        if enabled == previously_enabled:
+            return
+        self.view_box.plane_translation_enabled = bool(enabled)
+        self.plane_center_item.setVisible(bool(enabled))
+        if not enabled:
+            self.view_box._translating_plane = False
+        if enabled or previously_enabled:
+            self.set_plane_drag_center(0, 0)
+
+    def set_plane_drag_center(self, horizontal, vertical):
+        self.plane_center_item.setData([horizontal], [vertical])
+        self.vertical_line.setPos(horizontal)
+        self.horizontal_line.setPos(vertical)
+        for line in self.rotation_axes:
+            line.setPos((horizontal, vertical))
+
+    def set_plane_rotation(self, enabled, angle=0.0):
+        state = (bool(enabled), float(angle), self.view_box.plane_translation_enabled)
+        if getattr(self, "_plane_rotation_state", None) == state:
+            return
+        self._plane_rotation_state = state
+        self.view_box.plane_rotation_enabled = bool(enabled)
+        for offset, line in zip((0, 90), self.rotation_axes):
+            line.setAngle(float(angle)+offset)
+            line.setVisible(bool(enabled))
+        if not enabled:
+            self.view_box._rotating_plane = False
+        if self.view_box.plane_translation_enabled:
+            hint = "Drag the cyan center to move the plane. "
+            if enabled:
+                hint += "Drag an orange axis away from the center to rotate. "
+            self.plot.setToolTip(hint+"Shift+drag pans; right-drag zooms.")
+        else:
+            self.plot.setToolTip("")
 
     def set_plane_intersection(self, endpoints):
         if endpoints is None:
@@ -617,10 +769,39 @@ class SliceView(QtWidgets.QFrame):
     def set_orientation_labels(self, horizontal_ends=None, vertical_ends=None):
         horizontal_ends = horizontal_ends or self.spec.horizontal_ends
         vertical_ends = vertical_ends or self.spec.vertical_ends
+        state = tuple(map(str, (*horizontal_ends, *vertical_ends)))
+        if getattr(self, "_orientation_label_state", None) == state:
+            return
+        self._orientation_label_state = state
         self.orientation_items["h0"].setText(str(horizontal_ends[0]))
         self.orientation_items["h1"].setText(str(horizontal_ends[1]))
         self.orientation_items["v0"].setText(str(vertical_ends[0]))
         self.orientation_items["v1"].setText(str(vertical_ends[1]))
+        self._update_orientation_positions()
+
+    def _update_orientation_positions(self, *_args):
+        """Keep the compass visible through zoom, pan, aspect and size changes."""
+        rect = self.view_box.sceneBoundingRect()
+        if rect.width() <= 1 or rect.height() <= 1:
+            return
+        (x0, x1), (y0, y1) = self.view_box.viewRange()
+        center = rect.center()
+        points = {"h0": (x0, (y0+y1)/2), "h1": (x1, (y0+y1)/2),
+                  "v0": ((x0+x1)/2, y0), "v1": ((x0+x1)/2, y1)}
+        margin = 8.
+        for key, point in points.items():
+            scene = self.view_box.mapViewToScene(QtCore.QPointF(*point))
+            if key.startswith("h"):
+                left = scene.x() < center.x()
+                scene = QtCore.QPointF(rect.left()+margin if left else rect.right()-margin, center.y())
+                anchor = (0., .5) if left else (1., .5)
+            else:
+                top = scene.y() < center.y()
+                scene = QtCore.QPointF(center.x(), rect.top()+margin if top else rect.bottom()-margin)
+                anchor = (.5, 0.) if top else (.5, 1.)
+            item = self.orientation_items[key]
+            item.setAnchor(anchor)
+            item.setPos(self.view_box.mapSceneToView(scene))
 
     def reset_view(self, zoom=None):
         if self._shape[0] <= 0 or self._shape[1] <= 0:
@@ -678,6 +859,11 @@ class SliceView(QtWidgets.QFrame):
         self.brush_item.setBrush(QtGui.QBrush(fill))
         self.brush_item.show()
 
+    def set_colormap(self, colormap):
+        if getattr(self, "_image_colormap", None) is not colormap:
+            self.image_item.setLookupTable(colormap.getLookupTable(nPts=256, alpha=True))
+            self._image_colormap = colormap
+
     def set_slice(
         self,
         image: np.ndarray,
@@ -730,27 +916,22 @@ class SliceView(QtWidgets.QFrame):
             normalized_extent[3] - normalized_extent[2],
         )
         self.image_item.setImage(data.T, autoLevels=False, levels=levels)
-        self.image_item.setLookupTable(colormap.getLookupTable(nPts=256, alpha=True))
+        self.set_colormap(colormap)
         self.image_item.setRect(rect)
         self.set_overlay(overlay, rect=rect)
         self.set_noise_overlay(noise_overlay, rect=rect)
 
-        self.update_cursor(cursor, fixed_index, levels)
-        x0 = self._sample_origin[0]
-        x1 = x0 + max(0.0, (self._shape[0] - 1) * self._spacing[0])
-        y0 = self._sample_origin[1]
-        y1 = y0 + max(0.0, (self._shape[1] - 1) * self._spacing[1])
-        self.orientation_items["h0"].setPos(x0, (y0 + y1) / 2.0)
-        self.orientation_items["h1"].setPos(x1, (y0 + y1) / 2.0)
-        self.orientation_items["v0"].setPos((x0 + x1) / 2.0, y0)
-        self.orientation_items["v1"].setPos((x0 + x1) / 2.0, y1)
+        self.set_title(f"{self.spec.title}  {self.spec.horizontal_name} x {self.spec.vertical_name}")
+        self.update_cursor(cursor, fixed_index)
+        self._update_orientation_positions()
         self._update_brush_item()
         if geometry_changed:
             self.reset_view()
 
     def set_overlay(self, overlay: np.ndarray | None, rect=None):
         if overlay is None:
-            self.overlay_item.clear()
+            if self.overlay_item.image is not None:
+                self.overlay_item.clear()
             self.overlay_item.hide()
             return
         if rect is None:
@@ -775,7 +956,8 @@ class SliceView(QtWidgets.QFrame):
 
     def set_noise_overlay(self, overlay: np.ndarray | None, rect=None):
         if overlay is None:
-            self.noise_overlay_item.clear()
+            if self.noise_overlay_item.image is not None:
+                self.noise_overlay_item.clear()
             self.noise_overlay_item.hide()
             return
         if rect is None:
@@ -794,7 +976,10 @@ class SliceView(QtWidgets.QFrame):
                 )
         rgba = np.asarray(overlay, dtype=np.uint8)
         self.noise_overlay_item.setImage(np.transpose(rgba, (1, 0, 2)), autoLevels=False)
-        self.noise_overlay_item.setRect(rect)
+        geometry = (rect.x(), rect.y(), rect.width(), rect.height(), tuple(rgba.shape[:2]))
+        if getattr(self, "_noise_overlay_geometry", None) != geometry:
+            self.noise_overlay_item.setRect(rect)
+            self._noise_overlay_geometry = geometry
         self.noise_overlay_item.show()
 
     def update_image(
@@ -809,7 +994,8 @@ class SliceView(QtWidgets.QFrame):
         """Replace pixels during playback without rebuilding static presentation."""
         self.image_item.setImage(np.asarray(image).T, autoLevels=False, levels=levels)
         if overlay is None:
-            self.overlay_item.clear()
+            if self.overlay_item.image is not None:
+                self.overlay_item.clear()
             self.overlay_item.hide()
         else:
             rgba = np.asarray(overlay, dtype=np.uint8)
@@ -817,22 +1003,23 @@ class SliceView(QtWidgets.QFrame):
             self.overlay_item.setOpacity(float(np.max(rgba[..., 3])) / 255.0)
             self.overlay_item.show()
         self.set_noise_overlay(noise_overlay)
-        self.update_cursor(cursor, fixed_index, levels)
+        self.update_cursor(cursor, fixed_index)
 
     def update_cursor(self, cursor, fixed_index: int, levels=None):
-        h, v = int(cursor[0]), int(cursor[1])
+        h, v = float(cursor[0]), float(cursor[1])
         self.vertical_line.setPos(self._sample_origin[0] + h * self._spacing[0])
         self.horizontal_line.setPos(self._sample_origin[1] + v * self._spacing[1])
-        self.title_label.setText(
-            f"{self.spec.title}  {self.spec.horizontal_name} x {self.spec.vertical_name}"
-        )
-        self.position_label.setText(f"{self.spec.fixed_name} {int(fixed_index) + 1}")
-        if levels is not None:
+        position = f"{self.spec.fixed_name} {int(fixed_index) + 1}"
+        if self.position_label.text() != position:
+            self.position_label.setText(position)
+        if levels is not None and (self.image_item.levels is None
+                or tuple(self.image_item.levels) != tuple(levels)):
             self.image_item.setLevels(levels)
 
     def set_title(self, title, position=None):
-        self.title_label.setText(str(title))
-        if position is not None:
+        if self.title_label.text() != str(title):
+            self.title_label.setText(str(title))
+        if position is not None and self.position_label.text() != str(position):
             self.position_label.setText(str(position))
 
     def clear(self):

@@ -7,9 +7,13 @@ import numpy as np
 from scipy.ndimage import label as ndi_label
 
 from .quality_exclusions import build_exclusion_checks
+from .quality_cycles import build_cycle_check
+from .quality_placement import build_plane_placement_checks
+from .core.plane_state import current_plane_metrics, metric_validity, workspace_signature, stale_metric_families
+from .qc_locations import annotate_checks, iter_issues, qc_status
 
 
-QUALITY_REPORT_SCHEMA = "autoflow.quality.v1"
+QUALITY_REPORT_SCHEMA = "autoflow.quality.v2"
 
 
 def _json_value(value):
@@ -272,7 +276,8 @@ def _label_names(workspace):
 
 def _flow_hierarchy_report(workspace):
     """Build a label-named, flow-directed path/plane hierarchy for QC."""
-    metrics = [dict(metric) for metric in list(getattr(getattr(workspace, "derived", None), "plane_metrics", []) or []) if isinstance(metric, dict)]
+    metrics = current_plane_metrics(workspace)
+    metrics = [m for m in metrics if "sample_valid_t" not in m or (m["sample_valid_t"] and all(m["sample_valid_t"]))]
     path_info = list(getattr(workspace, "path_info", []) or [])
     planes = list(getattr(workspace, "planes", []) or [])
     path_ids = set(range(len(path_info)))
@@ -635,7 +640,8 @@ def build_quality_report(workspace, source_path="", run_context=None):
         required=False,
     ))
 
-    segmentation = getattr(ws, "segmask_labels_3d", None)
+    fine_segmentation = getattr(ws, "segmentation_analysis_labels_3d", None)
+    segmentation = fine_segmentation if fine_segmentation is not None else getattr(ws, "segmask_labels_3d", None)
     if segmentation is None:
         segmentation = getattr(ws, "segmask_3d", None)
     if segmentation is None:
@@ -655,7 +661,7 @@ def build_quality_report(workspace, source_path="", run_context=None):
         retained_components = int(np.count_nonzero(component_sizes > 0))
         seg_status = "fail" if not np.any(binary) else ("warn" if retained_components > 8 else "pass")
         label_values = [int(x) for x in np.unique(seg) if int(x) > 0]
-        volume_mm3 = float(np.count_nonzero(binary) * np.prod(resolution)) if geometry_ok else None
+        volume_mm3 = float(np.count_nonzero(binary) * np.prod(np.ones(3) if fine_segmentation is not None else resolution)) if geometry_ok else None
         checks.append(_check(
             "segmentation.availability",
             "Segmentation",
@@ -667,7 +673,9 @@ def build_quality_report(workspace, source_path="", run_context=None):
             action="Review disconnected components and label grouping." if seg_status != "pass" else "",
         ))
 
-        seg4d = getattr(ws, "segmask_labels", None)
+        seg4d = getattr(ws, "segmentation_analysis_labels", None)
+        if seg4d is None:
+            seg4d = getattr(ws, "segmask_labels", None)
         if seg4d is None:
             seg4d = getattr(ws, "segmask_binary", None)
         if seg4d is not None and np.asarray(seg4d).ndim == 4 and np.asarray(seg4d).shape[3] > 1:
@@ -711,6 +719,9 @@ def build_quality_report(workspace, source_path="", run_context=None):
             threshold="one connected component, no isolated nodes or graph cycles",
             action="Review short branches, disconnected segments, and loops before trusting downstream planes." if topology_status != "pass" else "",
         ))
+
+    checks.append(build_cycle_check(ws, _check))
+    checks.extend(build_plane_placement_checks(ws, _check))
 
     hierarchy = dict(getattr(ws, "graph_hierarchy", {}) or {})
     hierarchy_paths = list(hierarchy.get("paths", []))
@@ -756,7 +767,7 @@ def build_quality_report(workspace, source_path="", run_context=None):
             action="Open the flagged planes, verify the centerline, and adjust center or orientation." if plane_status != "pass" else "",
         ))
 
-    metrics = list(getattr(getattr(ws, "derived", None), "plane_metrics", []) or [])
+    metrics = current_plane_metrics(ws)
     if not metrics:
         checks.append(_check(
             "hemodynamics.plane_metrics",
@@ -807,6 +818,20 @@ def build_quality_report(workspace, source_path="", run_context=None):
             action="Inspect empty slices and phases with abrupt cross-sectional area changes." if metric_status != "pass" else "",
         ))
 
+        inferred_roi = []
+        for index, metric in enumerate(metrics):
+            phases = [t for t, mode in enumerate(metric.get('roi_resolution_t', []))
+                      if mode in {'interpolated', 'single_source_hold'}]
+            if phases:
+                inferred_roi.append({'plane_index': index, 'phases': phases,
+                    'source_frames': metric.get('roi_source_frames_t', []),
+                    'resolution': metric.get('roi_resolution_t', [])})
+        if inferred_roi:
+            checks.append(_check('hemodynamics.temporal_roi', 'Hemodynamics', 'warn',
+                'Inferred temporal contours',
+                f'{len(inferred_roi)} planes use interpolated or single-source ROI geometry; fields are sampled at the current phase.',
+                value={'planes': inferred_roi}, threshold='Missing observed contours are reconstructed, not independently observed.',
+                action='Inspect inferred contours and their source phases before accepting measurements.'))
         ic_values = []
         for collection in (
             dict(plane_qc.get("path_ic", {}) or {}).values(),
@@ -829,7 +854,7 @@ def build_quality_report(workspace, source_path="", run_context=None):
                 value={"minimum_ic": min_ic, "path_ic": plane_qc.get("path_ic", {}),
                        "segmentation_label_ic": plane_qc.get("segmentation_label_ic", {}),
                        "fork_ic": plane_qc.get("fork_ic", {})},
-                threshold="pass >=0.8; warn >=0.6",
+                threshold="pass >=0.8; warning <0.8; low consistency <0.6",
                 action="Review segmentation, plane ownership, orientation, and temporal flow curves." if ic_status != "pass" else "",
             ))
 
@@ -846,21 +871,53 @@ def build_quality_report(workspace, source_path="", run_context=None):
                 action="Compute PWV and inspect the arrival-time fit.",
             ))
         else:
-            ok_results = [item for item in pwv_results if str(item.get("status", "")) == "ok"]
+            stale_pwv = any(item.get("validity") == "stale" for item in pwv_results)
+            ok_results = [item for item in pwv_results if str(item.get("status", "")) == "ok" and item.get("validity") != "stale"]
             r2_values = [float(item["fit_r2"]) for item in ok_results if item.get("fit_r2") is not None]
             min_r2 = min(r2_values) if r2_values else None
             pwv_status = "fail" if not ok_results else ("warn" if len(ok_results) < len(pwv_results) or (min_r2 is not None and min_r2 < 0.8) else "pass")
+            if stale_pwv:
+                pwv_status = "not_run"
+            elif pwv_status == "pass" and any(item.get("quality_flags") for item in ok_results):
+                pwv_status = "warn"
             checks.append(_check(
                 "hemodynamics.pwv",
                 "Hemodynamics",
                 pwv_status,
                 "PWV fit",
                 f"successful groups={len(ok_results)}/{len(pwv_results)}, minimum R2={min_r2 if min_r2 is not None else 'n/a'}",
-                value={"successful_groups": len(ok_results), "group_count": len(pwv_results), "minimum_fit_r2": min_r2},
+                value={"successful_groups": len(ok_results), "group_count": len(pwv_results), "minimum_fit_r2": min_r2,
+                       "quality_flags": {str(item.get("name")): item.get("quality_flags", []) for item in pwv_results}},
                 threshold="all requested groups succeed and fit R2 >=0.8",
                 action="Review waveform quality, valid planes, cycle wrapping, and fit outliers." if pwv_status != "pass" else "",
             ))
+            if stale_pwv:
+                checks[-1]["validity"] = "stale"
 
+    stale_families = stale_metric_families(ws)
+    if stale_families:
+        check = _check("hemodynamics.derived_validity", "Hemodynamics", "not_run", "Derived measurement validity",
+            "Needs recalculation: "+", ".join(stale_families), value=stale_families,
+            action="Recompute the affected global fields, then plane summaries. Current flow-rate curves remain available.")
+        check["validity"] = "stale"
+        checks.append(check)
+    for step, failure in getattr(ws.pipeline, "errors", {}).items():
+        failure = dict(failure)
+        check = _check("execution."+str(step), "Execution", "fail", "Processing failed: "+str(step),
+            failure.get("message", "Processing failed; output is unavailable."), value=failure,
+            action="Correct the execution error and rerun the affected step.")
+        check["failure_kind"] = "execution"
+        checks.append(check)
+    annotate_checks(ws, checks)
+    for issue in iter_issues({"checks": checks}):
+        status = qc_status(issue)
+        if status != issue.get("status"):
+            issue["threshold_status"] = issue["status"]
+            issue["failure_kind"] = "quality"
+            issue["status"] = status
+    reviews = ws.input_state.metadata.get("quality_reviews", {})
+    for issue in iter_issues({"checks": checks}):
+        issue["review"] = dict(reviews.get(issue["issue_id"], {"status": "unreviewed"}))
     status_counts = {status: sum(1 for item in checks if item["status"] == status) for status in ("pass", "warn", "fail", "not_run")}
     required_checks = [item for item in checks if item.get("required", True)]
     if any(item["status"] == "fail" for item in required_checks):
@@ -874,6 +931,8 @@ def build_quality_report(workspace, source_path="", run_context=None):
 
     return {
         "schema": QUALITY_REPORT_SCHEMA,
+        "dependency_signature": workspace_signature(ws),
+        "analysis_revision": int(ws.analysis_revision),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": str(source_path or getattr(getattr(ws, "paths", None), "flow_path", "") or ""),
         "source_format": str(getattr(getattr(ws, "input_state", None), "source_format", "") or ""),
@@ -894,6 +953,6 @@ def save_quality_report(workspace, out_path, source_path="", run_context=None, r
     parent = os.path.dirname(os.path.abspath(out_path))
     if parent:
         os.makedirs(parent, exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as handle:
-        json.dump(_json_value(payload), handle, ensure_ascii=False, indent=2)
+    from .core.output import atomic_json_write
+    atomic_json_write(out_path, _json_value(payload))
     return out_path

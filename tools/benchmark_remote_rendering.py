@@ -1,4 +1,4 @@
-"""Measure remote 3D rendering, frame capture and Qt presentation separately.
+"""Measure native/SSH 3D rendering, frame capture and Qt presentation separately.
 
 Manual benchmark; does not modify its H5 input or run the analysis pipeline.
 Run with QT_QPA_PLATFORM=offscreen for a control, or xcb over forwarded X11.
@@ -26,12 +26,15 @@ def main():
     parser.add_argument('--scenes', nargs='+', choices=['surface', 'volume', 'slices'],
                         default=['surface', 'volume', 'slices'])
     parser.add_argument('--paint-format', choices=['default', 'rgb32'], default='default')
+    parser.add_argument('--backend', choices=['remote', 'native'], default='remote',
+                        help='Compare the SSH image widget with native Qt/VTK (use VirtualGL on VNC).')
     parser.add_argument('--full-repaint', action='store_true', help='Control: repaint the full widget every frame.')
     parser.add_argument('--compare', action='store_true', help='Run full/dirty/dirty/full controls at each size.')
     args = parser.parse_args()
 
-    from autoflow.ui.launcher import _configure_ssh_rendering
-    _configure_ssh_rendering()
+    if args.backend == 'remote':
+        from autoflow.ui.launcher import _configure_ssh_rendering
+        _configure_ssh_rendering()
     import h5py
     import numpy as np
     import pyvista as pv
@@ -41,12 +44,18 @@ def main():
     from autoflow.ui.remote_plotter import RemotePlotter
     from autoflow.ui.viewer import SceneController
 
+    if args.backend == 'native':
+        from pyvistaqt import QtInteractor
+        plotter_class = QtInteractor
+    else:
+        plotter_class = RemotePlotter
+
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     current_full_repaint = args.full_repaint
     changed_frame_region = remote_plotter._changed_frame_region
     remote_plotter._changed_frame_region = lambda *values: (
         None if current_full_repaint else changed_frame_region(*values))
-    class MeasuredRemotePlotter(RemotePlotter):
+    class MeasuredPlotter(plotter_class):
         paint_count = 0
         paint_pixels = 0
 
@@ -65,7 +74,7 @@ def main():
     output = dict(host=platform.node(), qt_platform=app.platformName(),
                   display=os.environ.get('DISPLAY'), input=str(args.input),
                   volume_shape=list(mag.shape), surface_cells=surface.n_cells,
-                  paint_format=args.paint_format, compare=args.compare,
+                  backend=args.backend, paint_format=args.paint_format, compare=args.compare,
                   full_repaint=args.full_repaint, frames=args.frames, cases=[])
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -76,7 +85,7 @@ def main():
         ws = Workspace()
         ws.mag_raw = mag[..., None]
         ws.resolution = spacing
-        plotter = MeasuredRemotePlotter()
+        plotter = MeasuredPlotter()
         plotter.setWindowTitle('AutoFlow X11 performance test')
         plotter.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.BypassWindowManagerHint)
         plotter.resize(640, 420)
@@ -92,7 +101,8 @@ def main():
                 scene.update_content_render(obj.uid, mode='slices', handles=False)
         plotter.reset_camera()
         plotter.render()
-        plotter._capture_frame()
+        if args.backend == 'remote':
+            plotter._capture_frame()
         output['render_window'] = plotter.render_window.GetClassName()
         output['opengl'] = [line.strip() for line in plotter.render_window.ReportCapabilities().splitlines()
                             if 'vendor string' in line or 'renderer string' in line]
@@ -106,10 +116,12 @@ def main():
             QtWidgets.QApplication.sync()
             QtTest.QTest.qWait(100)
             app.processEvents()
-            plotter._resize_timer.stop()
-            plotter._resize_render_window()
+            if args.backend == 'remote':
+                plotter._resize_timer.stop()
+                plotter._resize_render_window()
             scene.set_interaction_preview(True)
-            plotter._plotter.camera_position = base_camera
+            renderer_plotter = plotter._plotter if args.backend == 'remote' else plotter
+            renderer_plotter.camera_position = base_camera
             timings = []
             renders = [0]
             observer = plotter.render_window.AddObserver('EndEvent', lambda *_: renders.__setitem__(0, renders[0] + 1))
@@ -118,13 +130,14 @@ def main():
                 before_pixels = plotter.paint_pixels
                 begin = time.perf_counter()
                 plotter.camera.Azimuth(2.0)
-                plotter._plotter.render()
+                renderer_plotter.render()
                 rendered = time.perf_counter()
-                plotter._frame_timer.stop()
                 before_capture = renders[0]
-                plotter._capture_frame()
-                if args.paint_format == 'rgb32':
-                    plotter._frame = plotter._frame.convertToFormat(QtGui.QImage.Format_RGB32)
+                if args.backend == 'remote':
+                    plotter._frame_timer.stop()
+                    plotter._capture_frame()
+                    if args.paint_format == 'rgb32':
+                        plotter._frame = plotter._frame.convertToFormat(QtGui.QImage.Format_RGB32)
                 captured = time.perf_counter()
                 app.processEvents()
                 QtWidgets.QApplication.sync()
@@ -136,7 +149,8 @@ def main():
                                     plotter.paint_pixels - before_pixels])
             plotter.render_window.RemoveObserver(observer)
             values = np.asarray(timings)
-            record = dict(scene=kind, repaint='full' if current_full_repaint else 'dirty', run=run_index,
+            record = dict(scene=kind, repaint=('native' if args.backend == 'native' else
+                                             'full' if current_full_repaint else 'dirty'), run=run_index,
                           requested_size=[width, height],
                           widget_size=[plotter.width(), plotter.height()], render_size=list(plotter.window_size),
                           median_ms=dict(zip(['render', 'capture', 'present_sync', 'total'],

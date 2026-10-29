@@ -13,6 +13,7 @@ from ._parallel import _PlaneProcessToken, _mark_plane_process_progress, _wait_p
 
 from ._common import _ensure_mask4d
 from .sampling import _build_mask_phase_lookup
+from ...core.resources import bounded_workers
 
 
 def extract_vectors(polydata):
@@ -79,7 +80,7 @@ class _WssWallSupport:
         return np.isfinite(signed) & (signed <= 0.0)
 
 
-def _prepare_wss_wall(mask, spacing, origin, smoothing_iteration):
+def _prepare_wss_wall(mask, spacing, origin, smoothing_iteration, voxel_centered=False):
     """Reconstruct a closed wall at the boundary between voxel centres."""
     mask = np.asarray(mask, dtype=bool)
     if not np.any(mask):
@@ -100,7 +101,7 @@ def _prepare_wss_wall(mask, spacing, origin, smoothing_iteration):
         # of anisotropic or narrow vessels. Zero iterations disables both steps.
         phi = gaussian_filter(phi, 0.5 * np.min(spacing) / spacing, mode="nearest")
     grid = pv.ImageData(dimensions=padded.shape, spacing=spacing,
-                        origin=origin - 0.5 * spacing)
+                        origin=origin - (1.0 if voxel_centered else 0.5) * spacing)
     grid.point_data["wss_lumen"] = phi.ravel(order="F")
     wall = grid.contour([0.0], scalars="wss_lumen")
     wall.clear_data()
@@ -190,18 +191,22 @@ def cal_wss_from_surf(surf, velocity, viscosity=4.0, inward_distance=0.6,
 def _compute_wss_serial(mask4d, flow, spacing, origin=(0, 0, 0),
                         smoothing_iteration=200, viscosity=4.0,
                         inward_distance=None, parabolic_fitting=True,
-                        no_slip_condition=True, _progress_path=None):
+                        no_slip_condition=True, _progress_path=None, flow_spacing=None):
     mask4d = _ensure_mask4d(mask4d)
     flow = np.asarray(flow)
     if flow.ndim != 5 or flow.shape[-1] != 3:
         raise ValueError(f"flow must be XYZTV, got {flow.shape}")
-    if flow.shape[:4] != mask4d.shape:
+    if flow.shape[3] != mask4d.shape[3] or (flow_spacing is None and flow.shape[:3] != mask4d.shape[:3]):
         raise ValueError(f"flow shape {flow.shape[:4]} does not match mask {mask4d.shape}")
 
     spacing = np.asarray(spacing, dtype=float).reshape(3)
-    inward_distance = resolve_wss_inward_distance(spacing, inward_distance)
+    field_spacing = spacing if flow_spacing is None else np.asarray(flow_spacing, dtype=float).reshape(3)
+    if not np.all(np.isfinite(field_spacing)) or np.any(field_spacing <= 0):
+        raise ValueError("flow_spacing must contain positive finite millimetres")
+    inward_distance = resolve_wss_inward_distance(field_spacing, inward_distance)
+    field_offset = 0.5 if flow_spacing is None else 0.0
     origin = np.asarray(origin, dtype=float).reshape(3)
-    wss_volume = np.zeros(mask4d.shape, dtype=np.float32)
+    wss_volume = np.zeros(flow.shape[:4], dtype=np.float32)
     mask_phase_lookup = _build_mask_phase_lookup(mask4d)
     surface_cache = {}
     support_cache = {}
@@ -212,7 +217,8 @@ def _compute_wss_serial(mask4d, flow, spacing, origin=(0, 0, 0),
         rep_t = int(mask_phase_lookup[showt])
         if rep_t not in surface_cache:
             surface_cache[rep_t], support_cache[rep_t] = _prepare_wss_wall(
-                mask4d[..., rep_t] > 0, spacing, origin, smoothing_iteration)
+                mask4d[..., rep_t] > 0, spacing, origin, smoothing_iteration,
+                voxel_centered=flow_spacing is not None)
         base_surface = surface_cache[rep_t]
         if base_surface is None:
             surfs.append(None)
@@ -220,9 +226,16 @@ def _compute_wss_serial(mask4d, flow, spacing, origin=(0, 0, 0),
             continue
         # Preserve double-precision sampling without duplicating the whole
         # multi-phase velocity field just to process one phase at a time.
-        flow_t = np.asarray(flow[..., showt, :], dtype=float)
-        velocity = pv.ImageData(dimensions=flow_t.shape[:3], spacing=spacing,
-                                origin=origin + 0.5 * spacing)
+        # Keep every wall probe and its trilinear interpolation neighbours.
+        # The maximum normal displacement is 2*d for the parabolic fit.
+        points = np.asarray(base_surface.points)
+        halo_mm = inward_distance*(2 if parabolic_fitting else 1)
+        lower = np.maximum(np.floor((points.min(axis=0)-origin-halo_mm)/field_spacing-field_offset).astype(int)-2, 0)
+        upper = np.minimum(np.ceil((points.max(axis=0)-origin+halo_mm)/field_spacing-field_offset).astype(int)+3, flow.shape[:3])
+        region = tuple(slice(int(lo), int(hi)) for lo, hi in zip(lower, upper))
+        flow_t = np.asarray(flow[region+(showt, slice(None))], dtype=float)
+        velocity = pv.ImageData(dimensions=flow_t.shape[:3], spacing=field_spacing,
+                                origin=origin + (lower + field_offset) * field_spacing)
         for component, name in enumerate(("u", "v", "w")):
             velocity.point_data[name] = (flow_t[..., component] / 100.0).ravel(order="F")
         # cal_wss_from_surf writes phase-specific point data, so each phase
@@ -238,10 +251,10 @@ def _compute_wss_serial(mask4d, flow, spacing, origin=(0, 0, 0),
         if surf.n_points > 0 and "wss" in surf.point_data:
             pts = np.asarray(surf.points, dtype=float)
             vals = np.asarray(surf.point_data["wss"], dtype=np.float32)
-            vox = np.rint((pts - origin.reshape(1, 3)) / (spacing.reshape(1, 3) + 1e-12)).astype(int)
+            vox = np.rint((pts - origin.reshape(1, 3)) / (field_spacing.reshape(1, 3) + 1e-12)).astype(int)
             for k in range(3):
-                vox[:, k] = np.clip(vox[:, k], 0, mask4d.shape[k] - 1)
-            flat = np.ravel_multi_index((vox[:, 0], vox[:, 1], vox[:, 2]), mask4d.shape[:3])
+                vox[:, k] = np.clip(vox[:, k], 0, flow.shape[k] - 1)
+            flat = np.ravel_multi_index((vox[:, 0], vox[:, 1], vox[:, 2]), flow.shape[:3])
             tgt = wss_volume[..., showt].reshape(-1)
             valid = np.isfinite(vals)
             tgt[flat[~valid]] = np.nan
@@ -265,7 +278,7 @@ def _wss_phase_group(phases, mask, flow, spacing, origin, parameters, progress_p
 def compute_wss_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
                         smoothing_iteration=200, viscosity=4.0,
                         inward_distance=None, parabolic_fitting=True,
-                        no_slip_condition=True, max_workers=None):
+                        no_slip_condition=True, max_workers=None, flow_spacing=None):
     """Compute unchanged phase WSS using isolated processes for large 4D jobs.
 
     Identical masks share a worker and a prepared wall. Small/static cases stay
@@ -275,8 +288,8 @@ def compute_wss_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
     field = np.asarray(flow)
     parameters = dict(smoothing_iteration=smoothing_iteration, viscosity=viscosity,
                       inward_distance=inward_distance, parabolic_fitting=parabolic_fitting,
-                      no_slip_condition=no_slip_condition)
-    if field.ndim != 5 or field.shape[-1] != 3 or field.shape[:4] != mask.shape:
+                      no_slip_condition=no_slip_condition, flow_spacing=flow_spacing)
+    if field.ndim != 5 or field.shape[-1] != 3 or field.shape[3] != mask.shape[3] or (flow_spacing is None and field.shape[:3] != mask.shape[:3]):
         return _compute_wss_serial(mask, field, spacing, origin=origin, **parameters)
     lookup = _build_mask_phase_lookup(mask)
     groups = {}
@@ -285,6 +298,7 @@ def compute_wss_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
     if max_workers is None:
         max_workers = min(8, os.cpu_count() or 1) if mask.size >= 2_000_000 else 1
     workers = max(1, min(int(max_workers), len(groups)))
+    workers = bounded_workers(workers, field[..., 0, :].nbytes*4 + mask[..., 0].nbytes*8 + 128*1024**2)
     if workers == 1:
         return _compute_wss_serial(mask, field, spacing, origin=origin, **parameters)
     from joblib import Parallel, delayed
@@ -298,7 +312,7 @@ def compute_wss_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
                 for phases in groups.values())
         results = _wait_plane_processes(calculate, progress_path, count, report_progress, stage="wss")
     surfaces = [None] * count
-    volume = np.zeros(mask.shape, dtype=np.float32)
+    volume = np.zeros(field.shape[:4], dtype=np.float32)
     for phases, result in results:
         for offset, phase in enumerate(phases):
             surfaces[phase] = result["wss_surfaces"][offset]

@@ -8,8 +8,14 @@ from ..plane_rules import normalize_label_plane_rules
 
 
 ANCHORS = (
+    ("Label branch", "label_branch"),
+    ("Branch at vessel connection", "label_reference_branch"),
+    ("Flow-entry branch", "flow_inlet_branch"),
+    ("PV branch at SMV / SV confluence", "portal_branch"),
+    ("Saved multi-branch label route", "label_trunk"),
+    ("Saved route from vessel reference", "label_reference"),
     ("Observed label connections (all arms)", "label_connections"),
-    ("Longest continuous label interval", "label_longest"),
+    ("Longest label interval on one branch", "label_longest"),
     ("Label-local path level", "label_level"), ("Highest label-local path level", "label_terminal"),
     ("MPA / LPA / RPA junction", "pulmonary_split"), ("SMV / SV / PV confluence", "portal_confluence"),
     ("First PV split after confluence", "pv_first_split"), ("Common PV route", "portal_trunk"),
@@ -19,8 +25,8 @@ ANCHORS = (
     ("ARCH route from AAO to DAO", "arch_route"),
 )
 ANCHOR_TITLES = {value: title for title, value in ANCHORS}
-PATH_CHOICES = (("Require one path", "unique"), ("Longest label interval at this level", "longest"),
-                ("All paths at this level", "all"))
+PATH_CHOICES = (("Require one branch", "unique"), ("Dominant branch / longest saved interval", "longest"),
+                ("Each independent origin / saved path", "all"))
 
 
 def placement_summary(rule):
@@ -31,12 +37,14 @@ def placement_summary(rule):
         title = ANCHOR_TITLES.get(spec["anchor"], spec["anchor"])
         if spec["anchor"] == "label_level":
             title += f" L{spec.get('level', 1)}"
-        if spec["anchor"] in {"label_level", "label_terminal"}:
+        if spec["anchor"] in {"label_level", "label_terminal", "label_trunk", "label_reference", "label_branch", "label_reference_branch", "flow_inlet_branch", "portal_branch"}:
             title += "; " + dict((value, label) for label, value in PATH_CHOICES)[spec.get("path_selection", "unique")]
         position = ("before flow-oriented end " + f"{spec.get('offset_mm',5):g} mm" if spec["position"]=="before_end" else
                     "after flow-oriented start " + f"{spec.get('offset_mm',5):g} mm" if spec["position"]=="after_start" else
                     "inside label +" + f"{spec.get('offset_mm', 5):g} mm" if spec["position"] == "near" else
                     ", ".join(f"{100 * float(x):.6g}%" for x in spec["fractions"]))
+        if spec.get("fraction_reference"):
+            position += " from flow-oriented " + ("end" if spec["fraction_reference"] == "flow_end" else "start")
         rows.append(title + " → " + position)
         if spec.get("scope")=="label":
             rows[-1] += "; whole label"
@@ -53,7 +61,7 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.name, self.original = str(name), copy.deepcopy(rule)
         self.rule = None
-        self.allow_fallback = allow_fallback
+        self.allow_fallback = False
         self.setWindowTitle(self.name + " — landmark placement plan")
         self.resize(1320, 740)
         layout = QtWidgets.QVBoxLayout(self)
@@ -61,15 +69,22 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
         self.enabled.setObjectName("landmark_enabled")
         self.enabled.setChecked(rule.get("plane_count", 0) > 0)
         layout.addWidget(self.enabled)
-        explanation = QtWidgets.QLabel(
-            "Each row defines a connection or path property and positions inside the target label.\n"
-            "Observed connections retain every real arm. Fallback applies only when no connection exists; unsupported sections are skipped.")
-        explanation.setWordWrap(True)
-        layout.addWidget(explanation)
+        self.enabled.setToolTip("Each row defines a connection or path property and positions inside the target label. "
+            "Observed connections retain every real arm. Every configured placement is strict. Missing anchors/levels or rejected sections fail plane generation with per-label reasons.")
         self.table = QtWidgets.QTableWidget(0, 9)
         self.table.setObjectName("landmark_placements")
         self.table.setHorizontalHeaderLabels(["Anchor", "Label level", "Paths at level", "Position", "Offset (mm)", "Positions (%)", "No connection", "Level condition", "Scope"])
-        self.table.setColumnHidden(6, not allow_fallback)
+        for column, explanation in enumerate((
+                "Anatomical connection or path property used to locate this measurement.",
+                "Label-local level of the selected path.", "Which paths at that level receive measurements.",
+                "Placement by physical offset or fractional positions.", "Physical offset in millimetres from the chosen anchor.",
+                "Positions as percentages along the resolved label-local path.",
+                "Fallback used only when the requested anatomical connection is absent.",
+                "Apply a level condition when the specified labels connect in the same physical component.",
+                "Resolve this plan for each component or across the complete label.")):
+            self.table.horizontalHeaderItem(column).setToolTip(explanation)
+        self.table.setColumnHidden(6, True)
+        self.table.setColumnHidden(7, True)
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.Stretch)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
@@ -92,7 +107,8 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
         self.preview.setWordWrap(True)
         self.preview.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         layout.addWidget(self.preview)
-        advanced = QtWidgets.QGroupBox("Filters and smoothing (inherit shared settings unless overridden)")
+        advanced = QtWidgets.QGroupBox("Filters and smoothing")
+        advanced.setToolTip("Inherit shared settings unless explicitly overridden for this label.")
         form = QtWidgets.QFormLayout(advanced)
         self.overrides = {}
         for key, title in (("segmentation_filter", "Branch support"), ("fov_boundary_filter", "Exclude FOV-truncated sections")):
@@ -103,8 +119,24 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
             combo.setObjectName("landmark_" + key)
             self.overrides[key] = combo
             form.addRow(title, combo)
+        for key, title, choices in (
+            ('smoothing_method', 'Path smoothing', (('Radius adaptive','radius_adaptive'),('Savitzky-Golay (legacy)','savgol'),('None','none'))),
+            ('smoothing_backend', 'Fit backend', (('Auto (CPU for paths)','auto'),('CPU','cpu'),('GPU with CPU fallback','gpu'))),
+        ):
+            control = QtWidgets.QComboBox()
+            control.addItem('Inherit', None)
+            for label,value in choices:
+                control.addItem(label,value)
+            control.setCurrentIndex(control.findData(rule.get(key)))
+            control.setObjectName('landmark_'+key)
+            self.overrides[key] = control
+            form.addRow(title,control)
         for key, title, minimum, maximum in (
             ("fov_boundary_max_fraction", "Maximum FOV contact fraction", -1., 1.),
+            ('smoothing_radius_factor', 'Half-window / radius', 0., 100.),
+            ('smoothing_max_displacement_ratio', 'Maximum displacement / radius', -1., 1.),
+            ('smoothing_sample_step_mm', 'Physical sample spacing (mm)', 0., 100.),
+            ('smoothing_radius_sigma_mm', 'Radius smoothing scale (mm)', -1., 100.),
             ("smoothing_window", "Path smoothing window", 0, 100001),
             ("smoothing_polyorder", "Path smoothing order", -1, 100),
             ("inter_time", "Path interpolation factor", 0, 1000),
@@ -138,7 +170,7 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
         self.table.insertRow(row)
         anchor = QtWidgets.QComboBox()
         for title, value in ANCHORS:
-            if not self.allow_fallback and value == "label_connections":
+            if value in {"label_trunk","label_reference"} and spec["anchor"] != value:
                 continue
             anchor.addItem(title, value)
         anchor.setCurrentIndex(anchor.findData(spec["anchor"]))
@@ -155,7 +187,10 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
         position.addItem("Fractions of label interval", "fractions")
         position.addItem("Before flow-oriented end", "before_end")
         position.addItem("After flow-oriented start", "after_start")
-        position.setCurrentIndex(position.findData(spec["position"]))
+        position.addItem("Fractions from flow-oriented start", "flow_start_fractions")
+        position.addItem("Fractions from flow-oriented end", "flow_end_fractions")
+        position.setCurrentIndex(position.findData(spec["fraction_reference"] + "_fractions"
+            if spec.get("fraction_reference") else spec["position"]))
         offset = QtWidgets.QDoubleSpinBox()
         offset.setDecimals(3)
         offset.setRange(0, 10000)
@@ -210,13 +245,13 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle("Conditional label-local level")
         form = QtWidgets.QFormLayout(dialog)
-        note = QtWidgets.QLabel("Use the selected L level when all listed labels actually connect to this label in the same physical component. Leave blank to always use it.")
-        note.setWordWrap(True)
-        form.addRow(note)
         labels = QtWidgets.QLineEdit(", ".join(button.property("connected_labels") or []))
         other = QtWidgets.QSpinBox(); other.setRange(1,10000); other.setValue(button.property("otherwise_level") or 1)
         form.addRow("Connected labels (comma separated)", labels)
         form.addRow("Otherwise use L", other)
+        from .parameter_help import bind_help
+        bind_help(form, labels, "Use the selected L level only when all listed labels connect in the same physical component. Leave blank to always use this level.")
+        bind_help(form, other, "Label-local level used when the required connected labels are absent.")
         buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject); form.addRow(buttons)
         try:
@@ -241,21 +276,25 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
         placements = []
         for row in range(self.table.rowCount()):
             anchor, level, paths, position, offset, fractions = [self.table.cellWidget(row, i) for i in range(6)]
-            spec = {"anchor": anchor.currentData(), "position": position.currentData()}
+            value = position.currentData()
+            spec = {"anchor": anchor.currentData(), "position": "fractions" if value in
+                    {"flow_start_fractions", "flow_end_fractions"} else value}
+            if value in {"flow_start_fractions", "flow_end_fractions"}:
+                spec["fraction_reference"] = value.removesuffix("_fractions")
             if spec["anchor"] == "label_level":
                 spec["level"] = level.value()
-            if spec["anchor"] in {"label_level", "label_terminal"}:
+            if spec["anchor"] in {"label_level", "label_terminal", "label_trunk", "label_reference", "label_branch", "label_reference_branch", "flow_inlet_branch", "portal_branch"}:
                 choice = paths.currentData()
-                if choice != "unique":
+                if choice != "unique" or spec["anchor"] in {"label_branch","label_reference_branch","flow_inlet_branch","portal_branch"}:
                     spec["path_selection"] = choice
             scope=self.table.cellWidget(row,8)
-            if spec["anchor"] in {"label_level","label_terminal","label_longest"} and scope.currentData()=="label":
+            if spec["anchor"] in {"label_level","label_terminal","label_longest","label_trunk","label_branch","flow_inlet_branch"} and scope.currentData()=="label":
                 spec["scope"]="label"
             fallback = self.table.cellWidget(row, 6)
             if self.allow_fallback and spec["anchor"] == "label_connections" and fallback.property("fallback_spec"):
                 spec["fallback"] = copy.deepcopy(fallback.property("fallback_spec"))
             condition = self.table.cellWidget(row, 7)
-            if spec["anchor"] == "label_level" and condition.property("connected_labels"):
+            if False and spec["anchor"] == "label_level" and condition.property("connected_labels"):
                 spec["when_connected_to"] = list(condition.property("connected_labels"))
                 spec["otherwise_level"] = int(condition.property("otherwise_level"))
             if spec["position"] in {"near","before_end","after_start"}:
@@ -275,18 +314,18 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
             if fractions is None:
                 continue
             level.setEnabled(anchor.currentData() == "label_level")
-            paths.setEnabled(anchor.currentData() in {"label_level", "label_terminal"})
+            paths.setEnabled(anchor.currentData() in {"label_level", "label_terminal", "label_trunk", "label_reference", "label_branch", "label_reference_branch", "flow_inlet_branch", "portal_branch"})
             fallback = self.table.cellWidget(row, 6)
             condition = self.table.cellWidget(row, 7)
             scope=self.table.cellWidget(row,8)
             if scope is not None:
-                scope.setEnabled(anchor.currentData() in {"label_level","label_terminal","label_longest"})
+                scope.setEnabled(anchor.currentData() in {"label_level","label_terminal","label_longest","label_trunk","label_branch","flow_inlet_branch"})
             if fallback is not None:
                 fallback.setEnabled(self.allow_fallback and anchor.currentData() == "label_connections")
             if condition is not None:
                 condition.setEnabled(anchor.currentData() == "label_level")
             offset.setEnabled(position.currentData() in {"near","before_end","after_start"})
-            fractions.setEnabled(position.currentData() == "fractions")
+            fractions.setEnabled(position.currentData() in {"fractions", "flow_start_fractions", "flow_end_fractions"})
         try:
             placements = self.placements()
             count = sum(len(spec["fractions"]) if spec["position"] == "fractions" else 1 for spec in placements)

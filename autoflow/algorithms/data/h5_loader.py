@@ -131,6 +131,9 @@ def load_h5_data(
             "input_parameter_overrides": parameter_overrides,
         }
 
+        if seg_ds is not None and seg_ds.name + "_geometry1mm" in handle:
+            meta["geometry_cache_dataset"] = seg_ds.name + "_geometry1mm"
+
         if img_complex_ds is not None:
             img_complex = read_compressed_dataset(img_complex_ds)
             if img_complex.ndim != 5 or int(img_complex.shape[-1]) not in (4, 7):

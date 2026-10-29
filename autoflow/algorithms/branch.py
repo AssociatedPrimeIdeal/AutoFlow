@@ -8,7 +8,7 @@ from .hierarchy import graph_edge_chains, analyze_group_graph, hierarchy_path_or
 
 def _orient_node_paths_by_flow(node_paths, graph_points, flow_xyzt3=None, segmask_binary_4d=None,
                                spacing=(1.0, 1.0, 1.0), origin=(0.0, 0.0, 0.0),
-                               confidence_eps=0.05, sample_paths=None):
+                               confidence_eps=0.05, sample_paths=None, mask_spacing=None):
     if flow_xyzt3 is None or segmask_binary_4d is None:
         return [list(map(int, p)) for p in node_paths]
     flow = np.asarray(flow_xyzt3, dtype=np.float32)
@@ -32,11 +32,13 @@ def _orient_node_paths_by_flow(node_paths, graph_points, flow_xyzt3=None, segmas
             if len(candidate) >= 2:
                 sampled_path = candidate
         pts = sampled_path if sampled_path is not None else np.asarray(graph_points[nodes], dtype=float)
-        vox = np.rint((pts - origin.reshape(1, 3)) / (spacing.reshape(1, 3) + 1e-12)).astype(int)
+        vox = np.rint(pts / (spacing.reshape(1, 3) + 1e-12)).astype(int)
         for k in range(3):
             vox[:, k] = np.clip(vox[:, k], 0, flow.shape[k] - 1)
         vec = flow[vox[:, 0], vox[:, 1], vox[:, 2], :, :]
-        m = mask[vox[:, 0], vox[:, 1], vox[:, 2], :]
+        mask_vox = np.rint(pts / np.asarray(mask_spacing if mask_spacing is not None else spacing)).astype(int)
+        mask_vox = np.clip(mask_vox, 0, np.asarray(mask.shape[:3])-1)
+        m = mask[mask_vox[:, 0], mask_vox[:, 1], mask_vox[:, 2], :]
         flow_per_pt = np.sum(vec * m[..., None], axis=1)
         seg_dl = pts[1:] - pts[:-1]
         flow_mid = 0.5 * (flow_per_pt[1:] + flow_per_pt[:-1])
@@ -199,7 +201,7 @@ def build_path_info(node_paths, graph_points, forks=None):
 
 def segment_vessels_from_graph_and_mask(segmask_3d, graph, resolution, flow_xyzt3=None,
                                         segmask_binary_4d=None, origin=(0, 0, 0),
-                                        segmentation_labels=None):
+                                        segmentation_labels=None, flow_spacing=None):
     mask3d = np.asarray(segmask_3d, dtype=bool)
     G = graph_to_networkx(graph)
     if G.number_of_nodes() == 0:
@@ -237,17 +239,18 @@ def segment_vessels_from_graph_and_mask(segmask_3d, graph, resolution, flow_xyzt
     node_paths = _orient_node_paths_by_flow(
         node_paths, graph_points,
         flow_xyzt3=flow_xyzt3, segmask_binary_4d=segmask_binary_4d,
-        spacing=resolution, origin=origin, sample_paths=filtered_paths,
+        spacing=flow_spacing if flow_spacing is not None else resolution, origin=origin,
+        sample_paths=filtered_paths, mask_spacing=resolution,
     )
     hierarchy = analyze_group_graph(graph, node_paths, flow=flow_xyzt3,
-        mask=segmask_binary_4d, spacing=resolution, segmentation_labels=segmentation_labels)
+        mask=segmask_binary_4d, spacing=resolution, segmentation_labels=segmentation_labels, flow_spacing=flow_spacing)
     assignment_paths = [graph_points[np.asarray(nodes, dtype=int)] for nodes in node_paths]
     order = hierarchy_path_order(hierarchy)
     old_to_new = {old: new for new, old in enumerate(order)}
     if order != list(range(len(node_paths))):
         node_paths = [node_paths[index] for index in order]
         hierarchy = analyze_group_graph(graph, node_paths, flow=flow_xyzt3,
-            mask=segmask_binary_4d, spacing=resolution, segmentation_labels=segmentation_labels)
+            mask=segmask_binary_4d, spacing=resolution, segmentation_labels=segmentation_labels, flow_spacing=flow_spacing)
     point_paths = [graph_points[np.asarray(nodes, dtype=int)] for nodes in node_paths]
     forks = find_path_forks(node_paths, graph_points, graph=graph)
     path_info = build_path_info(node_paths, graph_points, forks)

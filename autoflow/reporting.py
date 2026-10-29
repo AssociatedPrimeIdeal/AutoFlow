@@ -4,6 +4,7 @@ import os
 import numpy as np
 
 from .algorithms import load_metrics_as_table
+from .report_snapshot import build_report_snapshot, render_report_html, save_report_html
 
 
 def load_metrics_from_output(out_dir):

@@ -12,6 +12,9 @@ from tempfile import TemporaryDirectory
 import numpy as np
 
 from ._common import segmentation_timestamp
+from . import shared_helpers
+
+_PREDICTOR_CACHE = {}
 from .grouped_runtime import iter_grouped_temporal_samples, predict_grouped_iterator
 from .channels import (
     _apply_label_map,
@@ -99,18 +102,17 @@ def _nnunet_4d_temporal_radius(channel_names):
 def _nnunet_4d_grouped_requested(runner=None, grouped_preprocessing=None):
     """Return whether the direct grouped predictor should be attempted.
 
-    The grouped implementation keeps a torch predictor in the caller process.
-    The GUI passes ``grouped_preprocessing=False`` so native CUDA/Qt failures
-    stay inside the nnUNet subprocess.  Other callers retain the environment
-    controlled behavior for backwards compatibility.
+    Shared preprocessing is experimental and defaults to off. Explicit API
+    opt-in or AUTOFLOW_NNUNET4D_GROUPED=experimental selects an isolated,
+    persistent worker. False always keeps the standard backend.
     """
     if grouped_preprocessing is not None:
         return bool(grouped_preprocessing) and runner is None
-    token = str(os.environ.get("AUTOFLOW_NNUNET4D_GROUPED", "auto") or "auto").strip().lower()
+    token = str(os.environ.get("AUTOFLOW_NNUNET4D_GROUPED", "off") or "auto").strip().lower()
     if token in {"0", "false", "no", "off", "standard", "subprocess"}:
         return False
     # A test/custom runner intentionally exercises the subprocess contract.
-    return runner is None
+    return runner is None and token in {"1", "true", "yes", "on", "required", "experimental"}
 
 
 def _generate_nnunet_4d_grouped(
@@ -130,13 +132,14 @@ def _generate_nnunet_4d_grouped(
     artifact_prefix,
     progress_callback,
     t_total_start,
+    origin=None,
 ):
     """Predict all temporal samples with one common crop and shared resampling."""
-    pipeline = _load_4d_pipeline_module(pipeline_script)
+    pipeline = shared_helpers
     # Dataset7020 plans may reference the project GPU resampler by name. The
     # grouped runner already owns the installer used by its batch workflow;
     # install it before PlansManager resolves the resampling function.
-    if str(resolved_device).strip().lower() == "cuda":
+    if str(resolved_device).strip().lower() == "cuda" and pipeline_script and Path(pipeline_script).is_file():
         _install_nnunet_4d_resampler(pipeline_script)
     channel_names = _ordered_mapping_values(dataset_json.get("channel_names") or dataset_json.get("modality") or {})
     radius = _nnunet_4d_temporal_radius(channel_names)
@@ -214,19 +217,7 @@ def _generate_nnunet_4d_grouped(
         from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 
         torch_device = torch.device(str(resolved_device))
-        predictor = nnUNetPredictor(
-            tile_step_size=0.5,
-            use_gaussian=True,
-            use_mirroring=False,
-            perform_everything_on_device=torch_device.type == "cuda",
-            device=torch_device,
-            verbose=False,
-            verbose_preprocessing=False,
-            allow_tqdm=False,
-        )
-        predictor.initialize_from_trained_model_folder(
-            str(model_path), use_folds=tuple(selected_folds), checkpoint_name=checkpoint_name
-        )
+        predictor, model_reused = _get_predictor(model_path, selected_folds, checkpoint_name, torch_device)
         if torch_device.type != "cuda":
             # Dataset7020's persisted plan points at a project CUDA resampler.
             # Keep CPU inference usable by changing only this in-memory plan;
@@ -333,6 +324,9 @@ def _generate_nnunet_4d_grouped(
             "time_count": nt,
             "temporal_radius": radius,
             "grouped_preprocessing": True,
+            "experimental": True,
+            "normalization_policy": shared_helpers.GROUPED_TEMPORAL_PREPROCESS_VERSION,
+            "model_reused": model_reused,
             "unique_source_maps": len(source_paths),
             "label_map": {str(k): int(v) for k, v in label_map.items()},
             "case_id": str(safe_case_id),
@@ -344,4 +338,38 @@ def _generate_nnunet_4d_grouped(
             "prediction_file": "" if artifact_prediction is None else str(artifact_prediction),
             "elapsed_sec": float(elapsed_total),
         }
+        from .model_grid import collect_geometry_cache
+        provenance.update(collect_geometry_cache([output_dir / f"{safe_case_id}__t{i:03d}.nii.gz" for i in range(nt)], seg_4d, np.asarray(resolution_nnunet)[::-1], np.asarray(origin if origin is not None else (0, 0, 0)), label_map, artifact_prefix))
         return np.asarray(seg_4d, dtype=np.int16), provenance
+
+
+def _get_predictor(model_path, selected_folds, checkpoint_name, torch_device):
+    from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+    import torch
+    checkpoint_stats = tuple((str(model_path / f"fold_{fold}" / checkpoint_name), (model_path / f"fold_{fold}" / checkpoint_name).stat().st_mtime_ns)
+                             for fold in selected_folds)
+    key = (str(model_path), tuple(selected_folds), checkpoint_name, str(torch_device), checkpoint_stats,
+           (model_path / "plans.json").stat().st_mtime_ns, (model_path / "dataset.json").stat().st_mtime_ns)
+    persistent = os.environ.get("AUTOFLOW_SHARED_WORKER_CHILD") == "1"
+    if persistent and key in _PREDICTOR_CACHE:
+        return _PREDICTOR_CACHE[key], True
+    _PREDICTOR_CACHE.clear()
+    if torch_device.type == "cuda":
+        torch.cuda.empty_cache()
+    predictor = nnUNetPredictor(
+        tile_step_size=0.5,
+        use_gaussian=True,
+        use_mirroring=False,
+        perform_everything_on_device=torch_device.type == "cuda",
+        device=torch_device,
+        verbose=False,
+        verbose_preprocessing=False,
+        allow_tqdm=False,
+    )
+    predictor.initialize_from_trained_model_folder(
+        str(model_path), use_folds=tuple(selected_folds), checkpoint_name=checkpoint_name
+    )
+
+    if persistent:
+        _PREDICTOR_CACHE[key] = predictor
+    return predictor, False

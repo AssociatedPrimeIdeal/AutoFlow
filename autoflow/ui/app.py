@@ -1,4 +1,9 @@
+from .selection_info import SelectionInfoPanel, consistency_rows
+from .browser import BrowserTree, ContextStack, INLINE_ROLE
+from .measurement_summary import MeasurementSummary
+from .pinned_metrics import pinned_metric_keys, pinned_metric_rows
 from .content_controls import ContentRenderControls
+from .workspace_layout import WorkspaceLayoutMixin
 from ..config import BACKGROUND_COLOR
 import hashlib
 import json
@@ -12,6 +17,8 @@ import signal
 import sys
 import time
 import traceback
+import uuid
+from contextlib import nullcontext
 from functools import partial, wraps
 from pathlib import Path
 
@@ -54,20 +61,31 @@ from ..algorithms.segmentation import (
 from ..core.models import ObjectKind, PlaneData, StepId, Workspace
 from ..core.pipeline import PipelineEngine
 from ..task_control import CancellationToken, TaskCancelled, check_cancelled, task_scope
-from ..runtime_paths import DOCUMENTATION_URL, documentation_index
 from .progress import TaskProgressDialog
 from .plane_handles import PlaneDragHandles
+from .time_navigation import FrameNavigationFilter
+from .plane_editing import PlaneEditingMixin, _PlaneCommand
+from .review import ReviewMixin
+from .report_actions import ReportActionsMixin
+from .report_actions import ReportActionsMixin
+from .analysis_plotting import (update_plane_curve, move_phase_cursor,
+                                style_analysis_figure, analysis_palette)
+from ..core.plane_state import (metric_validity, mutation_snapshot, remove_planes, selected_metric,
+                                invalidate_planes, refresh_plane_consistency)
 from ..config import apply_config_bundle_to_workspace, bundle_to_autoflow_kwargs, load_config_bundle
 from ..plane_io import load_plane_position_payload, project_planes_to_workspace, save_plane_positions
 from ..quality import build_quality_report, save_quality_report
 from ..algorithms import compute_plane_metrics, apply_internal_consistency_to_metrics, compute_plane_metrics_multithread, augment_plane_metrics_with_derived, save_plane_pixelwise_h5
-from ..algorithms.streamlines import _plane_seeds, create_pathline_temporal_source
+from ..algorithms.streamlines import _plane_seeds, create_pathline_temporal_source, pathline_sample_times
+from ..algorithms.flow_seeding import plane_seed_points, phase_mask
+from ..core.plane_state import workspace_signature, plane_signature
 from .editors import PlaneEditor
 from .input_dialogs import DualVencSelectDialog, H5CaseSelectDialog
 from .action_settings import ActionSettingsMixin, action_sections
 from .ortho_viewer import OrthoViewer
 from .segmentation import SegmentationDock, SOURCE_LABELS
-from .theme import apply_application_theme, configure_high_dpi, standard_icon
+from .theme import (apply_application_theme, configure_high_dpi, standard_icon,
+                    theme_colors, readable_color, workflow_status_colors)
 from ..rendering import (
     render_plane_rotation_video,
     render_pressure_gradient_video,
@@ -140,7 +158,6 @@ _ANALYSIS_MODE_ITEMS = [
     ("PWV", "pwv"),
     ("Plane Curve", "plane_curve"),
     ("Centerline Pressure", "centerline_pressure"),
-    ("Internal Consistency", "internal_consistency"),
 ]
 
 _BACKGROUND_PHASE_METHOD_ITEMS = [
@@ -206,7 +223,8 @@ _WORKFLOW_STAGES = [
     ("Segmentation", "segmentation"),
     ("Centerline & Planes", "centerline"),
     ("Hemodynamics", "hemodynamics"),
-    ("Review & Export", "review"),
+    ("Review QC", "review"),
+    ("Export", "export"),
 ]
 
 _WORKFLOW_STEPS = {
@@ -228,6 +246,7 @@ _WORKFLOW_STEPS = {
         StepId.PLANE_STREAMLINES,
     },
     "review": set(),
+    "export": set(),
 }
 
 _WORKFLOW_RUN_ALL_STEPS = {
@@ -360,7 +379,7 @@ class _AutoSegmentationWorker(_TaskWorker):
                 # Keep the GUI process free of the in-process torch predictor.
                 # Native CUDA/Qt failures must be contained by the nnUNet
                 # subprocess instead of terminating the application.
-                grouped_preprocessing=False,
+                grouped_preprocessing=None,
             )
             check_cancelled()
             seg = np.asarray(seg, dtype=np.int16)
@@ -503,9 +522,31 @@ class _PipelineTaskWorker(_TaskWorker):
                     "elapsed_sec": float(elapsed),
                     "result_message": str(result.message),
                 })
+            report_result = {}
+            report_steps = {
+                StepId.GENERATE_SKELETON, StepId.GENERATE_GRAPH, StepId.GENERATE_PLANES,
+                StepId.COMPUTE_PLANE_METRICS, StepId.COMPUTE_DERIVED_METRICS, StepId.COMPUTE_PWV,
+            }
+            if report_steps.intersection(self.completed_steps):
+                self.progress.emit({"stage": "report", "current": len(self._steps),
+                                    "total": len(self._steps), "message": "Writing single-case analysis HTML..."})
+                report_started = time.perf_counter()
+                try:
+                    from ..report_snapshot import build_report_snapshot, save_report_html
+                    snapshot = build_report_snapshot(self._workspace)
+                    report_path = save_report_html(snapshot, os.path.join(
+                        self._engine._output_dir(self._workspace), "analysis_report.html"))
+                    report_result = {"status": "complete", "file": report_path,
+                                     "snapshot_id": snapshot["snapshot_id"]}
+                except TaskCancelled:
+                    raise
+                except Exception as exc:
+                    report_result = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+                report_result["elapsed_sec"] = time.perf_counter() - report_started
             self.finished.emit({
                 "results": results,
                 "elapsed_sec": float(time.perf_counter() - started),
+                "analysis_report": report_result,
             })
         except TaskCancelled:
             raise
@@ -519,122 +560,81 @@ class _PathlineTaskWorker(_TaskWorker):
     failed = QtCore.Signal(str)
 
     def __init__(self, flow, mask_4d, branch_labels, planes, plane_indices, *,
-                 time_index, spacing, origin, rr, params):
+                 time_index, spacing, origin, rr, params, seed_segmentation=None, segmentation_labels=None):
         super().__init__()
-        self._flow = flow
-        self._mask_4d = mask_4d
-        self._branch_labels = branch_labels
-        self._planes = list(planes)
+        self._flow, self._mask_4d, self._branch_labels = flow, mask_4d, branch_labels
+        self._planes = [copy.deepcopy(plane) for plane in planes]
         self._plane_indices = [int(index) for index in plane_indices]
         self._time_index = int(time_index)
-        self._spacing = np.asarray(spacing, dtype=float).copy()
-        self._origin = np.asarray(origin, dtype=float).copy()
-        self._rr = float(rr)
-        self._params = dict(params or {})
+        self._spacing, self._origin = np.asarray(spacing, float).copy(), np.asarray(origin, float).copy()
+        self._rr, self._params = float(rr), dict(params or {})
+        self._seed_segmentation = seed_segmentation if seed_segmentation is not None else (
+            mask_4d if self._params.get("pathline_seed_region", "segmentation") == "segmentation" else None)
+        self._segmentation_labels = segmentation_labels
 
     @QtCore.Slot()
     @_cancellable_worker
     def run(self):
         started = time.perf_counter()
         try:
-            results = {}
-            seed_results = {}
+            results, seed_results, roi_sources = {}, {}, {}
             total = len(self._plane_indices)
-            if self._mask_4d.ndim == 4:
-                mask_t = self._mask_4d[..., min(max(0, self._time_index), self._mask_4d.shape[3] - 1)]
-            else:
-                mask_t = self._mask_4d
-            temporal_cache_mb = (
-                self._params["pathline_temporal_cache_mb"] if total > 1 else 0.0
-            )
-            temporal_source = create_pathline_temporal_source(
-                self._flow,
-                self._mask_4d,
-                self._spacing,
-                self._origin,
-                self._time_index,
-                self._rr,
-                temporal_cache_mb=temporal_cache_mb,
-            )
-            frame_steps = min(
-                len(temporal_source._times),
-                max(1, int(self._params["pathline_max_steps"])),
-            )
-            for current, plane_index in enumerate(self._plane_indices, start=1):
+            mask_t = phase_mask(self._mask_4d, self._flow.shape[:3], self._time_index)
+            temporal_cache_mb = self._params["pathline_temporal_cache_mb"] if total > 1 else 0.0
+            temporal_source = create_pathline_temporal_source(self._flow, self._mask_4d,
+                self._spacing, self._origin, self._time_index, self._rr, temporal_cache_mb=temporal_cache_mb)
+            frame_steps = len(pathline_sample_times(temporal_source, self._flow,
+                self._params.get("pathline_integration_step_mm"), self._params["pathline_max_steps"]))
+            for current, index in enumerate(self._plane_indices, start=1):
                 check_cancelled()
-                seeds = _plane_seeds(
-                    mask_t,
-                    self._planes[plane_index],
-                    self._spacing,
-                    self._origin,
-                    seed_ratio=self._params["pathline_seed_ratio"],
-                    min_seeds=self._params["pathline_min_seeds"],
-                    max_seeds=self._params["pathline_max_seeds"],
-                    rng_seed=self._params["pathline_rng_seed"],
-                    branch_labels_3d=self._branch_labels,
-                    t=self._time_index,
-                    seed_mode=self._params["pathline_seed_mode"],
-                )
-                seed_results[int(plane_index)] = seeds
-                plane_offset = (current - 1) * frame_steps
-                def _step_progress(step, step_total, *, _plane=int(plane_index), _offset=plane_offset, _current=current):
+                seeds, roi_source = plane_seed_points(self._flow, self._planes[index], self._spacing, self._origin,
+                    phase=self._time_index, region=self._params.get("pathline_seed_region", "segmentation"),
+                    segmentation=self._seed_segmentation, segmentation_labels=self._segmentation_labels,
+                    branch_labels=self._branch_labels,
+                    distribution=self._params.get("pathline_seed_distribution", "random"),
+                    grid_spacing_mm=self._params.get("pathline_grid_spacing_mm", 1.),
+                    mode=self._params["pathline_seed_mode"], count=self._params["pathline_max_seeds"],
+                    ratio=self._params["pathline_seed_ratio"], min_seeds=self._params["pathline_min_seeds"],
+                    rng_seed=self._params["pathline_rng_seed"])
+                seed_results[index], roi_sources[index] = seeds, roi_source
+                def progress(step, step_total, *, _index=index, _current=current):
                     check_cancelled()
-                    self.progress.emit({
-                        "current": min(_offset + int(step), _current * frame_steps),
-                        "total": total * frame_steps,
-                        "message": f"Integrating pathlines for plane {_plane} ({_current}/{total})",
-                        "elapsed_sec": float(time.perf_counter() - started),
-                    })
-                mesh = generate_pathlines_from_plane_at_t(
-                    self._flow,
-                    self._time_index,
-                    self._planes[plane_index],
-                    self._spacing,
-                    self._origin,
-                    mask_4d=self._mask_4d,
-                    mask_3d=mask_t,
-                    max_steps=self._params["pathline_max_steps"],
-                    terminal_speed=self._params["pathline_terminal_speed"],
-                    seed_ratio=self._params["pathline_seed_ratio"],
-                    min_seeds=self._params["pathline_min_seeds"],
-                    rng_seed=self._params["pathline_rng_seed"],
-                    rr=self._rr,
-                    branch_labels_3d=self._branch_labels,
-                    max_seeds=self._params["pathline_max_seeds"],
-                    seeds=seeds,
-                    progress_callback=_step_progress,
-                    seed_mode=self._params["pathline_seed_mode"],
-                    temporal_source=temporal_source,
-                )
-                results[int(plane_index)] = {int(self._time_index): mesh}
-                self.progress.emit({
-                    "current": current * frame_steps,
-                    "total": total * frame_steps,
-                    "message": f"Generated pathlines for plane {int(plane_index)} ({current}/{total})",
-                    "elapsed_sec": float(time.perf_counter() - started),
-                })
+                    self.progress.emit({"current": (_current-1)*frame_steps+step,
+                        "total": total*frame_steps, "message": f"Integrating plane {_index}: {len(seeds):,} seeds",
+                        "elapsed_sec": time.perf_counter()-started})
+                mesh = generate_pathlines_from_plane_at_t(self._flow, self._time_index, self._planes[index],
+                    self._spacing, self._origin, mask_4d=self._mask_4d, mask_3d=mask_t,
+                    max_steps=self._params["pathline_max_steps"], terminal_speed=self._params["pathline_terminal_speed"],
+                    rng_seed=self._params["pathline_rng_seed"], rr=self._rr, seeds=seeds,
+                    max_seeds=None if self._params.get("pathline_seed_distribution") == "uniform" else self._params["pathline_max_seeds"],
+                    progress_callback=progress, temporal_source=temporal_source,
+                    integration_step_mm=self._params.get("pathline_integration_step_mm"))
+                if mesh is not None:
+                    mesh.field_data["ROISourcePhase"] = np.asarray([-1 if roi_source is None else roi_source], np.int64)
+                results[index] = {self._time_index: mesh}
             check_cancelled()
-            self.finished.emit({
-                "plane_indices": self._plane_indices,
-                "meshes": results,
-                "seeds": seed_results,
+            self.finished.emit({"plane_indices": self._plane_indices, "meshes": results, "seeds": seed_results,
+                "roi_source_frames": roi_sources, "launch_phase": self._time_index,
+                "input_signature": self._params.get("input_signature"),
+                "plane_signatures": self._params.get("plane_signatures"),
                 "temporal_cache_all_phases": bool(temporal_source.cache_all_phases),
-                "elapsed_sec": float(time.perf_counter() - started),
-            })
+                "elapsed_sec": time.perf_counter()-started})
         except TaskCancelled:
             raise
         except Exception:
             self.failed.emit(traceback.format_exc())
 
-
-class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
+class MainWindow(WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEditingMixin, ActionSettingsMixin, QtWidgets.QMainWindow):
     def __init__(self, config_dir=None):
         super().__init__()
         self.setWindowTitle("AutoFlow")
+        self.setAcceptDrops(True)
         self.resize(1800, 980)
         self.setMinimumSize(1440, 800)
         self._config_dir = config_dir
         self._config_bundle = load_config_bundle(config_dir)
+        apply_application_theme(QtWidgets.QApplication.instance(),
+                                self._config_bundle.get("ui", {}).get("theme", "dark"))
         self.workspace = Workspace()
         apply_config_bundle_to_workspace(self.workspace, self._config_bundle)
         self.pipeline = PipelineEngine()
@@ -650,6 +650,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self._timeline_scrub_timer.setInterval(30)
         self._timeline_scrub_timer.timeout.connect(self._apply_pending_timeline_value)
         self._pending_timeline_value = None
+        self._keyboard_navigation_active = False
         self._edit_mode = None
         self._edit_group_name = ""
         self._edit_points = None
@@ -687,6 +688,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self._plane_widget_initializing = False
         self._plane_drag_metrics_dirty = False
         self._plane_edit_enabled = False
+        self._initialize_plane_transactions()
         self._plane_handles = None
         self._plane_edit_had_metrics = False
         self._plane_center_widget = None
@@ -729,12 +731,16 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self._input_signature = None
         self._build_ui()
         self._bind_scene()
+        self._frame_navigation_filter = FrameNavigationFilter(
+            self, self._queue_keyboard_time_step, self._finish_keyboard_time_step)
         self._esc_shortcut = QtGui.QShortcut(QtCore.Qt.Key_Escape, self)
         self._esc_shortcut.setContext(QtCore.Qt.ApplicationShortcut)
         self._esc_shortcut.activated.connect(self._force_exit_edit)
         QtCore.QTimer.singleShot(0, self._setup_focus_behavior)
         self.ortho_viewer.timeStepRequested.connect(self._on_ortho_time_step)
         self.ortho_viewer.planeRoiChanged.connect(self._on_plane_roi_changed)
+        self.ortho_viewer.planeRoiEditStarted.connect(self._begin_roi_transaction)
+        self.ortho_viewer.planeRoiEditFinished.connect(self._finish_roi_transaction)
         self._refresh_all()
         self.statusBar().showMessage("Ready")
 
@@ -767,25 +773,42 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         workflow_row.addWidget(self.workflow_status, 0)
         root.addLayout(workflow_row)
 
+        self.workspace_pages = QtWidgets.QStackedWidget()
+        self.workspace_pages.setObjectName('workspacePages')
+        root.addWidget(self.workspace_pages, 1)
+        self.workspace_page = QtWidgets.QWidget()
+        self.workspace_pages.addWidget(self.workspace_page)
+        workspace_layout = QtWidgets.QVBoxLayout(self.workspace_page)
+        workspace_layout.setContentsMargins(0, 0, 0, 0)
+        workspace_layout.setSpacing(8)
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.workspace_splitter = splitter
         splitter.setChildrenCollapsible(False)
         splitter.setHandleWidth(6)
-        root.addWidget(splitter, 1)
+        workspace_layout.addWidget(splitter, 1)
         left = QtWidgets.QWidget()
-        left.setMinimumWidth(280)
+        left.setMinimumWidth(300)
         left_lay = QtWidgets.QVBoxLayout(left)
         left_lay.setContentsMargins(0, 0, 0, 0)
         left_lay.setSpacing(6)
-        self._build_browser(left_lay)
+        self.left_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.left_splitter.setChildrenCollapsible(False)
+        self.left_splitter.setHandleWidth(6)
+        browser_panel = QtWidgets.QWidget()
+        browser_layout = QtWidgets.QVBoxLayout(browser_panel)
+        browser_layout.setContentsMargins(0, 0, 0, 0)
+        self._build_browser(browser_layout)
+        self.left_splitter.addWidget(browser_panel)
+        left_lay.addWidget(self.left_splitter)
         mid = QtWidgets.QWidget()
-        mid.setMinimumWidth(520)
+        mid.setMinimumWidth(420)
         mid_lay = QtWidgets.QVBoxLayout(mid)
         mid_lay.setContentsMargins(0, 0, 0, 0)
         mid_lay.setSpacing(6)
         if os.environ.get("AUTOFLOW_SSH_RENDERING") == "1":
             self.plotter = RemotePlotter(self)
         else:
-            self.plotter = QtInteractor(self)
+            self.plotter = QtInteractor(self, auto_update=False)
         self.plotter.setFocusPolicy(QtCore.Qt.ClickFocus)
         mid_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         self.mid_splitter = mid_splitter
@@ -796,35 +819,37 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         plotter_layout.setContentsMargins(0, 0, 0, 0)
         plotter_layout.setSpacing(3)
         plotter_layout.addWidget(self.plotter, 1)
-        range_bar = QtWidgets.QHBoxLayout()
-        range_bar.addWidget(QtWidgets.QLabel("Window/Level:"))
-        range_bar.addWidget(QtWidgets.QLabel("Window"))
+        range_bar = QtWidgets.QGridLayout()
+        range_bar.setVerticalSpacing(2)
+        range_bar.addWidget(QtWidgets.QLabel("Window"), 0, 0)
         self.slider_render_window = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.slider_render_window.setRange(1, 1000)
         self.slider_render_window.setEnabled(False)
         self.slider_render_window.setToolTip("Adjust window width")
-        range_bar.addWidget(self.slider_render_window, 1)
+        range_bar.addWidget(self.slider_render_window, 0, 1)
         self.label_render_window = QtWidgets.QLabel("—")
         self.label_render_window.setMinimumWidth(72)
-        range_bar.addWidget(self.label_render_window)
-        range_bar.addWidget(QtWidgets.QLabel("Level"))
+        range_bar.addWidget(self.label_render_window, 0, 2)
+        range_bar.addWidget(QtWidgets.QLabel("Level"), 1, 0)
         self.slider_render_level = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.slider_render_level.setRange(0, 1000)
         self.slider_render_level.setEnabled(False)
         self.slider_render_level.setToolTip("Adjust window level")
-        range_bar.addWidget(self.slider_render_level, 1)
+        range_bar.addWidget(self.slider_render_level, 1, 1)
         self.label_render_level = QtWidgets.QLabel("—")
         self.label_render_level.setMinimumWidth(72)
-        range_bar.addWidget(self.label_render_level)
+        range_bar.addWidget(self.label_render_level, 1, 2)
         self.btn_reset_render_range = QtWidgets.QPushButton("Auto")
         self.btn_reset_render_range.setToolTip("Restore the automatic range for the selected scalar object")
         self.btn_reset_render_range.setEnabled(False)
         self.btn_reset_render_range.clicked.connect(self._reset_selected_render_range)
-        range_bar.addWidget(self.btn_reset_render_range)
-        range_bar.addStretch(1)
+        range_bar.addWidget(self.btn_reset_render_range, 0, 3, 2, 1)
+        range_bar.setColumnStretch(1, 1)
         self.slider_render_window.valueChanged.connect(self._on_render_range_changed)
         self.slider_render_level.valueChanged.connect(self._on_render_range_changed)
-        plotter_layout.addLayout(range_bar)
+        self.render_range_controls = QtWidgets.QWidget()
+        self.render_range_controls.setLayout(range_bar)
+        self.appearance_layout.addWidget(self.render_range_controls)
         mid_splitter.addWidget(plotter_panel)
         step_and_params = QtWidgets.QWidget()
         sp_lay = QtWidgets.QVBoxLayout(step_and_params)
@@ -846,111 +871,127 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         mid_splitter.setSizes([640, 100])
         mid_lay.addWidget(mid_splitter, 1)
         right = QtWidgets.QWidget()
-        right.setMinimumWidth(360)
+        right.setMinimumWidth(440)
         right_lay = QtWidgets.QVBoxLayout(right)
         right_lay.setContentsMargins(0, 0, 0, 0)
         self.ortho_viewer = OrthoViewer(self.workspace, self)
         self.ortho_viewer.contentRenderRequested.connect(self._on_content_render_requested)
-        right_lay.addWidget(self.ortho_viewer)
+        self.ortho_viewer.planeTranslationStarted.connect(self._begin_plane_2d_translation)
+        self.ortho_viewer.planeTranslationChanged.connect(self._move_plane_from_2d)
+        self.ortho_viewer.planeTranslationFinished.connect(self._finish_plane_2d_translation)
+        self.ortho_viewer.planeRotationStarted.connect(self._begin_plane_2d_rotation)
+        self.ortho_viewer.planeRotationChanged.connect(self._rotate_plane_from_2d)
+        self.ortho_viewer.planeRotationFinished.connect(self._finish_plane_2d_rotation)
+        right_lay.addWidget(self.ortho_viewer, 1)
         splitter.addWidget(left)
         splitter.addWidget(mid)
         splitter.addWidget(right)
-        splitter.setSizes([360, 790, 450])
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 4)
-        splitter.setStretchFactor(2, 2)
+        splitter.setSizes([330, 600, 830])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(2, 3)
         timeline_w = QtWidgets.QWidget()
         tl_lay = QtWidgets.QVBoxLayout(timeline_w)
         tl_lay.setContentsMargins(0, 0, 0, 0)
         self._build_timeline(tl_lay)
-        root.addWidget(timeline_w, 0)
+        mid_lay.addWidget(timeline_w, 0)
 
-        self.bottom_tabs = QtWidgets.QTabWidget()
-        self.bottom_tabs.setDocumentMode(True)
-        self.bottom_tabs.setMinimumHeight(125)
-        self.bottom_tabs.setMaximumHeight(175)
+        self.selection_tabs = ContextStack(self._browser_parking)
+        self.selection_tabs.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Maximum)
         sel_w = QtWidgets.QWidget()
         sel_lay = QtWidgets.QVBoxLayout(sel_w)
-        sel_lay.setContentsMargins(6, 6, 6, 6)
+        sel_lay.setContentsMargins(0, 0, 0, 0)
+        sel_lay.setSpacing(8)
         self._build_selection_info(sel_lay)
+        path_w = QtWidgets.QWidget()
+        path_lay = QtWidgets.QVBoxLayout(path_w)
+        path_lay.setContentsMargins(0, 0, 0, 0)
+        self.text_path_info = SelectionInfoPanel()
+        path_lay.addWidget(self.text_path_info)
+        layer_w = QtWidgets.QWidget()
+        layer_lay = QtWidgets.QVBoxLayout(layer_w)
+        layer_lay.setContentsMargins(0, 0, 0, 0)
+        self.text_layer_info = SelectionInfoPanel()
+        layer_lay.addWidget(self.text_layer_info)
+        self.selection_tabs.addWidget(sel_w)
+        self.selection_tabs.addWidget(path_w)
+        self.selection_tabs.addWidget(layer_w)
         log_w = QtWidgets.QWidget()
         log_lay = QtWidgets.QVBoxLayout(log_w)
         log_lay.setContentsMargins(6, 6, 6, 6)
         self._build_log(log_lay)
-        self.bottom_tabs.addTab(sel_w, "Selection")
-        self.bottom_tabs.addTab(log_w, "Log")
-        root.addWidget(self.bottom_tabs, 0)
         self._build_segmentation_dock()
         self._build_pwv_dock()
+        self._finish_compact_workspace(log_w)
         self.workflow_tabs.currentChanged.connect(self._on_workflow_stage_changed)
+        self.workflow_tabs.tabBarClicked.connect(self._reopen_workflow_page)
         self._on_workflow_stage_changed(self.workflow_tabs.currentIndex())
 
     def _build_browser(self, parent):
-        grp = QtWidgets.QGroupBox("Browser")
-        lay = QtWidgets.QVBoxLayout(grp)
-        self.tree_objects = QtWidgets.QTreeWidget()
+        self.browser_panel = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(self.browser_panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        self._browser_parking = QtWidgets.QWidget(self.browser_panel)
+        self._browser_parking.hide()
+        parking_layout = QtWidgets.QVBoxLayout(self._browser_parking)
+        self._build_browser_tools(lay)
+        self.tree_objects = BrowserTree()
+        self.tree_objects.setMinimumHeight(120)
         self.tree_objects.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        self.tree_objects.setHeaderLabels(["Name", "Kind"])
-        header = self.tree_objects.header()
-        header.setStretchLastSection(False)
-        header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
-        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Fixed)
-        self.tree_objects.setColumnWidth(1, 58)
-        self.tree_objects.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.tree_objects.itemSelectionChanged.connect(self._on_browser_select)
         self.tree_objects.itemChanged.connect(self._on_tree_item_changed)
         self.tree_objects.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.tree_objects.customContextMenuRequested.connect(self._on_browser_ctx_menu)
-        lay.addWidget(self.tree_objects)
-        visibility_row = QtWidgets.QHBoxLayout()
-        visibility_row.addWidget(QtWidgets.QLabel("Visibility:"))
-        self.chk_all_planes_visible = QtWidgets.QCheckBox("Planes")
-        self.chk_all_planes_visible.setTristate(True)
-        self.chk_all_planes_visible.setToolTip("Show or hide all plane objects")
-        self.chk_all_planes_visible.clicked.connect(
-            lambda checked: self._set_render_category_visibility("planes", checked)
-        )
-        self.chk_all_pathlines_visible = QtWidgets.QCheckBox("Pathlines")
-        self.chk_all_pathlines_visible.setTristate(True)
-        self.chk_all_pathlines_visible.setToolTip("Show or hide all pathline objects")
-        self.chk_all_pathlines_visible.clicked.connect(
-            lambda checked: self._set_render_category_visibility("pathlines", checked)
-        )
-        visibility_row.addWidget(self.chk_all_planes_visible)
-        visibility_row.addWidget(self.chk_all_pathlines_visible)
-        visibility_row.addStretch()
-        lay.addLayout(visibility_row)
-        self.chk_selection_on_top = QtWidgets.QCheckBox("Selection on top")
+        lay.addWidget(self.tree_objects, 1)
+
+        self.browser_options_menu = QtWidgets.QMenu(self)
+        for name, title, callback in (
+                ('chk_all_planes_visible', 'Show all planes', lambda checked: self._set_render_category_visibility('planes', checked)),
+                ('chk_all_pathlines_visible', 'Show all pathlines', lambda checked: self._set_render_category_visibility('pathlines', checked))):
+            box = QtWidgets.QCheckBox(title)
+            box.setTristate(True)
+            box.clicked.connect(callback)
+            setattr(self, name, box)
+            action = QtWidgets.QWidgetAction(self.browser_options_menu)
+            action.setDefaultWidget(box)
+            self.browser_options_menu.addAction(action)
+        self.chk_selection_on_top = QtWidgets.QCheckBox('Selection on top')
         self.chk_selection_on_top.setChecked(True)
-        self.chk_selection_on_top.setToolTip("Draw selected Browser layers in front of other 3D layers")
         self.chk_selection_on_top.toggled.connect(self._on_selection_on_top_changed)
-        lay.addWidget(self.chk_selection_on_top)
+        action = QtWidgets.QWidgetAction(self.browser_options_menu)
+        action.setDefaultWidget(self.chk_selection_on_top)
+        self.browser_options_menu.addAction(action)
+        self.browser_options_menu.addSeparator()
+        self.btn_delete_obj = QtGui.QAction('Delete selected', self)
+        self.btn_delete_obj.setIcon(standard_icon(self, 'SP_TrashIcon'))
+        self.btn_delete_obj.triggered.connect(self._on_delete_object)
+        self.browser_options_menu.addAction(self.btn_delete_obj)
+        self.browser_options_button.setMenu(self.browser_options_menu)
+
         opacity_row = QtWidgets.QHBoxLayout()
-        self.label_browser_opacity = QtWidgets.QLabel("Opacity: —")
+        self.label_browser_opacity = QtWidgets.QLabel('Opacity: —')
         self.slider_browser_opacity = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.slider_browser_opacity.setRange(0, 100)
         self.slider_browser_opacity.setValue(100)
         self.slider_browser_opacity.setEnabled(False)
-        self.slider_browser_opacity.setToolTip("Adjust opacity for the selected Browser object(s)")
+        self.slider_browser_opacity.setToolTip('Adjust opacity for selected objects')
         self.slider_browser_opacity.valueChanged.connect(self._on_browser_opacity_changed)
         opacity_row.addWidget(self.label_browser_opacity)
         opacity_row.addWidget(self.slider_browser_opacity, 1)
-        lay.addLayout(opacity_row)
+        self._build_layer_appearance(parking_layout)
+        self.appearance_layout.addLayout(opacity_row)
         self.content_render_controls = ContentRenderControls(self)
         self.content_render_controls.settingsChanged.connect(self._on_content_render_settings)
         self.content_render_controls.positionChanged.connect(self._on_content_render_position)
         self.content_render_controls.interactionChanged.connect(lambda active: self.scene.set_interaction_preview(active))
-        lay.addWidget(self.content_render_controls)
-        self._build_plane_display_controls(lay)
-        row = QtWidgets.QHBoxLayout()
-        self.btn_delete_obj = QtWidgets.QPushButton("Delete Selected")
-        self.btn_delete_obj.setIcon(standard_icon(self, "SP_TrashIcon"))
-        self.btn_delete_obj.setProperty("role", "danger")
-        self.btn_delete_obj.clicked.connect(self._on_delete_object)
-        row.addWidget(self.btn_delete_obj)
-        row.addStretch()
-        lay.addLayout(row)
-        parent.addWidget(grp, 3)
+        self.appearance_layout.addWidget(self.content_render_controls)
+        self.content_render_controls.layout().labelForField(self.content_render_controls.cmap).hide()
+        self.content_render_controls.cmap.hide()
+        self.plane_display_controls = QtWidgets.QWidget()
+        self._build_plane_display_controls(QtWidgets.QVBoxLayout(self.plane_display_controls))
+        self.appearance_layout.addWidget(self.plane_display_controls)
+        parent.addWidget(self.browser_panel, 1)
 
     def _build_step_buttons(self, parent):
         grp = QtWidgets.QGroupBox("Steps")
@@ -1024,7 +1065,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         edit_lay.addWidget(self._edit_status_label)
         self._edit_hint_label = QtWidgets.QLabel()
         self._edit_hint_label.setWordWrap(True)
-        self._edit_hint_label.setStyleSheet("color: #555; padding: 3px 0;")
+        self._edit_hint_label.setStyleSheet(f"color: {theme_colors(self)['secondary']}; padding: 3px 0;")
         edit_lay.addWidget(self._edit_hint_label)
         edit_buttons = QtWidgets.QHBoxLayout()
         self._edit_btn_edge = QtWidgets.QPushButton("Edge Mode: OFF")
@@ -1113,6 +1154,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         quality_header.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
         self.quality_table.setMinimumHeight(150)
         quality_layout.addWidget(self.quality_table)
+        self._build_qc_details(quality_layout)
 
         self.flow_report_summary_label = QtWidgets.QLabel(
             "Vessel flow hierarchy becomes available after plane metrics are calculated."
@@ -1138,18 +1180,23 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self.btn_export_quality = QtWidgets.QPushButton("Export QC Report")
         self.btn_export_quality.clicked.connect(self._on_export_quality_report)
         quality_buttons.addWidget(self.btn_refresh_quality)
-        quality_buttons.addWidget(self.btn_export_quality)
+        self.btn_export_analysis_report = QtWidgets.QPushButton("Export Analysis Report…")
+        self.btn_export_analysis_report.clicked.connect(self._on_export_analysis_report)
         quality_buttons.addStretch()
         quality_layout.addLayout(quality_buttons)
+        html_buttons = QtWidgets.QHBoxLayout()
+        for title, callback, name in [("Open QC Report", self._on_open_case_qc, "openCaseQC"),
+                                      ("Open Batch QC…", self._on_open_batch_qc, "openBatchQC")]:
+            button = QtWidgets.QPushButton(title)
+            button.setObjectName(name)
+            button.clicked.connect(callback)
+            html_buttons.addWidget(button)
+        quality_layout.addLayout(html_buttons)
         self.params_layout.addWidget(quality_group)
 
-        transfer_group = QtWidgets.QGroupBox("Plane Coordinates")
-        transfer_layout = QtWidgets.QHBoxLayout(transfer_group)
-        self.btn_export_planes = QtWidgets.QPushButton("Export Selected...")
+        self.btn_export_planes = QtWidgets.QPushButton("Export selected planes…")
         self.btn_export_planes.clicked.connect(self._on_export_plane_coordinates)
-        transfer_layout.addWidget(self.btn_export_planes)
-        transfer_layout.addStretch()
-        self.params_layout.addWidget(transfer_group)
+        self._build_export_page()
 
     def _workflow_stage_key(self, index=None):
         if index is None:
@@ -1185,6 +1232,8 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             if ws.derived.plane_metrics:
                 return "Ready"
             return "Needs review" if len(ws.planes) > 0 else "Not ready"
+        if stage_key == "export":
+            return "Ready" if ws.data_loaded else "Not ready"
         report_status = str((self._last_quality_report or {}).get("overall_status", ""))
         return {
             "ready": "Ready",
@@ -1199,22 +1248,14 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         for index, (_label, stage_key) in enumerate(_WORKFLOW_STAGES):
             self.workflow_tabs.setTabToolTip(index, self._workflow_stage_state(stage_key))
         state = self._workflow_stage_state(self._workflow_stage_key())
-        palette = {
-            "Ready": ("#1b5e20", "#e8f5e9"),
-            "Needs review": ("#8a4b00", "#fff4d6"),
-            "Incomplete": ("#555555", "#eeeeee"),
-            "Not ready": ("#8b1e1e", "#fdecec"),
-            "Skipped (dual-VENC)": ("#555555", "#eeeeee"),
-            "Unavailable": ("#8a4b00", "#fff4d6"),
-            "Optional": ("#555555", "#eeeeee"),
-        }
-        foreground, background = palette.get(state, ("#555555", "#eeeeee"))
+        foreground, background = workflow_status_colors(state, self)
         self.workflow_status.setText(state)
         self.workflow_status.setStyleSheet(
             f"QLabel {{ color: {foreground}; background: {background}; border: 1px solid {foreground}; padding: 3px 8px; border-radius: 4px; }}"
         )
 
-    def _on_workflow_stage_changed(self, index):
+    def _on_workflow_stage_changed(self, index, *, open_report=True):
+        QtCore.QTimer.singleShot(0, self._update_qc_overlay)
         stage_key = self._workflow_stage_key(index)
         self.review_panel.setVisible(stage_key == "review")
         self.btn_reload_input.setVisible(stage_key == "input")
@@ -1277,19 +1318,30 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             if stage_key == "segmentation":
                 self.segmentation_dock.raise_()
         if hasattr(self, "pwv_dock"):
-            self.pwv_dock.setVisible(stage_key in {"hemodynamics", "review"})
-            if stage_key in {"hemodynamics", "review"}:
-                self.pwv_dock.raise_()
+            if stage_key not in {"hemodynamics", "review"}:
+                self.pwv_dock.hide()
         if self._edit_mode is not None and self._edit_panel is not None:
             self.steps_group.setVisible(False)
             self._edit_panel.setVisible(True)
-        if stage_key == "review" and self.workspace.data_loaded:
-            QtCore.QTimer.singleShot(0, self._refresh_quality_panel)
+        if stage_key == "review":
+            self.workspace_pages.setCurrentWidget(self.qc_page)
+            if not self.workspace.data_loaded:
+                self.qc_page.setCurrentWidget(self.qc_empty)
+            elif open_report:
+                QtCore.QTimer.singleShot(0, lambda: self._on_open_case_qc()
+                    if self._workflow_stage_key() == 'review' else None)
+        elif stage_key == "export":
+            self._refresh_export_page()
+            self.workspace_pages.setCurrentWidget(self._export_page)
+        else:
+            self.workspace_pages.setCurrentWidget(self.workspace_page)
+        self._sync_workspace_docks(self.workspace_pages.currentIndex())
         self._refresh_workflow_status()
 
     def _build_timeline(self, parent):
         grp = QtWidgets.QGroupBox("Timeline")
-        tl = QtWidgets.QHBoxLayout(grp)
+        tl = QtWidgets.QGridLayout(grp)
+        tl.setVerticalSpacing(2)
         self.btn_prev = QtWidgets.QPushButton()
         self.btn_prev.setIcon(standard_icon(self, "SP_MediaSkipBackward"))
         self.btn_prev.setToolTip("Previous frame")
@@ -1314,52 +1366,58 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self.lab_t = QtWidgets.QLabel("0")
         self.lab_t.setAlignment(QtCore.Qt.AlignCenter)
         self.lab_t.setMinimumWidth(32)
-        self.spin_interval = QtWidgets.QSpinBox()
-        self.spin_interval.setRange(10, 2000)
-        self.spin_interval.setValue(120)
-        self.spin_interval.setSuffix(" ms")
+        self.spin_fps = QtWidgets.QDoubleSpinBox()
+        self.spin_fps.setRange(0.5, 100.0)
+        self.spin_fps.setDecimals(1)
+        self.spin_fps.setSingleStep(1.0)
+        self.spin_fps.setValue(10.0)
+        self.spin_fps.setSuffix(" fps")
+        self.spin_fps.setAlignment(QtCore.Qt.AlignCenter)
+        self.spin_fps.setMinimumWidth(114)
+        self.spin_fps.setAccessibleName("Playback FPS")
+        self.spin_fps.setToolTip("Target playback FPS. Actual FPS depends on the visible scene; one acquired phase is shown per frame.")
         self.lab_playback_performance = QtWidgets.QLabel("Render: --")
         self.lab_playback_performance.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         self.lab_playback_performance.setMinimumWidth(180)
         self.lab_playback_performance.setToolTip("Rolling time spent updating the timeline scene and slice views, plus effective playback FPS.")
-        for w in [self.btn_prev, self.btn_play, self.btn_pause, self.btn_next]:
+        for column, w in enumerate([self.btn_prev, self.btn_play, self.btn_pause, self.btn_next]):
             w.setProperty("role", "icon")
             w.setAccessibleName(w.toolTip())
-            tl.addWidget(w)
-        tl.addWidget(self.slider_t, 1)
-        tl.addWidget(self.lab_t)
-        tl.addWidget(self.lab_playback_performance)
-        tl.addWidget(self.spin_interval)
+            tl.addWidget(w, 0, column)
+        tl.addWidget(self.slider_t, 0, 4)
+        tl.addWidget(self.lab_t, 0, 5)
+        tl.addWidget(self.lab_playback_performance, 1, 0, 1, 5)
+        tl.addWidget(self.spin_fps, 1, 5)
+        tl.setColumnStretch(4, 1)
         parent.addWidget(grp)
 
     def _build_selection_info(self, parent):
-        lay = QtWidgets.QHBoxLayout()
-        lay.setContentsMargins(0, 0, 0, 0)
-        box_plane = QtWidgets.QGroupBox("Plane")
-        lay_plane = QtWidgets.QVBoxLayout(box_plane)
-        self.text_plane_info = QtWidgets.QPlainTextEdit()
-        self.text_plane_info.setReadOnly(True)
-        self.text_plane_info.setMaximumHeight(82)
-        lay_plane.addWidget(self.text_plane_info)
+        self.text_plane_info = SelectionInfoPanel()
+        parent.addWidget(self.text_plane_info)
+        self.check_plane_unlocked = QtWidgets.QPushButton('Edit plane')
+        self.check_plane_unlocked.setCheckable(True)
+        self.check_plane_unlocked.setToolTip('Edit the selected plane; Apply saves, Cancel / Esc discards the draft.')
+        self.check_plane_unlocked.toggled.connect(self._set_plane_edit_unlocked)
+        parent.addWidget(self.check_plane_unlocked)
         plane_actions = QtWidgets.QHBoxLayout()
-        self.btn_add_plane = QtWidgets.QPushButton("Add Plane")
-        self.btn_add_plane.setToolTip("Add a free plane at the current ortho cursor")
+        self.btn_add_plane = QtWidgets.QPushButton('Add Plane', self._browser_parking)
         self.btn_add_plane.clicked.connect(self._add_manual_plane)
-        self.btn_edit_plane = QtWidgets.QPushButton("Edit Plane")
-        self.btn_edit_plane.setToolTip("Move and orient the selected plane with the 3D handles")
+        self.btn_add_plane.hide()
+        self.btn_edit_plane = QtWidgets.QPushButton('Apply plane')
         self.btn_edit_plane.clicked.connect(self._toggle_selected_plane_edit)
-        plane_actions.addWidget(self.btn_add_plane)
         plane_actions.addWidget(self.btn_edit_plane)
-        lay_plane.addLayout(plane_actions)
-        box_path = QtWidgets.QGroupBox("Path")
-        lay_path = QtWidgets.QVBoxLayout(box_path)
-        self.text_path_info = QtWidgets.QPlainTextEdit()
-        self.text_path_info.setReadOnly(True)
-        self.text_path_info.setMaximumHeight(82)
-        lay_path.addWidget(self.text_path_info)
-        lay.addWidget(box_plane, 1)
-        lay.addWidget(box_path, 1)
-        parent.addLayout(lay)
+        parent.addLayout(plane_actions)
+        self.plane_controls_scroll = QtWidgets.QScrollArea()
+        self.plane_controls_scroll.setWidgetResizable(True)
+        self.plane_controls_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.plane_controls_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        details = QtWidgets.QWidget()
+        details_layout = QtWidgets.QVBoxLayout(details)
+        details_layout.setContentsMargins(0, 0, 4, 0)
+        details_layout.setSizeConstraint(QtWidgets.QLayout.SetMinAndMaxSize)
+        self._build_plane_transaction_controls(details_layout, source_layout=parent, actions_layout=plane_actions)
+        self.plane_controls_scroll.setWidget(details)
+        parent.addWidget(self.plane_controls_scroll)
 
     def _build_plane_display_controls(self, parent):
         plane_display_row = QtWidgets.QHBoxLayout()
@@ -1427,6 +1485,8 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self.segmentation_dock.setObjectName("SegmentationDock")
         self.segmentation_panel = SegmentationDock(self)
         self.segmentation_dock.setWidget(self.segmentation_panel)
+        self.segmentation_dock.visibilityChanged.connect(
+            lambda visible: self._refresh_segmentation_ui(force=True) if visible else None)
         self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self.segmentation_dock)
         self.segmentation_panel.combo_source.currentIndexChanged.connect(self._on_segmentation_source_changed)
         self.segmentation_panel.check_visible.toggled.connect(self._on_segmentation_visibility_changed)
@@ -1458,12 +1518,13 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             self.log(f"4D cleanup failed: {type(exc).__name__}: {exc}")
 
     def _build_pwv_dock(self):
-        self.pwv_dock = QtWidgets.QDockWidget("Analysis", self)
+        self.pwv_dock = QtWidgets.QDockWidget("Measurements", self)
         self.pwv_dock.setObjectName("PWVDock")
         panel = QtWidgets.QWidget(self)
         layout = QtWidgets.QVBoxLayout(panel)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(6)
+        layout.setContentsMargins(12, 12, 12, 10)
+        layout.setSpacing(10)
+        self.measurements_panel = panel
 
         mode_row = QtWidgets.QHBoxLayout()
         mode_row.addWidget(QtWidgets.QLabel("Display"))
@@ -1490,25 +1551,11 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         curve_layout = QtWidgets.QVBoxLayout(curve_controls)
         curve_layout.setContentsMargins(0, 0, 0, 0)
         curve_row = QtWidgets.QHBoxLayout()
-        curve_row.addWidget(QtWidgets.QLabel("Plane Metric"))
+        curve_row.addWidget(QtWidgets.QLabel("Metric"))
         self.combo_plane_curve_metric = QtWidgets.QComboBox()
         self.combo_plane_curve_metric.currentIndexChanged.connect(self._on_plane_curve_metric_changed)
         curve_row.addWidget(self.combo_plane_curve_metric, 1)
         curve_layout.addLayout(curve_row)
-        smoothing_row = QtWidgets.QHBoxLayout()
-        smoothing_row.addWidget(QtWidgets.QLabel("Flowrate spline order"))
-        self.spin_flowrate_spline_order = QtWidgets.QSpinBox()
-        self.spin_flowrate_spline_order.setRange(1, 3)
-        self.spin_flowrate_spline_order.setValue(3)
-        self.spin_flowrate_spline_order.setToolTip(
-            "1: straight lines; 2: quadratic; 3: cubic (default). "
-            "Only the flowrate display curve changes; original samples and metrics are preserved. "
-            "Short series use the highest order supported by their sample count."
-        )
-        self.spin_flowrate_spline_order.valueChanged.connect(self._on_plane_curve_metric_changed)
-        smoothing_row.addWidget(self.spin_flowrate_spline_order)
-        smoothing_row.addStretch(1)
-        curve_layout.addLayout(smoothing_row)
         self.analysis_controls_stack.addWidget(curve_controls)
 
         pressure_controls = QtWidgets.QWidget(self)
@@ -1520,24 +1567,27 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         pressure_row.addWidget(self.combo_centerline_pressure_path, 1)
         self.analysis_controls_stack.addWidget(pressure_controls)
 
-        ic_controls = QtWidgets.QWidget(self)
-        ic_row = QtWidgets.QHBoxLayout(ic_controls)
-        ic_row.setContentsMargins(0, 0, 0, 0)
-        self.label_ic_target = QtWidgets.QLabel("Target: none")
-        self.label_ic_target.setWordWrap(True)
-        ic_row.addWidget(self.label_ic_target, 1)
-        self.analysis_controls_stack.addWidget(ic_controls)
-
         layout.addWidget(self.analysis_controls_stack)
 
-        self.label_pwv_status = QtWidgets.QLabel("No analysis available.")
-        self.label_pwv_status.setWordWrap(True)
+        self.label_pwv_status = MeasurementSummary()
+        self.label_pwv_status.parametersRequested.connect(lambda: self._open_action_settings("measurements"))
         layout.addWidget(self.label_pwv_status)
 
-        self.fig_pwv = Figure(figsize=(4.2, 5.4), dpi=90, facecolor="white")
+        self.fig_pwv = Figure(figsize=(4.2, 5.4), dpi=90, facecolor=analysis_palette(self)["panel"])
         self.canvas_pwv = FigureCanvas(self.fig_pwv)
+        for target in (panel, self.canvas_pwv, self.btn_measurements):
+            target.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+            target.customContextMenuRequested.connect(lambda _pos: self._open_action_settings("measurements"))
+        panel._settings_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Shift+F10"), panel)
+        panel._settings_shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+        panel._settings_shortcut.activated.connect(lambda: self._open_action_settings("measurements"))
+        self.btn_measurements.setToolTip("Open measurements; right-click for curve parameters")
+        self.canvas_pwv.mpl_connect(
+            "resize_event", lambda event: style_analysis_figure(self)
+            if event.width >= 160 and event.height >= 160 else None)
         layout.addWidget(self.canvas_pwv, 1)
 
+        self.pwv_dock.visibilityChanged.connect(lambda visible: self._refresh_analysis_panel() if visible else None)
         self.pwv_dock.setWidget(panel)
         self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self.pwv_dock)
         self.tabifyDockWidget(self.segmentation_dock, self.pwv_dock)
@@ -1560,6 +1610,15 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
 
     def _on_pwv_group_changed(self, _index=None):
         self._refresh_analysis_panel()
+
+    def _flowrate_spline_order(self):
+        cfg = (getattr(self.workspace, "render_settings", {}) or {}).get("measurements", {}) or {}
+        if not isinstance(cfg, dict):
+            return 3
+        try:
+            return min(3, max(1, int(cfg.get("flowrate_spline_order", 3))))
+        except (TypeError, ValueError):
+            return 3
 
     def _on_plane_curve_metric_changed(self, _index=None):
         self._refresh_analysis_panel()
@@ -1602,7 +1661,6 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
     def _plot_centerline_pressure(self):
         profile = self._selected_centerline_pressure_profile()
         if profile is None:
-            self.label_ic_target.setText("Target: path")
             self.label_pwv_status.setText("No centerline pressure profile available.")
             self._clear_pwv_axes("Run relative pressure to populate centerline pressure drop.", title="Centerline Pressure")
             return
@@ -1615,8 +1673,8 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         ax = self.fig_pwv.add_subplot(211)
         ax_drop = self.fig_pwv.add_subplot(212)
         if distances.size and values.size == distances.size:
-            ax.plot(distances, values, color="#c92a2a", linewidth=2.0)
-            ax.scatter([distances[0], distances[-1]], [values[0], values[-1]], color="#f08c00", zorder=4)
+            ax.plot(distances, values, color=analysis_palette(self)["curve"], linewidth=1.65)
+            ax.scatter([distances[0], distances[-1]], [values[0], values[-1]], color=analysis_palette(self)["curve"], s=20, zorder=4)
             ax.set_xlabel("Distance Along Centerline (mm)")
             ax.set_ylabel("Relative Pressure (Pa)")
             ax.set_title(f"Path {int(profile.get('path_index', -1))}: Relative Pressure at t={current_t}")
@@ -1627,9 +1685,9 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             ax.set_yticks([])
         phases = np.arange(drop_t.size, dtype=float)
         if drop_t.size:
-            ax_drop.plot(phases, drop_t, color="#1f77b4", marker="o", linewidth=2.0, markersize=4)
-            ax_drop.axvline(current_t, color="#f08c00", linestyle="--", linewidth=1.2, alpha=0.8)
-            ax_drop.scatter([current_t], [drop_t[min(current_t, drop_t.size - 1)]], color="#f08c00", zorder=4)
+            ax_drop.plot(phases, drop_t, color=analysis_palette(self)["curve"], marker="o", linewidth=1.65, markersize=2.5, markerfacecolor=analysis_palette(self)["panel"])
+            ax_drop.axvline(current_t, color=analysis_palette(self)["cursor"], linestyle=(0, (2, 4)), linewidth=.8)
+            ax_drop.scatter([current_t], [drop_t[min(current_t, drop_t.size - 1)]], color=analysis_palette(self)["curve"], s=24, zorder=4)
             ax_drop.set_xlabel("Cardiac Phase")
             ax_drop.set_ylabel("Pressure Drop (Pa)")
             ax_drop.set_title("Centerline Pressure Drop")
@@ -1638,7 +1696,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             ax_drop.text(0.5, 0.5, "No pressure-drop series", ha="center", va="center", transform=ax_drop.transAxes)
             ax_drop.set_xticks([])
             ax_drop.set_yticks([])
-        self.fig_pwv.tight_layout()
+        style_analysis_figure(self)
         self.canvas_pwv.draw_idle()
         def pressure_text(value):
             return f'{float(value):.4g} Pa' if value is not None and np.isfinite(value) else 'Unavailable'
@@ -1647,7 +1705,12 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             f"Path {int(profile.get('path_index', -1))}   Current phase: {current_t}",
             f"Current drop: {pressure_text(current_drop)}   Mean drop: {pressure_text(profile.get('pressure_drop_mean_Pa'))}   Peak |drop|: {pressure_text(profile.get('pressure_drop_peak_Pa'))}",
         ]
-        self.label_pwv_status.setText("\n".join(lines))
+        self.label_pwv_status.set_measurement(
+            f"Path {int(profile.get('path_index', -1))}", f"Phase {current_t} · Pressure drop",
+            pressure_text(current_drop).removesuffix(" Pa"), "Pa",
+            [("Mean", pressure_text(profile.get("pressure_drop_mean_Pa"))),
+             ("Peak |drop|", pressure_text(profile.get("pressure_drop_peak_Pa")))],
+            plain_text="\n".join(lines))
 
     def _selected_pwv_result(self):
         idx = self.combo_pwv_group.currentData()
@@ -1670,22 +1733,10 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         metric = getattr(plane, "metrics", {}) or {}
         if not metric and plane_idx < len(self.workspace.derived.plane_metrics):
             metric = self.workspace.derived.plane_metrics[plane_idx]
+        metric = selected_metric(self.workspace, plane_idx)
         if not metric:
             return plane_idx, None
         return plane_idx, dict(metric)
-
-    def _selected_analysis_path_index(self):
-        path_idx = int(getattr(self.workspace, "selected_path_index", -1))
-        if 0 <= path_idx < len(self.workspace.path_info):
-            return path_idx
-        plane_idx, metric = self._selected_plane_metric()
-        if metric is None:
-            return -1
-        try:
-            path_idx = int(metric.get("path_index", getattr(self.workspace.planes[plane_idx], "path_index", -1)))
-        except Exception:
-            path_idx = -1
-        return path_idx if 0 <= path_idx < len(self.workspace.path_info) else -1
 
     def _available_plane_curve_series(self, metric):
         options = []
@@ -1722,19 +1773,20 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
                     break
             self.combo_plane_curve_metric.setCurrentIndex(target_idx)
         self.combo_plane_curve_metric.blockSignals(False)
-        self.spin_flowrate_spline_order.setEnabled(
-            str(self.combo_plane_curve_metric.currentData() or "").startswith("flowrate_")
-        )
         return options
 
     def _clear_pwv_axes(self, message="No analysis available.", title="Analysis"):
+        token = (str(message), str(title))
+        if getattr(self, "_empty_analysis_token", None) == token and len(self.fig_pwv.axes) == 1 and not self.fig_pwv.axes[0].lines:
+            return
+        self._empty_analysis_token = token
         self.fig_pwv.clear()
         ax = self.fig_pwv.add_subplot(111)
         ax.set_title(str(title))
         ax.set_xticks([])
         ax.set_yticks([])
         ax.text(0.5, 0.5, str(message), ha="center", va="center", transform=ax.transAxes)
-        self.fig_pwv.tight_layout()
+        style_analysis_figure(self)
         self.canvas_pwv.draw_idle()
 
     def _plot_pwv_result(self, result):
@@ -1781,8 +1833,13 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         plot_error = str(result.get("plot_error", "") or "")
         if plot_error:
             lines.append(f"Plot error: {plot_error}")
-        self.label_pwv_status.setText("\n".join(lines))
-        self.fig_pwv.tight_layout()
+        self.label_pwv_status.set_measurement(
+            "", f"{status} · {valid_count}/{plane_count} valid planes",
+            f"{float(pwv):.4g}" if pwv is not None and np.isfinite(pwv) else "—", "m/s",
+            [("Fit R²", f"{float(fit_r2):.3f}" if fit_r2 is not None and np.isfinite(fit_r2) else "—"),
+             ("Path length", f"{float(longest_path):.1f} mm" if longest_path is not None else "—")],
+            notes="\n".join(value for value in (message, plot_error) if value), plain_text="\n".join(lines))
+        style_analysis_figure(self)
         self.canvas_pwv.draw_idle()
 
     def _plot_plane_curve(self):
@@ -1804,139 +1861,36 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             self.label_pwv_status.setText(f"Plane {int(plane_idx)} has no valid samples for {series_label}.")
             self._clear_pwv_axes("Selected metric is not available for this plane.", title="Plane Curve")
             return
-        self.fig_pwv.clear()
-        ax = self.fig_pwv.add_subplot(111)
-        phases = np.arange(values.size, dtype=float)
-        if str(series_key).startswith("flowrate_"):
-            curve_phases, curve_values = _flowrate_display_curve(
-                values, order=self.spin_flowrate_spline_order.value()
-            )
-            ax.plot(curve_phases, curve_values, color="#1f77b4", linewidth=2.0)
-            ax.plot(phases, values, color="#1f77b4", marker="o", linestyle="none",
-                    markersize=4, zorder=3)
-        else:
-            ax.plot(phases, values, color="#1f77b4", marker="o", linewidth=2.0, markersize=4)
-        current_t = int(np.clip(self.workspace.current_t, 0, max(0, values.size - 1)))
-        ax.axvline(current_t, color="#f08c00", linestyle="--", linewidth=1.2, alpha=0.8, label="Current Phase")
-        ax.scatter([current_t], [values[current_t]], color="#f08c00", zorder=4)
-        ax.set_title(f"Plane {int(plane_idx)}: {series_label}")
-        ax.set_xlabel("Cardiac Phase")
-        ax.set_ylabel(series_label)
-        ax.grid(True, alpha=0.25)
-        if values.size > 1:
-            ax.set_xlim(0.0, float(values.size - 1))
-        ax.legend(loc="best")
-        self.fig_pwv.tight_layout()
-        self.canvas_pwv.draw_idle()
+        values = update_plane_curve(self, int(plane_idx), metric, series_key, series_label, _flowrate_display_curve)
+        current_t = int(np.clip(self.workspace.current_t, 0, max(0, values.size-1)))
+        if not np.any(np.isfinite(values)):
+            self.label_pwv_status.setText("Not assessable: no valid ROI samples.")
+            self._clear_pwv_axes("No valid ROI samples for this measurement.", title="Plane Curve")
+            return
 
         plane = self.workspace.planes[int(plane_idx)]
         path_idx = int(metric.get("path_index", getattr(plane, "path_index", -1)))
         path_dir = str(metric.get("path_direction", "") or "")
-        header = f"Plane {int(plane_idx)}   Path {path_idx}"
-        if path_dir:
-            header += f"   {path_dir}"
         finite = values[np.isfinite(values)]
-        if finite.size == 0:
-            finite = np.array([0.0], dtype=float)
-        path_ic_value = metric.get("path_ic")
-        path_ic_text = "undefined" if path_ic_value is None else f"{float(path_ic_value):.3f}"
-        lines = [
-            header,
-            f"Metric: {series_label}   Frames: {int(values.size)}   Current phase: {current_t}",
-            f"Current: {float(values[current_t]):.4g}   Min: {float(np.min(finite)):.4g}   Mean: {float(np.mean(finite)):.4g}   Max: {float(np.max(finite)):.4g}",
-            f"Path IC: {path_ic_text}   Net Flow: {float(metric.get('netflow_mL_beat', 0.0)):.4g} mL/beat   Peak Velocity: {float(metric.get('peakv_cm_s', 0.0)):.4g} cm/s",
-        ]
-        related = []
-        for item in list(metric.get("fork_ic", []) or []):
-            try:
-                ic_value = item.get("ic", 1.0)
-                ic_text = "undefined" if ic_value is None else f"{float(ic_value):.3f}"
-                related.append(f"fork {int(item.get('fork_id', -1))} ({str(item.get('role', 'path'))}): {ic_text}")
-            except Exception:
-                continue
-        if related:
-            lines.append("Related branch IC: " + ", ".join(related))
-        self.label_pwv_status.setText("\n".join(lines))
-
-    def _plot_internal_consistency(self):
-        qc = dict(self.workspace.derived.plane_qc or {})
-        path_idx = self._selected_analysis_path_index()
-        if path_idx < 0:
-            self.label_ic_target.setText("Target: none")
-            self.label_pwv_status.setText("No path or plane selected.")
-            self._clear_pwv_axes("Select a path or plane to inspect path and branch internal consistency.", title="Internal Consistency")
-            return
-        if not qc:
-            self.label_ic_target.setText(f"Target: path {int(path_idx)}")
-            self.label_pwv_status.setText("No internal consistency results available.")
-            self._clear_pwv_axes("Run plane metrics to populate internal consistency.", title="Internal Consistency")
-            return
-        info = self.workspace.path_info[int(path_idx)]
-        self.label_ic_target.setText(f"Target: path {int(path_idx)}")
-        path_ic_raw = (qc.get("path_ic", {}) or {}).get(str(int(path_idx)))
-        path_ic = None if path_ic_raw is None else float(path_ic_raw)
-        qc_forks = {int(item.get("fork_id", -1)): item for item in list(qc.get("forks", []) or [])}
-        related_fork_ids = []
-        for fork_id in list(info.get("fork_ids", []) or []):
-            try:
-                fork_id = int(fork_id)
-            except Exception:
-                continue
-            if fork_id in qc_forks:
-                related_fork_ids.append(fork_id)
-        if not related_fork_ids:
-            for fork_id, item in qc_forks.items():
-                members = [int(x) for x in item.get("left", [])] + [int(x) for x in item.get("right", [])]
-                if int(path_idx) in members:
-                    related_fork_ids.append(int(fork_id))
-        related_fork_ids = sorted(dict.fromkeys(related_fork_ids))
-        labels = []
-        values = []
-        colors = []
-        if path_ic is not None:
-            labels.append(f"Path {int(path_idx)}")
-            values.append(path_ic)
-            colors.append("#1f77b4")
-        for fork_id in related_fork_ids:
-            item = qc_forks.get(int(fork_id), {})
-            fork_ic = item.get("ic", 1.0)
-            # Matplotlib bars cannot represent None.  Undefined forks remain
-            # visible in the status text below, but are omitted from the bar
-            # chart rather than plotted as a misleading zero.
-            if fork_ic is not None:
-                labels.append(f"Fork {int(fork_id)}")
-                values.append(float(fork_ic))
-                colors.append("#d9480f")
-        self.fig_pwv.clear()
-        ax = self.fig_pwv.add_subplot(111)
-        xpos = np.arange(len(values), dtype=float)
-        bars = ax.bar(xpos, values, color=colors, alpha=0.88)
-        ax.set_title(f"Path / Branch Internal Consistency: Path {int(path_idx)}")
-        ax.set_ylabel("Internal Consistency")
-        ax.set_ylim(0.0, 1.05)
-        ax.set_xticks(xpos)
-        ax.set_xticklabels(labels, rotation=15, ha="right")
-        ax.grid(True, axis="y", alpha=0.25)
-        for bar, value in zip(bars, values):
-            ax.text(bar.get_x() + bar.get_width() * 0.5, min(1.03, value + 0.03), f"{float(value):.3f}", ha="center", va="bottom", fontsize=9)
-        self.fig_pwv.tight_layout()
-        self.canvas_pwv.draw_idle()
-
-        incoming = [int(x) for x in info.get("incoming_path_ids", [])]
-        outgoing = [int(x) for x in info.get("outgoing_path_ids", [])]
-        lines = [
-            f"Path {int(path_idx)}   dir={str(info.get('direction_text', '') or '')}",
-            f"Path IC: {'undefined' if path_ic is None else f'{path_ic:.3f}'}   Incoming: {incoming if incoming else 'none'}   Outgoing: {outgoing if outgoing else 'none'}",
-        ]
-        if related_fork_ids:
-            for fork_id in related_fork_ids:
-                item = qc_forks.get(int(fork_id), {})
-                fork_ic = item.get("ic", 1.0)
-                ic_text = "undefined" if fork_ic is None else f"{float(fork_ic):.3f}"
-                lines.append(f"Branch/Fork {int(fork_id)}: IC={ic_text}   left={item.get('left', [])}   right={item.get('right', [])}")
-        else:
-            lines.append("No related branch junctions were found for the selected path.")
-        self.label_pwv_status.setText("\n".join(lines))
+        def display_number(value):
+            return "—" if value is None or not np.isfinite(float(value)) else f"{float(value):.4g}"
+        complete = not metric.get("sample_valid_t") or all(metric["sample_valid_t"])
+        parts = series_label.rsplit(" (", 1)
+        unit = parts[1].rstrip(")") if len(parts) == 2 else ""
+        context = f"Path {path_idx}" + (f" · {path_dir}" if path_dir else "")
+        context += f" · Phase {current_t} · {values.size} phases"
+        self.label_pwv_status.set_measurement(
+            f"Plane {int(plane_idx)}", context, display_number(values[current_t]), unit,
+            [("Min", display_number(np.min(finite))),
+             ("Mean", display_number(np.mean(finite))),
+             ("Max", display_number(np.max(finite)))],
+            notes="" if complete else "Incomplete cycle · unavailable phases remain gaps.",
+            plain_text="\n".join([
+                f"Plane {int(plane_idx)} | Path {path_idx}", context, f"Metric: {series_label}",
+                f"Current: {display_number(values[current_t])} {unit}",
+                f"Min: {display_number(np.min(finite))} | Mean: {display_number(np.mean(finite))} | Max: {display_number(np.max(finite))}",
+            ]),
+        )
 
     def _refresh_pwv_group_selector(self):
         results = list(self.workspace.derived.pwv_results or [])
@@ -1968,21 +1922,27 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self.combo_pwv_group.blockSignals(False)
 
     def _refresh_analysis_panel(self):
+        if hasattr(self, "pwv_dock") and not self.pwv_dock.isVisible():
+            self._analysis_dirty = True
+            return
+        self._analysis_dirty = False
         self._sync_analysis_controls()
         self._refresh_pwv_group_selector()
         self._refresh_centerline_pressure_path_selector()
         mode = self._analysis_mode()
         if mode == "pwv":
-            self.label_ic_target.setText("Target: PWV group")
             self._plot_pwv_result(self._selected_pwv_result())
         elif mode == "plane_curve":
-            self.label_ic_target.setText("Target: selected plane")
             self._plot_plane_curve()
         elif mode == "centerline_pressure":
-            self.label_ic_target.setText("Target: selected path")
             self._plot_centerline_pressure()
         else:
-            self._plot_internal_consistency()
+            self._plot_plane_curve()
+        plane_index, metric = self._selected_plane_metric()
+        keys = pinned_metric_keys(self.workspace)
+        rows = pinned_metric_rows(metric, keys) if mode == "plane_curve" or plane_index >= 0 else []
+        heading = f"Plane {plane_index} · Cycle summary" if mode != "plane_curve" and plane_index >= 0 else "Cycle summary"
+        self.label_pwv_status.set_pinned_metrics(heading, rows)
 
     def _refresh_pwv_plot(self):
         self._refresh_plane_curve_metric_options()
@@ -2000,21 +1960,30 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             a = QtGui.QAction(label, self)
             a.triggered.connect(slot)
             mf.addAction(a)
-        self.action_docs = QtGui.QAction("Docs", self)
-        self.action_docs.setObjectName("actionDocs")
-        self.action_docs.setShortcut(QtGui.QKeySequence("F1"))
-        self.action_docs.setStatusTip("Open AutoFlow documentation in your browser")
-        self.action_docs.triggered.connect(self._on_open_documentation)
-        mb.addAction(self.action_docs)
         me = mb.addMenu("Export")
+        a = QtGui.QAction("Export page", self)
+        a.triggered.connect(self._on_open_export_page)
+        me.addAction(a)
+        me.addSeparator()
         a = QtGui.QAction("Export Videos...", self)
         a.triggered.connect(self._on_export_videos)
+        me.addAction(a)
+        a = QtGui.QAction("Export Current 3D View Video...", self)
+        a.setObjectName("actionExportCurrentViewVideo")
+        a.triggered.connect(self._on_export_current_view_video)
+        me.addAction(a)
+        a = QtGui.QAction("Export Rotating 3D View Video...", self)
+        a.setObjectName("actionExportRotatingViewVideo")
+        a.triggered.connect(lambda: self._on_export_current_view_video(rotate=True))
         me.addAction(a)
         a = QtGui.QAction("Export Plane Coordinates...", self)
         a.triggered.connect(self._on_export_plane_coordinates)
         me.addAction(a)
         a = QtGui.QAction("Export QC Report...", self)
         a.triggered.connect(self._on_export_quality_report)
+        me.addAction(a)
+        a = QtGui.QAction("Export Analysis Report...", self)
+        a.triggered.connect(self._on_export_analysis_report)
         me.addAction(a)
         ms = mb.addMenu("Settings")
         a = QtGui.QAction("3D Axis Orientation...", self)
@@ -2026,26 +1995,16 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         a = QtGui.QAction("Viewer Display Settings...", self)
         a.triggered.connect(lambda: self.ortho_viewer.open_plane_display_settings())
         ms.addAction(a)
-        a = QtGui.QAction("3D Display Settings...", self)
+        a = QtGui.QAction("3D Colorbar Layout...", self)
         a.triggered.connect(lambda: self._open_action_settings("render"))
         ms.addAction(a)
         mv = mb.addMenu("View")
+        self.view_menu = mv
         for label, slot in [("Reset Camera", lambda: self.scene.reset_camera()), ("Toggle Axes", lambda: self.scene.toggle_axes()),
             ("White BG", lambda: self.scene.set_background("white")), ("Dark BG", lambda: self.scene.set_background(BACKGROUND_COLOR))]:
             a = QtGui.QAction(label, self)
             a.triggered.connect(slot)
             mv.addAction(a)
-
-    def _on_open_documentation(self):
-        index = documentation_index()
-        url = QtCore.QUrl.fromLocalFile(str(index)) if index is not None else QtCore.QUrl(DOCUMENTATION_URL)
-        if QtGui.QDesktopServices.openUrl(url):
-            self.statusBar().showMessage("Opened AutoFlow documentation in your browser.", 5000)
-        else:
-            self.log(f"Could not open documentation: {url.toDisplayString()}")
-            QtWidgets.QMessageBox.warning(
-                self, "Documentation", "Could not open the documentation in your browser.\n"
-                f"Open this address manually:\n{url.toDisplayString()}")
 
     def _on_content_render_requested(self, content):
         try:
@@ -2078,6 +2037,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self.content_render_controls.set_object(obj, self.scene.content_render_settings(obj.data_key) if obj else None)
         self.scene._content_position_callback = self._on_content_drag_position
         self.scene.select_content_render(obj.uid if obj else None)
+        self._size_layer_appearance()
 
     def _on_content_render_settings(self, settings):
         uid = self._selected_uid()
@@ -2173,7 +2133,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             junction_value = junction.get("internal_consistency")
             junction_text = "undefined" if junction_value is None else f"{float(junction_value):.3f}"
             relations.append(f"{junction.get('equation', '? = ?')}: {junction_text}")
-        text = f"Internal IC {internal}"
+        text = f"Path IC {internal}"
         if relations:
             text += "  ·  " + "  ·  ".join(relations)
         return text
@@ -2208,7 +2168,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         if consistency_values:
             ic_value = min(consistency_values)
             color = "#1b5e20" if ic_value >= 0.8 else ("#8a4b00" if ic_value >= 0.6 else "#b71c1c")
-            item.setForeground(3, QtGui.QBrush(QtGui.QColor(color)))
+            item.setForeground(3, QtGui.QBrush(readable_color(color, self)))
         if parent is None:
             self.flow_report_tree.addTopLevelItem(item)
         else:
@@ -2314,7 +2274,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self.quality_summary_label.setText(
             f"Overall: {str(report.get('overall_status', 'unknown')).replace('_', ' ').title()} | "
             f"pass={int(counts.get('pass', 0))}, warn={int(counts.get('warn', 0))}, "
-            f"fail={int(counts.get('fail', 0))}, not run={int(counts.get('not_run', 0))}"
+            f"error={int(counts.get('fail', 0))}, not run={int(counts.get('not_run', 0))}"
         )
         status_colors = {
             "pass": "#1b5e20",
@@ -2325,13 +2285,14 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         def add_check(check, parent=None):
             status = str(check.get("status", "not_run"))
             item = QtWidgets.QTreeWidgetItem([
-                status.replace("_", " ").upper(),
+                ("ERROR" if status == "fail" else status.replace("_", " ").upper()),
                 str(check.get("stage", "")),
                 str(check.get("title", check.get("id", ""))),
                 str(check.get("summary", "")),
             ])
+            item.setData(0, QtCore.Qt.ItemDataRole.UserRole, check)
             color = QtGui.QColor(status_colors.get(status, "#616161"))
-            item.setForeground(0, QtGui.QBrush(color))
+            item.setForeground(0, QtGui.QBrush(readable_color(color, self)))
             action = str(check.get("action", "") or "")
             threshold = str(check.get("threshold", "") or "")
             tooltip = "\n".join(part for part in [str(check.get("summary", "")), threshold, action] if part)
@@ -2347,14 +2308,17 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         for check in list(report.get("checks", []) or []):
             add_check(check)
         self._populate_quality_flow_tree(report.get("flow_hierarchy", {}))
+        self._filter_qc_rows()
+        self._update_qc_overlay()
         self._refresh_workflow_status()
 
     def _on_export_quality_report(self):
+        if self._pipeline_running_guard("exporting QC"):
+            return
         if not self.workspace.data_loaded:
             self.log("Load a case before exporting a QC report.")
             return
-        if self._last_quality_report is None:
-            self._refresh_quality_panel()
+        self._refresh_quality_panel()
         if self._last_quality_report is None:
             return
         default_path = os.path.join(self.pipeline._output_dir(self.workspace), "quality_report.json")
@@ -2453,6 +2417,13 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             if not imported:
                 raise ValueError("the file did not contain any importable planes")
             old_count = len(self.workspace.planes)
+            before = mutation_snapshot(self.workspace)
+            previous_planes = list(self.workspace.planes)
+            for plane in imported:
+                plane.placement["source_plane_id"] = plane.plane_id
+                plane.plane_id = uuid.uuid4().hex
+                plane.geometry_revision = plane.roi_revision = 0
+                plane.metrics = {}
             if operation == "append":
                 self.workspace.planes.extend(imported)
                 first_imported = old_count
@@ -2461,13 +2432,14 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
                 first_imported = 0
             self._last_plane_import_report = report
             self._last_quality_report = None
-            self.workspace.derived.plane_metrics = []
-            self.workspace.derived.plane_qc = {}
+            self.workspace.analysis_revision += 1
+            refresh_plane_consistency(self.workspace)
             self.pipeline._clear_pwv_state(self.workspace)
             for step in (StepId.COMPUTE_PLANE_METRICS, StepId.COMPUTE_PWV):
                 self.workspace.pipeline.completed.pop(step.value, None)
                 self.workspace.pipeline.skipped.pop(step.value, None)
-            self._rebuild_plane_objects()
+            self._sync_plane_scene(previous_planes)
+            self._plane_undo_stack.push(_PlaneCommand(self, before, mutation_snapshot(self.workspace), "Import planes"))
             self._refresh_all()
             source_path = str(self.workspace.paths.flow_path or self.workspace.paths.segmask_path or "")
             save_plane_positions(
@@ -2475,7 +2447,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
                 os.path.join(self.pipeline._output_dir(self.workspace), "plane_positions.json"),
                 source_path=source_path,
             )
-            self.pipeline._save_planes_json(self.workspace)
+            self._persist_plane_outputs(include_pixelwise=False)
             if 0 <= first_imported < len(self.workspace.planes):
                 uid = self._find_uid_by_indexed_data_key("plane", first_imported)
                 self._selected_plane_index = int(first_imported)
@@ -2495,6 +2467,8 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Plane Import Failed", f"{type(exc).__name__}: {exc}")
 
     def _on_export_plane_coordinates(self):
+        if self._pipeline_running_guard("exporting plane coordinates"):
+            return
         if not self.workspace.data_loaded or not self.workspace.planes:
             self.log("No planes are available to export.")
             return
@@ -2561,6 +2535,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         return seg.working_labels_3d
 
     def _set_working_segmentation_array(self, arr):
+        self.workspace.invalidate_segmentation_display()
         seg = self.workspace.segmentation
         if arr is None:
             seg.working_labels_3d = None
@@ -2642,11 +2617,23 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         # Group surfaces keep their Browser visibility during ordinary refreshes.
         # Only an explicit segmentation visibility action changes every group.
 
-    def _refresh_segmentation_ui(self):
+    def _refresh_segmentation_ui(self, force=False):
         panel = self.segmentation_panel
         ws = self.workspace
         seg = ws.segmentation
-        self._ensure_segmentation_label_metadata()
+        self._sync_segmentation_action_state()
+        if not force and not panel.isVisible():
+            self._segmentation_ui_dirty = True
+            return
+        self._segmentation_ui_dirty = False
+        labels = self._segmentation_labels_for_ui()
+        key = (id(labels), int(seg.revision), repr(seg.label_names), repr(seg.label_colors),
+               seg.active_source, int(seg.active_label), float(seg.opacity), bool(seg.visible),
+               repr(ws.get_active_segmentation_provenance()))
+        if not force and getattr(self, "_segmentation_panel_signature", None) == key:
+            return
+        self._segmentation_panel_signature = key
+        self._ensure_segmentation_label_metadata(labels)
 
         panel.combo_source.blockSignals(True)
         panel.combo_source.clear()
@@ -2668,17 +2655,18 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         provenance = ws.get_active_segmentation_provenance()
         panel.text_provenance.setPlainText(json.dumps(provenance, ensure_ascii=False, indent=2) if provenance else "")
 
-        labels = self._segmentation_labels_for_ui()
         panel.table_labels.blockSignals(True)
         panel.table_labels.clearContents()
         if labels is None:
             panel.table_labels.setRowCount(0)
         else:
-            label_values = [int(x) for x in np.unique(labels) if int(x) != 0]
+            values, counts = np.unique(labels, return_counts=True)
+            label_counts = {int(value): int(count) for value, count in zip(values, counts) if int(value) != 0}
+            label_values = list(label_counts)
             panel.table_labels.setRowCount(len(label_values))
             for row, label_id in enumerate(label_values):
                 key = str(int(label_id))
-                count = int(np.sum(labels == label_id))
+                count = label_counts[label_id]
                 items = [
                     QtWidgets.QTableWidgetItem(str(int(label_id))),
                     QtWidgets.QTableWidgetItem(seg.label_names.get(key, f"Label {label_id}")),
@@ -2704,6 +2692,13 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         color = seg.label_colors.get(active_key, _default_segmentation_color(seg.active_label))
         panel.btn_active_color.setText(color)
         panel.btn_active_color.setStyleSheet(f"QPushButton {{ background-color: {color}; color: black; }}")
+        n_labels = 0 if labels is None else len(label_values)
+        active_src = seg.active_source or "none"
+        panel.label_status.setText(f"Source: {active_src}   Labels: {n_labels}")
+
+    def _sync_segmentation_action_state(self):
+        panel = self.segmentation_panel
+        ws = self.workspace
         labeler_running = (
             self._labeler_process is not None
             and self._labeler_process.state() != QtCore.QProcess.ProcessState.NotRunning
@@ -2726,11 +2721,10 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         panel.btn_external_editor.setText(
             "SpatioTemporal Labeler Open" if labeler_running else "Open in SpatioTemporal Labeler"
         )
-        n_labels = 0 if labels is None else len([int(x) for x in np.unique(labels) if int(x) != 0])
-        active_src = seg.active_source or "none"
-        panel.label_status.setText(f"Source: {active_src}   Labels: {n_labels}")
 
     def _refresh_segmentation_preview(self):
+        self.workspace.invalidate_segmentation_display()
+        self._last_quality_report = None
         self._ensure_segmentation_label_metadata()
         self._sync_segmentation_scene_object()
         self._refresh_segmentation_ui()
@@ -2816,24 +2810,34 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         return True
 
     def _import_segmentation_path(self, path):
-        if self.workspace.segmentation.dirty:
+        ws = self.workspace
+        if ws.segmentation.dirty:
             self.log("Apply or cancel segmentation edits before importing a new source.")
             return False
-        if not self.workspace.data_loaded:
+        if not ws.data_loaded:
             self.log("Load a case before importing segmentation.")
             return False
         try:
-            seg, provenance = load_segmentation_file(
-                path,
-                spatial_shape=self.workspace.flow_raw.shape[:3] if self.workspace.flow_raw is not None else None,
-                time_count=self.workspace.time_count(),
-            )
-        except Exception as e:
-            self.log(f"Import segmentation failed: {type(e).__name__}: {e}")
+            from ..algorithms.geometry_grid import grid_shape, bind_segmentation_geometry
+            seg, provenance = load_segmentation_file(path, spatial_shape=None, time_count=ws.time_count())
+            field = ws.flow_raw if ws.flow_raw is not None else ws.mag_raw
+            native_shape = field.shape[:3]
+            fine_shape = grid_shape(native_shape, ws.resolution)
+            if seg.shape[:3] == fine_shape and (seg.shape[:3] != native_shape or provenance.get("grid") == "shared_1mm"):
+                if not np.allclose(provenance.get("resolution", [1., 1., 1.]), 1.):
+                    raise ValueError("geometry sidecar must use 1-mm spacing")
+                if not np.allclose(provenance.get("origin", ws.origin), ws.origin):
+                    raise ValueError("segmentation origin does not match the current input")
+                seg = bind_segmentation_geometry(ws, "imported", seg, provenance, self.pipeline._output_dir(ws))
+            elif seg.shape[:3] == native_shape:
+                ws.set_segmentation_source("imported", seg, provenance=provenance)
+            else:
+                raise ValueError(f"incompatible segmentation shape {seg.shape[:3]}")
+        except Exception as error:
+            self.log(f"Import segmentation failed: {type(error).__name__}: {error}")
             return False
-        self.workspace.segmentation.import_path = str(path)
-        self.workspace.segmentation.input_source = "imported"
-        self.workspace.set_segmentation_source("imported", seg, provenance=provenance)
+        ws.segmentation.import_path = str(path)
+        ws.segmentation.input_source = "imported"
         self._ensure_segmentation_label_metadata(np.max(seg, axis=3))
         return self._commit_segmentation_source_change("imported", f"Imported segmentation: {path}")
 
@@ -3125,7 +3129,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             provenance["saved_from_working_copy"] = True
             provenance["saved_at"] = segmentation_timestamp()
         try:
-            save_segmentation_file(path, seg, resolution=self.workspace.resolution, origin=self.workspace.origin, provenance=provenance)
+            save_segmentation_file(path, seg, resolution=self.workspace.segmentation_spacing, origin=self.workspace.origin, provenance=dict(provenance, grid="shared_1mm"))
             self.log(f"Saved segmentation: {path}")
         except Exception as e:
             self.log(f"Save segmentation failed: {type(e).__name__}: {e}")
@@ -3191,11 +3195,14 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
                 raise ValueError(f"active segmentation must be XYZT, got shape={segmentation.shape}")
             if mag.ndim == 3:
                 mag = np.repeat(mag[..., None], segmentation.shape[3], axis=3)
-            if mag.shape != segmentation.shape or flow.shape[:4] != segmentation.shape or flow.shape[-1] != 3:
+            if mag.shape[3] != segmentation.shape[3] or flow.shape[3] != segmentation.shape[3] or flow.shape[-1] != 3:
                 raise ValueError("magnitude, flow and segmentation must have matching XYZT dimensions")
             metadata = self._labeler_exchange_metadata(segmentation)
             exchange_dir = self._labeler_exchange_directory(metadata)
             def export(progress, log):
+                from ..algorithms.geometry_grid import field_on_geometry_grid
+                mag_fine = field_on_geometry_grid(mag, ws, segmentation.shape[:3])
+                flow_fine = field_on_geometry_grid(flow, ws, segmentation.shape[:3])
                 count = 0
                 progress({"stage": "labeler_digest", "message": "Checking image and segmentation files…"})
                 def written(name):
@@ -3203,8 +3210,8 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
                     count += 1
                     progress({"stage": "labeler_export", "current": count, "total": 6,
                               "message": f"Exported {name} ({count}/6)"})
-                result = export_labeler_exchange(exchange_dir, metadata, mag, flow, segmentation,
-                                                 ws.resolution, ws.origin, written)
+                result = export_labeler_exchange(exchange_dir, dict(metadata, grid="shared_1mm", image_sampling="temporary_linear_for_editor"), mag_fine, flow_fine, segmentation,
+                                                 ws.segmentation_spacing, ws.origin, written)
                 progress({"stage": "labeler_export", "current": 6, "total": 6,
                           "message": "Labeler features ready"})
                 return result
@@ -3550,6 +3557,9 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             return False
         if not self._begin_segmentation_edit_session():
             return False
+        fine_shape = np.asarray(self._current_working_labels_3d().shape)
+        xyz = np.clip(np.rint(np.array([x, y, z])*self.workspace.resolution).astype(int), 0, fine_shape-1)
+        x, y, z = xyz.tolist()
         tool = self.workspace.segmentation.tool
         label_value = int(self.workspace.segmentation.active_label)
         if not dragging:
@@ -3612,7 +3622,8 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
                 "edit_mode": edit_mode,
             }
         )
-        ws.set_segmentation_source(target_source, seg4d, provenance=provenance)
+        from ..algorithms.geometry_grid import bind_segmentation_geometry
+        bind_segmentation_geometry(ws, target_source, seg4d, provenance, self.pipeline._output_dir(ws))
         ws.clear_working_segmentation()
         self._seg_edit_active = False
         self._reset_segmentation_edit_history()
@@ -3651,6 +3662,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self._clear_plane_drag_widgets()
         self._set_path_info_text("")
         self._log_selected_plane_metric(int(plane_idx))
+        self.selection_tabs.setCurrentIndex(0)
         self._refresh_analysis_panel()
 
     def _on_3d_path_picked(self, uid, path_idx):
@@ -3679,6 +3691,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self._select_browser_item_by_uid(uid)
         self._set_plane_info_text("")
         self._log_selected_path_info(int(path_idx))
+        self.selection_tabs.setCurrentIndex(1)
         self._refresh_analysis_panel()
 
     def _find_uid_by_data_key(self, data_key):
@@ -3983,7 +3996,8 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         return item
 
     def _browser_add_leaf(self, parent, obj, *, name=None):
-        item = QtWidgets.QTreeWidgetItem([str(name or obj.name), obj.kind.value])
+        display_name = name or ('Centerline' if str(obj.data_key).startswith('smooth_path_') else obj.name)
+        item = QtWidgets.QTreeWidgetItem([str(display_name), obj.kind.value])
         tooltip = str(name or obj.name)
         if str(getattr(obj, "data_key", "")) == "pcmra_volume":
             tooltip += "\nShift+left-drag in 3D: window width / window level"
@@ -4086,6 +4100,8 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             parent = parent.parent()
 
     def _set_browser_item_visibility(self, item, visible):
+        if item.data(0, INLINE_ROLE):
+            return False
         target_state = QtCore.Qt.Checked if visible else QtCore.Qt.Unchecked
         refresh_segmentation = False
         uid = item.data(0, QtCore.Qt.UserRole)
@@ -4131,9 +4147,29 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         selected = 0 <= int(self._selected_plane_index) < len(self.workspace.planes)
         editing = bool(self._plane_edit_enabled and selected)
         if hasattr(self, "btn_edit_plane"):
-            self.btn_add_plane.setEnabled(bool(self.workspace.data_loaded))
+            self.btn_add_plane.setEnabled(bool(self.workspace.data_loaded) and not editing)
             self.btn_edit_plane.setEnabled(selected)
-            self.btn_edit_plane.setText("Finish Plane Edit" if editing else "Edit Plane")
+            self.btn_edit_plane.setText("Apply Plane")
+            self.btn_edit_plane.setVisible(editing)
+        if hasattr(self, "check_plane_unlocked"):
+            blocker = QtCore.QSignalBlocker(self.check_plane_unlocked)
+            self.check_plane_unlocked.setChecked(editing)
+            self.check_plane_unlocked.setText('Editing plane' if editing else 'Edit plane')
+            self.check_plane_unlocked.setEnabled(selected)
+            del blocker
+        if hasattr(self, "plane_edit_tools"):
+            self.btn_add_plane.setVisible(False)
+            self.combo_plane_add_source.hide()
+            self.btn_undo_plane.setVisible(editing or self._plane_undo_stack.canUndo())
+            self.btn_redo_plane.setVisible(editing or self._plane_undo_stack.canRedo())
+            self.btn_cancel_plane_edit.setVisible(editing)
+            self.plane_edit_tools.setVisible(editing)
+            self.combo_plane_add_source.setEnabled(not editing)
+            self.btn_undo_plane.setEnabled(bool(self._plane_draft_undo) if editing else self._plane_undo_stack.canUndo())
+            self.btn_redo_plane.setEnabled(bool(self._plane_draft_redo) if editing else self._plane_undo_stack.canRedo())
+            self.btn_cancel_plane_calculation.setVisible(self._plane_jobs.is_running)
+
+        self._queue_inline_inspector_size()
 
     def _position_plane_handles(self):
         if self._plane_handles is None or self._plane_drag_index is None:
@@ -4144,7 +4180,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             self.scene.world_to_display_vector(self._plane_axis_u),
             self.scene.world_to_display_vector(self._plane_axis_v), self._plane_widget_distance())
 
-    def _add_manual_plane(self):
+    def _legacy_add_manual_plane(self):
         if self._pipeline_running_guard("adding a plane") or self._autoseg_running_guard("adding a plane"):
             return
         if not self.workspace.data_loaded:
@@ -4196,7 +4232,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self._activate_plane_drag_widgets(plane_idx)
         self.log(f"Added manual plane {plane_idx} at the current ortho cursor")
 
-    def _toggle_selected_plane_edit(self):
+    def _legacy_toggle_selected_plane_edit(self):
         plane_idx = int(self._selected_plane_index)
         if not (0 <= plane_idx < len(self.workspace.planes)):
             self.log("Select a plane before editing it.")
@@ -4212,7 +4248,11 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         if self._plane_edit_enabled:
             self.log(f"Editing plane {plane_idx}")
 
-    def _clear_plane_drag_widgets(self):
+    def _legacy_clear_plane_drag_widgets(self):
+        self.ortho_viewer.set_plane_rotation_enabled(False)
+        self.ortho_viewer._draft_plane_basis = None
+        self.ortho_viewer._plane_rotation_reference = None
+        self.ortho_viewer._plane_translation_reference = None
         if self._plane_handles is not None:
             self._plane_handles.close()
             self._plane_handles = None
@@ -4231,7 +4271,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self._plane_axis_v = None
         self._refresh_plane_edit_controls()
 
-    def _update_plane_from_drag(self, plane_idx, center=None, normal=None):
+    def _legacy_update_plane_from_drag(self, plane_idx, center=None, normal=None):
         if self._plane_widget_initializing:
             return
         if not (0 <= int(plane_idx) < len(self.workspace.planes)):
@@ -4248,9 +4288,10 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
                 else self.workspace.centerline_paths
             )
             if 0 <= path_idx < len(paths) and len(np.asarray(paths[path_idx]).reshape(-1, 3)) > 0:
-                c, _segment_idx, _alpha, distance, _error, _cum = _project_point_to_path(
-                    paths[path_idx], c
-                )
+                projected, _segment_idx, _alpha, distance, _error, _cum = _project_point_to_path(paths[path_idx], c)
+                session = self._plane_edit_session
+                if session is None or session.get("path_locked", False):
+                    c = projected
                 plane.distance = float(distance)
             if np.linalg.norm(c - np.asarray(plane.center, dtype=float).reshape(3)) > tol:
                 plane.center = c
@@ -4260,13 +4301,13 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             if np.linalg.norm(n) > 1e-12:
                 new_normal = n / np.linalg.norm(n)
                 old_normal = np.asarray(plane.normal, dtype=float).reshape(3)
-                if min(np.linalg.norm(new_normal - old_normal), np.linalg.norm(new_normal + old_normal)) > 1e-5:
+                if np.linalg.norm(new_normal - old_normal) > 1e-5:
                     plane.normal = new_normal
                     changed = True
         if not changed:
             return
         self._last_quality_report = None
-        if not self._plane_drag_metrics_dirty:
+        if self._plane_edit_session is None and not self._plane_drag_metrics_dirty:
             # Geometry no longer matches the previously calculated values.
             plane.metrics = {}
             if len(self.workspace.derived.plane_metrics) == len(self.workspace.planes):
@@ -4292,31 +4333,41 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         # would draw the same volume twice for every mouse movement.
 
     def _persist_plane_outputs(self, include_pixelwise=True):
+        from ..core.output import atomic_json_write
+        if self._plane_edit_session is not None or self.ortho_viewer._roi_transaction is not None:
+            return
         out_dir = self.pipeline._output_dir(self.workspace)
-        metrics = self.workspace.derived.plane_metrics
-        qc = self.workspace.derived.plane_qc
-        if metrics and len(metrics) == len(self.workspace.planes):
-            with open(os.path.join(out_dir, "plane_metrics.json"), "w", encoding="utf-8") as f:
-                json.dump(metrics, f, ensure_ascii=False, indent=2)
-        if qc:
-            with open(os.path.join(out_dir, "plane_qc.json"), "w", encoding="utf-8") as f:
-                json.dump(qc, f, ensure_ascii=False, indent=2)
+        metrics = [dict(selected_metric(self.workspace, i, current_only=False) or {}) for i in range(len(self.workspace.planes))]
+        for i, (plane, metric) in enumerate(zip(self.workspace.planes, metrics)):
+            if metric:
+                metric.update(plane_id=plane.plane_id, plane_index=i, validity=metric_validity(plane, metric))
+        self.workspace.derived.plane_metrics = metrics
+        qc = copy.deepcopy(self.workspace.derived.plane_qc)
+        atomic_json_write(os.path.join(out_dir, "plane_metrics.json"), metrics)
+        atomic_json_write(os.path.join(out_dir, "plane_qc.json"), qc)
+        if not include_pixelwise:
+            from ..algorithms.metrics.export import refresh_pixelwise_validity
+            try:
+                refresh_pixelwise_validity(os.path.join(out_dir, "plane_metrics_pixelwise.h5"), self.workspace)
+            except OSError as exc:
+                self.log(f"Could not update previous pixelwise-export validity: {exc}")
         if include_pixelwise and metrics and len(metrics) == len(self.workspace.planes):
             plane_pixelwise_path = os.path.join(out_dir, "plane_metrics_pixelwise.h5")
             try:
                 _, plane_pixelwise = augment_plane_metrics_with_derived(
                     metrics,
                     self.workspace.planes,
-                    self.workspace.segmask_binary,
-                    self.workspace.resolution,
+                    self.workspace.segmentation_analysis_binary,
+                    self.workspace.segmentation_spacing,
                     self.workspace.origin,
-                    branch_labels_3d=self.workspace.branch_labels,
-                    segmentation_labels_3d=self.workspace.segmask_labels_3d,
-                    segmentation_labels_4d=self.workspace.segmask_labels,
+                    branch_labels_3d=self.workspace.geometry_branch_labels,
+                    segmentation_labels_3d=self.workspace.segmentation_analysis_labels_3d,
+                    segmentation_labels_4d=self.workspace.segmentation_analysis_labels,
                     tke_array=self.workspace.derived.tke_array,
                     pressure_gradient_array=self.workspace.derived.pressure_gradient_array,
                     relative_pressure_array=self.workspace.derived.relative_pressure_array,
                     wss_surfaces=self.workspace.derived.wss_surfaces,
+                    field_spacing=self.workspace.resolution,
                 )
                 save_plane_pixelwise_h5(plane_pixelwise_path, plane_pixelwise, rr_ms=self.workspace.rr, source_format=self.workspace.input_state.source_format)
                 self.workspace.derived.plane_pixelwise_file = plane_pixelwise_path
@@ -4327,7 +4378,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         except Exception:
             pass
 
-    def _finalize_plane_drag(self, plane_idx):
+    def _legacy_finalize_plane_drag(self, plane_idx):
         if not (0 <= int(plane_idx) < len(self.workspace.planes)):
             return
         if self._plane_edit_enabled and not self._plane_drag_metrics_dirty:
@@ -4362,6 +4413,8 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
     def _on_plane_roi_changed(self, plane_idx):
         if not (0 <= int(plane_idx) < len(self.workspace.planes)):
             return
+        invalidate_planes(self.workspace, [self.workspace.planes[int(plane_idx)].plane_id], "Measurement ROI changed", roi=True)
+        self._last_quality_report = None
         self._selected_plane_index = int(plane_idx)
         self._plane_drag_index = int(plane_idx)
         self._plane_drag_metrics_dirty = True
@@ -4384,13 +4437,12 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         # on the edited contour. Fully observed contours keep the fast path.
         metric = metrics[int(plane_idx)]
         frame = int(self.workspace.current_t)
-        sources = metric.get("roi_source_frame_t", [])
-        affects_other_frames = any(metric.get("roi_carried_forward_t", [])) or (
-            not sources or any(source is None for source in sources[frame + 1:]))
-        self._recompute_dragged_plane_metrics(persist=True, frame_only=not affects_other_frames)
+        # A new/deleted observation can alter both neighboring gaps, including
+        # the cycle boundary, even if the previous result was fully observed.
+        self._recompute_dragged_plane_metrics(persist=True, frame_only=False)
         self.log(f"Plane {int(plane_idx)} metric ROI updated")
 
-    def _activate_plane_drag_widgets(self, plane_idx):
+    def _legacy_activate_plane_drag_widgets(self, plane_idx):
         if self._edit_mode is not None or not (0 <= int(plane_idx) < len(self.workspace.planes)):
             return
         if self._plane_drag_active and int(self._plane_drag_index) == int(plane_idx):
@@ -4418,48 +4470,22 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
                 center=self.scene.display_to_world_point(new_center) - origin,
             )
 
-        def _axis_u_cb(new_tip):
-            if self._plane_axis_v is None:
-                return
-            c = self.scene.world_to_display_point(np.asarray(self.workspace.planes[int(plane_idx)].center, dtype=float).reshape(3) + origin)
-            proposed = self.scene.display_to_world_vector(np.asarray(new_tip, dtype=float).reshape(3) - c)
-            current_v = self._plane_axis_v
-            proposed = proposed - np.dot(proposed, current_v) * current_v
-            if np.linalg.norm(proposed) <= 1e-12:
-                return
-            self._plane_axis_u = proposed / np.linalg.norm(proposed)
-            new_normal = np.cross(self._plane_axis_u, current_v)
-            self._update_plane_from_drag(plane_idx, normal=new_normal)
-
-        def _axis_v_cb(new_tip):
-            if self._plane_axis_u is None:
-                return
-            c = self.scene.world_to_display_point(np.asarray(self.workspace.planes[int(plane_idx)].center, dtype=float).reshape(3) + origin)
-            proposed = self.scene.display_to_world_vector(np.asarray(new_tip, dtype=float).reshape(3) - c)
-            current_u = self._plane_axis_u
-            proposed = proposed - np.dot(proposed, current_u) * current_u
-            if np.linalg.norm(proposed) <= 1e-12:
-                return
-            self._plane_axis_v = proposed / np.linalg.norm(proposed)
-            new_normal = np.cross(current_u, self._plane_axis_v)
-            self._update_plane_from_drag(plane_idx, normal=new_normal)
-
         def _end_cb():
+            self._end_plane_gesture()
             # Preview only: no time-series metrics, pathlines or disk writes.
             if self._plane_drag_metrics_dirty:
                 self.ortho_viewer.set_selected_plane(int(plane_idx))
-                self.ortho_viewer.label_plane_metric.setText("Plane metrics: pending — Finish Plane Edit")
-                self._set_plane_info_text(f"Plane {plane_idx} · geometry changed\nMetrics update on Finish Plane Edit.")
+                self.ortho_viewer.label_plane_metric.setText("Plane metrics: pending — Apply Plane")
+                self._set_plane_info_text(f"Plane {plane_idx} · geometry preview\nApply to update metrics, or Cancel to restore.")
             self.plotter.render()
 
         try:
             self._plane_widget_initializing = True
             self._plane_handles = PlaneDragHandles(
-                self.plotter, self.scene, (_center_cb, _axis_u_cb, _axis_v_cb),
-                on_start=lambda: self._on_pause() if self._play_timer.isActive() else None,
+                self.plotter, self.scene, (_center_cb,),
+                on_start=self._begin_plane_gesture,
                 on_end=_end_cb)
-            (self._plane_center_widget, self._plane_axis_u_widget, self._plane_axis_v_widget) = (
-                rep for _, rep in self._plane_handles.handles)
+            self._plane_center_widget = self._plane_handles.handles[0][1]
             self._plane_drag_active = True
             self._plane_drag_index = int(plane_idx)
             self._plane_edit_enabled = True
@@ -4549,9 +4575,9 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         frame_plane.roi_edit_operations = {"0": copy.deepcopy(frame_ops)} if frame_ops else {}
         flow = np.asarray(ws.flow_raw)
         flow_frame = flow[..., frame:frame + 1, :]
-        mask = np.asarray(ws.segmask_binary, dtype=bool)
+        mask = np.asarray(ws.segmentation_analysis_binary, dtype=bool)
         mask_frame = mask[..., None] if mask.ndim == 3 else mask[..., frame:frame + 1]
-        labels = getattr(ws, "segmask_labels", None)
+        labels = getattr(ws, "segmentation_analysis_labels", None)
         labels_frame = None
         if labels is not None:
             labels = np.asarray(labels)
@@ -4564,18 +4590,18 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         partial = compute_plane_metrics(
             flow_frame,
             mask_frame,
-            ws.resolution,
+            ws.segmentation_spacing,
             ws.origin,
             [frame_plane],
             RR=ws.rr,
-            branch_labels_3d=ws.branch_labels,
-            segmentation_labels_3d=getattr(ws, "segmask_labels_3d", None),
+            branch_labels_3d=ws.geometry_branch_labels,
+            segmentation_labels_3d=getattr(ws, "segmentation_analysis_labels_3d", None),
             segmentation_labels_4d=labels_frame,
             path_info=ws.path_info,
             forks=ws.forks,
             paths=paths_for_tangent,
             return_qc=False,
-            skip_support_mesh=True,
+            skip_support_mesh=True, flow_spacing=ws.resolution,
         )
         if not partial:
             return None
@@ -4612,15 +4638,15 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
                 [metric],
                 [frame_plane],
                 mask_frame,
-                ws.resolution,
+                ws.segmentation_spacing,
                 ws.origin,
-                branch_labels_3d=ws.branch_labels,
-                segmentation_labels_3d=ws.segmask_labels_3d,
-                segmentation_labels_4d=frame_slice(ws.segmask_labels),
+                branch_labels_3d=ws.geometry_branch_labels,
+                segmentation_labels_3d=ws.segmentation_analysis_labels_3d,
+                segmentation_labels_4d=frame_slice(ws.segmentation_analysis_labels),
                 tke_array=frame_slice(ws.derived.tke_array),
                 pressure_gradient_array=frame_slice(ws.derived.pressure_gradient_array),
                 relative_pressure_array=frame_slice(ws.derived.relative_pressure_array),
-                wss_surfaces=wss_frame,
+                wss_surfaces=wss_frame, field_spacing=ws.resolution,
             )
             if derived_metrics:
                 metric = self._merge_plane_metric_frame(
@@ -4632,7 +4658,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
                 )
         return metric
 
-    def _recompute_dragged_plane_metrics(self, persist=False, frame_only=False):
+    def _legacy_recompute_dragged_plane_metrics(self, persist=False, frame_only=False):
         if self._plane_drag_index is None or not (0 <= int(self._plane_drag_index) < len(self.workspace.planes)):
             return
         if self.workspace.flow_raw is None or self.workspace.segmask_binary is None:
@@ -4701,32 +4727,34 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
                 )
                 partial_metrics = compute_plane_metrics(
                     self.workspace.flow_raw,
-                    self.workspace.segmask_binary,
-                    self.workspace.resolution,
+                    self.workspace.segmentation_analysis_binary,
+                    self.workspace.segmentation_spacing,
                     self.workspace.origin,
                     [self.workspace.planes[plane_idx]],
                     RR=self.workspace.rr,
-                    branch_labels_3d=self.workspace.branch_labels,
-                    segmentation_labels_4d=self.workspace.segmask_labels,
+                    branch_labels_3d=self.workspace.geometry_branch_labels,
+                    segmentation_labels_4d=self.workspace.segmentation_analysis_labels,
                     path_info=self.workspace.path_info,
                     forks=self.workspace.forks,
                     paths=paths_for_tangent,
                     return_qc=False,
+                    flow_spacing=self.workspace.resolution,
                 )
                 if partial_metrics and include_derived:
                     partial_metrics, _ = augment_plane_metrics_with_derived(
                         partial_metrics,
                         [self.workspace.planes[plane_idx]],
-                        self.workspace.segmask_binary,
-                        self.workspace.resolution,
+                        self.workspace.segmentation_analysis_binary,
+                        self.workspace.segmentation_spacing,
                         self.workspace.origin,
-                        branch_labels_3d=self.workspace.branch_labels,
-                        segmentation_labels_3d=self.workspace.segmask_labels_3d,
-                        segmentation_labels_4d=self.workspace.segmask_labels,
+                        branch_labels_3d=self.workspace.geometry_branch_labels,
+                        segmentation_labels_3d=self.workspace.segmentation_analysis_labels_3d,
+                        segmentation_labels_4d=self.workspace.segmentation_analysis_labels,
                         tke_array=self.workspace.derived.tke_array,
                         pressure_gradient_array=self.workspace.derived.pressure_gradient_array,
                         relative_pressure_array=self.workspace.derived.relative_pressure_array,
                         wss_surfaces=self.workspace.derived.wss_surfaces,
+                        field_spacing=self.workspace.resolution,
                     )
                 if partial_metrics:
                     partial_metrics[0]["plane_index"] = plane_idx
@@ -4758,14 +4786,28 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             self._set_plane_info_text("")
             return
         plane = self.workspace.planes[int(plane_idx)]
-        metric = getattr(plane, "metrics", {}) or {}
+        metric = selected_metric(self.workspace, int(plane_idx))
+        if not metric:
+            state = metric_validity(plane)
+            self._set_plane_info_text(f"Plane {plane_idx} | Path {plane.path_index}\n" +
+                ("Preview / Needs recalculation" if state == "stale" else "Not calculated") + " · —")
+            return
         t = int(np.clip(self.workspace.current_t, 0, max(0, self.workspace.time_count() - 1)))
+        valid = metric.get("sample_valid_t", [])
+        if t < len(valid) and not valid[t]:
+            self._set_plane_info_text(f"Plane {plane_idx} · t={t}\nNot assessable · Empty or non-finite ROI · —")
+            return
         fr = metric.get("flowrate_mL_s", [])
         ar = metric.get("area_mm2", [])
         mv = metric.get("meanv_cm_s_t", [])
-        flow_t = float(fr[t]) if len(fr) > t else 0.0
-        area_t = float(ar[t]) if len(ar) > t else 0.0
-        meanv_t = float(mv[t]) if len(mv) > t else float(metric.get("meanv_cm_s", 0.0))
+        def display(value, digits):
+            return "—" if value is None or not np.isfinite(float(value)) else f"{float(value):.{digits}f}"
+        flow_t = display(fr[t] if len(fr) > t else None, 4)
+        area_t = display(ar[t] if len(ar) > t else None, 3)
+        meanv_t = display(mv[t] if len(mv) > t else None, 3)
+        complete = not valid or all(valid)
+        peak = display(metric.get("peakv_cm_s") if complete else None, 3)
+        net = display(metric.get("netflow_mL_beat") if complete else None, 4)
         path_dir = metric.get("path_direction", "")
         header = f"Plane {int(plane_idx)} | Path {int(metric.get('path_index', plane.path_index))}"
         if path_dir:
@@ -4774,14 +4816,31 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         path_ic_text = "undefined" if path_ic_value is None else f"{float(path_ic_value):.3f}"
         text_block = (
             f"{header}\n"
-            f"t={t}  Flow Rate={flow_t:.4f} mL/s  Area={area_t:.3f} mm^2  Mean Velocity={meanv_t:.3f} cm/s\n"
-            f"Peak Velocity={float(metric.get('peakv_cm_s', 0.0)):.3f} cm/s  Net Flow={float(metric.get('netflow_mL_beat', 0.0)):.4f} mL/beat  IC={path_ic_text}"
+            f"t={t}  Flow Rate={flow_t} mL/s  Area={area_t} mm^2  Mean Velocity={meanv_t} cm/s\n"
+            f"Peak Velocity={peak} cm/s  Net Flow={net} mL/beat  IC={path_ic_text}"
         )
+        if not complete:
+            text_block += "\nCycle summary not assessable: some phases have missing ROI samples."
         carried = metric.get("roi_carried_forward_t", [])
         sources = metric.get("roi_source_frame_t", [])
-        if t < len(carried) and carried[t] and t < len(sources):
-            text_block += f"\nROI carried forward from phase {sources[t]}; velocity sampled at phase {t}."
-        self._set_plane_info_text(text_block)
+        interpolated = metric.get("roi_interpolated_t", [])
+        endpoints = metric.get("roi_source_frames_t", [])
+        if t < len(interpolated) and interpolated[t] and t < len(endpoints):
+            text_block += f"\nROI interpolated between phases {endpoints[t]}; velocity sampled at phase {t}."
+        elif t < len(carried) and carried[t] and t < len(sources):
+            text_block += f"\nROI held from the only available phase {sources[t]}; velocity sampled at phase {t}."
+        notes = "\n".join(text_block.splitlines()[3:])
+        ic_rows = consistency_rows(self.workspace, int(metric.get("path_index", plane.path_index)), metric)
+        for name, value, _unit in ic_rows[1:]:
+            text_block += f"\n{name}: {value}"
+        self._set_plane_info_text(text_block, summary=(
+            f"Plane {int(plane_idx)}", f"Path {int(metric.get('path_index', plane.path_index))} · {path_dir} · Phase {t}".replace(" ·  · ", " · "),
+            [("Flow rate", display(fr[t] if len(fr) > t else None, 2), "mL/s"),
+             ("Area", display(ar[t] if len(ar) > t else None, 2), "mm²"),
+             ("Mean velocity", display(mv[t] if len(mv) > t else None, 2), "cm/s"),
+             ("Peak velocity", display(metric.get("peakv_cm_s") if complete else None, 2), "cm/s"),
+             ("Net flow", display(metric.get("netflow_mL_beat") if complete else None, 2), "mL/beat"),
+             *ic_rows], notes))
 
     def _log_selected_path_info(self, path_idx):
         if not (0 <= int(path_idx) < len(self.workspace.path_info)):
@@ -4890,7 +4949,43 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
                            f"\nParents: {hierarchy.get('parent_path_indices', [])}"
                            f" | children: {hierarchy.get('child_path_indices', [])}"
                            f" | loop: {hierarchy.get('loop_id') or 'none'}")
-        self._set_path_info_text(text_block)
+        rows = [
+            ("Label", f"{owner_name} ({owner_label})", ""),
+            ("Nodes", f"{int(info.get('start_node', -1))} → {int(info.get('end_node', -1))}", ""),
+            ("Incoming", ", ".join(map(str, incoming)) or "—", ""),
+            ("Outgoing", ", ".join(map(str, outgoing)) or "—", ""),
+        ]
+        ic_rows = consistency_rows(self.workspace, int(path_idx))
+        rows.extend(ic_rows)
+        text_block += "\n" + " · ".join(f"{name}: {value}" for name, value, _unit in ic_rows)
+        if hierarchy:
+            rows.extend([
+                ("Group level", str(hierarchy.get("group_level", "—")), ""),
+                ("Parents", ", ".join(map(str, (hierarchy.get("parent_path_indices") or []))) or "—", ""),
+                ("Children", ", ".join(map(str, (hierarchy.get("child_path_indices") or []))) or "—", ""),
+                ("Loop", str(hierarchy.get("loop_id") or "—"), ""),
+            ])
+        fork_notes = []
+        for fork in self.workspace.forks:
+            if int(path_idx) in fork.get("left", []) or int(path_idx) in fork.get("right", []):
+                left = ", ".join(map(str, fork.get("left", []))) or "—"
+                right = ", ".join(map(str, fork.get("right", []))) or "—"
+                fork_notes.append(f"Fork {int(fork.get('node', -1))} · Left {left} · Right {right}")
+        notes = "\n".join(fork_notes)
+        if hierarchy:
+            levels = hierarchy.get("label_local_levels") or {}
+            if not isinstance(levels, dict):
+                levels = {}
+            formatted = []
+            for label, level in levels.items():
+                name = id_to_name.get(int(label), label) if str(label).isdigit() else label
+                formatted.append(f"{name}: {level}")
+            extra = [str(hierarchy.get("level_status") or "")]
+            if formatted:
+                extra.append("Label levels · " + "; ".join(formatted))
+            notes = "\n".join(value for value in [notes, *extra] if value)
+        self._set_path_info_text(text_block, summary=(
+            f"Path {int(path_idx)}", str(info.get("direction_text", "")), rows, notes))
 
     def _select_browser_item_by_uid(self, uid):
         self.tree_objects.blockSignals(True)
@@ -4901,7 +4996,9 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
                 parent.setExpanded(True)
                 parent = parent.parent()
             self.tree_objects.setCurrentItem(item)
+            item.setExpanded(True)
             self.tree_objects.blockSignals(False)
+            self._sync_context_panels()
             return
         self.tree_objects.blockSignals(False)
 
@@ -4909,14 +5006,23 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self.tree_objects.blockSignals(True)
         self.tree_objects.clearSelection()
         self.tree_objects.blockSignals(False)
+        self._sync_context_panels()
 
-    def _set_plane_info_text(self, text):
+    def _set_plane_info_text(self, text, summary=None):
         msg = str(text).strip() if text else "No plane selected."
-        self.text_plane_info.setPlainText(msg)
+        if summary is None:
+            self.text_plane_info.setPlainText(msg)
+        else:
+            self.text_plane_info.set_summary(*summary, plain_text=msg)
+        self._queue_inline_inspector_size()
 
-    def _set_path_info_text(self, text):
+    def _set_path_info_text(self, text, summary=None):
         msg = str(text).strip() if text else "No path selected."
-        self.text_path_info.setPlainText(msg)
+        if summary is None:
+            self.text_path_info.setPlainText(msg)
+        else:
+            self.text_path_info.set_summary(*summary, plain_text=msg)
+        self._queue_inline_inspector_size()
 
     def _autoseg_running_guard(self, action_text):
         if getattr(self, "_dicom_conversion_thread", None) is not None:
@@ -4928,6 +5034,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         return True
 
     def _refresh_selection_info(self):
+        self._update_qc_overlay()
         if not (0 <= int(self._selected_plane_index) < len(self.workspace.planes)):
             self._selected_plane_index = -1
             self._set_plane_info_text("")
@@ -4940,6 +5047,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         else:
             self._log_selected_path_info(path_idx)
         self._refresh_plane_edit_controls()
+        self._sync_context_panels()
         self._refresh_analysis_panel()
 
     def log(self, text):
@@ -5114,8 +5222,16 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self._refresh_pwv_plot()
         self._refresh_workflow_status()
         self._refresh_scene()
+        pane = getattr(self, '_html_document_panes', {}).get('qc')
+        if pane is not None:
+            from ..report_media import media_signature
+            if getattr(pane, 'qc_signature', None) != media_signature(self.workspace):
+                pane.set_stale(True)
+        if self._workflow_stage_key() == 'review' and not self.workspace.data_loaded:
+            self.qc_page.setCurrentWidget(self.qc_empty)
 
     def _refresh_browser(self):
+        view_state = self._capture_browser_view()
         self.tree_objects.blockSignals(True)
         self.tree_objects.clear()
         groups = {}
@@ -5135,7 +5251,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             if color_name:
                 color = QtGui.QColor(color_name)
                 if color.isValid():
-                    top.setForeground(0, QtGui.QBrush(color))
+                    top.setForeground(0, QtGui.QBrush(readable_color(color, self)))
             entry = {"name": group_name, "item": top, "types": {}, "paths": {}}
             groups[group_name] = entry
             self.tree_objects.addTopLevelItem(top)
@@ -5242,6 +5358,8 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
                         child.setExpanded(any(child.child(n).data(0, _BROWSER_NODE_ROLE) in {"path", "loop"}
                                               for n in range(child.childCount())))
         self._browser_add_joint_hierarchies()
+        self._compact_browser_types()
+        self._restore_browser_view(view_state)
         self.tree_objects.blockSignals(False)
         self._sync_render_category_visibility_controls()
         self._refresh_browser_opacity_control()
@@ -5250,7 +5368,8 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self.chk_selection_on_top.blockSignals(True)
         self.chk_selection_on_top.setChecked(self.workspace.render_settings.get("selected_layer_on_top", True))
         self.chk_selection_on_top.blockSignals(False)
-        self.scene.set_selected_layers([], render=False)
+        self.scene.set_selected_layers([obj.uid for obj in self._browser_selected_objects()], render=False)
+        self._sync_context_panels()
 
     def _render_category_objects(self, category):
         if category == "planes":
@@ -5325,6 +5444,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
 
     def _refresh_browser_opacity_control(self):
         objects = self._browser_selected_objects()
+        self._refresh_layer_appearance(objects)
         if not objects:
             self.slider_browser_opacity.blockSignals(True)
             self.slider_browser_opacity.setEnabled(False)
@@ -5379,7 +5499,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
                 continue
             if obj.scalars or obj.data_key == "pcmra_volume":
                 return obj
-        return self.scene._visible_volume_object()
+        return None
 
     def _render_object_range(self, obj):
         if obj.data_key == "pcmra_volume":
@@ -5406,6 +5526,8 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
 
     def _refresh_render_range_control(self):
         obj = self._selected_render_object()
+        self.render_range_controls.setVisible(obj is not None)
+        self._size_layer_appearance()
         if obj is None:
             self.slider_render_window.setEnabled(False)
             self.slider_render_level.setEnabled(False)
@@ -5475,16 +5597,12 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
     def _on_selection_on_top_changed(self, checked):
         self.scene.set_selected_layers([obj.uid for obj in self._browser_selected_objects()], on_top=checked)
 
-    def _on_browser_select(self):
+    def _apply_browser_selection(self):
         if self._plane_edit_enabled:
-            # Browser navigation is deliberate; finish the old plane before
-            # changing the selected index. Stray 3D clicks stay locked out.
-            objects = self._browser_selected_objects()
             current_uid = self._find_uid_by_indexed_data_key("plane", self._plane_drag_index)
-            if len(objects) == 1 and objects[0].uid == current_uid:
-                return
-            self._finalize_plane_drag(int(self._plane_drag_index))
-            self._clear_plane_drag_widgets()
+            self._select_browser_item_by_uid(current_uid)
+            self.statusBar().showMessage("Apply or cancel the current plane draft before changing selection.", 5000)
+            return
         self.scene.set_selected_layers([obj.uid for obj in self._browser_selected_objects()], render=False)
         self._refresh_content_render_controls()
         self._refresh_browser_opacity_control()
@@ -5493,6 +5611,12 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         item = items[0] if items else None
         uid = item.data(0, QtCore.Qt.UserRole) if item is not None else None
         node_type = item.data(0, _BROWSER_NODE_ROLE) if item is not None else None
+        if self.selection_tabs.currentIndex() != 2:
+            selected_object = self.workspace.scene_objects.get(uid)
+            if node_type in {"joint_path", "path", "path_reference"} or (selected_object and selected_object.kind == ObjectKind.BRANCH):
+                self.selection_tabs.setCurrentIndex(1)
+            elif selected_object and (selected_object.kind == ObjectKind.PLANE or _parse_pathline_index(selected_object.data_key) is not None):
+                self.selection_tabs.setCurrentIndex(0)
         if uid is not None and node_type == "joint_path":
             self.workspace.selected_path_index = -1
             self._selected_plane_index = -1
@@ -5593,6 +5717,8 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             self._refresh_selection_info()
 
     def _on_tree_item_changed(self, item, column):
+        if item.data(0, INLINE_ROLE):
+            return
         _ = column
         refresh_segmentation = False
         uid = item.data(0, QtCore.Qt.UserRole)
@@ -5614,7 +5740,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
 
     def _on_browser_ctx_menu(self, pos):
         item = self.tree_objects.itemAt(pos)
-        if item is None:
+        if item is None or item.data(0, INLINE_ROLE):
             return
         if not item.isSelected():
             self.tree_objects.setCurrentItem(item)
@@ -5724,8 +5850,8 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         if not valid_indices:
             self.log("No valid planes selected for Pathlines.")
             return
-        if self.workspace.flow_raw is None or self.workspace.segmask_raw is None:
-            self.log("Pathlines require loaded flow and segmentation.")
+        if self.workspace.flow_raw is None or (self.workspace.streamline_params.pathline_seed_region == "segmentation" and self.workspace.segmask_raw is None):
+            self.log("Pathlines require velocity and the selected seed region.")
             return
         active_indices = {
             int(idx)
@@ -5756,7 +5882,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self._pathline_progress_dialog.setRange(0, 1)
         self._pathline_progress_dialog.setValue(0)
         QtWidgets.QApplication.processEvents()
-        if prepare_segmentation:
+        if prepare_segmentation and self.workspace.segmask_raw is not None:
             try:
                 self.pipeline.preprocess(self.workspace)
             except Exception as exc:
@@ -5764,7 +5890,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
                 self._close_progress_dialog(self._pathline_progress_dialog)
                 self._pathline_progress_dialog = None
                 return
-        if self.workspace.segmask_binary is None:
+        if self.workspace.streamline_params.pathline_seed_region == "segmentation" and self.workspace.segmask_binary is None:
             self.log("Pathlines require a valid preprocessed segmentation.")
             self._close_progress_dialog(self._pathline_progress_dialog)
             self._pathline_progress_dialog = None
@@ -5807,7 +5933,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
 
     def _start_pathline_task(self, plane_indices, *, selected_plane_idx=None):
         ws = self.workspace
-        if ws.flow_raw is None or ws.segmask_binary is None:
+        if ws.flow_raw is None or (ws.streamline_params.pathline_seed_region == "segmentation" and ws.segmask_binary is None):
             return False
         params = ws.streamline_params
         self._on_pause()
@@ -5828,13 +5954,13 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self._pathline_thread = QtCore.QThread(self)
         self._pathline_worker = _PathlineTaskWorker(
             ws.flow_raw,
-            ws.segmask_binary,
+            ws.segmask_binary if params.pathline_seed_region == "segmentation" else np.ones(ws.flow_raw.shape[:3], bool),
             ws.branch_labels,
             ws.planes,
             plane_indices,
             # Pathlines are launched from phase zero and retain that complete
             # cardiac-cycle trajectory while the timeline is played.
-            time_index=0,
+            time_index=int(ws.current_t) if params.pathline_seed_region == "contour" else 0,
             spacing=ws.resolution,
             origin=ws.origin,
             rr=ws.rr,
@@ -5847,7 +5973,14 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
                 "pathline_terminal_speed": params.pathline_terminal_speed,
                 "pathline_rng_seed": params.pathline_rng_seed,
                 "pathline_temporal_cache_mb": getattr(params, "pathline_temporal_cache_mb", 512.0),
+                "pathline_seed_region": params.pathline_seed_region,
+                "pathline_seed_distribution": params.pathline_seed_distribution,
+                "pathline_grid_spacing_mm": params.pathline_grid_spacing_mm,
+                "pathline_integration_step_mm": params.pathline_integration_step_mm,
+                "input_signature": workspace_signature(ws, include_analysis=False),
+                "plane_signatures": {int(i): plane_signature(ws.planes[int(i)]) for i in plane_indices},
             },
+            seed_segmentation=ws.segmask_binary, segmentation_labels=ws.segmask_labels,
         )
         self._bind_task_progress(self._pathline_progress_dialog, self._pathline_worker)
         self._pathline_worker.moveToThread(self._pathline_thread)
@@ -5880,6 +6013,13 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         selected_plane_idx = self._pathline_selected_plane_idx
         self._pathline_selected_plane_idx = None
         data = dict(payload or {})
+        if data.get("input_signature") is not None and data["input_signature"] != workspace_signature(self.workspace, include_analysis=False):
+            self._on_pathline_failed("Input changed; discarded obsolete pathline result")
+            return
+        if any(not 0 <= int(index) < len(self.workspace.planes) or plane_signature(self.workspace.planes[int(index)]) != signature
+               for index, signature in (data.get("plane_signatures") or {}).items()):
+            self._on_pathline_failed("Plane or contour changed; discarded obsolete pathline result")
+            return
         indices = [int(idx) for idx in data.get("plane_indices", [])]
         meshes = dict(data.get("meshes", {}) or {})
         seed_payload = {
@@ -5897,6 +6037,9 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         if not pending_indices and set(self.workspace.active_pathline_plane_indices) >= set(range(len(self.workspace.planes))):
             self.workspace.pipeline.mark_done(StepId.PLANE_STREAMLINES)
         self.workspace.pathline_seed_cache.update(seed_payload)
+        counts = self.workspace.input_state.metadata.setdefault("flow_seed_counts", {}).setdefault("pathlines", {})
+        for index, seeds in seed_payload.items():
+            counts[self.workspace.planes[index].plane_id] = len(seeds)
         self._refresh_browser()
         self.scene.invalidate_cache("pathline_")
         self.scene.sync_from_workspace()
@@ -5912,6 +6055,10 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         elapsed = float(data.get("elapsed_sec", 0.0))
         temporal_cache = "reused all temporal VTK frames" if bool(data.get("temporal_cache_all_phases", False)) else "used bounded temporal VTK caching"
         self.log(f"Generated pathlines for {len(indices)} plane(s) in {elapsed:.2f}s; {temporal_cache}.")
+        incomplete = [index for index, phases in meshes.items() for mesh in phases.values()
+                      if mesh is not None and not bool(np.asarray(mesh.field_data.get("CompletedCycle", [1]))[0])]
+        if incomplete:
+            self.log(f"Pathlines stopped at Maximum steps before the full cycle for planes {incomplete}; increase Maximum steps or Integration step (mm).")
         self.statusBar().showMessage(f"Pathlines completed in {elapsed:.2f}s", 8000)
         self._close_progress_dialog(self._pathline_progress_dialog)
         self._pathline_progress_dialog = None
@@ -5951,7 +6098,8 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         if obj is None:
             return
         obj.color = color_name
-        self.scene.apply_object_properties(obj, render=False, refresh_scalar_bar=False)
+        obj.scalars, obj.show_scalar_bar = None, False
+        self.scene.readd_object(obj, refresh_scalar_bar=False)
         self._refresh_browser()
         self._refresh_scene()
 
@@ -5973,6 +6121,10 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self._refresh_scene()
 
     def _on_delete_object(self):
+        if self._pipeline_running_guard("deleting scene objects"):
+            return
+        before = mutation_snapshot(self.workspace)
+        previous_planes = list(self.workspace.planes)
         items = self.tree_objects.selectedItems()
         if not items:
             return
@@ -6008,12 +6160,12 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
                 self.workspace.pathline_colors.pop(int(idx), None)
             self.workspace.active_pathline_plane_indices = [int(idx) for idx in self.workspace.active_pathline_plane_indices if int(idx) not in removed]
         if plane_indices_removed:
-            self._clear_plane_drag_widgets()
-            self.workspace.clear_pathlines()
-            for pidx in sorted(plane_indices_removed, reverse=True):
-                if 0 <= pidx < len(self.workspace.planes):
-                    self.workspace.planes.pop(pidx)
-            self._rebuild_plane_objects()
+            remove_planes(self.workspace, [previous_planes[i].plane_id for i in set(plane_indices_removed)])
+            refresh_plane_consistency(self.workspace)
+            self._last_quality_report = None
+            self._sync_plane_scene(previous_planes)
+            self._plane_undo_stack.push(_PlaneCommand(self, before, mutation_snapshot(self.workspace), "Delete planes"))
+            self._persist_plane_outputs(include_pixelwise=False)
         self._selected_plane_index = -1
         self.workspace.selected_path_index = -1
         self.scene.highlight_plane(None)
@@ -6045,12 +6197,32 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         value = int(self._pending_timeline_value)
         self._pending_timeline_value = None
         self.workspace.current_t = value
-        self.scene.update_time(value)
-        self.ortho_viewer.refresh()
-        self._refresh_render_range_control()
-        if final or not self.slider_t.isSliderDown():
+        self._refresh_timeline()
+        self._refresh_time_views()
+        if final or (not self.slider_t.isSliderDown() and not self._keyboard_navigation_active):
             self._refresh_segmentation_ui()
             self._refresh_selection_info()
+
+    def _queue_keyboard_time_step(self, delta):
+        count = int(self.workspace.time_count())
+        if count <= 1 or self._pipeline_thread is not None:
+            return
+        if self._play_timer.isActive():
+            self._on_pause()
+        self._keyboard_navigation_active = True
+        base = self.workspace.current_t if self._pending_timeline_value is None else self._pending_timeline_value
+        self._pending_timeline_value = (int(base) + int(delta)) % count
+        self.lab_t.setText(str(self._pending_timeline_value))
+        # A throttle, not a trailing debounce: repeats never restart the timer.
+        # It paints throughout a held key, rather than waiting for key release.
+        if not self._timeline_scrub_timer.isActive():
+            self._timeline_scrub_timer.start()
+
+    def _finish_keyboard_time_step(self):
+        if not self._keyboard_navigation_active:
+            return
+        self._keyboard_navigation_active = False
+        self._finish_timeline_scrub()
 
     def _finish_timeline_scrub(self):
         self._timeline_scrub_timer.stop()
@@ -6063,23 +6235,30 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             self._on_next_frame()
 
     def _on_prev_frame(self):
-        self.workspace.current_t = max(0, self.workspace.current_t - 1)
+        self.workspace.current_t = (self.workspace.current_t - 1) % max(1, self.workspace.time_count())
         self._refresh_timeline()
-        self.scene.update_time(self.workspace.current_t)
-        self.ortho_viewer.refresh()
-        self._refresh_render_range_control()
+        self._refresh_time_views()
         self._refresh_segmentation_ui()
         self._refresh_selection_info()
 
     def _on_next_frame(self):
-        T = self.workspace.time_count()
-        self.workspace.current_t = min(T - 1, self.workspace.current_t + 1)
+        T = max(1, self.workspace.time_count())
+        self.workspace.current_t = (self.workspace.current_t + 1) % T
         self._refresh_timeline()
-        self.scene.update_time(self.workspace.current_t)
-        self.ortho_viewer.refresh()
-        self._refresh_render_range_control()
+        self._refresh_time_views()
         self._refresh_segmentation_ui()
         self._refresh_selection_info()
+
+    def _refresh_time_views(self):
+        viewer = self.ortho_viewer
+        if viewer._roi_transaction is not None and getattr(viewer, "_roi_edit_frame", self.workspace.current_t) != self.workspace.current_t:
+            viewer._cancel_plane_roi()
+            self.statusBar().showMessage("ROI draft discarded when changing phase. Apply ROI before navigating to keep it.", 6000)
+        with getattr(self.scene, "render_batch", nullcontext)():
+            self.scene.update_time(self.workspace.current_t)
+            self.ortho_viewer.refresh()
+            self._refresh_render_range_control()
+        move_phase_cursor(self)
 
     def _on_play(self):
         if self.workspace.time_count() <= 1:
@@ -6113,9 +6292,10 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self._playback_last_tick_started_at = tick_started_at
         self.workspace.current_t = (self.workspace.current_t + 1) % T
         self._refresh_timeline()
-        self.scene.update_time(self.workspace.current_t)
-        self.ortho_viewer.refresh(update_plane=False)
-        self._refresh_render_range_control()
+        with getattr(self.scene, "render_batch", nullcontext)():
+            self.scene.update_time(self.workspace.current_t)
+            self.ortho_viewer.refresh(update_plane=False)
+            self._refresh_render_range_control()
         render_elapsed_ms = (time.perf_counter() - tick_started_at) * 1000.0
         self._playback_render_times_ms.append(render_elapsed_ms)
         average_render_ms = sum(self._playback_render_times_ms) / len(self._playback_render_times_ms)
@@ -6129,7 +6309,8 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         # A single-shot timer prevents overdue playback events from accumulating
         # while VTK is busy. A requested interval below render time runs at the
         # fastest rate the scene can sustain.
-        delay_ms = max(0, int(self.spin_interval.value()) - int(round(render_elapsed_ms)))
+        frame_interval_ms = 1000.0 / self.spin_fps.value()
+        delay_ms = max(0, int(round(frame_interval_ms - render_elapsed_ms)))
         if self.scene is not None and self._play_timer.isSingleShot():
             self._play_timer.start(delay_ms)
 
@@ -6175,6 +6356,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             self._seg_edit_active = False
             self._reset_segmentation_edit_history()
             self.workspace = pending
+            self._plane_undo_stack.clear()
             self._active_input_case = resolved
             self._last_quality_report = None
             self._last_plane_import_report = None
@@ -6260,13 +6442,71 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self.log("Input parameters changed; reloading input and invalidating downstream results.")
         self._load_selected_input_case(self._active_input_case, parameter_overrides=parameters)
 
+    @staticmethod
+    def _input_drop_path(mime):
+        if not mime.hasUrls():
+            return None
+        urls = mime.urls()
+        if len(urls) != 1 or not urls[0].isLocalFile():
+            return None
+        path = urls[0].toLocalFile()
+        if os.path.isdir(path) or (
+            path.lower().endswith((".h5", ".hdf5")) and os.path.isfile(path)
+        ):
+            return path
+        return None
+
+    def dragEnterEvent(self, event):
+        if self._input_drop_path(event.mimeData()) is None:
+            event.ignore()
+            if event.mimeData().hasUrls():
+                self.statusBar().showMessage(
+                    "Drop one H5/HDF5 file or one DICOM directory accessible on this computer.", 8000
+                )
+            return
+        # Loading never moves or removes the file-manager source.
+        event.setDropAction(QtCore.Qt.DropAction.CopyAction)
+        event.accept()
+
+    def dragMoveEvent(self, event):
+        if self._input_drop_path(event.mimeData()) is None:
+            event.ignore()
+            return
+        event.setDropAction(QtCore.Qt.DropAction.CopyAction)
+        event.accept()
+
+    def dropEvent(self, event):
+        path = self._input_drop_path(event.mimeData())
+        if path is None:
+            event.ignore()
+            return
+        if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
+            event.ignore()
+            self.statusBar().showMessage("Cannot switch cases yet. Finish or cancel the active task or edit; see Log.", 8000)
+            return
+        event.setDropAction(QtCore.Qt.DropAction.CopyAction)
+        event.accept()
+        loader = self._load_dicom_directory if os.path.isdir(path) else self._load_h5_path
+        # Finish the desktop drag before opening selection/progress dialogs.
+        QtCore.QTimer.singleShot(0, lambda: loader(path))
+
     def _on_load_h5(self):
         if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
             return
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load H5", "", "H5 (*.h5 *.hdf5);;All (*)")
         if not path:
             return
-        cases = discover_h5_input_cases(path)
+        self._load_h5_path(path)
+
+    def _load_h5_path(self, path):
+        if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
+            return
+        try:
+            cases = discover_h5_input_cases(path)
+        except Exception as exc:
+            self.log(f"LOAD ERROR: {type(exc).__name__}: {exc}")
+            self.statusBar().showMessage("H5 could not be opened; see Log.", 10000)
+            return
         if not cases:
             self.log(f"LOAD ERROR: ValueError: no supported H5 cases found: {path}")
             return
@@ -6295,6 +6535,12 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         if not root:
             self.statusBar().showMessage("DICOM import cancelled: no directory selected.", 8000)
             return
+        self._load_dicom_directory(root)
+
+    def _load_dicom_directory(self, root):
+        if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
+            return
+        options = QtWidgets.QFileDialog.Option.DontUseNativeDialog
         self.statusBar().showMessage("DICOM directory selected. Choose a new H5 destination in Save Converted H5.")
         self.log(f"DICOM directory selected: {root}. Waiting for H5 destination.")
         target, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -6399,6 +6645,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         return {
             "render_background_color": str(rendering_cfg.get("render_background_color") or BACKGROUND_COLOR),
             "fps": int(rendering_cfg.get("fps", 12)),
+            "browser_companion": True,
             "plane_rotation_frames": int(rendering_cfg.get("plane_rotation_frames", 180)),
             "camera_view": str(rendering_cfg.get("camera_view", "right")),
             "camera_distance_scale": float(rendering_cfg.get("camera_distance_scale", 1.5)),
@@ -6508,7 +6755,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         form.addRow(video_box)
         layout.addLayout(form)
 
-        hint = QtWidgets.QLabel("WSS, TKE, and relative-pressure videos require derived data. Streamlines require segmentation and flow.")
+        hint = QtWidgets.QLabel("WSS, TKE, and relative-pressure videos require derived data. Streamlines require velocity and the selected seed region; Full FOV needs no segmentation.")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
@@ -6579,6 +6826,15 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             summary_path = self._update_video_export_summary(options.out_dir, requested,
                 result["outputs"], result["times"], time.perf_counter() - started)
             self.log(f"[Video Export] summary updated: {summary_path}")
+            from ..report_media import register_report_videos
+            register_report_videos(self.workspace, result['outputs'], render_config,
+                camera_behavior='rotation' if render_config['rotate_dynamic_video'] else 'fixed')
+            for name, error in result.get('errors', {}).items():
+                self.log(f'VIDEO PLAYBACK WARNING ({name}): {error}')
+                record = self.workspace.input_state.metadata.get('report_videos', {}).get(name)
+                if record is not None:
+                    record['browser_error'] = error
+            self._save_current_case_html(show=False)
         except TaskCancelled:
             self.log("Video export cancelled.")
         except Exception as e:
@@ -6599,6 +6855,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self._seg_edit_active = False
         self._reset_segmentation_edit_history()
         self.workspace.reset_all()
+        self._plane_undo_stack.clear()
         self._last_quality_report = None
         self._last_plane_import_report = None
         apply_config_bundle_to_workspace(self.workspace, self._config_bundle)
@@ -6610,6 +6867,18 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self.log("Workspace cleared")
 
     def _pipeline_running_guard(self, action_text):
+        if getattr(self, "_scene_export_running", False):
+            self.log("Current-view video export is running; cancel or wait before " + action_text + ".")
+            return True
+        if getattr(self.ortho_viewer, "_roi_transaction", None) is not None:
+            self.log("Apply or cancel the ROI draft before " + action_text + ".")
+            return True
+        if self._plane_edit_session is not None and action_text not in {"editing a plane", "adding a plane"}:
+            self.log("Apply or cancel the plane draft before " + action_text + ".")
+            return True
+        if self._plane_jobs.is_running and action_text not in {"editing a plane", "adding a plane"}:
+            self.log("Plane measurements are updating; wait or cancel before " + action_text + ".")
+            return True
         if getattr(self, "_dicom_conversion_thread", None) is not None:
             self.log(f"DICOM conversion is running. Wait before {action_text}.")
             return True
@@ -6737,6 +7006,11 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             self._finish_pipeline_scene_refresh(completed_steps)
             elapsed = float(data.get("elapsed_sec", 0.0))
             self.log(f"[{self._pipeline_task_label}] Completed in {elapsed:.2f}s")
+            report = data.get("analysis_report") or {}
+            if report.get("status") == "complete":
+                self.log(f"Analysis HTML saved: {report['file']} ({float(report.get('elapsed_sec', 0.0)):.2f}s)")
+            elif report.get("status") == "failed":
+                self.log(f"REPORT EXPORT ERROR: {report.get('error', 'Unknown error')}; completed measurements were retained.")
             self.statusBar().showMessage(f"{self._pipeline_task_label} completed in {elapsed:.2f}s", 8000)
         except Exception:
             self.log(f"VIEW REFRESH ERROR: {traceback.format_exc()}")
@@ -6774,8 +7048,10 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         if self._pathline_running_guard("finishing Hemodynamics Run All"):
             return
         try:
-            self.pipeline.preprocess(self.workspace)
-            self.scene.trigger_streamlines()
+            if self.workspace.streamline_params.seed_region == "segmentation":
+                self.pipeline.preprocess(self.workspace)
+            if self.scene.trigger_streamlines() is False:
+                return
             self.workspace.pipeline.mark_done(StepId.GENERATE_STREAMLINES)
             self._refresh_browser()
             self._refresh_workflow_status()
@@ -6813,6 +7089,7 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
                 self._prepare_unwrap_action()
             if step == StepId.COMPUTE_PWV:
                 self.workspace.pwv_params.enabled = True
+                self._show_measurements("pwv")
             self._clear_plane_drag_widgets()
             if step == StepId.EDIT_SKELETON:
                 self._start_skeleton_interactive_edit()
@@ -6821,8 +7098,10 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
                 self._start_graph_interactive_edit()
                 return
             if step == StepId.GENERATE_STREAMLINES:
-                self.pipeline.preprocess(self.workspace)
-                self.scene.trigger_streamlines()
+                if self.workspace.streamline_params.seed_region == "segmentation":
+                    self.pipeline.preprocess(self.workspace)
+                if self.scene.trigger_streamlines() is False:
+                    return
                 self.workspace.pipeline.mark_done(StepId.GENERATE_STREAMLINES)
                 self._sync_params_to_ui()
                 self._refresh_browser()
@@ -7748,6 +8027,12 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             ws.pipeline.skipped.pop(step.value, None)
 
     def _force_exit_edit(self):
+        if self.ortho_viewer._roi_transaction is not None:
+            self.ortho_viewer._cancel_plane_roi()
+            return
+        if self._plane_edit_session is not None:
+            self._cancel_plane_edit()
+            return
         if self._edit_mode is None:
             return
         self.log("ESC: force exit interactive edit")
@@ -7858,6 +8143,21 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
         self.log("Edit Graph: no graph nodes are available for a vessel group.")
 
     def closeEvent(self, event):
+        if getattr(self, "_scene_export_running", False):
+            progress = getattr(self, '_view_export_progress', None)
+            if progress is not None:
+                progress.cancel()
+            event.ignore()
+            return
+        self.ortho_viewer._cancel_plane_roi()
+        if not self._plane_jobs.close():
+            self.log("Stopping plane calculation; close again after it stops.")
+            event.ignore()
+            return
+        if self._plane_edit_session is not None:
+            self._cancel_plane_edit()
+        self._timeline_scrub_timer.stop()
+        self._frame_navigation_filter.held.clear()
         if self._dicom_conversion_thread is not None:
             self.log("Wait for DICOM conversion to finish before closing the GUI.")
             event.ignore()
@@ -7893,6 +8193,15 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
             pass
         self.scene._clear_content_widgets()
         self.scene._close_interaction_rendering()
+        if hasattr(self, "_qc_overlay"):
+            self._qc_overlay.close()
+        self.scene.cancel_pending_render()
+        from ..algorithms.segmentation.shared_worker import close_shared_inference_worker
+        close_shared_inference_worker()
+        for dialog in list(getattr(self, '_html_document_dialogs', {}).values()):
+            dialog.close()
+        for pane in list(getattr(self, '_html_document_panes', {}).values()):
+            pane.shutdown()
         # Finalize VTK while its Qt/Win32 window still exists. Letting Python
         # destroy it after the native window closes leaves an invalid WGL handle.
         self.plotter.close()
@@ -7900,6 +8209,8 @@ class MainWindow(ActionSettingsMixin, QtWidgets.QMainWindow):
 
 
 def main(config_dir=None):
+    from .html_view import configure_html_runtime
+    configure_html_runtime()
     configure_high_dpi()
     app = QtWidgets.QApplication(sys.argv)
     apply_application_theme(app)

@@ -9,6 +9,37 @@ from pathlib import Path
 import tempfile
 
 
+SMOOTHING_DEFAULTS = {
+    'smoothing_method': 'radius_adaptive',
+    'smoothing_radius_factor': 2.0,
+    'smoothing_max_displacement_ratio': 0.15,
+    'smoothing_sample_step_mm': 0.5,
+    'smoothing_radius_sigma_mm': 3.0,
+    'smoothing_backend': 'auto',
+}
+
+
+def smoothing_options(payload=None):
+    """Validate the shared configuration used by GUI, API and plane builders."""
+    payload = dict(payload or {})
+    out = {key: payload.get(key, default) for key, default in SMOOTHING_DEFAULTS.items()}
+    out['smoothing_method'] = str(out['smoothing_method']).lower()
+    out['smoothing_backend'] = str(out['smoothing_backend']).lower()
+    if out['smoothing_method'] not in {'radius_adaptive', 'savgol', 'none'}:
+        raise ValueError('smoothing_method must be radius_adaptive, savgol or none')
+    if out['smoothing_backend'] not in {'auto', 'cpu', 'gpu'}:
+        raise ValueError('smoothing_backend must be auto, cpu or gpu')
+    for key in ('smoothing_radius_factor', 'smoothing_sample_step_mm', 'smoothing_radius_sigma_mm',
+                'smoothing_max_displacement_ratio'):
+        out[key] = float(out[key])
+        minimum = 0 if key in {'smoothing_radius_sigma_mm', 'smoothing_max_displacement_ratio'} else 1e-12
+        if not math.isfinite(out[key]) or out[key] < minimum:
+            raise ValueError(f'{key} must be finite and at least {minimum:g}')
+    if out['smoothing_max_displacement_ratio'] > 1:
+        raise ValueError('smoothing_max_displacement_ratio must be between 0 and 1')
+    return out
+
+
 def default_main_path(name):
     """Choose the root side of the label's own directed vessel tree."""
     return "outflow" if str(name) in {"SV", "SMV", "SSS", "StrS", "LTS", "RTS", "LIJV", "RIJV"} else "inflow"
@@ -21,11 +52,13 @@ LABEL_LAYOUT_DEFAULTS = {
     "segmentation_filter": None, "fov_boundary_filter": None,
     "fov_boundary_max_fraction": None, "smoothing_window": None,
     "smoothing_polyorder": None, "inter_time": None,
+    **{key: None for key in SMOOTHING_DEFAULTS},
 }
 
 
 LANDMARK_ANCHORS = {
-    "label_connections", "label_longest",
+    "label_branch", "label_reference_branch", "flow_inlet_branch", "portal_branch",
+    "label_connections", "label_longest", "label_trunk", "label_reference",
     "label_level", "label_terminal", "pulmonary_split", "portal_confluence",
     "pv_first_split", "portal_trunk", "vertebral_confluence", "pca_split",
     "left_carotid_split", "right_carotid_split", "sinus_confluence",
@@ -33,47 +66,31 @@ LANDMARK_ANCHORS = {
 }
 
 
-def default_label_placements(name, profile="default"):
-    """Shared observed connections; label rules control positions and fallback."""
-    def level(fractions, number=1, **conditions):
-        return dict(anchor="label_level", level=number, path_selection="longest",
-                    position="fractions", fractions=fractions, **conditions)
-    midpoint = {"anchor": "label_longest", "position": "fractions", "fractions": [.5]}
-    def connected(*, fractions=None, offset=5., fallback=None):
-        spec = {"anchor": "label_connections", "position": "fractions" if fractions is not None else "near",
-                "fallback": copy.deepcopy(fallback or midpoint)}
+def default_label_placements(name):
+    """Positions on one graph branch, clipped to the target label."""
+    def branch(fractions, *, inlet=False):
+        return [{"anchor":"flow_inlet_branch" if inlet else "label_branch", "scope":"label",
+                 "path_selection":"unique" if inlet else "longest",
+                 "position":"fractions", "fractions":fractions}]
+    def reference(*, fractions=None, offset=15., all_origins=False):
+        spec={"anchor":"label_reference_branch", "path_selection":"all" if all_origins else "longest",
+              "position":"fractions" if fractions is not None else "near"}
         spec.update(fractions=fractions) if fractions is not None else spec.update(offset_mm=offset)
         return [spec]
-    if name == "DAO":
-        return [{"anchor":"label_longest", "scope":"label", "position":"fractions", "fractions":[.1,.3,.5]}]
-    if name == "AAO":
-        return connected(fractions=[.2,.5,.8], fallback=level([.2,.5,.8]))
-    if name == "MPA":
-        return connected(fractions=[.2], fallback=level([.2]))
-    if name in {"RBCT", "CCA", "LBCT", "RPA", "LPA"}:
-        return connected(offset=15.)
-    if name in {"StrS", "LTS", "RTS", "SSS"}:
-        return [{"anchor":"label_level" if name=="SSS" else "label_terminal", "scope":"label",
-                 **({"level":1} if name=="SSS" else {}), "path_selection":"longest",
-                 "position":"before_end" if name=="SSS" else "after_start", "offset_mm":20.}]
-    if name == "PV":
-        return connected(fractions=[.2,.5,.8], fallback={"anchor":"label_terminal", "path_selection":"longest",
-                                                        "position":"fractions", "fractions":[.2,.5,.8]})
-    if name in {"SMV", "SV"}:
-        return connected(offset=15., fallback={"anchor":"label_terminal", "path_selection":"longest",
-                                               "position":"before_end", "offset_mm":20.})
-    if name == "BA":
-        return [level([.5], 2, when_connected_to=["LVA","RVA"], otherwise_level=1)]
-    if name in {"LIJV", "RIJV"}:
-        return [{"anchor":"label_terminal", "scope":"label", "path_selection":"longest",
-                 "position":"fractions", "fractions":[1/3,2/3]}]
-    if name in {"LRA", "RRA"}:
-        return connected(fractions=[.25,.5,.75])
-    if name in {"LICA", "RICA", "LVA", "RVA"}:
-        return connected(fallback=level([.33,.66]))
-    if name in {"LMCA", "RMCA"}:
-        return connected(fallback=level([.5]))
-    return connected()
+    if name=='AAO':return branch([.2,.5,.8])
+    if name=='DAO':return branch([.1,.3,.5])
+    if name in {'LICA','RICA'}:return branch([.33,.66],inlet=True)
+    if name in {'LVA','RVA'}:return branch([.3,.5])
+    if name=='BA':return branch([.5])
+    if name in {'LIJV','RIJV'}:return branch([1/3,2/3])
+    if name in {'LRA','RRA'}:return reference(fractions=[.1,.3,.5],all_origins=True)
+    if name=='PV':return [{"anchor":"portal_branch","path_selection":"unique",
+                          "position":"fractions","fractions":[.2,.5,.8]}]
+    if name in {'MPA','LPA','RPA'}:return reference(fractions=[.3])
+    if name in {'LTS','RTS','SSS','StrS'}:return reference(fractions=[.1])
+    if name in {'RBCT','CCA','LBCT','SMV','SV'}:return reference()
+    if name in {'ACA','LMCA','RMCA','LPCA','RPCA'}:return reference(fractions=[.1],all_origins=name=='ACA')
+    return reference(offset=5.)
 
 
 def default_label_plane_rules():
@@ -92,7 +109,7 @@ def default_label_plane_rules():
 
 def _validate_placement(name, placement, *, allow_fallback=True):
     fields = {"anchor","position","offset_mm","fractions","level","path_selection","scope",
-              "fallback","when_connected_to","otherwise_level"}
+              "fallback","when_connected_to","otherwise_level","fraction_reference"}
     if not isinstance(placement,dict) or set(placement)-fields:
         raise ValueError(f"Invalid placement fields for {name}")
     anchor=placement.get("anchor")
@@ -101,17 +118,21 @@ def _validate_placement(name, placement, *, allow_fallback=True):
     choice=placement.get("path_selection","unique")
     if not isinstance(choice,str) or choice not in {"unique","longest","all"}:
         raise ValueError(f"{name} placement path_selection must be unique, longest or all")
-    if "path_selection" in placement and anchor not in {"label_level","label_terminal"}:
+    if "path_selection" in placement and anchor not in {"label_level","label_terminal","label_trunk","label_reference","label_branch","label_reference_branch","flow_inlet_branch","portal_branch"}:
         raise ValueError(f"{name} path_selection applies only to label-level/interval anchors")
     position=placement.get("position")
     if not isinstance(position,str) or position not in {"near","fractions","before_end","after_start"}:
         raise ValueError(f"{name} placement position must be near, fractions, before_end or after_start")
-    if position in {"before_end","after_start"} and anchor not in {"label_level","label_terminal","label_longest"}:
+    if position in {"before_end","after_start"} and anchor not in {"label_level","label_terminal","label_longest","label_trunk","label_branch","flow_inlet_branch"}:
         raise ValueError(f"{name} {position} requires a label path-property anchor")
-    if "scope" in placement and (anchor not in {"label_level","label_terminal","label_longest"}
+    if "scope" in placement and (anchor not in {"label_level","label_terminal","label_longest","label_trunk","label_branch","flow_inlet_branch"}
                                   or not isinstance(placement["scope"],str)
                                   or placement["scope"] not in {"component","label"}):
         raise ValueError(f"{name} scope must be component or label for path-property anchors")
+    if "fraction_reference" in placement and (position != "fractions" or
+            anchor not in {"label_level", "label_terminal", "label_longest", "label_trunk", "label_branch", "flow_inlet_branch"} or
+            placement["fraction_reference"] not in {"flow_start", "flow_end"}):
+        raise ValueError(f"{name} fraction_reference requires fractions on a label path and flow_start or flow_end")
     if position=="fractions":
         values=placement.get("fractions")
         if not isinstance(values,list) or not values or any(isinstance(x,bool) or not isinstance(x,(int,float))
@@ -127,18 +148,8 @@ def _validate_placement(name, placement, *, allow_fallback=True):
         level=placement.get("level",1)
         if isinstance(level,bool) or not isinstance(level,int) or level<1:
             raise ValueError(f"{name} placement level must be a positive integer (L1 = 1)")
-    if "when_connected_to" in placement or "otherwise_level" in placement:
-        labels=placement.get("when_connected_to")
-        alternate=placement.get("otherwise_level")
-        if anchor!="label_level" or not isinstance(labels,list) or not labels or any(not isinstance(x,str) or not x.strip() for x in labels):
-            raise ValueError(f"{name} when_connected_to requires label_level and a non-empty list of labels")
-        if isinstance(alternate,bool) or not isinstance(alternate,int) or alternate<1:
-            raise ValueError(f"{name} otherwise_level must be a positive integer")
-    if "fallback" in placement:
-        fallback=placement["fallback"]
-        if not allow_fallback or anchor!="label_connections" or not isinstance(fallback,dict) or fallback.get("anchor")=="label_connections":
-            raise ValueError(f"{name} fallback must be a single non-connection placement")
-        _validate_placement(name,fallback,allow_fallback=False)
+    if "fallback" in placement or "when_connected_to" in placement or "otherwise_level" in placement:
+        raise ValueError(f"{name}: fallback placements and alternate levels are no longer supported; choose one explicit anchor/level")
     return count
 
 
@@ -211,6 +222,10 @@ def normalize_label_plane_rules(value):
             if number is not None and (isinstance(number, bool) or not isinstance(number, int)
                                        or number < (0 if key == "smoothing_polyorder" else 1)):
                 raise ValueError(f"{name}.{key} must be an integer or null (inherit)")
+        custom_smoothing = {key: rule[key] for key in SMOOTHING_DEFAULTS if rule[key] is not None}
+        if custom_smoothing:
+            validated = smoothing_options(custom_smoothing)
+            rule.update({key: validated[key] for key in custom_smoothing})
         if rule["plane_mode"] == "landmark":
             rule.pop("main_path", None)
             placements = rule.get("placements", default_label_placements(name))

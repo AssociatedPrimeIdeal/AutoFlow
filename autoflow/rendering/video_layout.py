@@ -2,7 +2,7 @@
 
 import math
 
-from .style import foreground_color
+from .style import foreground_color, style_scalar_bar
 
 
 class VideoOverlay:
@@ -15,6 +15,7 @@ class VideoOverlay:
     """
 
     def __init__(self, plotter, workspace, title):
+        self._plotter = plotter
         self.title = str(title)
         try:
             rr_ms = float(getattr(workspace, "rr", None))
@@ -58,7 +59,9 @@ class VideoOverlay:
 
     def update(self, *, frame_index, total_frames, phase_index=None,
                phase_count=None, azimuth_deg=None):
-        """Update the two actors without rendering or modifying the scene."""
+        """Update captions and style any new scalar bar without rendering."""
+        for bar in self._plotter.scalar_bars.values():
+            style_scalar_bar(bar)
         header = self.title
         if phase_index is not None and phase_count is not None and phase_count > 0:
             count = int(phase_count)

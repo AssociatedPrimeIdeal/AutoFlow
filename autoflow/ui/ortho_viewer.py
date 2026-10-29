@@ -1,6 +1,8 @@
 from ..rendering.content import ScalarContentSource
+from ..core.cache import ByteLRUCache
 import copy
 import hashlib
+import weakref
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
@@ -17,9 +19,10 @@ from skimage.measure import find_contours
 from ..algorithms.metrics import _build_plane_slice_region, _resolve_plane_roi_frame, _target_label_for_plane
 from ..algorithms.surfaces import _build_branch_grid, _extract_surface
 from .contour_edit import new_contour_from_stroke, polygon_area, replace_contour_segment
-from .slice_view import PLANE_SPECS, SliceView, make_colormap, make_label_overlay
+from .slice_view import PLANE_SPECS, SliceView, make_colormap, make_label_overlay, plane_orientation_labels, anatomical_plane_title
 from ..algorithms.slice_streamlines import trace_planar_streamlines, project_streamline_slab, limit_polyline_length
 from ..algorithms.streamlines import generate_streamlines_at_t
+from ..algorithms.flow_display import clip_flow_lines
 from .viewer_display import OrthoDisplayMixin
 
 
@@ -36,6 +39,7 @@ class ReorderableSliceContainer(QtWidgets.QWidget):
         self._layout.setSpacing(4)
         self._views = dict(views)
         self._order = []
+        self._pinned_first = None
         self._drag_name = None
         self._drag_start = None
         for name, view in self._views.items():
@@ -50,6 +54,9 @@ class ReorderableSliceContainer(QtWidgets.QWidget):
     def set_order(self, order, *, emit=True):
         normalized = [str(name) for name in list(order or []) if str(name) in self._views]
         normalized.extend(name for name in self._views if name not in normalized)
+        if self._pinned_first in normalized:
+            normalized.remove(self._pinned_first)
+            normalized.insert(0, self._pinned_first)
         while self._layout.count():
             item = self._layout.takeAt(0)
             if item.widget() is not None:
@@ -59,6 +66,10 @@ class ReorderableSliceContainer(QtWidgets.QWidget):
             self._layout.addWidget(self._views[name], 1)
         if emit:
             self.orderChanged.emit(self.order())
+
+    def set_pinned_first(self, name=None):
+        self._pinned_first = str(name) if name in self._views else None
+        self.set_order(self._order, emit=False)
 
     def eventFilter(self, watched, event):
         if event.type() == QtCore.QEvent.Type.MouseButtonPress and event.button() == QtCore.Qt.MouseButton.LeftButton:
@@ -111,13 +122,27 @@ class ReorderableSliceContainer(QtWidgets.QWidget):
 class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
     timeStepRequested = QtCore.Signal(int)
     planeRoiChanged = QtCore.Signal(int)
+    planeRoiEditStarted = QtCore.Signal(int)
+    planeRoiEditFinished = QtCore.Signal(int, bool)
     contentRenderRequested = QtCore.Signal(int)
+    planeTranslationStarted = QtCore.Signal(str)
+    planeTranslationChanged = QtCore.Signal(str, float, float)
+    planeTranslationFinished = QtCore.Signal(str)
+    planeRotationStarted = QtCore.Signal(str)
+    planeRotationChanged = QtCore.Signal(str, float)
+    planeRotationFinished = QtCore.Signal(str)
 
     def __init__(self, workspace, parent=None):
         super().__init__(parent)
         self.workspace = workspace
         self._selected_plane_idx = None
+        self._plane_rotation_enabled = False
+        self._plane_rotation_reference = None
+        self._plane_translation_reference = None
+        self._draft_plane_basis = None
         self._cache = {}
+        self._axis_sample_cache = ByteLRUCache(64 * 1024 ** 2)
+        self._overlay_rgba_cache = ByteLRUCache(64 * 1024 ** 2)
         self._playback_active = False
         self._pending_cursor = None
         self._cursor_refresh_timer = QtCore.QTimer(self)
@@ -152,6 +177,7 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             np.clip(float(settings.value("plane/slice_default_view_fraction", 0.5)), 0.1, 1.0)
         )
         self._plane_roi_undo = []
+        self._roi_transaction = None
         self._plane_roi_redo = []
         self._plane_roi_workspace = workspace
         self._plane_roi_planes = tuple(workspace.planes)
@@ -179,6 +205,8 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         ctrl = QtWidgets.QHBoxLayout()
         self.combo_content = QtWidgets.QComboBox()
         self.combo_content.setMinimumWidth(140)
+        self.combo_content.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_content.setMinimumContentsLength(12)
         self._content_labels = [
             "Flow LR (cm/s)", "Flow AP (cm/s)", "Flow FH (cm/s)",
             "Magnitude", "PC-MRA", "Speed (cm/s)",
@@ -204,7 +232,6 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         self.btn_segmentation_overlay.setChecked(self.display_state()["segmentation"]["visible"])
         self.btn_segmentation_overlay.setToolTip("Show 2D segmentation overlay")
         self.btn_segmentation_overlay.toggled.connect(self._on_segmentation_display_toggled)
-        ctrl.addWidget(self.btn_segmentation_overlay)
         self.slider_overlay_opacity = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.slider_overlay_opacity.setRange(0, 100)
         self.slider_overlay_opacity.setFixedWidth(78)
@@ -220,7 +247,6 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         self.btn_noise_overlay.setChecked(False)
         self.btn_noise_overlay.setToolTip("Show excluded voxels (weak signal or unstable velocity) in red on orthogonal slices")
         self.btn_noise_overlay.toggled.connect(self._on_noise_overlay_toggled)
-        ctrl.addWidget(self.btn_noise_overlay)
         self.slider_noise_overlay_opacity = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.slider_noise_overlay_opacity.setRange(0, 100)
         self.slider_noise_overlay_opacity.setFixedWidth(78)
@@ -252,6 +278,13 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         self.btn_edit_contour.setCheckable(True)
         self.btn_edit_contour.setEnabled(False)
         self.btn_edit_contour.toggled.connect(self._toggle_plane_roi_editor)
+        self.check_roi_all_frames = QtWidgets.QCheckBox("Apply to all frames")
+        self.check_roi_all_frames.setToolTip(
+            "Off: edit the current phase; later missing phases may reuse this contour. "
+            "On: copy the same plane-local contour to every phase of this plane. "
+            "Existing contours in those phases are replaced when you Apply ROI."
+        )
+        self.check_roi_all_frames.toggled.connect(self._on_roi_scope_changed)
         self.btn_undo_plane_roi = QtWidgets.QToolButton()
         self.btn_undo_plane_roi.setText("Undo")
         self.btn_undo_plane_roi.clicked.connect(self._undo_plane_roi)
@@ -262,6 +295,12 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         self.btn_reset_plane_roi.setText("Reset frame")
         self.btn_reset_plane_roi.setToolTip("Remove contour edits from the current frame only")
         self.btn_reset_plane_roi.clicked.connect(self._reset_plane_roi)
+        self.btn_apply_plane_roi = QtWidgets.QToolButton()
+        self.btn_apply_plane_roi.setText("Apply ROI")
+        self.btn_apply_plane_roi.clicked.connect(self._apply_plane_roi)
+        self.btn_cancel_plane_roi = QtWidgets.QToolButton()
+        self.btn_cancel_plane_roi.setText("Cancel ROI / Esc")
+        self.btn_cancel_plane_roi.clicked.connect(self._cancel_plane_roi)
         ctrl.addStretch()
         layout.addLayout(ctrl)
 
@@ -272,9 +311,11 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         self.check_projected_streamlines.setToolTip("Clip generated 3D streamlines to a nearby slab, then project onto the slice")
         self.label_streamline_status = QtWidgets.QLabel()
         self.label_streamline_status.setWordWrap(True)
-        streamline_controls.addWidget(self.check_planar_streamlines, 0, 0, 1, 2)
-        streamline_controls.addWidget(self.check_projected_streamlines, 0, 2, 1, 2)
-        streamline_controls.addWidget(self.label_streamline_status, 0, 4, 1, 2)
+        streamline_controls.addWidget(self.btn_segmentation_overlay, 0, 0)
+        streamline_controls.addWidget(self.btn_noise_overlay, 0, 1)
+        streamline_controls.addWidget(self.check_planar_streamlines, 0, 2)
+        streamline_controls.addWidget(self.check_projected_streamlines, 0, 3)
+        streamline_controls.addWidget(self.label_streamline_status, 1, 0, 1, 4)
         self.spin_streamline_density = QtWidgets.QDoubleSpinBox()
         self.spin_streamline_density.setRange(0.25, 3.0)
         self.spin_streamline_density.setSingleStep(0.25)
@@ -303,14 +344,22 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         self._sync_streamline_controls()
 
         self.contour_controls = QtWidgets.QWidget()
-        contour_ctrl = QtWidgets.QHBoxLayout(self.contour_controls)
+        contour_layout = QtWidgets.QVBoxLayout(self.contour_controls)
+        contour_layout.setContentsMargins(0, 0, 0, 0)
+        contour_layout.addWidget(self.btn_edit_contour)
+        self.roi_edit_tools = QtWidgets.QWidget()
+        contour_ctrl = QtWidgets.QGridLayout(self.roi_edit_tools)
         contour_ctrl.setContentsMargins(0, 0, 0, 0)
-        contour_ctrl.addWidget(QtWidgets.QLabel("Plane contour:"))
-        contour_ctrl.addWidget(self.btn_edit_contour)
-        contour_ctrl.addWidget(self.btn_undo_plane_roi)
-        contour_ctrl.addWidget(self.btn_redo_plane_roi)
-        contour_ctrl.addWidget(self.btn_reset_plane_roi)
-        contour_ctrl.addStretch()
+        contour_ctrl.addWidget(self.btn_undo_plane_roi, 0, 0)
+        contour_ctrl.addWidget(self.btn_redo_plane_roi, 0, 1)
+        contour_ctrl.addWidget(self.btn_reset_plane_roi, 0, 2)
+        contour_ctrl.addWidget(self.check_roi_all_frames, 1, 0, 1, 3)
+        contour_ctrl.addWidget(self.btn_apply_plane_roi, 2, 0, 1, 2)
+        contour_ctrl.addWidget(self.btn_cancel_plane_roi, 2, 2)
+        self.btn_apply_plane_roi.hide()
+        self.btn_cancel_plane_roi.hide()
+        contour_layout.addWidget(self.roi_edit_tools)
+        self.roi_edit_tools.hide()
         self.contour_controls.hide()
         layout.addWidget(self.contour_controls)
 
@@ -356,7 +405,7 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             colorMap=make_colormap("gray"),
             interactive=True,
             colorMapMenu=False,
-            pen="#d7e0e3",
+            pen=pg.mkPen(None),
         )
         self.colorbar_widget.addItem(self.colorbar_item)
         self.colorbar_item.sigLevelsChanged.connect(self._on_colorbar_levels_changed)
@@ -366,6 +415,12 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         layout.addLayout(self._velocity_colorbar_layout)
 
         for view in self.slice_views.values():
+            view.view_box.planeTranslationStarted.connect(self.planeTranslationStarted)
+            view.view_box.planeTranslationChanged.connect(self.planeTranslationChanged)
+            view.view_box.planeTranslationFinished.connect(self.planeTranslationFinished)
+            view.view_box.planeRotationStarted.connect(self.planeRotationStarted)
+            view.view_box.planeRotationChanged.connect(self.planeRotationChanged)
+            view.view_box.planeRotationFinished.connect(self.planeRotationFinished)
             view.cursorRequested.connect(self._on_slice_cursor_requested)
             view.view_box.sigRangeChanged.connect(lambda *_args, name=view.spec.name: self._link_slice_range(name))
             view.hoverMoved.connect(self._on_slice_hovered)
@@ -390,11 +445,39 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         self._next_shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self._next_shortcut.activated.connect(lambda: self.timeStepRequested.emit(1))
 
+    def set_plane_rotation_enabled(self, enabled):
+        self._plane_rotation_enabled = bool(enabled)
+        if not enabled:
+            self._plane_rotation_reference = None
+            self._plane_translation_reference = None
+        for name, view in self.slice_views.items():
+            view.set_plane_translation(enabled)
+            view.set_plane_rotation(enabled and name != "axial")
+
+    def _plane_view_bases(self, normal):
+        u, v = self._plane_axes(normal)
+        bases = {"axial": (u, v), "coronal": (v, normal), "sagittal": (u, normal)}
+        reference = self._plane_rotation_reference
+        if reference:
+            bases[reference["name"]] = reference["basis"]
+        return bases
+
     def _on_slice_order_changed(self, order):
+        if self._selected_plane_idx is not None and 0 <= int(self._selected_plane_idx) < len(self.workspace.planes):
+            return  # Plane-mode reordering must not replace the saved volume order.
         self.workspace.render_settings["viewer_display"]["view"]["order"] = ",".join(order)
         QtCore.QSettings("AutoFlow", "AutoFlow").setValue(
             "ortho/slice_order", ",".join(str(name) for name in order)
         )
+
+    def _sync_plane_view_order(self, *, force=False):
+        has_plane = self._selected_plane_idx is not None and 0 <= int(self._selected_plane_idx) < len(self.workspace.planes)
+        pinned = "axial" if has_plane else None
+        if not force and self.view_grid._pinned_first == pinned:
+            return
+        self.view_grid.set_pinned_first(pinned)
+        if not has_plane:
+            self.view_grid.set_order(self.display_state()["view"]["order"].split(","), emit=False)
 
     def set_segmentation_edit_handler(self, handler):
         # Segmentation editing is handled by the external Labeler exchange.
@@ -410,14 +493,9 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             return None
         if self._selected_plane_idx is not None and 0 <= int(self._selected_plane_idx) < len(self.workspace.planes):
             selected = self.workspace.planes[int(self._selected_plane_idx)]
-            normal = np.asarray(selected.normal, dtype=float).reshape(3)
+            normal = np.asarray(selected.normal, dtype=float).reshape(3).copy()
             normal /= np.linalg.norm(normal) + 1e-12
-            axis_u, axis_v = self._plane_axes(normal)
-            bases = {
-                "axial": (axis_u, axis_v),
-                "coronal": (axis_v, normal),
-                "sagittal": (axis_u, normal),
-            }
+            bases = self._plane_view_bases(normal)
             horizontal, vertical = bases[plane]
             view = self.slice_views[plane]
             offset_h = view._sample_origin[0] + int(h) * view._spacing[0]
@@ -430,6 +508,11 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             voxel = np.rint(point / (self._get_resolution() + 1e-12)).astype(int)
             return tuple(int(np.clip(voxel[axis], 0, shape[axis] - 1)) for axis in range(3))
         cx, cy, cz = self.slider_x.value(), self.slider_y.value(), self.slider_z.value()
+        if getattr(self, '_axis_uses_geometry_grid', False):
+            spec = PLANE_SPECS[plane]
+            res = self._get_resolution()
+            h = int(np.clip(np.rint(float(h)/res[spec.horizontal_axis]), 0, shape[spec.horizontal_axis]-1))
+            v = int(np.clip(np.rint(float(v)/res[spec.vertical_axis]), 0, shape[spec.vertical_axis]-1))
         if plane == "axial":
             return int(h), int(v), cz
         if plane == "coronal":
@@ -481,7 +564,7 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         self.refresh(update_plane=False)
 
     def _plane_intersection_for_slice(self, plane, fixed_axis, fixed_index, shape, resolution):
-        normal = np.asarray(plane.normal, dtype=float).reshape(3)
+        normal = np.asarray(plane.normal, dtype=float).reshape(3).copy()
         norm = float(np.linalg.norm(normal))
         if norm <= 1e-12:
             return None
@@ -535,11 +618,11 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             [float(second[axis] - origin[axis]) for axis in axes],
         ]
 
-    def _resample_basis(self, volume, center, axis_u, axis_v, fov_mm, spacing_mm, order=1, cell_centered=True):
+    def _resample_basis(self, volume, center, axis_u, axis_v, fov_mm, spacing_mm, order=1, cell_centered=True, source_spacing=None):
         center = np.asarray(center, dtype=float).reshape(3)
         axis_u = np.asarray(axis_u, dtype=float).reshape(3)
         axis_v = np.asarray(axis_v, dtype=float).reshape(3)
-        res = self._get_resolution()
+        res = self._get_resolution() if source_spacing is None else np.asarray(source_spacing, dtype=float)
         origin = np.asarray(getattr(self.workspace, "origin", np.zeros(3)), dtype=float).reshape(3)
         grid_key = (
             tuple(np.round(center, 5).tolist()),
@@ -574,6 +657,8 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         return sampled.reshape(count, count), axis
 
     def _plane_orthogonal_geometry(self, plane, frame_index):
+        if self._plane_rotation_reference:
+            return self._plane_rotation_reference["geometry"]
         center = np.asarray(plane.center, dtype=float).reshape(3)
         shape = self._get_volume_shape()
         resolution = self._get_resolution()
@@ -590,7 +675,7 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             ],
             dtype=float,
         )
-        normal = np.asarray(plane.normal, dtype=float).reshape(3)
+        normal = np.asarray(plane.normal, dtype=float).reshape(3).copy()
         normal /= np.linalg.norm(normal) + 1e-12
         axis_u, axis_v = self._plane_axes(normal)
         axes = ((axis_u, axis_v), (axis_v, normal), (axis_u, normal))
@@ -655,7 +740,7 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             return contours
 
         center = np.asarray(plane.center, dtype=float).reshape(3)
-        normal = np.asarray(plane.normal, dtype=float).reshape(3)
+        normal = np.asarray(plane.normal, dtype=float).reshape(3).copy()
         normal /= np.linalg.norm(normal) + 1e-12
         region_key = (
             int(self._selected_plane_idx),
@@ -737,12 +822,45 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
     def _cached_image_levels(self, image, fallback):
         fallback = tuple(float(value) for value in fallback)
         key = (self._array_cache_token(image), fallback)
+        owner = np.asarray(image)
+        while isinstance(owner.base, np.ndarray):
+            owner = owner.base
+        bucket = self._cache.get("image_levels", {})
+        entry = bucket.get(key)
+        if entry is not None and entry[0]() is not owner:
+            # Freed resampling buffers can be reallocated at the same address.
+            # A weak owner token prevents stale windows without retaining pixels.
+            del bucket[key]
         return self._cached(
             "image_levels",
             key,
-            lambda: self._auto_image_levels(image, fallback),
-            max_items=24,
-        )
+            lambda: (weakref.ref(owner), self._auto_image_levels(image, fallback)),
+            # A phase can have separate full-volume and per-view windows.
+            # Keep a complete cycle instead of evicting its first phases.
+            max_items=max(24, 4 * int(self.workspace.time_count())),
+        )[1]
+
+    def _cached_array_value(self, group, array, builder, extra=(), *, rgba=False):
+        """Cache derived display values without pinning sampled source buffers."""
+        owner = np.asarray(array)
+        while isinstance(owner.base, np.ndarray):
+            owner = owner.base
+        key = (group, self._array_cache_token(array), extra)
+        bucket = self._overlay_rgba_cache if rgba else self._cache.setdefault(group, {})
+        entry = bucket.get(key)
+        if entry is not None and entry[0]() is owner:
+            return entry[1]
+        if entry is not None:
+            del bucket[key]
+        value = builder()
+        if not rgba and len(bucket) >= max(24, 4 * int(self.workspace.time_count())):
+            bucket.pop(next(iter(bucket)))
+        bucket[key] = (weakref.ref(owner), value)
+        return value
+
+    def _scalar_fallback_range(self, volume):
+        return self._cached_array_value("image_fallback", volume,
+            lambda: (float(np.nanmin(volume)), float(np.nanmax(volume))))
 
     @staticmethod
     def _array_cache_token(value):
@@ -753,9 +871,11 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         return (pointer, tuple(int(item) for item in array.shape), tuple(int(item) for item in array.strides), array.dtype.str)
 
     def _plane_orthogonal_slices(self, vol, labels, noise_region, plane, center, fov_mm, spacing_mm):
-        normal = np.asarray(plane.normal, dtype=float); normal /= np.linalg.norm(normal) + 1e-12
+        normal = np.asarray(plane.normal, dtype=float).copy(); normal /= np.linalg.norm(normal) + 1e-12
         center = np.asarray(center, dtype=float).reshape(3)
+        view_bases = self._plane_view_bases(normal)
         key = (
+            tuple(tuple(float(x) for x in axis) for pair in view_bases.values() for axis in pair),
             self._array_cache_token(vol),
             tuple(np.round(center, 5).tolist()),
             tuple(np.round(normal, 7).tolist()),
@@ -767,13 +887,12 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         )
 
         def _build():
-            u, v = self._plane_axes(normal)
-            bases = [(u, v, "Plane U × V"), (v, normal, "Plane V × N"), (u, normal, "Plane U × N")]
+            bases = [(a, b, anatomical_plane_title(a, b)) for a, b in view_bases.values()]
             images = []
             for axis_u, axis_v, title in bases:
                 image, _ = self._resample_basis(
                     vol, center, axis_u, axis_v, fov_mm, spacing_mm,
-                    order=1, cell_centered=True,
+                    order=1, cell_centered=False,
                 )
                 images.append((image, title, axis_u, axis_v))
             return images
@@ -787,7 +906,7 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
                     hashlib.blake2b(array.view(np.uint8), digest_size=16).digest())
         # A content token also invalidates nearest-neighbour overlays after an
         # in-place label edit, without retaining a second copy of the volume.
-        overlay_key = (key[1:7], content_token(labels), content_token(noise_region))
+        overlay_key = ((key[0], key[2:8]), content_token(labels), content_token(noise_region))
 
         def build_overlays():
             overlays = []
@@ -796,12 +915,12 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
                 if labels is not None:
                     sampled, _ = self._resample_basis(
                         labels, center, axis_u, axis_v, fov_mm, spacing_mm,
-                        order=0, cell_centered=True)
+                        order=0, cell_centered=False, source_spacing=self.workspace.segmentation_spacing)
                     overlay = np.rint(sampled).astype(np.int16)
                 if noise_region is not None:
                     sampled_noise, _ = self._resample_basis(
                         noise_region, center, axis_u, axis_v, fov_mm, spacing_mm,
-                        order=0, cell_centered=True)
+                        order=0, cell_centered=False)
                     noise_overlay = sampled_noise >= 0.5
                 overlays.append((overlay, noise_overlay))
             return overlays
@@ -885,6 +1004,9 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             self.refresh(update_plane=True)
 
     def _stop_plane_roi_editor(self):
+        if self._roi_transaction is not None:
+            self._cancel_plane_roi()
+        self.roi_edit_tools.hide()
         self._contour_stroke = []
         self._contour_preview = None
         self._edit_boundary = None
@@ -906,6 +1028,22 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             self._stop_plane_roi_editor()
             return
 
+        plane = self.workspace.planes[int(plane_idx)]
+        parent = self.window()
+        if getattr(parent, "_plane_edit_session", None) or getattr(getattr(parent, "_plane_jobs", None), "is_running", False):
+            self._stop_plane_roi_editor()
+            return
+        if self._roi_transaction is None:
+            self.planeRoiEditStarted.emit(int(plane_idx))
+            self._roi_transaction = (plane, copy.deepcopy(self._snapshot_plane_roi(plane)))
+            self._roi_edit_frame = int(self.workspace.current_t)
+            plane.placement["_roi_draft"] = True
+            self._plane_roi_undo.clear()
+            self._plane_roi_redo.clear()
+            self.btn_apply_plane_roi.show()
+            self.btn_cancel_plane_roi.show()
+
+        self.roi_edit_tools.show()
         for name, view in self.slice_views.items():
             view.set_contour_editing(name == "axial")
         self._edit_boundary = self._current_edit_boundary()
@@ -918,10 +1056,10 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         if not (len(metrics) == len(self.workspace.planes) and bool(metrics[int(plane_idx)])):
             return
         polygon = np.asarray(boundary, dtype=float).reshape(-1, 2) if boundary is not None else np.empty((0, 2))
-        if len(polygon) < 3 or self.workspace.segmask_binary is None:
+        if len(polygon) < 3 or self._analysis_segmentation_inputs()[0] is None:
             return
         try:
-            mask = np.asarray(self.workspace.segmask_binary, dtype=bool)
+            mask = np.asarray(self._analysis_segmentation_inputs()[0], dtype=bool)
             t = int(self.workspace.current_t)
             mask_t = mask[..., t] if mask.ndim == 4 else mask
             plane = copy.copy(self.workspace.planes[int(plane_idx)])
@@ -929,10 +1067,10 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             _build_plane_slice_region(
                 mask_t,
                 plane,
-                self.workspace.resolution,
+                self._analysis_segmentation_inputs()[3],
                 self.workspace.origin,
                 select_connected=True,
-                frame_index=0,
+                frame_index=0, voxel_centered=self.workspace.segmentation_analysis_binary is not None,
             )
         except Exception:
             return
@@ -1050,14 +1188,94 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             str(key): [dict(item) for item in value]
             for key, value in dict(getattr(plane, "roi_edit_operations", {}) or {}).items()
         }
-        operations[frame_key] = [{"mode": "replace", "polygon": np.asarray(contour, dtype=float).tolist()}]
+        if self._roi_transaction is not None:
+            operations = self._scoped_contour_operations(contour)
+        else:
+            operations[frame_key] = [{"mode": "replace", "polygon": np.asarray(contour, dtype=float).tolist()}]
         plane.roi_edit_operations = operations
         self._plane_roi_undo.append((int(plane_idx), before))
         self._plane_roi_redo.clear()
         self._cache.pop("plane_region", None)
         self._cache.pop("plane_content", None)
         self._cache.pop("plane_contours", None)
-        self.planeRoiChanged.emit(int(plane_idx))
+        self._notify_plane_roi_change(int(plane_idx))
+
+    def _scoped_contour_operations(self, contour):
+        plane, original = self._roi_transaction
+        operations = copy.deepcopy(original["roi_edit_operations"])
+        all_frames = self.check_roi_all_frames.isChecked()
+        targets = range(self.workspace.time_count()) if all_frames else (int(self.workspace.current_t),)
+        for frame in targets:
+            operations[str(frame)] = [{"mode": "replace", "scope": "all" if all_frames else "frame",
+                                       "polygon": np.asarray(contour, dtype=float).tolist()}]
+        return operations
+
+    def _on_roi_scope_changed(self, _checked):
+        if self._roi_transaction is None:
+            return
+        plane, original = self._roi_transaction
+        key = str(int(self.workspace.current_t))
+        current = (plane.roi_edit_operations or {}).get(key, [])
+        if current == original["roi_edit_operations"].get(key, []) or not current:
+            return
+        replacement = next((op for op in reversed(current) if op.get("mode") == "replace"), None)
+        if replacement is None:
+            return
+        before = self._snapshot_plane_roi(plane)
+        plane.roi_edit_operations = self._scoped_contour_operations(replacement["polygon"])
+        if before != self._snapshot_plane_roi(plane):
+            self._plane_roi_undo.append((int(self._selected_plane_idx), before))
+            self._plane_roi_redo.clear()
+            for group in ("plane_region", "plane_content", "plane_contours", "plane_roi_history"):
+                self._cache.pop(group, None)
+            self._notify_plane_roi_change(int(self._selected_plane_idx))
+
+    def _notify_plane_roi_change(self, index):
+        if self._roi_transaction is not None:
+            self.refresh_plane_contours()
+            scope = f"all {self.workspace.time_count()} frames" if self.check_roi_all_frames.isChecked() else "current frame edit"
+            self.label_plane_metric.setText(f"Current plane / {scope} ROI preview · Apply or Cancel")
+        else:
+            self.planeRoiChanged.emit(index)
+
+    def _apply_plane_roi(self):
+        transaction = self._roi_transaction
+        if transaction is None:
+            return
+        plane, before = transaction
+        index = next((i for i, candidate in enumerate(self.workspace.planes) if candidate is plane), None)
+        changed = before != self._snapshot_plane_roi(plane)
+        plane.placement.pop("_roi_draft", None)
+        self._roi_transaction = None
+        self._stop_plane_roi_editor()
+        self.btn_apply_plane_roi.hide()
+        self.btn_cancel_plane_roi.hide()
+        if index is not None:
+            self.planeRoiEditFinished.emit(index, changed)
+        self._plane_roi_undo.clear()
+        self._plane_roi_redo.clear()
+        self.refresh_plane_contours()
+
+    def _cancel_plane_roi(self):
+        transaction = self._roi_transaction
+        if transaction is None:
+            return
+        plane, before = transaction
+        plane.roi_polygon_uv_mm = copy.deepcopy(before["roi_polygon_uv_mm"])
+        plane.roi_edit_operations = copy.deepcopy(before["roi_edit_operations"])
+        plane.placement.pop("_roi_draft", None)
+        self._roi_transaction = None
+        self._stop_plane_roi_editor()
+        self.btn_apply_plane_roi.hide()
+        self.btn_cancel_plane_roi.hide()
+        self._plane_roi_undo.clear()
+        self._plane_roi_redo.clear()
+        for key in ("plane_region", "plane_content", "plane_contours", "plane_roi_history"):
+            self._cache.pop(key, None)
+        index = next((i for i, candidate in enumerate(self.workspace.planes) if candidate is plane), None)
+        if index is not None:
+            self.planeRoiEditFinished.emit(index, False)
+            self.refresh_plane_contours()
 
     def _sync_plane_roi_history(self):
         """Invalidate index-based history when its case or plane objects change."""
@@ -1096,7 +1314,7 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         }
         self._cache.pop("plane_region", None); self._cache.pop("plane_content", None); self._cache.pop("plane_contours", None)
         self._contour_display_override = None
-        self.planeRoiChanged.emit(int(plane_idx))
+        self._notify_plane_roi_change(int(plane_idx))
 
     def _undo_plane_roi(self):
         self._sync_plane_roi_history()
@@ -1121,7 +1339,8 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         plane_idx = self._selected_plane_idx
         if plane_idx is None or not (0 <= int(plane_idx) < len(self.workspace.planes)):
             return
-        self._stop_plane_roi_editor()
+        if self._roi_transaction is None:
+            self.btn_edit_contour.setChecked(True)
         plane = self.workspace.planes[int(plane_idx)]
         frame_key = str(int(self.workspace.current_t))
         operations = dict(getattr(plane, "roi_edit_operations", {}) or {})
@@ -1135,7 +1354,7 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         self._cache.pop("plane_content", None)
         self._cache.pop("plane_contours", None)
         self._contour_display_override = None
-        self.planeRoiChanged.emit(int(plane_idx))
+        self._notify_plane_roi_change(int(plane_idx))
 
     def _on_overlay_opacity_changed(self, value):
         opacity = float(np.clip(float(value) / 100.0, 0.0, 1.0))
@@ -1227,6 +1446,7 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         else:
             text = "" if available else "Flow unavailable"
         self.label_streamline_status.setText(text)
+        self.label_streamline_status.setVisible(bool(text))
 
     def _projection_streamline_mesh(self, t):
         from .streamline_jobs import streamline_requests
@@ -1240,7 +1460,12 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
                     pass
             manager.ready.connect(self._projection_mesh_ready)
             self._streamline_requests = manager
-        return manager.request(t)
+        mesh = manager.request(t)
+        minimum = float(self.workspace.streamline_params.display_min_speed_cm_s)
+        if mesh is None or minimum == 0:
+            return mesh
+        return self._cached("projection_display_speed", (id(mesh), minimum),
+                            lambda: clip_flow_lines(mesh, minimum), max_items=12)
 
     def _projection_mesh_ready(self, phase):
         if self.workspace.streamline_active and int(self.workspace.current_t) == phase:
@@ -1266,8 +1491,7 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         if selected_plane is not None:
             normal = np.asarray(selected_plane.normal, dtype=float).copy()
             normal /= np.linalg.norm(normal) + 1e-12
-            u, v = self._plane_axes(normal)
-            horizontal, vertical = {"axial": (u, v), "coronal": (v, normal), "sagittal": (u, normal)}[name]
+            horizontal, vertical = self._plane_view_bases(normal)[name]
             world_center = origin + np.asarray(center, dtype=float)
         else:
             spec = PLANE_SPECS[name]
@@ -1293,11 +1517,15 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
                     sample_spacing = max(float(np.min(res)) * 0.75, 0.25)
                     components = [self._resample_basis(
                         flow[..., component], center, horizontal, vertical, fov_mm,
-                        sample_spacing, order=1, cell_centered=True,
+                        sample_spacing, order=1, cell_centered=False,
                     )[0] for component in range(3)]
                     samples = np.stack(components, axis=-1)
                 else:
-                    samples = np.take(flow, fixed, axis=spec.fixed_axis)
+                    if getattr(self, '_axis_uses_geometry_grid', False):
+                        samples = np.stack([self._axis_geometry_sample(flow[..., component], name, fixed,
+                            view._shape, source_spacing=res, order=1) for component in range(3)], axis=-1)
+                    else:
+                        samples = np.take(flow, fixed, axis=spec.fixed_axis)
                 vectors = np.stack((samples @ horizontal, samples @ vertical), axis=-1)
                 curves = trace_planar_streamlines(
                     vectors, view._spacing, mask=None if labels is None else labels > 0,
@@ -1350,7 +1578,8 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         shape = self._get_volume_shape()
         if shape is None or tuple(region.shape) != tuple(shape):
             return None
-        return ~region
+        return self._cached_array_value("noise_region", np.asarray(mask), lambda: ~region,
+            extra=(int(self.workspace.current_t) if np.asarray(mask).ndim == 4 else 0,), rgba=True)
 
     def _noise_region_overlay(self, region_2d, name=None):
         cfg = self.display_state(name)["noise"]
@@ -1358,10 +1587,13 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         visible = override.get("visible", self._noise_overlay_visible)
         if not visible or region_2d is None:
             return None
-        region = np.asarray(region_2d, dtype=bool)
-        rgba = np.zeros((*region.shape, 4), dtype=np.uint8)
-        rgba[region] = QtGui.QColor(cfg["color"]).getRgb()
-        return rgba
+        def build():
+            region = np.asarray(region_2d, dtype=bool)
+            rgba = np.zeros((*region.shape, 4), dtype=np.uint8)
+            rgba[region] = QtGui.QColor(cfg["color"]).getRgb()
+            return rgba
+        return self._cached_array_value("noise_rgba", region_2d, build,
+            extra=(cfg["color"], int(self.workspace.segmentation.revision)), rgba=True)
 
     def _available_content_keys(self):
         """Only expose acquired data and derived fields that actually exist."""
@@ -1446,6 +1678,7 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         self._stop_plane_roi_editor()
         self._selected_plane_idx = idx
         has_plane = idx is not None and 0 <= int(idx) < len(self.workspace.planes)
+        self._sync_plane_view_order()
         self.btn_edit_contour.setEnabled(has_plane)
         self.contour_controls.setVisible(has_plane)
         self._refresh_content_choices()
@@ -1486,18 +1719,8 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         return self._content_source.scalar_volume(t, self.combo_content.currentData())
 
     def _display_labels_source(self):
-        """Return active display labels without materialising 3-D repeats."""
-        ws = self.workspace
-        segmentation = getattr(ws, "segmentation", None)
-        working_4d = getattr(segmentation, "working_labels_4d", None)
-        if working_4d is not None:
-            return np.asarray(working_4d, dtype=np.int16)
-        working_3d = getattr(segmentation, "working_labels_3d", None)
-        if working_3d is not None:
-            return np.asarray(working_3d, dtype=np.int16)
-        getter = getattr(ws, "get_active_segmentation", None)
-        active = getter() if callable(getter) else getattr(ws, "segmask_raw", None)
-        return None if active is None else np.asarray(active, dtype=np.int16)
+        """Display the shared 1-mm labels, including edited previews."""
+        return self.workspace.segmentation_display_4d()
 
     def _display_labels_for_frame(self, frame_index):
         display = self._display_labels_source()
@@ -1507,6 +1730,43 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             index = min(max(0, int(frame_index)), display.shape[3] - 1)
             return display[..., index]
         return display
+
+    def _axis_geometry_sample(self, volume, name, fixed, shape, *, source_spacing, order):
+        key = None
+        if self._playback_active:
+            key = (id(self.workspace), self._array_cache_token(volume),
+                   name, int(fixed), tuple(shape), tuple(self._get_resolution()),
+                   tuple(np.asarray(source_spacing, float)), int(order), int(self.workspace.segmentation.revision))
+            cached = self._axis_sample_cache.get(key)
+            if cached is not None:
+                return cached
+        spec = PLANE_SPECS[name]
+        a, b, c = spec.horizontal_axis, spec.vertical_axis, spec.fixed_axis
+        u, v = np.meshgrid(np.arange(shape[0], dtype=float), np.arange(shape[1], dtype=float), indexing='ij')
+        points = np.empty((3,)+tuple(shape), float)
+        points[a], points[b] = u, v
+        points[c] = float(fixed)*self._get_resolution()[c]
+        coordinates = points/np.asarray(source_spacing, float).reshape(3, 1, 1)
+        values = np.asarray(volume, dtype=np.float32) if order else volume
+        sampled = map_coordinates(values, coordinates, order=order, mode='constant', cval=0., prefilter=False)
+        if key is not None:
+            self._axis_sample_cache[key] = sampled
+        return sampled
+
+    def _geometry_axis_slices(self, volume, labels, noise, cursor, plane_centers):
+        slices = {}
+        res = self._get_resolution()
+        for name, spec in PLANE_SPECS.items():
+            a, b, c = spec.horizontal_axis, spec.vertical_axis, spec.fixed_axis
+            shape = (labels.shape[a], labels.shape[b])
+            fixed = cursor[c]
+            image = self._axis_geometry_sample(volume, name, fixed, shape, source_spacing=res, order=1)
+            segmentation = self._axis_geometry_sample(labels, name, fixed, shape, source_spacing=self.workspace.segmentation_spacing, order=0)
+            noise_slice = None if noise is None else self._axis_geometry_sample(noise, name, fixed, shape, source_spacing=res, order=0)
+            fine_cursor = (float(cursor[a])*res[a], float(cursor[b])*res[b])
+            title = {'axial': 'Axial', 'coronal': 'Coronal', 'sagittal': 'Sagittal'}[name]
+            slices[name] = (image, segmentation, noise_slice, fine_cursor, fixed, (1., 1.), title, None, plane_centers[name])
+        return slices
 
     def _get_mask_3d(self):
         ws = self.workspace
@@ -1544,13 +1804,16 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         cfg = self.display_state(name)["segmentation"]
         if not seg_state.visible or not cfg["visible"] or labels_2d is None or cfg["mode"] == "outline":
             return None
-        labels_2d = self._filtered_display_labels(labels_2d, name)
-        colors = {
-            int(value): cfg["colors"].get(str(int(value)), self._label_color(int(value)))
-            for value in np.unique(labels_2d)
-            if int(value) > 0
-        }
-        return make_label_overlay(labels_2d, colors, cfg.get("opacity", seg_state.opacity))
+        def build():
+            labels = self._filtered_display_labels(labels_2d, name)
+            colors = {
+                int(value): cfg["colors"].get(str(int(value)), self._label_color(int(value)))
+                for value in np.unique(labels) if int(value) > 0
+            }
+            return make_label_overlay(labels, colors, cfg.get("opacity", seg_state.opacity))
+        key = (int(seg_state.revision), cfg["labels"], float(cfg.get("opacity", seg_state.opacity)),
+               tuple(sorted(cfg["colors"].items())), tuple(sorted(seg_state.label_colors.items())))
+        return self._cached_array_value("label_rgba", labels_2d, build, extra=key, rgba=True)
 
     def _update_value_label(self, vol, title):
         if vol is None:
@@ -1570,7 +1833,17 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             return
         plane = ws.planes[self._selected_plane_idx]
         metrics = plane.metrics or {}
+        from ..core.plane_state import metric_validity
+        validity = metric_validity(plane, metrics)
+        if validity != "current":
+            message = "Needs recalculation / preview" if validity == "stale" else "Not calculated"
+            self.label_plane_metric.setText(f"Plane {self._selected_plane_idx}: {message} · —")
+            return
         t = int(ws.current_t)
+        valid = metrics.get("sample_valid_t", [])
+        if t < len(valid) and not valid[t]:
+            self.label_plane_metric.setText(f"Plane {self._selected_plane_idx} · t={t}: Not assessable · Empty or non-finite ROI")
+            return
         fr = metrics.get("flowrate_mL_s", [])
         ar = metrics.get("area_mm2", [])
         mv = metrics.get("meanv_cm_s_t", [])
@@ -1631,13 +1904,40 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         try:
             self.colorbar_item.setColorMap(colormap)
             self.colorbar_item.setLevels(values=levels, update_items=False)
-            self.colorbar_item.axis.setLabel(text=str(title or ""), color="#d7e0e3")
+            self.colorbar_item.axis.setLabel(text=str(title or ""), color="#b8c2d0")
+            if hasattr(self, "_display_axis_font"):
+                self._style_colorbar_axis(self.colorbar_item.axis)
             self._colorbar_state = state
         finally:
             self._updating_colorbar = False
 
     def refresh(self, update_plane=True):
+        # All display settings are read-only during one synchronous repaint.
+        # Resolve shared/per-view/content overrides once, not for every layer.
+        previous = getattr(self, "_refresh_display_states", None)
+        state = self.workspace.render_settings.get("viewer_display", {})
+        stamp = (id(self.workspace), self.combo_content.currentData() if hasattr(self, "combo_content") else None)
+        if (getattr(self, "_resolved_display_stamp", None) != stamp
+                or getattr(self, "_resolved_display_snapshot", None) != state):
+            self._resolved_display_stamp = stamp
+            self._resolved_display_snapshot = copy.deepcopy(state)
+            self._resolved_display_states = {}
+        self._refresh_display_states = self._resolved_display_states
+        try:
+            return self._refresh_views(update_plane)
+        finally:
+            self._refresh_display_states = previous
+
+    def _refresh_views(self, update_plane=True):
+        if update_plane:
+            # Full refreshes follow edits, cursor/content changes and pause.
+            # Drop sampled pixels and windows keyed by their memory addresses.
+            self._axis_sample_cache.clear()
+            self._overlay_rgba_cache.clear()
+            for group in ("image_levels", "image_fallback", "noise_region", "plane_slices", "plane_overlays"):
+                self._cache.pop(group, None)
         self._sync_plane_roi_history()
+        self._sync_plane_view_order()
         self._refresh_content_choices()
         ws = self.workspace
         # Never carry an intersection from a previous plane, time frame, or
@@ -1673,7 +1973,7 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             cmap = make_colormap(self._current_cmap)
             clim = style.get("clim", None)
             if clim is None:
-                clim = (float(np.nanmin(vol)), float(np.nanmax(vol)))
+                clim = self._scalar_fallback_range(vol)
             if self._manual_levels is not None:
                 clim = self._manual_levels
             clim = tuple(float(value) for value in clim)
@@ -1729,11 +2029,16 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
                         "coronal": (plane_center[0], plane_center[2]),
                         "sagittal": (plane_center[1], plane_center[2]),
                     }
-                slices = {
-                    "axial": (vol[:, :, cz], None if labels_3d is None else labels_3d[:, :, cz], None if noise_region_3d is None else noise_region_3d[:, :, cz], (cx, cy), cz, (res[0], res[1]), "Axial", None, plane_centers["axial"]),
-                    "coronal": (vol[:, cy, :], None if labels_3d is None else labels_3d[:, cy, :], None if noise_region_3d is None else noise_region_3d[:, cy, :], (cx, cz), cy, (res[0], res[2]), "Coronal", None, plane_centers["coronal"]),
-                    "sagittal": (vol[cx, :, :], None if labels_3d is None else labels_3d[cx, :, :], None if noise_region_3d is None else noise_region_3d[cx, :, :], (cy, cz), cx, (res[1], res[2]), "Sagittal", None, plane_centers["sagittal"]),
-                }
+                self._axis_uses_geometry_grid = (ws.segmentation_labels_1mm is not None
+                    or getattr(ws, '_segmentation_preview_grid_cache', None) is not None)
+                if self._axis_uses_geometry_grid and labels_3d is not None:
+                    slices = self._geometry_axis_slices(vol, labels_3d, noise_region_3d, (cx, cy, cz), plane_centers)
+                else:
+                    slices = {
+                        "axial": (vol[:, :, cz], None if labels_3d is None else labels_3d[:, :, cz], None if noise_region_3d is None else noise_region_3d[:, :, cz], (cx, cy), cz, (res[0], res[1]), "Axial", None, plane_centers["axial"]),
+                        "coronal": (vol[:, cy, :], None if labels_3d is None else labels_3d[:, cy, :], None if noise_region_3d is None else noise_region_3d[:, cy, :], (cx, cz), cy, (res[0], res[2]), "Coronal", None, plane_centers["coronal"]),
+                        "sagittal": (vol[cx, :, :], None if labels_3d is None else labels_3d[cx, :, :], None if noise_region_3d is None else noise_region_3d[cx, :, :], (cy, cz), cx, (res[1], res[2]), "Sagittal", None, plane_centers["sagittal"]),
+                    }
             for plane, (image, labels, noise_region, cursor, fixed, view_spacing, view_title, extent, view_center) in slices.items():
                 spec = PLANE_SPECS[plane]
                 # Time and fixed-index changes replace pixels; only presentation
@@ -1763,11 +2068,9 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
                 self._update_slice_streamlines(plane, t, labels, selected_plane, orth_center, orth_fov)
                 if mode == "plane" and selected_plane is not None:
                     self.slice_views[plane].set_title(view_title, "selected plane")
-                    plane_axes = {
-                        "axial": (("-U", "+U"), ("-V", "+V")),
-                        "coronal": (("-V", "+V"), ("-N", "+N")),
-                        "sagittal": (("-U", "+U"), ("-N", "+N")),
-                    }
+                    normal = np.asarray(selected_plane.normal, dtype=float)
+                    plane_axes = {name: plane_orientation_labels(*basis)
+                                  for name, basis in self._plane_view_bases(normal).items()}
                     self.slice_views[plane].set_orientation_labels(*plane_axes[plane])
                 else:
                     self.slice_views[plane].set_title(view_title, f"{spec.fixed_name} {int(fixed) + 1}")
@@ -1790,6 +2093,15 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
                     else:
                         self.slice_views[plane].clear_contours()
                 self._style_slice(plane)
+                rotating = self._plane_rotation_enabled and selected_plane is not None and plane != "axial"
+                angle = 0.0
+                reference = self._plane_rotation_reference
+                if rotating and reference and reference["name"] == plane:
+                    horizontal, vertical = reference["basis"]
+                    n = np.asarray(selected_plane.normal)
+                    angle = np.degrees(np.arctan2(-np.dot(n, horizontal), np.dot(n, vertical)))
+                self.slice_views[plane].set_plane_translation(self._plane_rotation_enabled and selected_plane is not None)
+                self.slice_views[plane].set_plane_rotation(rotating, angle)
                 seg_cfg = self.display_state(plane)["segmentation"]
                 boundary_labels = self._filtered_display_labels(labels, plane) if seg_cfg["visible"] and seg_cfg["mode"] in {"outline", "both"} else None
                 colors = {int(v): seg_cfg["colors"].get(str(int(v)), self._label_color(int(v))) for v in np.unique(boundary_labels) if v > 0} if boundary_labels is not None else {}
@@ -1840,8 +2152,12 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             # Presentation-only failure must not invalidate the saved ROI.
             return
 
-    @staticmethod
-    def _plane_axes(normal):
+    def _plane_axes(self, normal):
+        if self._draft_plane_basis is not None:
+            u, v = self._draft_plane_basis
+            n = np.asarray(normal)/max(np.linalg.norm(normal), 1e-12)
+            if np.dot(np.cross(u, v), n) > 1-1e-8:
+                return u.copy(), v.copy()
         normal = np.asarray(normal, dtype=float)
         normal = normal / (np.linalg.norm(normal) + 1e-12)
         reference = np.eye(3, dtype=float)[int(np.argmin(np.abs(normal)))]
@@ -1861,8 +2177,9 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         *,
         interpolation_order=1,
         cell_centered=False,
+        source_spacing=None,
     ):
-        spacing = self._get_resolution()
+        spacing = self._get_resolution() if source_spacing is None else np.asarray(source_spacing, dtype=float)
         u, v = self._plane_axes(normal)
         sample_count = int(np.clip(np.ceil(float(fov_mm) / max(float(sample_spacing_mm), 1e-3)) + 1, 129, 257))
         axis_mm = np.linspace(-0.5 * float(fov_mm), 0.5 * float(fov_mm), sample_count)
@@ -1884,27 +2201,32 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         )
         return sampled.reshape(sample_count, sample_count), axis_mm, u, v
 
+    def _analysis_segmentation_inputs(self):
+        ws = self.workspace
+        from ..algorithms.geometry_grid import measurement_segmentation
+        geometry = measurement_segmentation(ws)
+        return geometry.binary, geometry.labels, geometry.branches, geometry.spacing
+
     def _effective_plane_region(self, plane, t, *, return_source=False):
         ws = self.workspace
-        mask = ws.segmask_binary
+        mask, labels, branches, seg_spacing = self._analysis_segmentation_inputs()
         if mask is None:
             return (None, None) if return_source else None
         mask = np.asarray(mask, dtype=bool)
         if mask.ndim not in (3, 4):
             return (None, None) if return_source else None
         plane_seg_label = int(getattr(plane, "segmentation_label", 0) or 0)
-        labels = getattr(ws, "segmask_labels", None)
-        key = (id(plane), id(ws.segmask_binary), id(labels), id(ws.branch_labels),
-               tuple(plane.center), tuple(plane.normal), tuple(ws.resolution), tuple(ws.origin),
+        key = (id(plane), id(mask), id(labels), id(branches),
+               tuple(plane.center), tuple(plane.normal), tuple(seg_spacing), tuple(ws.origin),
                int(plane.label), plane_seg_label,
                repr(getattr(plane, "roi_polygon_uv_mm", []) or []),
                repr(getattr(plane, "roi_edit_operations", {}) or {}))
         history = self._cached("plane_roi_history", key, dict, max_items=8)
         branch_grid = self._cached(
-            "plane_branch_grid", (id(ws.branch_labels), tuple(ws.resolution), tuple(ws.origin)),
-            lambda: _build_branch_grid(ws.branch_labels, ws.resolution, ws.origin), max_items=1,
+            "plane_branch_grid", (id(branches), tuple(seg_spacing), tuple(ws.origin)),
+            lambda: _build_branch_grid(branches, seg_spacing, np.asarray(ws.origin)-0.5*np.asarray(seg_spacing) if ws.segmentation_analysis_binary is not None else ws.origin), max_items=1,
         )
-        target = _target_label_for_plane(plane, ws.branch_labels, np.asarray(ws.resolution), ws.origin)
+        target = _target_label_for_plane(plane, branches, np.asarray(seg_spacing), ws.origin)
 
         def build(frame):
             mask_t = mask[..., min(frame, mask.shape[3] - 1)] if mask.ndim == 4 else mask
@@ -1915,43 +2237,41 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
                 if labels_t.shape == mask_t.shape:
                     mask_t = mask_t & (labels_t == plane_seg_label)
             return _build_plane_slice_region(
-                mask_t, plane, ws.resolution, ws.origin,
+                mask_t, plane, seg_spacing, ws.origin,
                 branch_grid=branch_grid, target_label=target,
-                select_connected=True, frame_index=frame,
+                select_connected=True, frame_index=frame, voxel_centered=ws.segmentation_analysis_binary is not None,
             )
 
-        region, source = _resolve_plane_roi_frame(history, plane, max(0, int(t)), build)
+        from ..algorithms.roi_time import interpolate_plane_regions
+        frame = max(0, int(t))
+        region, source = _resolve_plane_roi_frame(history, plane, frame, build,
+            time_count=max(1, ws.time_count()),
+            interpolate=lambda a, b, w: interpolate_plane_regions(a, b, w, plane,
+                mask.shape[:3], seg_spacing, ws.origin, voxel_centered=ws.segmentation_analysis_binary is not None))
+        # An interpolated contour is displayed from its reconstructed mesh,
+        # never as the manual polygon of just one endpoint.
+        if history['_roi_frame_provenance'][frame]['mode'] == 'interpolated':
+            source = None
         return (region, source) if return_source else region
 
     def _segmentation_plane_region(self, plane, t):
         ws = self.workspace
-        mask = self._display_labels_for_frame(t)
-        if mask is None:
-            mask = ws.segmask_binary
-        if mask is None:
+        labels = self._display_labels_for_frame(t)
+        spacing = ws.segmentation_spacing
+        if labels is None:
+            labels = ws.segmask_binary
+            spacing = ws.resolution
+        if labels is None:
             return None
-        mask = np.asarray(mask)
-        if mask.ndim == 4:
-            mask = mask[..., min(max(0, int(t)), mask.shape[3] - 1)]
-        if mask.ndim != 3:
+        labels = np.asarray(labels)
+        if labels.ndim == 4:
+            labels = labels[..., min(max(0, int(t)), labels.shape[3]-1)]
+        if labels.ndim != 3:
             return None
-        mask = mask != 0
-        plane_seg_label = int(getattr(plane, "segmentation_label", 0) or 0)
-        labels = getattr(ws, "segmask_labels", None)
-        if plane_seg_label > 0 and labels is not None:
-            labels = np.asarray(labels)
-            if labels.ndim == 4:
-                labels = labels[..., min(max(0, int(t)), labels.shape[3] - 1)]
-            if labels.shape == mask.shape:
-                mask = mask & (labels == plane_seg_label)
-        return _build_plane_slice_region(
-            mask,
-            plane,
-            ws.resolution,
-            ws.origin,
-            select_connected=True,
-            frame_index=int(t),
-        )
+        value = int(getattr(plane, 'segmentation_label', 0) or 0)
+        mask = labels == value if value > 0 else labels > 0
+        return _build_plane_slice_region(mask, plane, spacing, ws.origin,
+                                         select_connected=True, frame_index=int(t), voxel_centered=ws.segmentation_labels_1mm is not None)
 
     def _plane_region_coordinates(self, region, plane):
         if region is None or getattr(region, "n_points", 0) == 0:
@@ -2087,7 +2407,7 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
 
     def _effective_plane_mask(self, plane, t):
         ws = self.workspace
-        mask = ws.segmask_binary
+        mask, labels, _branches, _spacing = self._analysis_segmentation_inputs()
         if mask is None:
             return None
         mask = np.asarray(mask, dtype=bool)
@@ -2096,32 +2416,16 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         if mask.ndim != 3:
             return None
         plane_seg_label = int(getattr(plane, "segmentation_label", 0) or 0)
-        labels = getattr(ws, "segmask_labels_3d", None)
         if plane_seg_label > 0 and labels is not None:
             labels = np.asarray(labels)
             if labels.ndim == 4:
-                labels = labels[..., 0]
+                labels = labels[..., min(max(0, int(t)), labels.shape[3]-1)]
             if labels.shape == mask.shape:
                 mask = mask & (labels == plane_seg_label)
         return mask
 
     def _segmentation_plane_labels(self, t):
-        ws = self.workspace
-        source = getattr(ws, "segmask_raw", None)
-        if source is not None:
-            source = np.asarray(source)
-            mask = source[..., min(max(0, int(t)), source.shape[3] - 1)] if source.ndim == 4 else source
-        else:
-            mask = self._display_labels_for_frame(t)
-        if mask is None:
-            mask = getattr(ws, "segmask_binary", None)
-            if mask is not None:
-                mask = np.asarray(mask)
-                if mask.ndim == 4:
-                    mask = mask[..., min(max(0, int(t)), mask.shape[3] - 1)]
-        if mask is None or np.asarray(mask).ndim != 3:
-            return None
-        return np.asarray(mask, dtype=np.int16)
+        return self._display_labels_for_frame(t)
 
     def _segmentation_plane_mask(self, t):
         labels = self._segmentation_plane_labels(t)
@@ -2132,7 +2436,7 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         if mask is None or not np.any(mask):
             return None
         sampled, axis_mm, _u, _v = self._resample_oblique(
-            mask, center_mm, normal, fov_mm, sample_spacing_mm
+            mask, center_mm, normal, fov_mm, sample_spacing_mm, source_spacing=self.workspace.segmentation_spacing
         )
         grid_spacing_mm = float(abs(axis_mm[-1] - axis_mm[0]) / max(len(axis_mm) - 1, 1))
         smooth_sigma = max(1.0, 0.45 / max(grid_spacing_mm, 1e-6))
@@ -2154,7 +2458,8 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             fov_mm,
             sample_spacing_mm,
             interpolation_order=0,
-            cell_centered=True,
+            cell_centered=False,
+            source_spacing=self.workspace.segmentation_spacing,
         )
         return np.asarray(np.rint(sampled), dtype=np.int16), axis_mm
 
@@ -2218,7 +2523,7 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         if mask is None or not np.any(mask):
             return None
         sampled, axis_mm, _u, _v = self._resample_oblique(
-            mask.astype(np.float32), center_mm, normal, fov_mm, sample_spacing_mm
+            mask.astype(np.float32), center_mm, normal, fov_mm, sample_spacing_mm, source_spacing=self._analysis_segmentation_inputs()[3]
         )
         binary = sampled > 0.45
         components, component_count = label_components(binary)
@@ -2529,12 +2834,17 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         self.ax_plane.set_ylim(extent[2], extent[3])
 
     def reset_state(self):
+        self.set_plane_rotation_enabled(False)
+        self._draft_plane_basis = None
         from .display_settings import merge_display, saved_display_defaults
         self.workspace.render_settings["viewer_display"] = merge_display(
             saved_display_defaults(), self.workspace.render_settings.get("viewer_display", {}))
         self._stop_plane_roi_editor()
         self._selected_plane_idx = None
+        self._sync_plane_view_order(force=True)
         self._cache.clear()
+        self._axis_sample_cache.clear()
+        self._overlay_rgba_cache.clear()
         self._plane_region_surface_cache.clear()
         self._manual_levels = None
         self._current_volume = None

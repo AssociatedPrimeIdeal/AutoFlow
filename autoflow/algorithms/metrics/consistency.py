@@ -4,6 +4,11 @@ import numpy as np
 
 
 def summarize_internal_consistency(plane_metrics, path_info=None, forks=None):
+    unavailable = [m for m in plane_metrics if m.get("validity") == "stale" or
+                   ("sample_valid_t" in m and (not m["sample_valid_t"] or not all(m["sample_valid_t"])))]
+    incomplete_paths = {int(m.get("path_index", -1)) for m in unavailable}
+    incomplete_labels = {int(m.get("segmentation_label", 0)) for m in unavailable}
+    plane_metrics = [m for m in plane_metrics if int(m.get("path_index", -1)) not in incomplete_paths]
     by_path = {}
     for metric in plane_metrics:
         pidx = int(metric.get("path_index", -1))
@@ -30,13 +35,15 @@ def summarize_internal_consistency(plane_metrics, path_info=None, forks=None):
     if path_info is not None:
         for pidx in range(len(path_info)):
             path_ic.setdefault(str(int(pidx)), None)
+    for pidx in incomplete_paths:
+        path_ic[str(pidx)] = None
     # When segmentation filtering is active, expose an additional consistency
     # view keyed by the numeric segmentation label.  Path consistency remains
     # available for topology QC and backwards compatibility.
     by_seg = {}
     for metric in plane_metrics:
         label = int(metric.get("segmentation_label", 0) or 0)
-        if label > 0:
+        if label > 0 and label not in incomplete_labels:
             by_seg.setdefault(label, []).append(abs(float(metric.get("netflow_mL_beat", 0.0))))
     segmentation_ic = {}
     for label, values in by_seg.items():

@@ -294,6 +294,12 @@ class RemotePlotter(QtWidgets.QWidget):
             and bool(event.modifiers() & QtCore.Qt.ShiftModifier)
         )
         if event.button() == QtCore.Qt.LeftButton:
+            dispatch_orientation = getattr(self, "_autoflow_orientation_dispatch", None)
+            if callable(dispatch_orientation) and dispatch_orientation("press"):
+                if callable(preview):
+                    preview(False)
+                event.accept()
+                return
             dispatch_plane = getattr(self, "_autoflow_plane_widget_dispatch", None)
             if not shift_left and callable(dispatch_plane) and dispatch_plane("press"):
                 event.accept()
@@ -347,6 +353,9 @@ class RemotePlotter(QtWidgets.QWidget):
             return
         self._set_mouse_payload(payload)
         self._last_motion_at = time.monotonic()
+        dispatch_orientation = getattr(self, "_autoflow_orientation_dispatch", None)
+        if callable(dispatch_orientation) and dispatch_orientation("move"):
+            return
         dispatch_plane = getattr(self, "_autoflow_plane_widget_dispatch", None)
         if callable(dispatch_plane) and dispatch_plane("move"):
             return
@@ -371,6 +380,13 @@ class RemotePlotter(QtWidgets.QWidget):
         self._flush_mouse_move()
         self._mouse_buttons_active = bool(event.buttons())
         self._set_mouse_event(event)
+        dispatch_orientation = getattr(self, "_autoflow_orientation_dispatch", None)
+        if event.button() == QtCore.Qt.LeftButton and callable(dispatch_orientation) and dispatch_orientation("release"):
+            preview = getattr(self, "_autoflow_interaction_preview", None)
+            if callable(preview):
+                preview(False)
+            event.accept()
+            return
         dispatch_plane = getattr(self, "_autoflow_plane_widget_dispatch", None)
         if event.button() == QtCore.Qt.LeftButton and callable(dispatch_plane) and dispatch_plane("release"):
             preview = getattr(self, "_autoflow_interaction_preview", None)

@@ -15,6 +15,8 @@ from ..algorithms.segmentation import resolve_nnunet_model_folder, resolve_nnune
 from ..config import apply_config_bundle_to_workspace
 from ..core.models import PwvParams, StepId, Workspace
 from ..plane_rules import load_plane_rules_file, normalize_label_plane_rules, save_plane_rules_file
+from .parameter_help import bind_help, compact_label, parameter_help
+from .pinned_metrics import DEFAULT_PINNED_METRICS, PINNED_METRICS
 
 
 class _RatioSpinBox(QtWidgets.QDoubleSpinBox):
@@ -38,6 +40,7 @@ class Field:
     maximum: float = 1e6
     visible: object = None
     default: object = None
+    help: str = ""
 
 
 def option(key, label, *choices, visible=None):
@@ -50,6 +53,14 @@ def number(key, label, minimum=0, maximum=1e6, integer=False, visible=None):
 
 def flag(key, label, visible=None):
     return Field(key, label, "bool", visible=visible)
+
+
+def _flow_display_setting(key):
+    return key.startswith("streamline_params.") and key.split(".", 1)[1] in {
+        "display_style", "display_min_speed_cm_s", "line_width", "tube_radius",
+        "pathline_display_style", "pathline_display_min_speed_cm_s", "pathline_trail_duration_ms",
+        "pathline_tube_radius", "pathline_color_mode", "pathline_color",
+    }
 
 
 def _get(root, path, default=None):
@@ -71,7 +82,7 @@ def _set(root, path, value):
         setattr(root, keys[-1], copy.deepcopy(value))
 
 
-def action_sections(action, ws):
+def _action_sections(action, ws):
     """Return only GUI-exposed settings; existing config-only fields stay intact."""
     b = "loader_params.background_phase_correction."
     s = "skeleton_params."
@@ -80,11 +91,21 @@ def action_sections(action, ws):
     d = "derived_params."
     u = "phase_unwrap_params."
     w = "pwv_params."
+    if action == "measurements":
+        field = number("render_settings.measurements.flowrate_spline_order", "Flowrate spline order", 1, 3, integer=True)
+        field.default = 3
+        field.help = ("1: straight segments; 2: quadratic; 3: cubic. Only the displayed flowrate line changes. "
+                      "Original samples, current-phase values, metrics and exports are preserved; short series lower the order automatically.")
+        pinned = Field("render_settings.measurements.pinned_metrics", "Show", "checklist",
+                       choices=tuple((f"{name} ({unit})", key) for key, name, unit, _source in PINNED_METRICS),
+                       default=list(DEFAULT_PINNED_METRICS),
+                       help="Keep these cycle summaries visible when switching the selected curve metric. Unavailable, stale or incomplete-cycle values show a dash.")
+        return [("Curves", [field]), ("Pinned metrics", [pinned])]
     if action == "input":
-        return [("Input", [Field("input.resolution", "Resolution (mm, LR/AP/FH)"),
-                           Field("input.venc", "VENC (cm/s, LR/AP/FH)"),
-                           Field("input.spatial_order", "Source spatial order"),
-                           Field("input.venc_order", "Source velocity order")])]
+        return [("Physical calibration", [Field("input.resolution", "Voxel spacing (mm)", "input_triplet"),
+                                           Field("input.venc", "VENC (cm/s)", "input_triplet")]),
+                ("Source axes / channels", [Field("input.spatial_order", "Stored spatial dimensions · SpatialOrder", "input_order"),
+                                             Field("input.venc_order", "Stored velocity channels · VENCOrder", "input_order")])]
     if action == "segmentation":
         return [("Segmentation", [
             option("segmentation.auto_backend", "Mode", ("3D", "nnUNet"), ("4D", "nnUNet4D")),
@@ -131,6 +152,7 @@ def action_sections(action, ws):
     if action == StepId.GENERATE_SKELETON:
         filtering = lambda v: v[s + "remove_small_cc"]
         return [("Skeleton", [
+            number(s + "geometry_spacing_mm", "Shared segmentation spacing (mm)", 1, 1),
             option(s + "special_handling", "Special handling", ("Three-pass merge", "three_pass_merge"),
                    ("Contact surface", "contact_surface")),
             flag(s + "remove_small_cc", "Remove small components"),
@@ -145,11 +167,13 @@ def action_sections(action, ws):
     if action == StepId.GENERATE_GRAPH:
         return [("Graph", [option(s + "graph_connectivity", "Skeleton graph connectivity",
                                   ("6 — face neighbors", 6), ("26 — face, edge and corner neighbors", 26)),
+                           option(s + "radius_tree_policy", "Cycle topology", ("Auto", "auto"),
+                                  ("Endpoint/radius forest", "forest"), ("Disable radius routing", "preserve")),
                            flag(s + "junction_cluster_enabled", "Simplify compact junction clusters"),
-                           number(s + "junction_cluster_max_extent_voxels", "Maximum cluster extent per axis (voxels)", 1, 10000),
+                           number(s + "junction_cluster_max_extent_voxels", "Optional cluster extent per axis (voxels; 0 = unlimited)", 0, 10000),
                            number(s + "junction_cluster_min_cycle_rank", "Minimum cluster cycle rank", 1, 1000000, integer=True),
                            number(s + "cycle_flow_threshold", "Flow C threshold (delete paths below)", 0, 1),
-                           flag(s + "cycle_preserve_connectivity", "Protect label connectivity and endpoints"),
+                           flag(s + "cycle_preserve_connectivity", "Protect components, endpoints and label coverage"),
                            number(s + "min_edge_points", "Minimum terminal edge count", 0, 100000, integer=True)])]
     if action == StepId.GENERATE_PLANES:
         fixed = lambda v: v[p + "plane_mode"] == "fixed_step"
@@ -174,12 +198,26 @@ def action_sections(action, ws):
             flag(p + "fov_boundary_filter", "Exclude planes at FOV boundary"),
             number(p + "fov_boundary_max_fraction", "Maximum FOV contact fraction", 0, 1,
                    visible=lambda v: v[p + "fov_boundary_filter"]),
-            number(p + "smoothing_window", "Path smoothing window", 1, 100001, integer=True),
-            number(p + "smoothing_polyorder", "Path smoothing order", 0, 100, integer=True),
+            option(p + "smoothing_method", "Path smoothing", ("Radius adaptive (default)", "radius_adaptive"),
+                   ("Savitzky-Golay (legacy)", "savgol"), ("None", "none")),
+            number(p + "smoothing_radius_factor", "Half-window / lumen radius", .01, 100,
+                   visible=lambda v: v[p + "smoothing_method"] == "radius_adaptive"),
+            number(p + "smoothing_max_displacement_ratio", "Maximum displacement / radius", 0, 1,
+                   visible=lambda v: v[p + "smoothing_method"] == "radius_adaptive"),
+            number(p + "smoothing_sample_step_mm", "Physical sample spacing (mm)", .01, 100,
+                   visible=lambda v: v[p + "smoothing_method"] == "radius_adaptive"),
+            number(p + "smoothing_radius_sigma_mm", "Radius smoothing scale (mm)", 0, 100,
+                   visible=lambda v: v[p + "smoothing_method"] == "radius_adaptive"),
+            option(p + "smoothing_backend", "Fit backend", ("Auto (CPU for paths)", "auto"), ("CPU", "cpu"), ("GPU with CPU fallback", "gpu"),
+                   visible=lambda v: v[p + "smoothing_method"] == "radius_adaptive"),
+            number(p + "smoothing_window", "Legacy SG window", 1, 100001, integer=True,
+                   visible=lambda v: v[p + "smoothing_method"] == "savgol"),
+            number(p + "smoothing_polyorder", "Legacy SG order", 0, 100, integer=True,
+                   visible=lambda v: v[p + "smoothing_method"] == "savgol"),
             number(p + "inter_time", "Path interpolation factor", 1, 1000, integer=True),
         ])]
     if action == StepId.COMPUTE_PLANE_METRICS:
-        return [("Plane metrics", [flag(d + "use_multithread", "Parallel plane metrics")])]
+        return [("Plane metrics", [flag(d + "use_multithread", "Parallel plane metrics")])] + _action_sections("measurements", ws)
     if action == StepId.COMPUTE_DERIVED_METRICS:
         return [
             ("Fluid", [number(d + "viscosity", "Viscosity (mPa·s)"), number(d + "rho", "Density (kg/m³)", 1)]),
@@ -193,22 +231,56 @@ def action_sections(action, ws):
                         number(d + "vortex_support_erosion_iters", "Support erosion (vox)", 0, 100, integer=True)]),
         ]
     if action == StepId.GENERATE_STREAMLINES:
-        return [("Streamlines", [number(f + "seed_ratio", "Seed ratio", .0001, 1),
-                                number(f + "max_steps", "Maximum steps", 1, 200000, integer=True),
-                                number(f + "terminal_speed", "Terminal speed (m/s)")])]
+        random = lambda v: v[f + "seed_distribution"] == "random"
+        ratio = lambda v: random(v) and v[f + "seed_mode"] == "ratio"
+        info = Field("streamline_seed_info", "Actual seeds (last run)", "info",
+                     default=str(ws.input_state.metadata.get("flow_seed_counts", {}).get("streamlines", "Not generated")))
+        return [("Basic", [
+            option(f + "seed_region", "Seed region", ("Full FOV", "fov"), ("Inside segmented vessels", "segmentation"), ("Noise removed region", "noise_free")),
+            number(f + "grid_spacing_mm", "Seed spacing (mm)", 0, 1e4, visible=lambda v: not random(v)),
+            number(f + "seed_count", "Seed count", 1, 2000000, integer=True, visible=lambda v: random(v) and not ratio(v)),
+            number(f + "seed_ratio", "Seed ratio", .0001, 1, visible=ratio),
+            number(f + "line_width", "Thickness (px)", .25, 20, visible=lambda v: v[f + "display_style"] == "lines"),
+            number(f + "tube_radius", "Thickness (mm)", .001, 1e4, visible=lambda v: v[f + "display_style"] == "tubes"),
+            info,
+        ]), ("Advanced", [
+            option(f + "seed_distribution", "Seed distribution", ("Random", "random"), ("Uniform grid", "uniform")),
+            option(f + "seed_mode", "Random seed amount", ("Fixed count", "fixed"), ("Ratio", "ratio"), visible=random),
+            number(f + "min_seeds", "Minimum seeds", 1, 2000000, integer=True, visible=ratio),
+            number(f + "rng_seed", "Random seed", -2147483647, 2147483647, integer=True, visible=random),
+            Field(f + "integration_step_mm", "Integration step (mm)", "optional_positive"),
+            option(f + "integration_backend", "Integration device", ("GPU preferred", "auto"), ("CPU (VTK)", "vtk"), ("GPU (CUDA)", "cuda")),
+            number(f + "max_steps", "Maximum steps", 1, 200000, integer=True),
+            number(f + "terminal_speed", "Integration terminal speed (m/s)"),
+            option(f + "display_style", "Display style", ("Thin lines", "lines"), ("Tubes", "tubes")),
+            number(f + "display_min_speed_cm_s", "Minimum display speed (cm/s)"),
+        ])]
     if action == StepId.PLANE_STREAMLINES:
-        ratio = lambda v: v[f + "pathline_seed_mode"] == "ratio"
+        random = lambda v: v[f + "pathline_seed_distribution"] == "random"
+        ratio = lambda v: random(v) and v[f + "pathline_seed_mode"] == "ratio"
+        counts = ws.input_state.metadata.get("flow_seed_counts", {}).get("pathlines", {})
+        info = Field("pathline_seed_info", "Actual seeds (last run)", "info",
+                     default=", ".join(f"Plane {index}: {counts[plane.plane_id]:,}" for index, plane in enumerate(ws.planes)
+                                       if plane.plane_id in counts) or "Not generated")
         return [("Integration", [
-            option(f + "pathline_seed_mode", "Seed mode", ("Fixed count", "fixed"), ("Ratio", "ratio")),
-            number(f + "pathline_max_seeds", "Seed count / limit", 1, 100000, integer=True),
+            option(f + "pathline_seed_region", "Seed region", ("Inside segmentation", "segmentation"), ("Inside current contour", "contour")),
+            option(f + "pathline_seed_distribution", "Seed distribution", ("Random", "random"), ("Uniform grid", "uniform")),
+            number(f + "pathline_grid_spacing_mm", "Grid spacing (mm)", .01, 1e4, visible=lambda v: not random(v)),
+            option(f + "pathline_seed_mode", "Seed mode", ("Fixed count", "fixed"), ("Ratio", "ratio"), visible=random),
+            number(f + "pathline_max_seeds", "Seed count / limit", 1, 2000000, integer=True, visible=random),
             number(f + "pathline_seed_ratio", "Seed ratio", .0001, 1, visible=ratio),
             number(f + "pathline_min_seeds", "Minimum seeds", 1, 100000, integer=True, visible=ratio),
+            info, Field(f + "pathline_integration_step_mm", "Integration step (mm or auto)", "optional_positive"),
             number(f + "pathline_max_steps", "Maximum steps", 1, 200000, integer=True),
-            number(f + "pathline_terminal_speed", "Terminal speed (m/s)"),
-            number(f + "pathline_rng_seed", "Random seed", -2147483647, 2147483647, integer=True),
+            number(f + "pathline_terminal_speed", "Integration terminal speed (m/s)"),
+            number(f + "pathline_rng_seed", "Random seed", -2147483647, 2147483647, integer=True, visible=random),
             number(f + "pathline_temporal_cache_mb", "Temporal cache (MiB)", 0, 8192),
-        ]), ("Display", [number(f + "pathline_tube_radius", "Tube radius (mm)", .001, 1e4),
-                         option(f + "pathline_color_mode", "Color mode", ("Per plane", "per_plane"), ("Per group", "per_group"), ("Uniform", "uniform")),
+        ]), ("Display", [
+                         option(f + "pathline_display_style", "Display style", ("Particles", "particles"), ("Particles + short trails", "trails"), ("Full history", "history")),
+                         number(f + "pathline_display_min_speed_cm_s", "Minimum display speed (cm/s)"),
+                         number(f + "pathline_trail_duration_ms", "Trail duration (ms)", .001, 1e6, visible=lambda v: v[f + "pathline_display_style"] == "trails"),
+                         number(f + "pathline_tube_radius", "Tube radius (mm)", .001, 1e4, visible=lambda v: v[f + "pathline_display_style"] == "history"),
+                         option(f + "pathline_color_mode", "Color mode", ("Per plane", "per_plane"), ("Per group", "per_group"), ("Uniform", "uniform"), ("Velocity", "velocity"), ("Particle age", "age")),
                          Field(f + "pathline_color", "Uniform color", "color", visible=lambda v: v[f + "pathline_color_mode"] == "uniform")])]
     if action == StepId.COMPUTE_PWV:
         foot = lambda v: v[w + "transit_time_method"] == "foot_to_foot"
@@ -237,11 +309,6 @@ def action_sections(action, ws):
                                   number(w + "plot_dpi", "Plot DPI", 72, 1200, integer=True)]),
         ]
     if action == "render":
-        fields = [Field("render_settings." + key + "_clim", label + " range (auto or min, max)", "range")
-                  for key, label in [("wss", "WSS"), ("tke", "TKE"), ("pressure_gradient", "Pressure gradient"),
-                                     ("relative_pressure", "Relative pressure"), ("streamline", "Streamlines")]]
-        fields += [number(d + "pressure_gradient_layer_opacity", "Pressure gradient opacity", 0, 1),
-                   number(d + "relative_pressure_layer_opacity", "Relative pressure opacity", 0, 1)]
         bars = []
         for key, label, value, lo, hi in [("width", "Width", .08, .01, 1), ("height", "Height", .65, .05, 1),
                                          ("stack_gap", "Gap", .03, 0, 1), ("position_x", "X", .87, 0, .98),
@@ -250,8 +317,13 @@ def action_sections(action, ws):
             field = number("render_settings.shared_colorbar_bar_cfg." + key, label, lo, hi, integer="font" in key)
             field.default = value
             bars.append(field)
-        return [("3D display", fields), ("Colorbar", bars)]
+        return [("Colorbar layout", bars)]
     return []
+
+
+def action_sections(action, ws):
+    from .settings_layout import compact_action_sections
+    return compact_action_sections(action, _action_sections(action, ws))
 
 
 def input_values(ws):
@@ -272,6 +344,10 @@ class ActionSettingsDialog(QtWidgets.QDialog):
         self.resize(620, 520)
         self.workspace = workspace
         self.fields = [field for _, fields in sections for field in fields]
+        self._input_settings = any(field.key.startswith("input.") for field in self.fields)
+        if self._input_settings:
+            self.setMinimumWidth(720)
+            self.resize(860, 740)
         if any(field.kind == "plane_rules" for field in self.fields):
             self.resize(1000, 620)
         self.controls = {}
@@ -288,29 +364,52 @@ class ActionSettingsDialog(QtWidgets.QDialog):
         self._model_backend = None
         self._model_presets = set()
         layout = QtWidgets.QVBoxLayout(self)
+        if self._input_settings:
+            source = str(workspace.paths.flow_path or "No source loaded")
+            group = str(workspace.input_state.metadata.get("source_group") or "/")
+            context = QtWidgets.QLabel(f"Source: {source}\nData group: {group}")
+            context.setTextFormat(QtCore.Qt.PlainText)
+            context.setWordWrap(True)
+            layout.addWidget(context)
         self.tabs = QtWidgets.QTabWidget()
         layout.addWidget(self.tabs)
         nested_tabs = {}
         for title, fields in sections:
             self._pages.append(fields)
             target_tabs = self.tabs
-            if "::" in title:
-                group, title = title.split("::", 1)
-                if group not in nested_tabs:
-                    nested_tabs[group] = QtWidgets.QTabWidget()
-                    self.tabs.addTab(nested_tabs[group], group)
-                target_tabs = nested_tabs[group]
+            parts = title.split("::")
+            for depth, group in enumerate(parts[:-1], 1):
+                prefix = tuple(parts[:depth])
+                if prefix not in nested_tabs:
+                    nested_tabs[prefix] = QtWidgets.QTabWidget()
+                    target_tabs.addTab(nested_tabs[prefix], group)
+                target_tabs = nested_tabs[prefix]
+            title = parts[-1]
             page = QtWidgets.QWidget()
             form = QtWidgets.QFormLayout(page)
             form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
             form.setLabelAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+            if self._input_settings:
+                form.setRowWrapPolicy(QtWidgets.QFormLayout.WrapAllRows)
             for field in fields:
                 control, widget = self._make_control(field)
                 control.setObjectName(field.key)
-                form.addRow(field.label, widget)
+                form.addRow(compact_label(field.label), widget)
+                bind_help(form, widget, field.help or parameter_help(field.key, field.label, control.toolTip()))
                 self.controls[field.key] = control
                 self.rows[field.key] = widget
                 self.forms[field.key] = form
+            if any(field.key == "input.venc_order" for field in fields):
+                from .input_calibration import source_channel_help
+                for key in ("input.spatial_order", "input.venc_order"):
+                    widget = self.rows[key]
+                    bind_help(form, widget, parameter_help(key, key.rsplit(".", 1)[-1])+"\n\n"+source_channel_help(workspace))
+                self.input_mapping_preview = QtWidgets.QLabel()
+                self.input_mapping_preview.setWordWrap(True)
+                self.input_mapping_preview.setTextFormat(QtCore.Qt.RichText)
+                self.input_mapping_preview.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+                self.input_mapping_preview.setStyleSheet("background: #eef5f2; padding: 8px;")
+                form.addRow(self.input_mapping_preview)
             if any(field.key == "derived_params.rho" for field in fields):
                 available = workspace.source_sigma is not None or workspace.source_tke_array is not None
                 notice = QtWidgets.QLabel("TKE: source data available" if available else "TKE: unavailable; skipped when source data are missing")
@@ -334,10 +433,10 @@ class ActionSettingsDialog(QtWidgets.QDialog):
                 row.addWidget(button)
             layout.addLayout(row)
         buttons = QtWidgets.QDialogButtonBox()
-        self.defaults_button = buttons.addButton("Restore defaults", QtWidgets.QDialogButtonBox.ResetRole)
+        self.defaults_button = buttons.addButton("Restore applied values" if self._input_settings else "Restore defaults", QtWidgets.QDialogButtonBox.ResetRole)
         self.defaults_button.clicked.connect(lambda: self.set_values(self._defaults))
         buttons.addButton(QtWidgets.QDialogButtonBox.Cancel).clicked.connect(self.reject)
-        save = buttons.addButton("Save", QtWidgets.QDialogButtonBox.AcceptRole)
+        save = buttons.addButton("Save for next reload" if self._input_settings else "Save", QtWidgets.QDialogButtonBox.AcceptRole)
         save.setDefault(True)
         save.clicked.connect(self.accept)
         if run_label:
@@ -346,11 +445,18 @@ class ActionSettingsDialog(QtWidgets.QDialog):
             self.run_button.clicked.connect(self._save_and_run)
         layout.addWidget(buttons)
         self.set_values(self._initial)
+        self.tabs.currentChanged.connect(self._settings_page_changed)
+        for nested in self.tabs.findChildren(QtWidgets.QTabWidget):
+            nested.currentChanged.connect(self._settings_page_changed)
         for control in self.controls.values():
-            if isinstance(control, QtWidgets.QComboBox):
+            if self._input_settings:
+                control.changed.connect(self._update_input_mapping)
+            elif isinstance(control, QtWidgets.QComboBox):
                 control.currentIndexChanged.connect(self._update_visibility)
             elif isinstance(control, QtWidgets.QCheckBox):
                 control.toggled.connect(self._update_visibility)
+            elif isinstance(control, QtWidgets.QListWidget):
+                control.itemChanged.connect(self._update_visibility)
             elif isinstance(control, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
                 control.valueChanged.connect(self._update_visibility)
 
@@ -371,11 +477,39 @@ class ActionSettingsDialog(QtWidgets.QDialog):
         return values
 
     def _make_control(self, field):
-        if field.kind in {"choice", "model"}:
+        if field.kind == "info":
+            control = QtWidgets.QLabel()
+            control.setWordWrap(True)
+        elif field.kind in {"input_triplet", "input_order"}:
+            from .input_calibration import InputTripletEditor
+            control = InputTripletEditor(field.key.split(".")[1])
+        elif field.kind in {"choice", "model"}:
             control = QtWidgets.QComboBox()
             control.setEditable(field.kind == "model")
             for label, value in field.choices:
                 control.addItem(label, value)
+            if field.key in {"streamline_params.seed_region", "streamline_params.pathline_seed_region"}:
+                segmentation = any(mask is not None for mask in (self.workspace.segmask_binary, self.workspace.segmask_raw, self.workspace.segmask_3d))
+                contour = bool(self.workspace.planes) and (segmentation or any(
+                    getattr(plane, "roi_edit_operations", {}) or getattr(plane, "roi_polygon_uv_mm", [])
+                    for plane in self.workspace.planes))
+                available = {"fov": True, "segmentation": segmentation,
+                             "noise_free": self.workspace.pcmra_render_mask is not None, "contour": contour}
+                for index in range(control.count()):
+                    item = control.model().item(index)
+                    if not available[control.itemData(index)]:
+                        item.setEnabled(False)
+                        item.setToolTip("Load or generate the corresponding segmentation, noise mask, or plane contour first")
+        elif field.kind == "checklist":
+            control = QtWidgets.QListWidget()
+            control.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+            control.setMinimumHeight(220)
+            control.setMaximumHeight(280)
+            for label, value in field.choices:
+                item = QtWidgets.QListWidgetItem(label, control)
+                item.setData(QtCore.Qt.UserRole, value)
+                item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+                item.setCheckState(QtCore.Qt.Unchecked)
         elif field.kind == "bool":
             control = QtWidgets.QCheckBox()
         elif field.kind in {"int", "float"}:
@@ -396,15 +530,11 @@ class ActionSettingsDialog(QtWidgets.QDialog):
             layout.setContentsMargins(0, 0, 0, 0)
             layout.addWidget(control, 1)
             from ..config import default_config_dir
-            presets = QtWidgets.QComboBox()
-            presets.setObjectName("plane_plan_preset")
-            presets.addItem("Choose plane plan…", None)
-            for title, filename in (("Combined default", "default"), ("Cardiopulmonary", "cardiopulmonary"),
-                ("Portal", "portal"), ("Renal", "renal"), ("Brain", "brain"), ("Neck (ICA / VA / IJV)", "neck")):
-                presets.addItem(title, str(default_config_dir() / "plane_plans" / (filename + ".json")))
-            presets.activated.connect(lambda index: self._load_plane_preset(presets.itemData(index)))
-            self._plane_preset_combo = presets
-            layout.addWidget(presets)
+            defaults = QtWidgets.QPushButton("Defaults")
+            defaults.setObjectName("plane_plan_defaults")
+            defaults.clicked.connect(lambda: self._load_plane_rules_source(
+                str(default_config_dir() / "plane_plans" / "default.json")))
+            layout.addWidget(defaults)
             load = QtWidgets.QPushButton("Load…")
             save = QtWidgets.QPushButton("Save…")
             load.clicked.connect(self._load_plane_config)
@@ -419,7 +549,7 @@ class ActionSettingsDialog(QtWidgets.QDialog):
             control.horizontalHeader().setSectionResizeMode(6, QtWidgets.QHeaderView.Stretch)
             control.itemDoubleClicked.connect(lambda item: self._edit_label_rule(control, item.row()) if item.column() == 6 else None)
             control.setMinimumHeight(300)
-            control.setToolTip("Landmark plans use explicit anatomical junctions or path levels. Missing or ambiguous anchors are omitted, with no flow-root fallback. Zero disables a label.")
+            control.setToolTip("Landmark plans use explicit anatomical junctions or path levels. Unavailable positions are omitted and recorded as QC errors; processing continues. Zero disables a label.")
         elif field.kind == "groups":
             control = QtWidgets.QTableWidget(0, 2)
             control.setHorizontalHeaderLabels(["Name", "Labels (ids or names)"])
@@ -456,9 +586,9 @@ class ActionSettingsDialog(QtWidgets.QDialog):
         source, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load plane config", field.text(), "JSON (*.json)")
         if not source:
             return
-        self._load_plane_preset(source)
+        self._load_plane_rules_source(source)
 
-    def _load_plane_preset(self, source):
+    def _load_plane_rules_source(self, source):
         if not source:
             return
         field = self.controls["plane_gen_params.label_rules_file"]
@@ -466,11 +596,6 @@ class ActionSettingsDialog(QtWidgets.QDialog):
             rules = load_plane_rules_file(source)
             self._populate_plane_rules(self.controls["plane_gen_params.label_rules"], rules)
             field.setText(str(Path(source).resolve()))
-            preset = getattr(self, "_plane_preset_combo", None)
-            if preset is not None:
-                index = next((i for i in range(1, preset.count())
-                              if Path(preset.itemData(i)).resolve() == Path(source).resolve()), 0)
-                preset.setCurrentIndex(index)
             self.error.clear()
             self._update_visibility()
         except (OSError, ValueError, TypeError) as exc:
@@ -649,13 +774,20 @@ class ActionSettingsDialog(QtWidgets.QDialog):
             control = self.controls[field.key]
             value = values[field.key]
             blocker = QtCore.QSignalBlocker(control)
-            if field.kind == "choice":
+            if field.kind in {"input_triplet", "input_order"}:
+                control.set_values(value)
+            elif field.kind == "choice":
                 if field.key == "phase_unwrap_params.method" and value not in {control.itemData(i) for i in range(control.count())}:
                     value = "lap4D"
                 index = control.findData(value)
                 control.setCurrentIndex(max(index, 0))
             elif field.kind == "model":
                 control.setEditText(str(value or "auto"))
+            elif field.kind == "checklist":
+                chosen = set(value or [])
+                for index in range(control.count()):
+                    item = control.item(index)
+                    item.setCheckState(QtCore.Qt.Checked if item.data(QtCore.Qt.UserRole) in chosen else QtCore.Qt.Unchecked)
             elif field.kind == "bool":
                 control.setChecked(bool(value))
             elif field.kind in {"int", "float"}:
@@ -681,6 +813,18 @@ class ActionSettingsDialog(QtWidgets.QDialog):
             self._mask_memory[method] = values["phase_unwrap_params.mask_source"]
         self._model_backend = None
         self._update_visibility()
+        self._update_input_mapping()
+
+    def _update_input_mapping(self, *_args):
+        if not hasattr(self, "input_mapping_preview") or len(self.controls) < 4:
+            return
+        from .input_calibration import input_mapping_html
+        try:
+            values = {key.split(".")[1]: control.text() for key, control in self.controls.items() if key.startswith("input.")}
+            self.input_mapping_preview.setText(input_mapping_html(values))
+        except (ValueError, TypeError) as exc:
+            import html
+            self.input_mapping_preview.setText("<b>Mapping unavailable</b><br>"+html.escape(str(exc)))
 
     def _raw_value(self, field):
         control = self.controls[field.key]
@@ -690,6 +834,9 @@ class ActionSettingsDialog(QtWidgets.QDialog):
             # An edited path must not inherit the previously selected item's data.
             index = control.currentIndex()
             return str(control.itemData(index) if index >= 0 and control.currentText() == control.itemText(index) else control.currentText()).strip() or "auto"
+        if field.kind == "checklist":
+            return [control.item(index).data(QtCore.Qt.UserRole) for index in range(control.count())
+                    if control.item(index).checkState() == QtCore.Qt.Checked]
         if field.kind == "bool":
             return control.isChecked()
         if field.kind in {"int", "float"}:
@@ -702,9 +849,10 @@ class ActionSettingsDialog(QtWidgets.QDialog):
                 item = control.item(row, 0)
                 rule = dict(item.data(QtCore.Qt.UserRole) or {})
                 rule["plane_count"] = control.cellWidget(row, 1).value()
-                rule["spacing_ratio"] = control.cellWidget(row, 2).value()
-                rule["main_path"] = control.cellWidget(row, 3).currentData()
                 rule["plane_mode"] = control.cellWidget(row, 4).currentData()
+                if rule["plane_mode"] != "landmark":
+                    rule["spacing_ratio"] = control.cellWidget(row, 2).value()
+                rule["main_path"] = control.cellWidget(row, 3).currentData()
                 rules[item.text()] = rule
             return rules
         if field.kind == "groups":
@@ -717,6 +865,11 @@ class ActionSettingsDialog(QtWidgets.QDialog):
             return groups
         return control.text().strip()
 
+    def _settings_page_changed(self, *_args):
+        if self._auto_height is None or self.height() == self._auto_height:
+            self._auto_height = None
+        self._update_visibility()
+
     def _update_visibility(self, *_args):
         self._update_masks()
         self._update_models()
@@ -728,9 +881,15 @@ class ActionSettingsDialog(QtWidgets.QDialog):
             widget.setVisible(visible)
             form.labelForField(widget).setVisible(visible)
         if self._auto_height is None or self.height() == self._auto_height:
-            height = max(sum(320 if field.kind == "plane_rules" else 190 if field.kind == "groups" else 90 if field.kind == "json" else 32
-                             for field in fields if not self.rows[field.key].isHidden()) for fields in self._pages)
+            pages = self._pages
+            active = [fields for fields in pages if any(self.rows[field.key].isVisibleTo(self) for field in fields)]
+            pages = active or pages
+            height = max(sum(320 if field.kind == "plane_rules" else 240 if field.kind == "groups" else 240 if field.kind == "checklist" else 90 if field.kind == "json" else 32
+                             for field in fields if not self.rows[field.key].isHidden()) for fields in pages)
             height = min(650, max(220, height + 125 + (32 if len(self._pages) > 1 else 0)))
+            if self._input_settings:
+                screen = self.screen()
+                height = min(740, max(500, screen.availableGeometry().height()-100))
             self.resize(self.width(), height)
             self._auto_height = self.height()
 
@@ -795,13 +954,21 @@ class ActionSettingsDialog(QtWidgets.QDialog):
     def values(self):
         values = dict(self._initial)
         for field in self.fields:
-            if field.visible is not None and self.rows[field.key].isHidden():
+            if field.kind == "info":
+                values.pop(field.key, None)
+                continue
+            if (field.visible is not None and self.rows[field.key].isHidden()
+                    and field.key not in {"streamline_params.line_width", "streamline_params.tube_radius"}):
                 continue
             value = self._raw_value(field)
+            if field.key.endswith("seed_region") and self.workspace.data_loaded:
+                combo = self.controls[field.key]
+                if not combo.model().item(combo.currentIndex()).isEnabled():
+                    raise ValueError("The selected seed region is unavailable; choose an available region first.")
             if field.kind == "optional_positive":
                 value = None if value.lower() in {"", "auto", "none"} else float(value)
                 if value is not None and (not math.isfinite(value) or value <= 0):
-                    raise ValueError("Inward distance must be positive or auto.")
+                    raise ValueError(field.label + " must be positive or auto.")
             elif field.kind == "range":
                 if value.lower() in {"", "auto", "none"}:
                     value = None
@@ -888,6 +1055,12 @@ class ActionSettingsMixin:
         if (self._pipeline_running_guard("changing action settings") or self._autoseg_running_guard("changing action settings")
                 or self._pathline_running_guard("changing action settings") or self._edit_mode is not None):
             return
+        if action == "render":
+            from .colorbar_layout import ColorbarLayoutDialog
+            dialog = ColorbarLayoutDialog(self)
+            dialog.exec()
+            dialog.deleteLater()
+            return
         if action == "run_all":
             stage = self._workflow_stage_key()
             action = {
@@ -907,7 +1080,7 @@ class ActionSettingsMixin:
             defaults.spatial_order = self.workspace.spatial_order
             defaults.venc_order = self.workspace.venc_order
         title = action.label.replace("&&", "&") if isinstance(action, StepId) else {
-            "input": "Reload input", "segmentation": "Automatic segmentation", "render": "3D display",
+            "input": "Reload input", "segmentation": "Automatic segmentation", "render": "3D colorbar layout", "measurements": "Measurements",
         }.get(action if isinstance(action, str) else "", "Run all")
         auxiliary = (("Reset noise mask", "reset_noise"),) if action == StepId.REMOVE_NOISE else (
             (("Revert unwrapping", "revert_unwrap"),) if action == StepId.UNWRAP_PHASE else ())
@@ -924,17 +1097,19 @@ class ActionSettingsMixin:
                 self._revert_phase_unwrap()
                 return
             values = dialog.values()
-            changed = any(value != dialog._initial[key] for key, value in values.items())
+            changed_keys = {key for key, value in values.items() if value != dialog._initial[key]}
+            changed = bool(changed_keys)
+            computation_changed = any(not (_flow_display_setting(key) or key.startswith("render_settings.measurements.")) for key in changed_keys)
             self._publish_action_settings(values)
             if "phase_unwrap_params.method" in values:
                 method = values["phase_unwrap_params.method"]
                 dialog._mask_memory[method] = values["phase_unwrap_params.mask_source"]
                 self.workspace.input_state.metadata["gui_phase_unwrap_masks"] = dialog._mask_memory
-            if changed and (not isinstance(action, str) or action not in {"render", "input", "segmentation"}):
+            if computation_changed and (not isinstance(action, str) or action not in {"render", "input", "segmentation"}):
                 keys = action if isinstance(action, tuple) else (action,)
                 self._mark_action_settings_pending(keys)
             if changed:
-                self.log(f"{title} settings saved." + (" Rerun to update results." if action != "render" else ""))
+                self.log(f"{title} settings saved." + (" Rerun to update results." if computation_changed and action != "render" else ""))
             self._sync_params_to_ui()
             if dialog.run_requested and run is not None:
                 run()
@@ -942,6 +1117,27 @@ class ActionSettingsMixin:
             dialog.deleteLater()
 
     def _publish_action_settings(self, values):
+        from ..core.plane_state import invalidate_metric_families
+        flow_display_changed = any(_flow_display_setting(key) and value != _get(self.workspace, key, None)
+                                   for key, value in values.items())
+        families = set()
+        pwv_changed = False
+        for key, value in values.items():
+            if key.startswith("derived_params.") and value != _get(self.workspace, key, None):
+                field = key.split(".", 1)[1]
+                if any(word in field for word in ("opacity", "color", "cmap", "clim", "render")):
+                    continue
+                if field.startswith("wss_"):
+                    families.add("wss")
+                elif field.startswith("tke_"):
+                    families.add("tke")
+                elif field.startswith(("pressure_", "relative_pressure_")):
+                    families.add("pressure")
+                elif field.startswith("vortex_"):
+                    families.add("vortex")
+            previous_pwv = self.workspace.pwv_params.to_dict().get("groups") if key == "pwv_params.groups" else _get(self.workspace, key, None)
+            if key.startswith("pwv_params.") and not key.endswith(("plot_color", "fit_color")) and value != previous_pwv:
+                pwv_changed = True
         ws = self.workspace
         input_parameters = {key.split(".")[1]: value for key, value in values.items() if key.startswith("input.")}
         if input_parameters:
@@ -967,13 +1163,25 @@ class ActionSettingsMixin:
             candidate.phase_unwrap_params.enabled = True
         for root in roots:
             setattr(ws, root, getattr(candidate, root))
-        if any(key.startswith("render_settings.") for key in values):
+        invalidate_metric_families(ws, families)
+        if pwv_changed:
+            ws.analysis_revision += 1
+            for result in ws.derived.pwv_results:
+                result.update(validity="stale", stale_reason="PWV parameters changed")
+        if families or pwv_changed:
+            self._last_quality_report = None
+        if any(key.startswith("render_settings.") and not key.startswith("render_settings.measurements.") for key in values):
             shared = ws.render_settings.get("shared_colorbar_bar_cfg", {})
             for key in ("wss", "tke", "pressure_gradient", "relative_pressure", "streamline"):
                 ws.render_settings.setdefault(key + "_bar_cfg", {}).update(shared)
             self._apply_render_settings_to_scene_objects()
+        if any(key.startswith("render_settings.measurements.") for key in values):
+            self._refresh_analysis_panel()
         if "streamline_params.pathline_color" in values:
             self._refresh_automatic_pathline_colors()
+        if flow_display_changed:
+            self.scene.apply_flow_display_settings()
+            self.ortho_viewer.refresh()
 
     def _mark_action_settings_pending(self, keys):
         dependencies = {

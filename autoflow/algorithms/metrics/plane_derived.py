@@ -3,6 +3,7 @@
 import os
 import numpy as np
 from ...task_control import check_cancelled, task_scope
+from ...core.plane_state import ensure_plane_identity
 from ..surfaces import _build_branch_grid
 
 from ._common import _ensure_mask4d
@@ -76,18 +77,37 @@ def _append_available_summary(metric, prefix, series):
     metric[prefix] = float(np.mean(values[valid])) if np.any(valid) else None
 
 
+def _prepare_plane_tke(mask4d, array, field_spacing):
+    if field_spacing is None or np.asarray(array).shape[:3] == np.asarray(mask4d).shape[:3]:
+        return _prepare_tke_array(mask4d, tke_array=array)
+    value = np.asarray(array, dtype=np.float32)
+    nt = int(np.asarray(mask4d).shape[3])
+    if value.ndim == 3:
+        value = np.broadcast_to(value[..., None], value.shape+(nt,))
+    elif value.ndim == 4 and value.shape[3] == 1:
+        value = np.broadcast_to(value, value.shape[:3]+(nt,))
+    if value.ndim != 4 or value.shape[3] != nt:
+        raise ValueError('TKE phases must match the segmentation phases')
+    return value
+
+
 def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_labels_3d=None,
                                     tke_array=None, pressure_gradient_array=None,
                                     relative_pressure_array=None, wss_surfaces=None,
                                     branch_grid=None, mask_phase_lookup=None,
                                     support_mesh_cache=None, pressure_gradient_support_mask=None, *,
                                     segmentation_labels_3d=None, segmentation_labels_4d=None,
-                                    _tke_prepared=False):
+                                    _tke_prepared=False, sampling_context=None, field_spacing=None):
     mask4d = _ensure_mask4d(mask4d)
     spacing = np.asarray(spacing, dtype=float).reshape(3)
     origin = np.asarray(origin, dtype=float).reshape(3)
     Nt = int(mask4d.shape[3])
-    branch_grid = branch_grid if branch_grid is not None else _build_branch_grid(branch_labels_3d, spacing, origin)
+    from functools import partial
+    sample_field = partial(_sample_field_from_slice_spec, field_spacing=field_spacing,
+                           mask_spacing=spacing, origin=origin)
+    voxel_centered = field_spacing is not None
+    grid_origin = origin-0.5*spacing if voxel_centered else origin
+    branch_grid = branch_grid if branch_grid is not None else _build_branch_grid(branch_labels_3d, spacing, grid_origin)
     target_label = _target_label_for_plane(plane, branch_labels_3d, spacing, origin)
     normal = np.asarray(plane.normal, dtype=float).reshape(3)
     normal = normal / (np.linalg.norm(normal) + 1e-12)
@@ -102,7 +122,7 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
     needs_volume_slice = has_tke or has_pressure_gradient or has_relative_pressure or has_wss
 
     if has_tke and not _tke_prepared:
-        tke_array = _prepare_tke_array(mask4d, tke_array=tke_array, sigma=None)
+        tke_array = _prepare_plane_tke(mask4d, tke_array, field_spacing)
     if has_pressure_gradient:
         pressure_gradient_array = np.asarray(pressure_gradient_array, dtype=np.float32)
         if pressure_gradient_array.ndim != 5 or pressure_gradient_array.shape[-1] != 3:
@@ -114,19 +134,19 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
     pressure_support = None
     if pressure_gradient_support_mask is not None:
         pressure_support = _ensure_mask4d(pressure_gradient_support_mask)
-        if pressure_support.shape[:3] != mask4d.shape[:3] or pressure_support.shape[3] not in (1, Nt):
+        if (field_spacing is None and pressure_support.shape[:3] != mask4d.shape[:3]) or pressure_support.shape[3] not in (1, Nt):
             raise ValueError("pressure_gradient_support_mask must match the spatial mask and have one or all phases")
 
     if mask_phase_lookup is None:
         mask_phase_lookup = _build_mask_phase_lookup(mask4d) if needs_volume_slice else []
     if support_mesh_cache is None and needs_volume_slice:
-        support_mesh_cache = _build_plane_support_mesh_cache(mask4d, mask_phase_lookup, spacing, origin)
+        support_mesh_cache = _build_plane_support_mesh_cache(mask4d, mask_phase_lookup, spacing, grid_origin)
         _add_labeled_plane_support_meshes(
             support_mesh_cache, mask4d,
             segmentation_labels_4d if segmentation_labels_4d is not None else segmentation_labels_3d,
-            [plane], spacing, origin,
+            [plane], spacing, grid_origin,
         )
-    slice_cache = {}
+    slice_cache = sampling_context.slice_cache(plane) if sampling_context is not None else {}
 
     tke_mean_t = []
     tke_peak_t = []
@@ -160,22 +180,26 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
                 slice_cache, mask4d, mask_phase_lookup, support_mesh_cache, plane, tidx,
                 spacing, origin, branch_grid=branch_grid, target_label=target_label,
                 segmentation_labels_3d=segmentation_labels_3d,
-                segmentation_labels_4d=segmentation_labels_4d,
+                segmentation_labels_4d=segmentation_labels_4d, voxel_centered=voxel_centered,
             )
             entry["roi_source_frame"] = np.asarray([
                 -1 if slice_spec is None else slice_spec["roi_source_frame"]], dtype=np.int32)
             entry["roi_carried_forward"] = np.asarray([
                 False if slice_spec is None else slice_spec["roi_carried_forward"]], dtype=np.uint8)
 
+        from ..roi_time import roi_pixel_metadata
+        provenance = slice_cache.get('_roi_frame_provenance', {}).get(tidx, {})
+        entry.update(roi_pixel_metadata(provenance.get('source_frames', []),
+            provenance.get('mode') == 'interpolated', provenance.get('weight'), provenance.get('mode', 'missing')))
         sampled_pressure_support = None
         if pressure_support is not None and slice_spec is not None:
-            sampled_pressure_support = np.asarray(_sample_field_from_slice_spec(
+            sampled_pressure_support = np.asarray(sample_field(
                 pressure_support[..., min(tidx, pressure_support.shape[3] - 1)],
                 mask4d.shape[:3], "pressure_support", slice_spec), dtype=bool).reshape(-1)
 
         if has_tke and slice_spec is not None:
             tke_series_vals = np.asarray(
-                _sample_field_from_slice_spec(tke_array[..., tidx], mask4d.shape[:3], "tke", slice_spec),
+                sample_field(tke_array[..., tidx], mask4d.shape[:3], "tke", slice_spec),
                 dtype=float,
             ).reshape(-1)
             if tke_series_vals.size:
@@ -186,7 +210,7 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
 
         if has_pressure_gradient and slice_spec is not None:
             vec = np.asarray(
-                _sample_field_from_slice_spec(
+                sample_field(
                     pressure_gradient_array[..., tidx, :],
                     mask4d.shape[:3],
                     "pressure_gradient",
@@ -212,7 +236,7 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
 
         if has_relative_pressure and slice_spec is not None:
             vals = np.asarray(
-                _sample_field_from_slice_spec(
+                sample_field(
                     relative_pressure_array[..., tidx],
                     mask4d.shape[:3],
                     "relative_pressure",
@@ -271,7 +295,7 @@ def summarize_plane_derived_metrics(plane, mask4d, spacing, origin, branch_label
                     vals = np.asarray(wall.point_data.get("wss", []), dtype=float).reshape(-1)
                     sample_points = np.asarray(wall.points, dtype=float)
                 if len(vals) == len(sample_points):
-                    selected = _plane_slice_point_mask(sample_points, slice_spec, mask4d.shape[:3], spacing, origin)
+                    selected = _plane_slice_point_mask(sample_points, slice_spec, mask4d.shape[:3], spacing, grid_origin)
                     selected &= _plane_roi_point_mask(sample_points, plane, origin)
                     vals = vals[selected]
                 wss_vals = vals[np.isfinite(vals)]
@@ -314,16 +338,24 @@ def _augment_plane_metrics_serial(plane_metrics, planes, mask4d, spacing, origin
                                  tke_array=None, pressure_gradient_array=None,
                                  relative_pressure_array=None, wss_surfaces=None, progress_callback=None,
                                  pressure_gradient_support_mask=None,
-                                 segmentation_labels_3d=None, segmentation_labels_4d=None):
+                                 segmentation_labels_3d=None, segmentation_labels_4d=None,
+                                 sampling_context=None, field_spacing=None):
     mask4d = _ensure_mask4d(mask4d)
-    shared_branch_grid = _build_branch_grid(branch_labels_3d, spacing, origin)
-    mask_phase_lookup = _build_mask_phase_lookup(mask4d)
-    support_mesh_cache = _build_plane_support_mesh_cache(mask4d, mask_phase_lookup, spacing, origin)
-    _add_labeled_plane_support_meshes(
-        support_mesh_cache, mask4d,
-        segmentation_labels_4d if segmentation_labels_4d is not None else segmentation_labels_3d,
-        planes, spacing, origin,
-    )
+    grid_origin = np.asarray(origin)-0.5*np.asarray(spacing) if field_spacing is not None else origin
+    if sampling_context is not None:
+        sampling_context.validate(mask4d, spacing, origin)
+        shared_branch_grid = sampling_context.branch_grid
+        mask_phase_lookup = sampling_context.phase_lookup
+        support_mesh_cache = sampling_context.support_mesh_cache
+    else:
+        shared_branch_grid = _build_branch_grid(branch_labels_3d, spacing, grid_origin)
+        mask_phase_lookup = _build_mask_phase_lookup(mask4d)
+        support_mesh_cache = _build_plane_support_mesh_cache(mask4d, mask_phase_lookup, spacing, grid_origin)
+        _add_labeled_plane_support_meshes(
+            support_mesh_cache, mask4d,
+            segmentation_labels_4d if segmentation_labels_4d is not None else segmentation_labels_3d,
+            planes, spacing, grid_origin,
+        )
     metrics = [dict(m) for m in plane_metrics]
     pixelwise = []
     for idx, metric in enumerate(metrics):
@@ -340,12 +372,14 @@ def _augment_plane_metrics_serial(plane_metrics, planes, mask4d, spacing, origin
             mask_phase_lookup=mask_phase_lookup,
             support_mesh_cache=support_mesh_cache,
             _tke_prepared=True,
+            sampling_context=sampling_context, field_spacing=field_spacing,
             pressure_gradient_support_mask=pressure_gradient_support_mask,
             segmentation_labels_3d=segmentation_labels_3d,
             segmentation_labels_4d=segmentation_labels_4d,
         )
         metric.update(summary)
         payload["plane_index"] = int(idx)
+        payload.update(ensure_plane_identity(planes[idx]))
         payload["center"] = np.asarray(planes[idx].center, dtype=float).reshape(3).tolist()
         payload["normal"] = np.asarray(planes[idx].normal, dtype=float).reshape(3).tolist()
         payload["label"] = int(getattr(planes[idx], "label", 0) or 0)
@@ -358,6 +392,13 @@ def _augment_plane_metrics_serial(plane_metrics, planes, mask4d, spacing, origin
                 entry["roi_source_frame"] = np.asarray([-1 if sources[t] is None else sources[t]], dtype=np.int32)
             if t < len(carried):
                 entry["roi_carried_forward"] = np.asarray([carried[t]], dtype=np.uint8)
+            from ..roi_time import roi_pixel_metadata
+            def item(key, default):
+                values = metric.get(key, [])
+                return values[t] if t < len(values) else default
+            entry.update(roi_pixel_metadata(item('roi_source_frames_t', []),
+                item('roi_interpolated_t', False), item('roi_interpolation_weight_t', None),
+                item('roi_resolution_t', 'missing')))
         pixelwise.append(payload)
         if progress_callback is not None:
             progress_callback({"stage": "plane_derived", "current": idx + 1, "total": len(metrics),
@@ -368,7 +409,7 @@ def _augment_plane_metrics_serial(plane_metrics, planes, mask4d, spacing, origin
 def _augment_plane_metrics_chunk(indexed_metrics, planes, mask4d, spacing, origin, branch_labels_3d,
                                  tke_array, pressure_gradient_array, relative_pressure_array, wss_surfaces,
                                  progress_path, pressure_gradient_support_mask,
-                                 segmentation_labels_3d, segmentation_labels_4d):
+                                 segmentation_labels_3d, segmentation_labels_4d, field_spacing=None):
     indices = [index for index, _metric in indexed_metrics]
     local_planes = [planes[index] for index in indices]
     with task_scope(_PlaneProcessToken(progress_path)):
@@ -378,7 +419,7 @@ def _augment_plane_metrics_chunk(indexed_metrics, planes, mask4d, spacing, origi
             progress_callback=lambda _payload: _mark_plane_process_progress(progress_path),
             pressure_gradient_support_mask=pressure_gradient_support_mask,
             segmentation_labels_3d=segmentation_labels_3d,
-            segmentation_labels_4d=segmentation_labels_4d,
+            segmentation_labels_4d=segmentation_labels_4d, field_spacing=field_spacing,
         )
     for index, payload in zip(indices, payloads):
         payload["plane_index"] = int(index)
@@ -390,18 +431,20 @@ def augment_plane_metrics_with_derived(plane_metrics, planes, mask4d, spacing, o
                                        relative_pressure_array=None, wss_surfaces=None, *,
                                        use_multithread=False, max_workers=None, progress_callback=None,
                                        pressure_gradient_support_mask=None,
-                                       segmentation_labels_3d=None, segmentation_labels_4d=None):
+                                       segmentation_labels_3d=None, segmentation_labels_4d=None,
+                                       sampling_context=None, field_spacing=None):
     mask4d = _ensure_mask4d(mask4d)
     if tke_array is not None:
-        tke_array = _prepare_tke_array(mask4d, tke_array=tke_array)
+        tke_array = _prepare_plane_tke(mask4d, tke_array, field_spacing)
     count = min(len(plane_metrics), len(planes))
     if max_workers is None:
         max_workers = min(8, count, max(1, os.cpu_count() or 1)) if use_multithread and count * mask4d.shape[3] >= 512 else 1
-    if int(max_workers) <= 1 or count != len(plane_metrics):
+    if int(max_workers) <= 1 or count != len(plane_metrics) or sampling_context is not None:
         return _augment_plane_metrics_serial(
             plane_metrics, planes, mask4d, spacing, origin, branch_labels_3d,
             tke_array, pressure_gradient_array, relative_pressure_array, wss_surfaces, progress_callback,
             pressure_gradient_support_mask, segmentation_labels_3d, segmentation_labels_4d,
+            sampling_context=sampling_context, field_spacing=field_spacing,
         )
     import tempfile
     from joblib import Parallel, delayed
@@ -415,7 +458,7 @@ def augment_plane_metrics_with_derived(plane_metrics, planes, mask4d, spacing, o
                 delayed(_augment_plane_metrics_chunk)(
                     indexed[offset::workers], planes, mask4d, spacing, origin, branch_labels_3d,
                     tke_array, pressure_gradient_array, relative_pressure_array, wss_surfaces, progress_path,
-                    pressure_gradient_support_mask, segmentation_labels_3d, segmentation_labels_4d,
+                    pressure_gradient_support_mask, segmentation_labels_3d, segmentation_labels_4d, field_spacing,
                 ) for offset in range(workers)
             )
         chunks = _wait_plane_processes(calculate, progress_path, count, progress_callback, stage="plane_derived")

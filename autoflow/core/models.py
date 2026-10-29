@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
-from ..plane_rules import default_label_plane_rules, normalize_label_plane_rules
+from ..plane_rules import default_label_plane_rules, normalize_label_plane_rules, smoothing_options
 
 from ..case_types import BackgroundPhaseCorrectionConfig, PhaseUnwrappingConfig, NoiseRemovalConfig, InputState, LoadedCase, LoaderCapabilities, normalize_dicom_backend
 
@@ -135,17 +135,23 @@ def validate_cycle_cleanup_parameters(threshold, preserve_connectivity):
     return threshold, bool(preserve_connectivity)
 
 
+def validate_radius_tree_policy(value):
+    if not isinstance(value, str) or value not in {"auto", "forest", "preserve"}:
+        raise ValueError("radius_tree_policy must be auto, forest or preserve")
+    return value
+
+
 def validate_junction_cluster_parameters(enabled, max_extent_voxels, min_cycle_rank):
     if not isinstance(enabled, (bool, np.bool_)):
         raise ValueError("junction_cluster_enabled must be a boolean")
     if isinstance(max_extent_voxels, (bool, np.bool_)):
-        raise ValueError("junction_cluster_max_extent_voxels must be finite and at least 1")
+        raise ValueError("junction_cluster_max_extent_voxels must be 0 (unlimited) or finite and at least 1")
     try:
         extent = float(max_extent_voxels)
     except (TypeError, ValueError):
-        raise ValueError("junction_cluster_max_extent_voxels must be finite and at least 1") from None
-    if not np.isfinite(extent) or extent < 1:
-        raise ValueError("junction_cluster_max_extent_voxels must be finite and at least 1")
+        raise ValueError("junction_cluster_max_extent_voxels must be 0 (unlimited) or finite and at least 1") from None
+    if not np.isfinite(extent) or (extent != 0 and extent < 1):
+        raise ValueError("junction_cluster_max_extent_voxels must be 0 (unlimited) or finite and at least 1")
     if (isinstance(min_cycle_rank, (bool, np.bool_))
             or not isinstance(min_cycle_rank, (int, np.integer)) or min_cycle_rank < 1):
         raise ValueError("junction_cluster_min_cycle_rank must be a positive integer")
@@ -154,6 +160,7 @@ def validate_junction_cluster_parameters(enabled, max_extent_voxels, min_cycle_r
 
 @dataclass
 class SkeletonParams:
+    geometry_spacing_mm: float = 1.0
     remove_small_cc: bool = True
     # How a configured special-label group is prepared before skeletonization.
     # ``three_pass_merge`` is the default experiment requested for the aortic
@@ -167,17 +174,18 @@ class SkeletonParams:
     cc_rel_min_ratio: float = 0.10
     # Minimum number of graph edge segments retained in a terminal branch.
     # Short endpoint-to-junction spurs are removed during graph generation.
-    min_edge_points: int = 3
+    min_edge_points: int = 9
     graph_connectivity: int = 26
     cycle_flow_threshold: float = 0.3
     cycle_preserve_connectivity: bool = True
+    radius_tree_policy: str = "auto"
     junction_cluster_enabled: bool = True
-    junction_cluster_max_extent_voxels: float = 8.0
+    junction_cluster_max_extent_voxels: float = 0.0
     junction_cluster_min_cycle_rank: int = 2
     do_closing: bool = False
     do_opening: bool = False
     gaussian_sigma: float = 0.5
-    gaussian_enabled: bool = True
+    gaussian_enabled: bool = False
     dilation_iters: int = 0
     erosion_iters: int = 0
     opening_iters: int = 0
@@ -185,14 +193,17 @@ class SkeletonParams:
     label_map: Dict[str, int] = field(default_factory=dict)
     label_groups: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     single_label_group_name: str = "single_label"
-    single_label_browser_color: str = "#d9480f"
+    single_label_browser_color: str = "#8eb6c7"
     default_group_browser_color: str = "#1c7ed6"
 
     def to_dict(self):
+        if not np.isfinite(self.geometry_spacing_mm) or self.geometry_spacing_mm < 0:
+            raise ValueError("geometry_spacing_mm must be finite and nonnegative; legacy values migrate to the shared 1-mm grid")
         threshold, preserve = validate_cycle_cleanup_parameters(self.cycle_flow_threshold, self.cycle_preserve_connectivity)
         junction_enabled, junction_extent, junction_rank = validate_junction_cluster_parameters(
             self.junction_cluster_enabled, self.junction_cluster_max_extent_voxels, self.junction_cluster_min_cycle_rank)
         return {
+            "geometry_spacing_mm": float(self.geometry_spacing_mm),
             "remove_small_cc": self.remove_small_cc,
             "special_handling": str(self.special_handling or "three_pass_merge"),
             "special_merge_radius_mm": float(self.special_merge_radius_mm),
@@ -205,6 +216,7 @@ class SkeletonParams:
             "graph_connectivity": validate_graph_connectivity(self.graph_connectivity),
             "cycle_flow_threshold": threshold,
             "cycle_preserve_connectivity": preserve,
+            "radius_tree_policy": validate_radius_tree_policy(self.radius_tree_policy),
             "junction_cluster_enabled": junction_enabled,
             "junction_cluster_max_extent_voxels": junction_extent,
             "junction_cluster_min_cycle_rank": junction_rank,
@@ -280,9 +292,13 @@ class SkeletonParams:
         threshold, preserve = validate_cycle_cleanup_parameters(payload.get("cycle_flow_threshold", .3),
                                                                payload.get("cycle_preserve_connectivity", True))
         junction_enabled, junction_extent, junction_rank = validate_junction_cluster_parameters(
-            payload.get("junction_cluster_enabled", True), payload.get("junction_cluster_max_extent_voxels", 8.0),
+            payload.get("junction_cluster_enabled", True), payload.get("junction_cluster_max_extent_voxels", 0.0),
             payload.get("junction_cluster_min_cycle_rank", 2))
+        geometry_spacing = float(payload.get("geometry_spacing_mm", 1.0))
+        if not np.isfinite(geometry_spacing) or geometry_spacing < 0:
+            raise ValueError("geometry_spacing_mm must be finite and nonnegative; legacy values migrate to the shared 1-mm grid")
         return SkeletonParams(
+            geometry_spacing_mm=1.0,
             remove_small_cc=bool(payload.get("remove_small_cc", True)),
             special_handling=special_handling,
             special_merge_radius_mm=max(0.0, float(payload.get("special_merge_radius_mm", 1.5))),
@@ -291,17 +307,18 @@ class SkeletonParams:
             min_cc_volume_mm3=float(payload.get("min_cc_volume_mm3", 50.0)),
             cc_filter_mode=str(payload.get("cc_filter_mode", "hybrid") or "hybrid"),
             cc_rel_min_ratio=float(payload.get("cc_rel_min_ratio", 0.10)),
-            min_edge_points=max(0, int(payload.get("min_edge_points", payload.get("min_edge_count", 3)) or 0)),
+            min_edge_points=max(0, int(payload.get("min_edge_points", payload.get("min_edge_count", 9)) or 0)),
             graph_connectivity=validate_graph_connectivity(payload.get("graph_connectivity", 26)),
             cycle_flow_threshold=threshold,
             cycle_preserve_connectivity=preserve,
+            radius_tree_policy=validate_radius_tree_policy(payload.get("radius_tree_policy", "auto")),
             junction_cluster_enabled=junction_enabled,
             junction_cluster_max_extent_voxels=junction_extent,
             junction_cluster_min_cycle_rank=junction_rank,
             do_closing=bool(payload.get("do_closing", False)),
             do_opening=bool(payload.get("do_opening", False)),
             gaussian_sigma=float(payload.get("gaussian_sigma", 0.5)),
-            gaussian_enabled=bool(payload.get("gaussian_enabled", True)),
+            gaussian_enabled=bool(payload.get("gaussian_enabled", False)),
             dilation_iters=int(payload.get("dilation_iters", 0) or 0),
             erosion_iters=int(payload.get("erosion_iters", 0) or 0),
             opening_iters=int(payload.get("opening_iters", 0) or 0),
@@ -309,7 +326,7 @@ class SkeletonParams:
             label_map=label_map,
             label_groups=label_groups,
             single_label_group_name=str(payload.get("single_label_group_name", "single_label") or "single_label"),
-            single_label_browser_color=str(payload.get("single_label_browser_color", "#d9480f") or "#d9480f"),
+            single_label_browser_color=str(payload.get("single_label_browser_color", "#8eb6c7") or "#8eb6c7"),
             default_group_browser_color=str(payload.get("default_group_browser_color", "#1c7ed6") or "#1c7ed6"),
         )
 
@@ -351,6 +368,7 @@ class SkeletonParams:
             "graph_connectivity",
             "cycle_flow_threshold",
             "cycle_preserve_connectivity",
+            "radius_tree_policy",
             "junction_cluster_enabled",
             "junction_cluster_max_extent_voxels",
             "junction_cluster_min_cycle_rank",
@@ -370,6 +388,7 @@ class SkeletonParams:
             graph_connectivity=self.graph_connectivity,
             cycle_flow_threshold=self.cycle_flow_threshold,
             cycle_preserve_connectivity=self.cycle_preserve_connectivity,
+            radius_tree_policy=self.radius_tree_policy,
             junction_cluster_enabled=self.junction_cluster_enabled,
             junction_cluster_max_extent_voxels=self.junction_cluster_max_extent_voxels,
             junction_cluster_min_cycle_rank=self.junction_cluster_min_cycle_rank,
@@ -395,6 +414,7 @@ class SkeletonParams:
             "graph_connectivity",
             "cycle_flow_threshold",
             "cycle_preserve_connectivity",
+            "radius_tree_policy",
             "junction_cluster_enabled",
             "junction_cluster_max_extent_voxels",
             "junction_cluster_min_cycle_rank",
@@ -424,6 +444,7 @@ class SkeletonParams:
         params.graph_connectivity = validate_graph_connectivity(params.graph_connectivity)
         params.cycle_flow_threshold, params.cycle_preserve_connectivity = validate_cycle_cleanup_parameters(
             params.cycle_flow_threshold, params.cycle_preserve_connectivity)
+        params.radius_tree_policy = validate_radius_tree_policy(params.radius_tree_policy)
         params.junction_cluster_enabled, params.junction_cluster_max_extent_voxels, params.junction_cluster_min_cycle_rank = validate_junction_cluster_parameters(
             params.junction_cluster_enabled, params.junction_cluster_max_extent_voxels, params.junction_cluster_min_cycle_rank)
         # Group-level configs written before the rename remain readable.
@@ -449,6 +470,12 @@ class PlaneGenerationParams:
     segmentation_filter: bool = True
     fov_boundary_filter: bool = True
     fov_boundary_max_fraction: float = 0.25
+    smoothing_method: str = "radius_adaptive"
+    smoothing_radius_factor: float = 2.0
+    smoothing_max_displacement_ratio: float = 0.15
+    smoothing_sample_step_mm: float = 0.5
+    smoothing_radius_sigma_mm: float = 3.0
+    smoothing_backend: str = "auto"
     smoothing_window: int = 15
     smoothing_polyorder: int = 2
     inter_time: int = 10
@@ -470,6 +497,7 @@ class PlaneGenerationParams:
             "segmentation_filter": bool(self.segmentation_filter),
             "fov_boundary_filter": bool(self.fov_boundary_filter),
             "fov_boundary_max_fraction": float(self.fov_boundary_max_fraction),
+            **smoothing_options(vars(self)),
             "smoothing_window": int(self.smoothing_window),
             "smoothing_polyorder": int(self.smoothing_polyorder),
             "inter_time": int(self.inter_time),
@@ -515,6 +543,7 @@ class PlaneGenerationParams:
             segmentation_filter=bool(payload.get("segmentation_filter", True)),
             fov_boundary_filter=bool(payload.get("fov_boundary_filter", True)),
             fov_boundary_max_fraction=fov_fraction,
+            **smoothing_options(payload),
             smoothing_window=int(payload.get("smoothing_window", 15)),
             smoothing_polyorder=int(payload.get("smoothing_polyorder", 2)),
             inter_time=int(payload.get("inter_time", 10)),
@@ -529,6 +558,16 @@ class StreamlineParams:
     terminal_speed: float = 0.01
     rng_seed: int = 0
     tube_radius: float = 0.05
+    seed_region: str = "segmentation"
+    seed_distribution: str = "random"
+    seed_mode: str = "ratio"
+    seed_count: int = 1000
+    grid_spacing_mm: float = 0.0  # Auto: three voxel spacings along each grid axis.
+    integration_step_mm: Optional[float] = None
+    integration_backend: str = "auto"
+    display_style: str = "lines"
+    display_min_speed_cm_s: float = 0.0
+    line_width: float = 1.0
 
     pathline_seed_ratio: float = 0.2
     pathline_max_steps: int = 200
@@ -541,6 +580,13 @@ class StreamlineParams:
     pathline_color: str = "deepskyblue"
     pathline_color_mode: str = "per_plane"
     pathline_temporal_cache_mb: float = 512.0
+    pathline_seed_region: str = "segmentation"
+    pathline_seed_distribution: str = "random"
+    pathline_grid_spacing_mm: float = 1.0
+    pathline_integration_step_mm: Optional[float] = None
+    pathline_display_style: str = "history"
+    pathline_display_min_speed_cm_s: float = 0.0
+    pathline_trail_duration_ms: float = 100.0
 
     def to_dict(self):
         return {
@@ -550,6 +596,16 @@ class StreamlineParams:
             "terminal_speed": self.terminal_speed,
             "rng_seed": self.rng_seed,
             "tube_radius": self.tube_radius,
+            "seed_region": self.seed_region,
+            "seed_distribution": self.seed_distribution,
+            "seed_mode": self.seed_mode,
+            "seed_count": int(self.seed_count),
+            "grid_spacing_mm": float(self.grid_spacing_mm),
+            "integration_step_mm": self.integration_step_mm,
+            "integration_backend": self.integration_backend,
+            "display_style": self.display_style,
+            "display_min_speed_cm_s": float(self.display_min_speed_cm_s),
+            "line_width": float(self.line_width),
             "pathline_seed_ratio": self.pathline_seed_ratio,
             "pathline_max_steps": self.pathline_max_steps,
             "pathline_min_seeds": self.pathline_min_seeds,
@@ -561,10 +617,20 @@ class StreamlineParams:
             "pathline_color": str(self.pathline_color),
             "pathline_color_mode": str(self.pathline_color_mode),
             "pathline_temporal_cache_mb": float(self.pathline_temporal_cache_mb),
+            "pathline_seed_region": self.pathline_seed_region,
+            "pathline_seed_distribution": self.pathline_seed_distribution,
+            "pathline_grid_spacing_mm": float(self.pathline_grid_spacing_mm),
+            "pathline_integration_step_mm": self.pathline_integration_step_mm,
+            "pathline_display_style": self.pathline_display_style,
+            "pathline_display_min_speed_cm_s": float(self.pathline_display_min_speed_cm_s),
+            "pathline_trail_duration_ms": float(self.pathline_trail_duration_ms),
         }
 
     @staticmethod
     def from_dict(d):
+        def optional_step(key):
+            value = d.get(key)
+            return None if value in (None, "", "auto") else float(value)
         return StreamlineParams(
             seed_ratio=float(d.get("seed_ratio", 0.1)),
             max_steps=int(d.get("max_steps", 200)),
@@ -572,6 +638,16 @@ class StreamlineParams:
             terminal_speed=float(d.get("terminal_speed", 0.01)),
             rng_seed=int(d.get("rng_seed", 0)),
             tube_radius=float(d.get("tube_radius", 0.05)),
+            seed_region=str(d.get("seed_region", "segmentation")),
+            seed_distribution=str(d.get("seed_distribution", "random")),
+            seed_mode=str(d.get("seed_mode", "ratio")),
+            seed_count=max(1, int(d.get("seed_count", 1000))),
+            grid_spacing_mm=float(d.get("grid_spacing_mm", 0.0)),
+            integration_step_mm=optional_step("integration_step_mm"),
+            integration_backend=str(d.get("integration_backend", "auto")),
+            display_style=str(d.get("display_style", "lines")),
+            display_min_speed_cm_s=max(0., float(d.get("display_min_speed_cm_s", 0.0))),
+            line_width=max(.25, float(d.get("line_width", 1.0))),
             pathline_seed_ratio=float(d.get("pathline_seed_ratio", d.get("seed_ratio", 0.2))),
             pathline_max_steps=int(d.get("pathline_max_steps", d.get("max_steps", 200))),
             pathline_min_seeds=int(d.get("pathline_min_seeds", d.get("min_seeds", 50))),
@@ -581,8 +657,15 @@ class StreamlineParams:
             pathline_rng_seed=int(d.get("pathline_rng_seed", d.get("rng_seed", 0))),
             pathline_tube_radius=float(d.get("pathline_tube_radius", d.get("tube_radius", 0.25))),
             pathline_color=str(d.get("pathline_color", d.get("plane_pathline_color", "deepskyblue")) or "deepskyblue"),
-            pathline_color_mode=(str(d.get("pathline_color_mode", "per_plane") or "per_plane").strip().lower() if str(d.get("pathline_color_mode", "per_plane") or "per_plane").strip().lower() in {"uniform", "per_plane", "per_group"} else "per_plane"),
+            pathline_color_mode=(str(d.get("pathline_color_mode", "per_plane") or "per_plane").strip().lower() if str(d.get("pathline_color_mode", "per_plane") or "per_plane").strip().lower() in {"uniform", "per_plane", "per_group", "velocity", "age"} else "per_plane"),
             pathline_temporal_cache_mb=max(0.0, float(d.get("pathline_temporal_cache_mb", 512.0))),
+            pathline_seed_region=str(d.get("pathline_seed_region", "segmentation")),
+            pathline_seed_distribution=str(d.get("pathline_seed_distribution", "random")),
+            pathline_grid_spacing_mm=float(d.get("pathline_grid_spacing_mm", 1.0)),
+            pathline_integration_step_mm=optional_step("pathline_integration_step_mm"),
+            pathline_display_style=str(d.get("pathline_display_style", "history")),
+            pathline_display_min_speed_cm_s=max(0., float(d.get("pathline_display_min_speed_cm_s", 0.0))),
+            pathline_trail_duration_ms=max(.001, float(d.get("pathline_trail_duration_ms", 100.0))),
         )
 
 
@@ -729,7 +812,7 @@ class LabelParams:
     label_map: Dict[str, int] = field(default_factory=dict)
     label_groups: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     single_label_group_name: str = "single_label"
-    single_label_browser_color: str = "#d9480f"
+    single_label_browser_color: str = "#8eb6c7"
     default_group_browser_color: str = "#1c7ed6"
 
     def to_dict(self):
@@ -778,7 +861,7 @@ class LabelParams:
             label_map=label_map,
             label_groups=label_groups,
             single_label_group_name=str(payload.get("single_label_group_name", "single_label") or "single_label"),
-            single_label_browser_color=str(payload.get("single_label_browser_color", "#d9480f") or "#d9480f"),
+            single_label_browser_color=str(payload.get("single_label_browser_color", "#8eb6c7") or "#8eb6c7"),
             default_group_browser_color=str(payload.get("default_group_browser_color", "#1c7ed6") or "#1c7ed6"),
         )
 
@@ -977,10 +1060,12 @@ class PathsState:
 class PipelineFlags:
     completed: Dict[str, bool] = field(default_factory=dict)
     skipped: Dict[str, bool] = field(default_factory=dict)
+    errors: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def mark_done(self, step: StepId, skipped: bool = False):
         self.completed[step.value] = True
         self.skipped[step.value] = bool(skipped)
+        getattr(self, "errors", {}).pop(step.value, None)
 
     def is_done(self, step: StepId) -> bool:
         return bool(self.completed.get(step.value, False))
@@ -988,6 +1073,7 @@ class PipelineFlags:
     def reset(self):
         self.completed.clear()
         self.skipped.clear()
+        getattr(self, "errors", {}).clear()
 
 
 @dataclass
@@ -1028,6 +1114,16 @@ class PlaneData:
     roi_edit_operations: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
     placement: Dict[str, Any] = field(default_factory=dict)
     metrics: Dict[str, Any] = field(default_factory=dict)
+    plane_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    geometry_revision: int = 0
+    roi_revision: int = 0
+
+    def __post_init__(self):
+        self.plane_id = str(self.plane_id or self.metrics.get("plane_id") or uuid.uuid4())
+
+    def identity_dict(self):
+        return {"plane_id": self.plane_id, "geometry_revision": int(self.geometry_revision),
+                "roi_revision": int(self.roi_revision)}
 
 
 @dataclass
@@ -1099,6 +1195,7 @@ class SegmentationVersion:
 
 @dataclass
 class SegmentationState:
+    revision: int = 0
     original: SegmentationVersion = field(default_factory=SegmentationVersion)
     imported: SegmentationVersion = field(default_factory=SegmentationVersion)
     threshold: SegmentationVersion = field(default_factory=SegmentationVersion)
@@ -1250,6 +1347,7 @@ class SegmentationState:
 
 @dataclass
 class Workspace:
+    analysis_revision: int = 0
     paths: PathsState = field(default_factory=PathsState)
     pipeline: PipelineFlags = field(default_factory=PipelineFlags)
     loader_params: LoaderParams = field(default_factory=LoaderParams)
@@ -1280,6 +1378,15 @@ class Workspace:
     segmask_labels_3d: Optional[np.ndarray] = None
     segmask_binary: Optional[np.ndarray] = None
     segmask_3d: Optional[np.ndarray] = None
+    # Separate 1-mm topology/display copy; segmask_* retain native measurement masks.
+    segmentation_labels_1mm: Optional[np.ndarray] = None
+    segmentation_labels_1mm_3d: Optional[np.ndarray] = None
+    segmentation_analysis_labels: Optional[np.ndarray] = None
+    segmentation_analysis_labels_3d: Optional[np.ndarray] = None
+    segmentation_analysis_binary: Optional[np.ndarray] = None
+    segmentation_analysis_mask: Optional[np.ndarray] = None
+    segmentation_geometry: Dict[str, Any] = field(default_factory=dict)
+    geometry_branch_labels: Optional[np.ndarray] = None
     segmentation_preprocess_qc: Dict[str, Any] = field(default_factory=dict)
     group_order: List[str] = field(default_factory=list)
     multilabel_groups: Dict[str, Dict[str, Any]] = field(default_factory=dict)
@@ -1296,6 +1403,9 @@ class Workspace:
 
     skeleton_points: Optional[np.ndarray] = None
     skeleton_mask: Optional[np.ndarray] = None
+    skeleton_labels: Optional[np.ndarray] = None
+    skeleton_spacing: Optional[np.ndarray] = None
+    skeleton_geometry: Dict[str, Any] = field(default_factory=dict)
 
     graph: GraphData = field(default_factory=GraphData)
     graph_hierarchy: Dict[str, Any] = field(default_factory=dict)
@@ -1369,6 +1479,10 @@ class Workspace:
             return None
         return getattr(self.segmentation, source)
 
+    def _pack_segmentation_geometry(self):
+        from ..algorithms.geometry_grid import pack_geometry_arrays
+        return pack_geometry_arrays(self)
+
     def time_count(self):
         if self.flow_raw is not None and self.flow_raw.ndim == 5:
             return int(self.flow_raw.shape[3])
@@ -1396,6 +1510,7 @@ class Workspace:
             raise ValueError(f"unknown segmentation source: {source}")
         version.data = None if data is None else np.asarray(data, dtype=np.int16).copy()
         version.provenance = copy.deepcopy(provenance or {})
+        self.invalidate_segmentation_display()
         if version.data is None and self.segmentation.active_source == source:
             self.segmentation.active_source = ""
             self.segmask_raw = None
@@ -1432,26 +1547,36 @@ class Workspace:
         self.segmentation.working_labels_4d = None
         self.segmentation.working_source = ""
         self.segmentation.dirty = False
+        self.invalidate_segmentation_display()
+
+    def invalidate_segmentation_display(self):
+        """Call after replacing or editing label arrays in place."""
+        self.segmentation.revision += 1
+        self.analysis_revision += 1
+        self._segmentation_display_cache = None
+        self._segmentation_geometry_cache = None
+        self._segmentation_preview_grid_cache = None
+        self.segmentation_labels_1mm = None
+        self.segmentation_labels_1mm_3d = None
+        self.segmentation_geometry = {}
+
+    @property
+    def segmentation_spacing(self):
+        return np.ones(3, dtype=float)
+
+    def segmentation_geometry_data(self, *, display=False):
+        from ..algorithms.geometry_grid import segmentation_geometry_data
+        return segmentation_geometry_data(self, display=display)
 
     def segmentation_display_4d(self):
-        if self.segmentation.working_labels_4d is not None:
-            return np.asarray(self.segmentation.working_labels_4d, dtype=np.int16)
-        if self.segmentation.working_labels_3d is not None:
-            labels = np.asarray(self.segmentation.working_labels_3d, dtype=np.int16)
-            active = self.get_active_segmentation()
-            nt = int(active.shape[3]) if active is not None and active.ndim == 4 else self.time_count()
-            nt = max(1, nt)
-            return np.repeat(labels[..., None], nt, axis=3).astype(np.int16)
-        active = self.get_active_segmentation()
-        return None if active is None else np.asarray(active, dtype=np.int16)
+        data = self.segmentation_geometry_data(display=True)
+        if data is not None and data.ndim == 3:
+            return np.broadcast_to(data[..., None], data.shape+(max(1, self.time_count()),))
+        return data
 
     def segmentation_display_3d(self):
-        display = self.segmentation_display_4d()
-        if display is None:
-            return None
-        if display.ndim == 3:
-            return np.asarray(display, dtype=np.int16)
-        return np.max(display, axis=3).astype(np.int16)
+        from ..algorithms.geometry_grid import prepare_segmentation_geometry
+        return prepare_segmentation_geometry(self, display=True)[0]
 
     def display_unique_labels(self):
         display = self.segmentation_display_4d()
@@ -1530,6 +1655,9 @@ class Workspace:
 
     def reset_segmentation_results(self):
         self._preprocess_signature = None
+        for name in ('segmentation_analysis_labels', 'segmentation_analysis_labels_3d',
+                     'segmentation_analysis_binary', 'segmentation_analysis_mask', 'geometry_branch_labels'):
+            setattr(self, name, None)
         self.segmentation_preprocess_qc = {}
         for attr in [
             "segmask_labels",
@@ -1541,6 +1669,11 @@ class Workspace:
             "branch_labels",
         ]:
             setattr(self, attr, None)
+        self.skeleton_labels = None
+        self.skeleton_spacing = None
+        self.skeleton_geometry = {}
+        self._geometry_grid_cache = None
+        self._geometry_vote_cache = None
         self.group_order = []
         self.multilabel_groups = {}
         self.willis_ring_status = {}
@@ -1602,6 +1735,13 @@ class Workspace:
             setattr(self, attr, default)
         self.resolution = np.array([1., 1., 1.])
         self.segmentation_preprocess_qc = {}
+        self.segmentation_geometry = {}
+        self._segmentation_geometry_cache = None
+        self._segmentation_preview_grid_cache = None
+        for name in ('segmentation_labels_1mm', 'segmentation_labels_1mm_3d',
+                     'segmentation_analysis_labels', 'segmentation_analysis_labels_3d',
+                     'segmentation_analysis_binary', 'segmentation_analysis_mask', 'geometry_branch_labels'):
+            setattr(self, name, None)
         self.origin = np.array([0., 0., 0.])
         self.venc = np.array([1., 1., 1.])
         self.rr = 1000.0
@@ -1610,6 +1750,11 @@ class Workspace:
                       "phase_wrapped", "phase_wrapped_high",
                       "streamline_seeds", "mag_raw", "source_sigma", "source_tke_array", "correction_raw", "correction_high_raw"]:
             setattr(self, attr, None)
+        self.skeleton_labels = None
+        self.skeleton_spacing = None
+        self.skeleton_geometry = {}
+        self._geometry_grid_cache = None
+        self._geometry_vote_cache = None
         self.group_order = []
         self.multilabel_groups = {}
         self.willis_ring_status = {}
@@ -1670,7 +1815,7 @@ class Workspace:
                 "cycle_cleanup": copy.deepcopy(state.get("cycle_cleanup", {})),
                 "junction_cluster_cleanup": copy.deepcopy(state.get("junction_cluster_cleanup", {})),
                 "forks": copy.deepcopy(state.get("forks", [])),
-                "planes": [{"center": arr(p.center), "normal": arr(p.normal), "label": int(p.label),
+                "planes": [{**p.identity_dict(), "center": arr(p.center), "normal": arr(p.normal), "label": int(p.label),
                             "segmentation_label": int(getattr(p, "segmentation_label", 0) or 0),
                             "path_index": int(p.path_index), "distance": float(p.distance), "group_name": str(p.group_name),
                             "roi_polygon_uv_mm": copy.deepcopy(getattr(p, "roi_polygon_uv_mm", []) or []),
@@ -1681,6 +1826,8 @@ class Workspace:
                 "plane_index_offset": int(state.get("plane_index_offset", 0)),
             }
         return {
+            "schema_version": 2,
+            "analysis_revision": int(self.analysis_revision),
             "paths": {"segmask_path": self.paths.segmask_path, "flow_path": self.paths.flow_path,
                       "workspace_path": self.paths.workspace_path, "output_dir": self.paths.output_dir},
             "pipeline": {"completed": dict(self.pipeline.completed), "skipped": dict(self.pipeline.skipped)},
@@ -1711,6 +1858,8 @@ class Workspace:
             "segmask_3d": arr(self.segmask_3d),
             "segmask_labels_3d": arr(self.segmask_labels_3d),
             "segmentation_preprocess_qc": copy.deepcopy(self.segmentation_preprocess_qc),
+            "segmentation_geometry": copy.deepcopy(self.segmentation_geometry),
+            "segmentation_grid_npz": self._pack_segmentation_geometry(),
             "group_order": [str(x) for x in self.group_order],
             "multilabel_groups": group_payload,
             "willis_ring_status": copy.deepcopy(self.willis_ring_status),
@@ -1722,6 +1871,9 @@ class Workspace:
             "correction_high_raw": arr(self.correction_high_raw),
             "skeleton_points": arr(self.skeleton_points),
             "skeleton_mask": arr(self.skeleton_mask),
+            "skeleton_labels": arr(self.skeleton_labels),
+            "skeleton_spacing": arr(self.skeleton_spacing),
+            "skeleton_geometry": copy.deepcopy(self.skeleton_geometry),
             "graph": {"points": arr(self.graph.points), "edges": arr(self.graph.edges)},
             "branch_labels": arr(self.branch_labels),
             "centerline_paths": [arr(x) for x in self.centerline_paths],
@@ -1730,11 +1882,12 @@ class Workspace:
             "path_info": copy.deepcopy(self.path_info),
             "graph_hierarchy": copy.deepcopy(self.graph_hierarchy),
             "forks": copy.deepcopy(self.forks),
-            "planes": [{"center": arr(p.center), "normal": arr(p.normal), "label": int(p.label),
+            "planes": [{**p.identity_dict(), "center": arr(p.center), "normal": arr(p.normal), "label": int(p.label),
                         "segmentation_label": int(getattr(p, "segmentation_label", 0) or 0),
                         "path_index": int(p.path_index), "distance": float(p.distance),
                         "group_name": str(p.group_name),
                         "roi_polygon_uv_mm": copy.deepcopy(getattr(p, "roi_polygon_uv_mm", []) or []),
+                        "roi_edit_operations": copy.deepcopy(getattr(p, "roi_edit_operations", {}) or {}),
                         "placement": copy.deepcopy(getattr(p, "placement", {}) or {}),
                         "metrics": copy.deepcopy(p.metrics)} for p in self.planes],
             "flow_raw": arr(self.flow_raw),
@@ -1779,6 +1932,8 @@ class Workspace:
         }
 
     def restore_dict(self, d):
+        self.analysis_revision = int(d.get("analysis_revision", 0)) + 1
+        self._segmentation_display_cache = None
         self._loaded_input_source = None
         self._loaded_input_kwargs = {}
         self.paths = PathsState(**{k: d.get("paths", {}).get(k, "") for k in ["segmask_path", "flow_path", "workspace_path", "output_dir"]})
@@ -1829,6 +1984,9 @@ class Workspace:
             planes = []
             for p in state.get("planes", []):
                 planes.append(PlaneData(
+                    plane_id=p.get("plane_id", ""),
+                    geometry_revision=int(p.get("geometry_revision", 0)),
+                    roi_revision=int(p.get("roi_revision", 0)),
                     center=np.asarray(p.get("center", [0.0, 0.0, 0.0]), dtype=float),
                     normal=np.asarray(p.get("normal", [1.0, 0.0, 0.0]), dtype=float),
                     label=int(p.get("label", 1)),
@@ -1877,6 +2035,14 @@ class Workspace:
         self.correction_high_raw = nparr("correction_high_raw", np.float32)
         self.skeleton_points = nparr("skeleton_points")
         self.skeleton_mask = nparr("skeleton_mask")
+        self.skeleton_labels = nparr("skeleton_labels")
+        self.skeleton_spacing = nparr("skeleton_spacing")
+        self.skeleton_geometry = copy.deepcopy(d.get("skeleton_geometry", {}))
+        self._geometry_grid_cache = None
+        self._geometry_vote_cache = None
+        from ..algorithms.geometry_grid import restore_geometry_arrays
+        self.segmentation_geometry = copy.deepcopy(d.get('segmentation_geometry', {}))
+        restore_geometry_arrays(self, d.get('segmentation_grid_npz'))
         gd = d.get("graph", {})
         self.graph = GraphData(
             points=np.asarray(gd.get("points", []), dtype=float).reshape(-1, 3) if gd.get("points") else np.empty((0, 3)),
@@ -1891,12 +2057,25 @@ class Workspace:
         self.planes = []
         for p in d.get("planes", []):
             self.planes.append(PlaneData(
+                plane_id=p.get("plane_id", ""),
+                geometry_revision=int(p.get("geometry_revision", 0)),
+                roi_revision=int(p.get("roi_revision", 0)),
                 center=np.asarray(p["center"], dtype=float), normal=np.asarray(p["normal"], dtype=float),
                 label=int(p.get("label", 1)), segmentation_label=int(p.get("segmentation_label", 0) or 0), path_index=int(p.get("path_index", 0)),
                 distance=float(p.get("distance", 0.0)), group_name=str(p.get("group_name", "") or ""),
                 roi_polygon_uv_mm=copy.deepcopy(p.get("roi_polygon_uv_mm", []) or []),
+                roi_edit_operations=copy.deepcopy(p.get("roi_edit_operations", {}) or {}),
                 placement=copy.deepcopy(p.get("placement", {}) or {}),
                 metrics=copy.deepcopy(p.get("metrics", {}))))
+        for group_name, group in self.multilabel_groups.items():
+            saved = d.get("multilabel_groups", {}).get(group_name, {}).get("planes", [])
+            for index, group_plane in enumerate(group.get("planes", [])):
+                if index < len(saved) and not saved[index].get("plane_id"):
+                    matches = [plane for plane in self.planes if plane.group_name == group_name and
+                               np.allclose(plane.center, group_plane.center, atol=1e-7, rtol=0) and
+                               np.allclose(plane.normal, group_plane.normal, atol=1e-7, rtol=0)]
+                    if len(matches) == 1:
+                        group_plane.plane_id = matches[0].plane_id
         self.flow_raw = nparr("flow_raw")
         self.flow_input = nparr("flow_input")
         self.phase_wrapped = nparr("phase_wrapped", np.float32)
@@ -1953,3 +2132,5 @@ class Workspace:
         self.current_t = int(d.get("current_t", 0))
         self.data_loaded = bool(d.get("data_loaded", False))
         self.selected_path_index = int(d.get("selected_path_index", -1))
+        from ..algorithms.geometry_grid import migrate_measurement_results
+        migrate_measurement_results(self)

@@ -95,7 +95,8 @@ def unwrap_phase(
                                "message": f"Unwrapping phase component {component + 1}/3 ({method_token})"})
         phi = np.asarray(phase[..., component], dtype=np.float32)
         if method_token == "lap4D" and gpu_device:
-            unwrapped, nr = _lap4d_gpu(phi, mask4, ts=float(cfg["lap4d_ts"]), device=gpu_device)
+            unwrapped, nr = _lap4d_gpu(phi, mask4, ts=float(cfg["lap4d_ts"]), device=gpu_device,
+                                      tfc=bool(cfg["tfc"]))
             used_device = gpu_device
         elif method_token == "gc3D" and gpu_device:
             # CUDA accelerates only masked graph construction; PyMaxflow/PUMA
@@ -154,10 +155,13 @@ def unwrap_phase(
         wrap_count[..., component] = np.asarray(nr, dtype=np.int16)
 
     evaluated = mask4[..., None]
-    wrap_count = np.where(evaluated, wrap_count, 0).astype(np.int16)
-    wrap_mask = (np.abs(wrap_count) > 0) & evaluated
     # Preserve the loaded background outside the requested mask.
     phase_unwrapped = np.where(evaluated, phase_unwrapped, phase)
+    # Diagnostics must describe the final phase, including temporal correction
+    # and background restoration, rather than a backend's intermediate count.
+    wraps = np.rint((phase_unwrapped - phase) / (2.0 * np.pi))
+    wrap_count = np.where(evaluated & np.isfinite(wraps), wraps, 0).astype(np.int16)
+    wrap_mask = (np.abs(wrap_count) > 0) & evaluated
     flow_unwrapped = phase_unwrapped * venc3.reshape((1, 1, 1, 1, 3)) / np.pi
     flow_wrapped = phase * venc3.reshape((1, 1, 1, 1, 3)) / np.pi
     per_component = []
@@ -182,6 +186,9 @@ def unwrap_phase(
         "device": used_device,
         "elapsed_sec": float(time.perf_counter() - started),
         "backend_metadata": backend_metadata,
+        "temporal_alignment_rule": "normalized_valid_phase_mean_v2",
+        "diagnostic_rule": "final_phase_round_v2",
+        "odd_axis_policy": "full_axes",
         "statistics": {
             "evaluated_voxels": int(np.count_nonzero(mask4)),
             "wrapped_voxels_any": int(np.count_nonzero(np.any(wrap_mask, axis=-1))),

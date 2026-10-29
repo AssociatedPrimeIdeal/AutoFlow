@@ -36,6 +36,13 @@ def _wait_plane_processes(calculate, progress_path, total, progress_callback, *,
     runner = threading.Thread(target=run, name="autoflow-plane-processes")
     runner.start()
     offset = completed = 0
+    def emit_completion():
+        nonlocal completed
+        completed += 1
+        if progress_callback is not None:
+            progress_callback({"stage": stage, "current": completed, "total": total,
+                "message": (f"Computed WSS phase {completed}/{total}" if stage == "wss" else
+                    f"{'Sampled derived' if stage == 'plane_derived' else 'Calculated'} plane metrics ({completed}/{total})")})
     def update():
         nonlocal offset, completed
         with open(progress_path, "rb") as handle:
@@ -45,11 +52,8 @@ def _wait_plane_processes(calculate, progress_path, total, progress_callback, *,
         # Preserve one callback per completed plane even when several worker
         # markers arrive before the parent next polls the shared progress file.
         for _event in events:
-            completed += 1
-            if progress_callback is not None:
-                progress_callback({"stage": stage, "current": completed, "total": total,
-                                   "message": (f"Computed WSS phase {completed}/{total}" if stage == "wss" else
-                                               f"{'Sampled derived' if stage == 'plane_derived' else 'Calculated'} plane metrics ({completed}/{total})")})
+            if completed < total:
+                emit_completion()
     try:
         while runner.is_alive():
             check_cancelled()
@@ -59,6 +63,11 @@ def _wait_plane_processes(calculate, progress_path, total, progress_callback, *,
         update()
         if state["error"] is not None:
             raise state["error"]
+        # Successful worker completion is authoritative. Windows append writes
+        # from separate processes can overwrite progress markers; never lose
+        # the final notifications or infer completion after a worker error.
+        while completed < total:
+            emit_completion()
         return state["result"]
     except BaseException:
         # Workers observe this marker at phase/plane boundaries. Join before

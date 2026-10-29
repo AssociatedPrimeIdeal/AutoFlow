@@ -9,5 +9,12 @@
   "tube_radius": 0.25,
   "color": "deepskyblue",
   "color_mode": "per_plane",
-  "temporal_cache_mb": 512.0
+  "temporal_cache_mb": 512.0,
+  "seed_region": "segmentation",
+  "seed_distribution": "uniform",
+  "grid_spacing_mm": 1.0,
+  "integration_step_mm": null,
+  "display_style": "trails",
+  "display_min_speed_cm_s": 0.0,
+  "trail_duration_ms": 100.0
 }

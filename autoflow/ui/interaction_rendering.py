@@ -7,6 +7,7 @@ class InteractionRenderingMixin:
     def _initialize_interaction_rendering(self):
         self._interaction_preview_active = False
         self._interaction_mapper_states = {}
+        self._interaction_flow_uids = set()
         self._interaction_view_state = None
         self._interaction_observers = []
 
@@ -25,8 +26,23 @@ class InteractionRenderingMixin:
                         self._interaction_observers.append((target, observer))
         self.plotter._autoflow_interaction_preview = self.set_interaction_preview
 
+    def _streamline_interaction_preview(self, obj, data):
+        return (self._interaction_preview_active and obj.data_key == "streamlines_live"
+                and self.workspace.streamline_params.display_style == "tubes"
+                and obj.tube_radius > 0 and data is not None
+                and (obj.uid in self._interaction_flow_uids or data.n_points >= 50_000))
+
     def _apply_interaction_mapper_quality(self, obj):
-        if not self._interaction_preview_active or obj.actor is None or not self._is_volume_object(obj):
+        if not self._interaction_preview_active or obj.actor is None:
+            return
+        if not self._is_volume_object(obj):
+            if (obj.data_key == "streamlines_live"
+                    and self.workspace.streamline_params.display_style == "tubes"
+                    and obj.tube_radius > 0):
+                data = self._build_dataset(obj.data_key)
+                if self._streamline_interaction_preview(obj, data) and obj.uid not in self._interaction_flow_uids:
+                    self._interaction_flow_uids.add(obj.uid)
+                    self._update_dynamic_object(obj)
             return
         mapper = obj.actor.GetMapper()
         key = id(mapper)
@@ -73,6 +89,14 @@ class InteractionRenderingMixin:
                 for name, value in original.items():
                     getattr(mapper, "Set" + name)(value)
             self._interaction_mapper_states.clear()
+            flow_uids = tuple(self._interaction_flow_uids)
+            self._interaction_flow_uids.clear()
+            for uid in flow_uids:
+                obj = self.workspace.scene_objects.get(uid)
+                if obj is not None and obj.visible and obj.actor is not None:
+                    # Playback can advance while dragging. Restore the full
+                    # geometry for the current phase, not the press phase.
+                    self._update_dynamic_object(obj)
             if self._interaction_view_state is not None:
                 render_pass, fxaa, update_rate = self._interaction_view_state
                 renderer.SetPass(render_pass)
@@ -80,7 +104,7 @@ class InteractionRenderingMixin:
                 window.SetDesiredUpdateRate(update_rate)
             self._interaction_view_state = None
             if render:
-                self.plotter.render()
+                getattr(self, "request_render", self.plotter.render)()
 
     def _close_interaction_rendering(self):
         self.set_interaction_preview(False, render=False)

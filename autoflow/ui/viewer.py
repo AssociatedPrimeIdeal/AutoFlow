@@ -1,11 +1,20 @@
 import numpy as np
+from ..config import METRIC_DATA_KEYS
+from ..rendering.style import configured_metric_style, metric_colormap
+from ..rendering.datasets import metric_display_mesh
+import hashlib
+import weakref
+from contextlib import contextmanager
 import pyvista as pv
 from pyvista import _vtk
 
 from ..core.models import ObjectKind
+from ..core.cache import ByteLRUCache
+from ..algorithms.flow_display import clip_flow_lines, pathline_display, pathline_color_style
+from ..algorithms.flow_seeding import plane_seed_points, volume_seed_domain, phase_mask
 from ..config import BACKGROUND_COLOR
 from ..rendering.style import (
-    configure_plotter, scalar_bar_args, surface_style, plane_display_size,
+    configure_plotter, scalar_bar_args, style_scalar_bar, surface_style, plane_display_size,
     wss_display_surface, metric_volume_kwargs, apply_metric_volume_opacity,
 )
 from ..rendering.datasets import (tke_display_mesh, display_support_surface,
@@ -13,6 +22,7 @@ from ..rendering.datasets import (tke_display_mesh, display_support_surface,
 from .content_rendering import ContentRenderingMixin
 from .interaction_rendering import InteractionRenderingMixin
 from .scene_layers import SceneLayersMixin
+from .orientation_marker import AnatomicalOrientationMarker
 from ..algorithms import (
     build_multilabel_surface_t,
     build_surface_from_mask3d,
@@ -23,6 +33,7 @@ from ..algorithms import (
     generate_pathlines_from_plane_at_t,
     create_uniform_grid,
 )
+from ..algorithms.surfaces import build_cell_mask_surface
 from ..algorithms.streamlines import (
     _plane_seeds,
     automatic_streamline_clim,
@@ -96,9 +107,13 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         self.workspace = workspace
         self.logger = logger
         self._axes_shown = True
-        self._mesh_cache = {}
-        self._display_mesh_cache = {}
-        self._phase_lookup_cache = {}
+        self._orientation_marker = None
+        self._mesh_cache = ByteLRUCache()
+        self._display_mesh_cache = ByteLRUCache(512 * 1024 ** 2)
+        self._phase_lookup_cache = ByteLRUCache(4 * 1024 ** 2)
+        self._render_depth = 0
+        self._render_pending = False
+        self._render_timer = None
         self._automatic_clim_cache = {}
         self._tracked_actors = {}
         self._saved_camera = None
@@ -122,6 +137,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         self._plane_selection_locked = False
         self._active_scalar_bar_uid = None
         self._volume_range_cache = {}
+        self._volume_scalar_range_cache = ByteLRUCache(128 * 1024)
         self._volume_wl_observer_ids = []
         self._volume_wl_active = False
         self._volume_wl_pending_event = None
@@ -136,10 +152,48 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         self._initialize_content_rendering()
         self._initialize_interaction_rendering()
 
+    def request_render(self, *, defer=True):
+        self._render_pending = True
+        if self._render_depth:
+            return
+        if defer:
+            from PySide6 import QtCore, QtWidgets
+            if QtWidgets.QApplication.instance() is not None:
+                if self._render_timer is None:
+                    self._render_timer = QtCore.QTimer()
+                    self._render_timer.setSingleShot(True)
+                    self._render_timer.timeout.connect(self.flush_render)
+                if not self._render_timer.isActive():
+                    self._render_timer.start(0)
+                return
+        self.flush_render()
+
+    def flush_render(self):
+        if self._render_timer is not None:
+            self._render_timer.stop()
+        if self._render_pending and not self._render_depth:
+            self._render_pending = False
+            self.plotter.render()
+
+    def cancel_pending_render(self):
+        if self._render_timer is not None:
+            self._render_timer.stop()
+        self._render_pending = False
+
+    @contextmanager
+    def render_batch(self):
+        self._render_depth += 1
+        try:
+            yield
+        finally:
+            self._render_depth -= 1
+            if not self._render_depth:
+                self.flush_render()
+
     def _is_volume_object(self, obj):
         if self.is_content_render(obj):
             return self.content_render_settings(obj.data_key)["mode"] != "slices"
-        return obj.data_key == "tke_volume"
+        return obj.data_key == "tke_volume" and configured_metric_style(self.workspace, "tke_volume")["mode"] == "volume"
 
     @staticmethod
     def _foreground_volume_range(values):
@@ -164,6 +218,8 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
             values = np.asarray(data['TKE'] if values is None else values)
             finite = values[np.isfinite(values)]
             return 0.0, max(float(np.max(finite)) if finite.size else 1.0, 1e-6)
+        range_cache_key = None
+        range_cache_stamp = None
         if respect_clim and getattr(obj, "clim", None) is not None:
             lo, hi = (float(x) for x in obj.clim)
         else:
@@ -188,9 +244,21 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
             name = str(getattr(obj, "scalars", "") or "PC-MRA")
             try:
                 if name in data.cell_data:
-                    values = np.asarray(data.cell_data[name], dtype=float)
+                    attributes, association = data.cell_data, "cell"
+                    array = data.GetCellData().GetArray(name)
                 elif name in data.point_data:
-                    values = np.asarray(data.point_data[name], dtype=float)
+                    attributes, association = data.point_data, "point"
+                    array = data.GetPointData().GetArray(name)
+                else:
+                    attributes, array = None, None
+                if array is not None:
+                    range_cache_key = (id(data), association, name)
+                    range_cache_stamp = int(array.GetMTime())
+                    cached = self._volume_scalar_range_cache.get(range_cache_key)
+                    if cached is not None and cached[0]() is data and cached[1] == range_cache_stamp:
+                        return cached[2]
+                if attributes is not None:
+                    values = np.asarray(attributes[name], dtype=float)
             except Exception:
                 values = None
             finite = values[np.isfinite(values)] if values is not None else np.empty(0)
@@ -200,7 +268,10 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
             lo = 0.0
         if not np.isfinite(hi) or hi <= lo:
             hi = lo + 1.0
-        return float(lo), float(hi)
+        result = (float(lo), float(hi))
+        if range_cache_key is not None:
+            self._volume_scalar_range_cache[range_cache_key] = (weakref.ref(data), range_cache_stamp, result)
+        return result
 
     def _set_volume_opacity(self, obj, data=None):
         """Update window/level and opacity without recreating the volume actor."""
@@ -220,8 +291,21 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
                                             workspace=self.workspace, data_key=obj.data_key)
                 return
             mapper = actor.GetMapper()
+            # AutoFlow builds both transfer functions below. Avoid PyVista
+            # rebuilding its 256-entry functions first on every range change.
+            # Older PyVista versions without this observer hook keep the
+            # original (correct, but slower) path.
             try:
-                mapper.scalar_range = (lo, hi)
+                lookup = getattr(prop, "_lookup_table", None)
+                observer = getattr(prop, "_lookup_table_observer_id", None)
+                if observer is not None and lookup is mapper.lookup_table:
+                    lookup.RemoveObserver(observer)
+                    prop._lookup_table_observer_id = None
+            except (AttributeError, TypeError):
+                pass
+            try:
+                if tuple(mapper.scalar_range) != (lo, hi):
+                    mapper.scalar_range = (lo, hi)
             except Exception:
                 pass
             try:
@@ -300,6 +384,12 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         self._add_orientation_axes()
         self._ensure_volume_window_level_interaction()
         self._ensure_native_qt_mouse_bridge()
+        # Start from the patient's anterior side, matching the marker's face.
+        camera = self.plotter.camera
+        center = np.asarray(camera.GetFocalPoint())
+        distance = max(np.linalg.norm(np.asarray(camera.GetPosition()) - center), 1.0)
+        camera.SetPosition(*(center + np.array([0., -1., 0.]) * self._display_axis_signs * distance))
+        camera.SetViewUp(*(np.array([0., 0., 1.]) * self._display_axis_signs))
         self.reset_camera(render=False)
 
     def _ensure_plane_overlay_renderer(self):
@@ -370,7 +460,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         except Exception:
             return
         try:
-            interactor = widget.iren
+            interactor = getattr(widget.iren, "interactor", widget.iren)
         except Exception:
             return
 
@@ -402,6 +492,11 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
                     )
                 except Exception:
                     return False
+                marker = controller._orientation_marker
+                if marker is not None and (mouse_move or event.button() == QtCore.Qt.MouseButton.LeftButton):
+                    kind = "move" if mouse_move else ("press" if button_press else "release")
+                    if marker.dispatch(kind):
+                        return True
                 if mouse_move:
                     shift_left = controller._volume_wl_active
                 elif button_press:
@@ -577,7 +672,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
                 pass
         if render:
             try:
-                self.plotter.render()
+                self.request_render()
             except Exception:
                 pass
 
@@ -589,26 +684,20 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         obj.clim = None
         self._update_dynamic_object(obj)
         try:
-            self.plotter.render()
+            self.request_render()
         except Exception:
             pass
         return True
 
     def _add_orientation_axes(self):
-        try:
-            self.plotter.add_axes(
-                xlabel=self._display_axis_directions[0],
-                ylabel=self._display_axis_directions[1],
-                zlabel=self._display_axis_directions[2],
-                line_width=2,
-            )
-            widget = getattr(self.plotter.renderer, "axes_widget", None)
-            if widget is not None:
-                widget.GetRenderer().SetLayer(3)
-            if not self._axes_shown:
-                self.plotter.hide_axes()
-        except Exception:
-            pass
+        if not callable(getattr(self.plotter, "add_orientation_widget", None)):
+            return
+        if self._orientation_marker is not None:
+            self._orientation_marker.close()
+        self._orientation_marker = AnatomicalOrientationMarker(self)
+        self.plotter._autoflow_orientation_dispatch = self._orientation_marker.dispatch
+        if not self._axes_shown:
+            self.plotter.hide_axes()
 
     def set_display_axis_directions(self, directions):
         """Set display-only positive axis directions and rebuild rendered actors."""
@@ -779,6 +868,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         self._phase_lookup_cache.clear()
         self._automatic_clim_cache.clear()
         self._volume_range_cache.clear()
+        self._volume_scalar_range_cache.clear()
         self._display_transform_cache.clear()
         self._active_scalar_bar_uid = None
         self._remove_plane_highlight()
@@ -797,16 +887,16 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         self._phase_lookup_cache.clear()
         self._automatic_clim_cache.clear()
         self._volume_range_cache.clear()
+        self._volume_scalar_range_cache.clear()
         self._display_transform_cache.clear()
         if prefix is None:
             self._mesh_cache.clear()
             self._display_mesh_cache.clear()
         else:
-            self._mesh_cache = {k: v for k, v in self._mesh_cache.items() if not k[0].startswith(prefix)}
-            self._display_mesh_cache = {
-                key: value for key, value in self._display_mesh_cache.items()
-                if not key[0].startswith(prefix)
-            }
+            for cache in (self._mesh_cache, self._display_mesh_cache):
+                for key in list(cache):
+                    if str(key[0]).startswith(prefix):
+                        del cache[key]
 
     def set_background(self, color):
         self._background_color = str(color or BACKGROUND_COLOR)
@@ -821,7 +911,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
                 self.plotter.show_axes()
             else:
                 self.plotter.hide_axes()
-            self.plotter.render()
+            self.request_render()
         except Exception:
             pass
 
@@ -829,7 +919,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         try:
             self.plotter.reset_camera(bounds=self._visible_scene_bounds(), render=False)
             if render:
-                self.plotter.render()
+                self.request_render()
         except Exception:
             pass
 
@@ -876,7 +966,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         if not had_rendered_scene and self._tracked_actors:
             self.reset_camera(render=False)
         try:
-            self.plotter.render()
+            self.request_render()
         except Exception:
             pass
 
@@ -895,7 +985,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
             self._remove_path_highlight()
         self._refresh_shared_scalar_bar(render=False)
         try:
-            self.plotter.render()
+            self.request_render()
         except Exception:
             pass
 
@@ -910,7 +1000,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         if not had_rendered_scene and self._tracked_actors:
             self.reset_camera(render=False)
         try:
-            self.plotter.render()
+            self.request_render()
         except Exception:
             pass
 
@@ -934,7 +1024,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
             except Exception:
                 pass
         try:
-            self.plotter.render()
+            self.request_render()
         except Exception:
             pass
 
@@ -1004,7 +1094,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
             updated = True
         if render:
             try:
-                self.plotter.render()
+                self.request_render()
             except Exception:
                 pass
         return updated
@@ -1016,7 +1106,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         if obj.actor is None:
             self._render_object(obj, refresh_scalar_bar=refresh_scalar_bar)
             if render:
-                self.plotter.render()
+                self.request_render()
             return
         was_visible = False
         try:
@@ -1035,14 +1125,14 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
                 self._refresh_shared_scalar_bar(render=False)
             if render:
                 try:
-                    self.plotter.render()
+                    self.request_render()
                 except Exception:
                     pass
             return
         if obj.data_key == "noise_region":
             self._set_noise_point_opacity(obj)
             if render:
-                self.plotter.render()
+                self.request_render()
             return
         try:
             prop = obj.actor.GetProperty()
@@ -1064,7 +1154,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
             self._refresh_shared_scalar_bar(render=False)
         if render:
             try:
-                self.plotter.render()
+                self.request_render()
             except Exception:
                 pass
 
@@ -1108,7 +1198,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
             cfg["selected_only"] = bool(selected_only)
         self._refresh_plane_visibility()
         if render:
-            self.plotter.render()
+            self.request_render()
 
     def highlight_plane(self, uid):
         self._remove_plane_highlight()
@@ -1116,7 +1206,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         self._refresh_plane_visibility()
         if uid is None:
             try:
-                self.plotter.render()
+                self.request_render()
             except Exception:
                 pass
             return
@@ -1137,7 +1227,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         except Exception:
             self._highlight_plane_actor = None
         try:
-            self.plotter.render()
+            self.request_render()
         except Exception:
             pass
 
@@ -1146,7 +1236,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         self._highlight_path_uid = uid
         if uid is None:
             try:
-                self.plotter.render()
+                self.request_render()
             except Exception:
                 pass
             return
@@ -1167,7 +1257,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         except Exception:
             self._highlight_path_actor = None
         try:
-            self.plotter.render()
+            self.request_render()
         except Exception:
             pass
 
@@ -1175,7 +1265,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         self._clear_fork_and_context_actors()
         if int(path_idx) < 0:
             try:
-                self.plotter.render()
+                self.request_render()
             except Exception:
                 pass
             return
@@ -1222,7 +1312,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
             except Exception:
                 self._highlight_fork_actor = None
         try:
-            self.plotter.render()
+            self.request_render()
         except Exception:
             pass
 
@@ -1448,7 +1538,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
                 lut[levels <= lo + (hi - lo) * anatomy["threshold"]] = 0
             return dict(scalars=obj.scalars, cmap=obj.cmap, clim=self._volume_scalar_range(obj, data),
                         opacity=lut, lighting=False, show_scalar_bar=False, render=False, reset_camera=False)
-        if obj.data_key == 'tke_volume':
+        if obj.data_key == 'tke_volume' and self._is_volume_object(obj):
             kwargs = metric_volume_kwargs(self.workspace, obj.data_key, self._volume_scalar_range(obj, data))
             return dict(kwargs, scalars='TKE', mapper=self._volume_mapper_name(),
                         show_scalar_bar=False, render=False, reset_camera=False)
@@ -1490,7 +1580,8 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
             category_metadata = self._segmentation_category_metadata(obj, data)
             if category_metadata is None:
                 kw["scalars"] = obj.scalars
-                kw["cmap"] = obj.cmap
+                kw["cmap"] = (metric_colormap(self.workspace, obj.data_key, obj.cmap)
+                              if obj.data_key in METRIC_DATA_KEYS else obj.cmap)
             else:
                 display_name, labels = category_metadata
                 kw["scalars"] = display_name
@@ -1521,7 +1612,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         if obj.kind.value in ("Graph", "Branch", "Flow", "Aux"):
             kw["line_width"] = obj.line_width
             kw["render_lines_as_tubes"] = True
-        if obj.data_key.startswith("pathline_") and getattr(data, "n_lines", 0) == 0:
+        if obj.data_key.startswith("pathline_") and (getattr(data, "n_lines", 0) == 0 or self.workspace.streamline_params.pathline_display_style in {"particles", "trails"}):
             kw["render_points_as_spheres"] = True
             kw["point_size"] = max(float(obj.point_size), 6.0)
         if obj.kind == ObjectKind.FLOW and use_scalars:
@@ -1541,7 +1632,8 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
             return None
         ws = self.workspace
         flow = ws.flow_raw
-        mask = ws.segmask_binary if ws.segmask_binary is not None else ws.segmask_3d
+        region = ws.streamline_params.seed_region
+        mask = (ws.segmask_binary if ws.segmask_binary is not None else ws.segmask_3d) if region == "segmentation" else (ws.pcmra_render_mask if region == "noise_free" else None)
         key = (id(flow), id(mask))
         clim = self._automatic_clim_cache.get(key)
         if clim is None:
@@ -1568,11 +1660,28 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         # flow actor, which preserves the rounded appearance without the
         # heavy CPU-side geometry expansion.
         if str(getattr(obj, "data_key", "")) == "streamlines_live":
+            if self.workspace.streamline_params.display_style == "lines":
+                return data
+            if self._streamline_interaction_preview(obj, data):
+                self._interaction_flow_uids.add(obj.uid)
+                return data
+        if str(getattr(obj, "data_key", "")).startswith("pathline_") and self.workspace.streamline_params.pathline_display_style in {"particles", "trails"}:
             return data
-        key = (str(obj.data_key), id(data), float(obj.tube_radius))
+        key = (str(obj.data_key), id(data), float(obj.tube_radius), str(obj.scalars or ""))
         cached = self._display_mesh_cache.get(key)
         if cached is None:
-            cached = data.tube(radius=float(obj.tube_radius))
+            source = data
+            if obj.data_key == "streamlines_live":
+                # Auxiliary integration/vector arrays are retained in the
+                # scientific polyline cache, not expanded onto every tube
+                # vertex. Keep only arrays needed for this actor's colors.
+                source = data.copy(deep=False)
+                for attributes in (source.point_data, source.cell_data):
+                    for name in list(attributes):
+                        if name != obj.scalars:
+                            del attributes[name]
+            cached = source.tube(radius=float(obj.tube_radius))
+            cached._flow_display_source = data
             self._display_mesh_cache[key] = cached
         return cached
 
@@ -1644,7 +1753,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
             self._active_scalar_bar_uid = None
         if render:
             try:
-                self.plotter.render()
+                self.request_render()
             except Exception:
                 pass
 
@@ -1677,6 +1786,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         self._clear_shared_scalar_bar(render=False)
         try:
             bar = self.plotter.add_scalar_bar(mapper=mapper, render=False, **self._scalar_bar_args_for_object(obj))
+            style_scalar_bar(bar)
             self._place_hud_scalar_bar(bar)
             self._active_scalar_bar_uid = obj.uid
         except Exception as e:
@@ -1684,13 +1794,14 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
             self.logger(f"Scalar bar refresh failed: {obj.name}: {type(e).__name__}: {e}")
         if render:
             try:
-                self.plotter.render()
+                self.request_render()
             except Exception:
                 pass
 
     def _voxel_centered_grid(self, values, name):
         spacing = np.asarray(self.workspace.resolution, dtype=float).reshape(-1)[:3]
-        origin = np.asarray(self.workspace.origin, dtype=float).reshape(-1)[:3] - 0.5 * spacing
+        offset = 1.0 if self.workspace.segmentation_labels_1mm is not None else 0.5
+        origin = np.asarray(self.workspace.origin, dtype=float).reshape(-1)[:3] - offset * spacing
         grid = pv.ImageData(
             dimensions=tuple((np.asarray(values.shape, dtype=int) + 2).tolist()),
             spacing=tuple(spacing.tolist()),
@@ -1703,6 +1814,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         ws = self.workspace
         t = ws.current_t
         sp = ws.resolution
+        seg_sp = ws.segmentation_spacing
         org = ws.origin
 
         if data_key.startswith("content_volume_"):
@@ -1756,17 +1868,21 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
             if seg_display is None:
                 return None
             rep_t = self._representative_phase(seg_display, t)
-            return self._cached(data_key, rep_t, lambda: build_multilabel_surface_t(seg_display, rep_t, sp, org))
+            return self._cached(data_key, rep_t, lambda: build_multilabel_surface_t(seg_display, rep_t, seg_sp, np.asarray(org)-0.5*seg_sp))
 
         if data_key == "segmask_pre_surface":
-            if ws.segmask_labels is None:
+            labels = ws.segmentation_analysis_labels
+            if labels is None:
                 return None
-            return self._cached(data_key, t, lambda: build_multilabel_surface_t(ws.segmask_labels, t, sp, org))
+            if labels.ndim == 3:
+                labels = labels[..., None]
+            phase = min(int(t), labels.shape[3]-1)
+            return self._cached(data_key, phase, lambda: build_multilabel_surface_t(labels, phase, seg_sp, np.asarray(org)-0.5*seg_sp))
 
         if data_key == "segmask_3d_surface":
-            if ws.segmask_3d is None:
+            if ws.segmentation_analysis_mask is None:
                 return None
-            return self._cached(data_key, 0, lambda: build_surface_from_mask3d(ws.segmask_3d, sp, org, smooth_iter=1000))
+            return self._cached(data_key, 0, lambda: build_cell_mask_surface(ws.segmentation_analysis_mask, seg_sp, np.asarray(org)-0.5*seg_sp, smooth_iter=1000))
 
         if data_key in {"phase_wrap_mask", "phase_wrap_count"}:
             result = getattr(ws, "phase_unwrap_result", {}) or {}
@@ -1776,14 +1892,14 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         if isinstance(data_key, str) and data_key.startswith("segmask_group_"):
             group_name = str(data_key[len("segmask_group_"):])
             group_state = ws.multilabel_groups.get(group_name, {})
-            mask = group_state.get("segmask_3d")
+            mask = group_state.get("geometry_mask_3d")
             if mask is None:
                 return None
             return self._cached(
                 data_key,
                 0,
-                lambda: build_surface_from_mask3d(
-                    np.asarray(mask, dtype=bool), sp, org, smooth_iter=1000
+                lambda: build_cell_mask_surface(
+                    np.asarray(mask, dtype=bool), seg_sp, np.asarray(org)-0.5*seg_sp, smooth_iter=1000
                 ),
             )
 
@@ -1802,7 +1918,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
                 data_key,
                 0,
                 lambda: build_surface_from_mask3d(
-                    ws.skeleton_mask, sp, org, smooth_iter=1000
+                    ws.skeleton_mask, getattr(ws, "skeleton_spacing", None) if getattr(ws, "skeleton_spacing", None) is not None else sp, org, smooth_iter=1000
                 ),
             )
 
@@ -1864,119 +1980,22 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
             return pv.PolyData(np.asarray(points, dtype=float).reshape(-1, 3))
 
         if data_key == "streamlines_live":
-            return self._get_streamline_mesh(t)
+            mesh = self._get_streamline_mesh(t)
+            minimum = float(ws.streamline_params.display_min_speed_cm_s)
+            if mesh is None or minimum == 0:
+                return mesh
+            visible = self._cached("streamline_display_speed", (id(mesh), minimum),
+                                   lambda: clip_flow_lines(mesh, minimum))
+            return visible if visible.n_points else None
 
         idx = _parse_indexed_data_key(data_key, "pathline")
         if idx is not None:
             return self._get_pathline_mesh(idx, t)
 
-        if data_key == "wss_surface_live":
-            if not ws.derived.wss_surfaces:
-                return None
-            return ws.derived.wss_surfaces[min(max(0, t), len(ws.derived.wss_surfaces) - 1)]
-
-        if data_key == "tke_volume":
-            return self._cached(data_key, t, lambda: tke_display_mesh(ws, t))
-
-        vortex_fields = {
-            "vorticity_magnitude_volume": ("vorticity_magnitude", "Vorticity Magnitude"),
-            "q_criterion_volume": ("q_criterion_array", "Q-Criterion"),
-            "swirling_strength_volume": ("swirling_strength_array", "Swirling Strength"),
-        }
-        if data_key in vortex_fields:
-            field_name, scalar_name = vortex_fields[data_key]
-            source = getattr(ws.derived, field_name, None)
-            support_source = ws.derived.vortex_support_mask
-            if source is None or support_source is None:
-                return None
-
-            def _build_vortex_t():
-                arr = np.asarray(source, dtype=np.float32)
-                tidx = min(max(0, int(t)), arr.shape[3] - 1) if arr.ndim == 4 else 0
-                vol_t = arr[..., tidx] if arr.ndim == 4 else arr
-                support = np.asarray(support_source, dtype=bool)
-                if support.ndim == 4:
-                    support_t = support[..., min(max(0, int(t)), support.shape[3] - 1)]
-                else:
-                    support_t = support
-                vol_t = np.where(support_t, vol_t, np.float32(0.0)).astype(np.float32, copy=False)
-                return self._sample_supported_surface(
-                    vol_t,
-                    support_source,
-                    tidx,
-                    sp,
-                    org,
-                    name=scalar_name,
-                    cache_key=data_key,
-                )
-
-            return self._cached(data_key, int(t), _build_vortex_t)
-
-        if data_key == "pressure_gradient_volume":
-            if ws.derived.pressure_gradient_magnitude is None:
-                return None
-            def _build_pressure_gradient_t():
-                arr = np.asarray(ws.derived.pressure_gradient_magnitude, dtype=np.float32)
-                support = ws.derived.pressure_gradient_support_mask
-                support_source = support
-                if arr.ndim == 4:
-                    tidx = min(max(0, int(t)), arr.shape[3] - 1)
-                    vol_t = arr[..., tidx]
-                    support_t = np.asarray(support[..., tidx], dtype=bool) if support is not None and np.asarray(support).ndim == 4 else None
-                else:
-                    vol_t = arr
-                    support_t = np.asarray(support, dtype=bool) if support is not None else None
-                if support_t is None:
-                    if ws.segmask_binary is not None:
-                        support_source = ws.segmask_binary
-                        if ws.segmask_binary.ndim == 4:
-                            support_t = np.asarray(ws.segmask_binary[..., min(max(0, int(t)), ws.segmask_binary.shape[3] - 1)], dtype=bool)
-                        else:
-                            support_t = np.asarray(ws.segmask_binary, dtype=bool)
-                    elif ws.segmask_3d is not None:
-                        support_source = ws.segmask_3d
-                        support_t = np.asarray(ws.segmask_3d, dtype=bool)
-                    else:
-                        support_t = np.ones(vol_t.shape, dtype=bool)
-                        support_source = support_t
-                vol_t = np.where(support_t, vol_t, 0.0)
-                return self._sample_supported_surface(
-                    vol_t, support_source, t, sp, org, name="PressureGradient"
-                )
-            return self._cached(data_key, t, _build_pressure_gradient_t)
-
-        if data_key == "relative_pressure_volume":
-            if ws.derived.relative_pressure_array is None:
-                return None
-            def _build_relative_pressure_t():
-                arr = np.asarray(ws.derived.relative_pressure_array, dtype=np.float32)
-                support = ws.derived.pressure_gradient_support_mask
-                support_source = support
-                if arr.ndim == 4:
-                    tidx = min(max(0, int(t)), arr.shape[3] - 1)
-                    vol_t = arr[..., tidx]
-                    support_t = np.asarray(support[..., tidx], dtype=bool) if support is not None and np.asarray(support).ndim == 4 else None
-                else:
-                    vol_t = arr
-                    support_t = np.asarray(support, dtype=bool) if support is not None else None
-                if support_t is None:
-                    if ws.segmask_binary is not None:
-                        support_source = ws.segmask_binary
-                        if ws.segmask_binary.ndim == 4:
-                            support_t = np.asarray(ws.segmask_binary[..., min(max(0, int(t)), ws.segmask_binary.shape[3] - 1)], dtype=bool)
-                        else:
-                            support_t = np.asarray(ws.segmask_binary, dtype=bool)
-                    elif ws.segmask_3d is not None:
-                        support_source = ws.segmask_3d
-                        support_t = np.asarray(ws.segmask_3d, dtype=bool)
-                    else:
-                        support_t = np.ones(vol_t.shape, dtype=bool)
-                        support_source = support_t
-                vol_t = np.where(support_t, vol_t, 0.0)
-                return self._sample_supported_surface(
-                    vol_t, support_source, t, sp, org, name="RelativePressure"
-                )
-            return self._cached(data_key, t, _build_relative_pressure_t)
+        if data_key in METRIC_DATA_KEYS and data_key != "streamlines_live":
+            if data_key == "tke_volume" and configured_metric_style(ws, data_key)["mode"] == "volume":
+                return self._cached(data_key, t, lambda: tke_display_mesh(ws, t))
+            return self._cached(data_key, t, lambda: metric_display_mesh(ws, data_key, t))
 
         if data_key == "derived_streamlines_live":
             if not ws.derived.streamlines:
@@ -2070,7 +2089,10 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         return None
 
     def _cached(self, data_key, t, builder):
-        key = (data_key, t)
+        ws = self.workspace
+        key = (data_key, t, int(ws.segmentation.revision), id(ws.flow_raw), id(ws.pcmra_array),
+               id(ws.derived.wss_volume), id(ws.derived.pressure_gradient_array),
+               id(ws.derived.relative_pressure_array))
         if key in self._mesh_cache:
             return self._mesh_cache[key]
         mesh = builder()
@@ -2082,14 +2104,20 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         arr = np.asarray(array)
         if arr.ndim < 4 or arr.shape[3] <= 1:
             return 0
-        key = (id(array), tuple(int(x) for x in arr.shape), arr.dtype.str)
+        key = (id(array), tuple(int(x) for x in arr.shape), arr.dtype.str,
+               int(self.workspace.segmentation.revision))
         lookup = self._phase_lookup_cache.get(key)
         if lookup is None:
             representatives = {}
             lookup = []
             for tidx in range(int(arr.shape[3])):
-                token = np.ascontiguousarray(arr[..., tidx]).tobytes()
-                rep_t = representatives.setdefault(token, int(tidx))
+                value = np.ascontiguousarray(arr[..., tidx])
+                token = hashlib.blake2b(value.view(np.uint8), digest_size=16).digest()
+                candidates = representatives.setdefault(token, [])
+                rep_t = next((index for index in candidates if np.array_equal(value, arr[..., index])), None)
+                if rep_t is None:
+                    rep_t = int(tidx)
+                    candidates.append(rep_t)
                 lookup.append(rep_t)
             self._phase_lookup_cache[key] = lookup
         return int(lookup[min(max(0, int(t)), len(lookup) - 1)])
@@ -2139,74 +2167,61 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         ws = self.workspace
         if int(plane_idx) not in ws.active_pathline_plane_indices:
             return None
-        # A pathline is the one-cycle trajectory of particles released at
-        # phase zero. Playback only reveals its cached prefix.
-        launch_time = 0
+        if not 0 <= int(plane_idx) < len(ws.planes) or ws.flow_raw is None:
+            return None
+        p = ws.streamline_params
         plane_cache = ws.pathline_cache.setdefault(int(plane_idx), {})
-        full_pathline = plane_cache.get(launch_time)
-        if full_pathline is None:
-            if ws.flow_raw is None or ws.segmask_binary is None:
-                return None
-            if plane_idx < 0 or plane_idx >= len(ws.planes):
+        launch = int(next(iter(plane_cache))) if plane_cache else (int(ws.current_t) if p.pathline_seed_region == "contour" else 0)
+        if launch not in plane_cache:
+            segmentation = ws.segmask_binary if ws.segmask_binary is not None else ws.segmask_3d
+            if p.pathline_seed_region == "segmentation" and segmentation is None:
                 return None
             plane = ws.planes[int(plane_idx)]
-            p = ws.streamline_params
-            mask_t = ws.segmask_binary[..., launch_time]
-            seed_cache = getattr(ws, "pathline_seed_cache", {})
-            seeds = seed_cache.get(int(plane_idx))
-            if seeds is None:
-                seeds = _plane_seeds(
-                    mask_t,
-                    plane,
-                    ws.resolution,
-                    ws.origin,
-                    seed_ratio=p.pathline_seed_ratio,
-                    min_seeds=p.pathline_min_seeds,
-                    max_seeds=getattr(p, "pathline_max_seeds", 250),
-                    rng_seed=p.pathline_rng_seed,
-                    branch_labels_3d=ws.branch_labels,
-                    t=launch_time,
-                    seed_mode=getattr(p, "pathline_seed_mode", "fixed"),
-                )
-                if seeds is not None:
-                    seed_cache[int(plane_idx)] = np.asarray(seeds, dtype=float)
-            full_pathline = generate_pathlines_from_plane_at_t(
-                ws.flow_raw, launch_time, plane, ws.resolution, ws.origin,
-                mask_4d=ws.segmask_binary,
-                mask_3d=mask_t,
-                max_steps=p.pathline_max_steps,
-                terminal_speed=p.pathline_terminal_speed,
-                seed_ratio=p.pathline_seed_ratio,
-                min_seeds=p.pathline_min_seeds,
-                rng_seed=p.pathline_rng_seed,
-                rr=ws.rr,
-                branch_labels_3d=ws.branch_labels,
-                max_seeds=getattr(p, "pathline_max_seeds", 250),
-                seeds=seeds,
-                seed_mode=getattr(p, "pathline_seed_mode", "fixed"),
-            )
-            plane_cache[launch_time] = full_pathline
+            seeds, roi_source = plane_seed_points(ws.flow_raw, plane, ws.resolution, ws.origin,
+                phase=launch, region=p.pathline_seed_region, segmentation=segmentation,
+                segmentation_labels=ws.segmask_labels, branch_labels=ws.branch_labels,
+                distribution=p.pathline_seed_distribution, grid_spacing_mm=p.pathline_grid_spacing_mm,
+                mode=p.pathline_seed_mode, count=p.pathline_max_seeds, ratio=p.pathline_seed_ratio,
+                min_seeds=p.pathline_min_seeds, rng_seed=p.pathline_rng_seed)
+            ws.pathline_seed_cache[int(plane_idx)] = seeds
+            domain = segmentation if p.pathline_seed_region == "segmentation" else np.ones(ws.flow_raw.shape[:3], bool)
+            mask = phase_mask(domain, ws.flow_raw.shape[:3], launch)
+            mesh = generate_pathlines_from_plane_at_t(ws.flow_raw, launch, plane, ws.resolution, ws.origin,
+                mask_4d=domain, mask_3d=mask, max_steps=p.pathline_max_steps,
+                terminal_speed=p.pathline_terminal_speed, rng_seed=p.pathline_rng_seed, rr=ws.rr,
+                seeds=seeds, max_seeds=None if p.pathline_seed_distribution == "uniform" else p.pathline_max_seeds,
+                integration_step_mm=p.pathline_integration_step_mm,
+                temporal_cache_mb=p.pathline_temporal_cache_mb)
+            if mesh is not None:
+                mesh.field_data["ROISourcePhase"] = np.asarray([-1 if roi_source is None else roi_source], np.int64)
+            plane_cache[launch] = mesh
+            ws.input_state.metadata.setdefault("flow_seed_counts", {}).setdefault("pathlines", {})[plane.plane_id] = len(seeds)
+        full = plane_cache[launch]
+        if full is None:
+            return None
+        if "PathlinePhase" not in getattr(full, "point_data", {}):
+            return full
         time_count = max(1, int(ws.time_count()))
-        progress = float(np.clip(int(t), 0, time_count - 1)) / float(max(time_count - 1, 1))
-        return self._cached(
-            f"pathline_display_{int(plane_idx)}",
-            int(t),
-            lambda: pathline_prefix_at_phase(full_pathline, progress),
-        )
+        progress = float((int(t) - launch) % time_count) / float(time_count)
+        key = (id(full), int(t), launch, p.pathline_display_style, p.pathline_trail_duration_ms,
+               p.pathline_display_min_speed_cm_s, float(ws.rr))
+        result = self._cached(f"pathline_display_{int(plane_idx)}", key,
+            lambda: pathline_display(full, progress, style=p.pathline_display_style,
+                trail_duration_ms=p.pathline_trail_duration_ms, rr_ms=ws.rr,
+                minimum_cm_s=p.pathline_display_min_speed_cm_s))
+        return result if result is not None and result.n_points else None
 
     def trigger_streamlines(self):
         ws = self.workspace
-        if ws.flow_raw is None or ws.segmask_3d is None:
-            self.logger("Cannot generate streamlines: need flow + segmask_3d")
-            return
-        ws.streamline_seeds = generate_seed_points(
-            ws.segmask_3d,
-            ws.resolution,
-            ws.origin,
-            ratio=ws.streamline_params.seed_ratio,
-            rng_seed=ws.streamline_params.rng_seed,
-            min_seeds=ws.streamline_params.min_seeds,
-        )
+        if ws.flow_raw is None:
+            self.logger("Cannot generate streamlines: need velocity data")
+            return False
+        try:
+            volume_seed_domain(ws.flow_raw, ws.streamline_params.seed_region,
+                segmentation=ws.segmask_binary, noise_keep=ws.pcmra_render_mask, phase=int(ws.current_t))
+        except ValueError as exc:
+            self.logger(str(exc)); return False
+        ws.streamline_seeds = None
         ws.streamline_cache.clear()
         ws.streamline_active = True
         p = ws.streamline_params
@@ -2214,17 +2229,18 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         self.logger(f"Streamlines enabled: seed_ratio={p.seed_ratio} max_steps={p.max_steps} min_seeds={p.min_seeds} terminal_speed={p.terminal_speed} rng_seed={p.rng_seed}")
         ws.remove_object_by_data_key("streamlines_live")
         ws.add_object(name="streamlines", kind=ObjectKind.FLOW,
-                      data_key="streamlines_live", visible=True, opacity=1.0,
+                      data_key="streamlines_live", visible=True, opacity=1.0, line_width=p.line_width,
                       scalars="Velocity", cmap="turbo", clim=render_cfg.get("streamline_clim"), dynamic=True,
                       show_scalar_bar=bool(render_cfg.get("streamline_show_scalar_bar", True)), scalar_bar_title="Velocity (m/s)",
                       scalar_bar_cfg=dict(render_cfg.get("streamline_bar_cfg", {}) or {}),
                       tube_radius=ws.streamline_params.tube_radius)
         self.sync_from_workspace()
+        return True
 
     def trigger_pathlines(self, plane_indices=None, *, precomputed=None):
         ws = self.workspace
-        if ws.flow_raw is None or ws.segmask_3d is None:
-            self.logger("Cannot generate Pathlines: need flow + segmask_3d")
+        if ws.flow_raw is None or (ws.streamline_params.pathline_seed_region == "segmentation" and ws.segmask_binary is None and ws.segmask_3d is None):
+            self.logger("Cannot generate Pathlines: need velocity and the selected seed region")
             return
         if plane_indices is None:
             plane_indices = list(range(len(ws.planes)))
@@ -2252,7 +2268,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
                 int(time_idx): mesh for time_idx, mesh in dict(time_meshes or {}).items()
             })
         p = ws.streamline_params
-        self.logger(f"Pathlines enabled for planes {valid} from t=0: seed_mode={getattr(p, 'pathline_seed_mode', 'fixed')} seed_ratio={p.pathline_seed_ratio} min_seeds={p.pathline_min_seeds} seed_count_or_limit={getattr(p, 'pathline_max_seeds', 250)} max_steps={p.pathline_max_steps} terminal_speed={p.pathline_terminal_speed} rng_seed={p.pathline_rng_seed} color_mode={getattr(p, 'pathline_color_mode', 'per_plane')}")
+        self.logger(f"Pathlines enabled for planes {valid}: region={p.pathline_seed_region} distribution={p.pathline_seed_distribution} grid_spacing_mm={p.pathline_grid_spacing_mm} color_mode={p.pathline_color_mode}")
         for plane_idx in valid:
             group_name = str(getattr(ws.planes[int(plane_idx)], "group_name", "") or "")
             if group_name:
@@ -2271,13 +2287,30 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
                 browser_color=ws.skeleton_params.browser_color_for_group(group_name) if group_name else "",
                 visible=True,
                 opacity=1.0,
-                color=ws.pathline_color_for_plane(plane_idx),
+                **pathline_color_style(ws, plane_idx),
                 dynamic=True,
-                show_scalar_bar=False,
                 tube_radius=ws.streamline_params.pathline_tube_radius,
             )
         self.invalidate_cache("pathline_")
         self.sync_from_workspace()
+
+    def apply_flow_display_settings(self):
+        """Refresh presentation while retaining the integrated trajectory caches."""
+        p = self.workspace.streamline_params
+        for obj in self.workspace.scene_objects.values():
+            if obj.data_key == "streamlines_live":
+                obj.line_width, obj.tube_radius = p.line_width, p.tube_radius
+                self.readd_object(obj, refresh_scalar_bar=False)
+            else:
+                index = _parse_indexed_data_key(obj.data_key, "pathline")
+                if index is None:
+                    continue
+                obj.tube_radius = p.pathline_tube_radius
+                for key, value in pathline_color_style(self.workspace, index).items():
+                    setattr(obj, key, value)
+                self.readd_object(obj, refresh_scalar_bar=False)
+        self._refresh_shared_scalar_bar(render=False)
+        self.request_render()
 
     def trigger_plane_streamlines(self, plane_idx):
         self.trigger_pathlines([int(plane_idx)])
@@ -2335,7 +2368,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
                 continue
             plane = self.workspace.planes[plane_idx]
             center = np.asarray(plane.center, dtype=float).reshape(3) + np.asarray(self.workspace.origin, dtype=float).reshape(3)
-            normal = np.asarray(plane.normal, dtype=float).reshape(3)
+            normal = np.asarray(plane.normal, dtype=float).reshape(3).copy()
             norm = float(np.linalg.norm(normal))
             if norm <= 1e-12:
                 continue

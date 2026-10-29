@@ -2,36 +2,13 @@
   "label_rules": {
     "AAO": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 3,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
+          "anchor": "label_branch",
+          "scope": "label",
+          "path_selection": "longest",
           "position": "fractions",
-          "fallback": {
-            "anchor": "label_level",
-            "level": 1,
-            "path_selection": "longest",
-            "position": "fractions",
-            "fractions": [
-              0.2,
-              0.5,
-              0.8
-            ]
-          },
           "fractions": [
             0.2,
             0.5,
@@ -42,93 +19,38 @@
     },
     "MPA": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 1,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "fractions",
-          "fallback": {
-            "anchor": "label_level",
-            "level": 1,
-            "path_selection": "longest",
-            "position": "fractions",
-            "fractions": [
-              0.2
-            ]
-          },
           "fractions": [
-            0.2
+            0.3
           ]
         }
       ]
     },
     "ARCH": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 0,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "near",
-          "fallback": {
-            "anchor": "label_longest",
-            "position": "fractions",
-            "fractions": [
-              0.5
-            ]
-          },
           "offset_mm": 5.0
         }
       ]
     },
     "DAO": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 3,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_longest",
+          "anchor": "label_branch",
           "scope": "label",
+          "path_selection": "longest",
           "position": "fractions",
           "fractions": [
             0.1,
@@ -140,331 +62,132 @@
     },
     "RBCT": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 1,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "near",
-          "fallback": {
-            "anchor": "label_longest",
-            "position": "fractions",
-            "fractions": [
-              0.5
-            ]
-          },
           "offset_mm": 15.0
         }
       ]
     },
     "CCA": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 1,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "near",
-          "fallback": {
-            "anchor": "label_longest",
-            "position": "fractions",
-            "fractions": [
-              0.5
-            ]
-          },
           "offset_mm": 15.0
         }
       ]
     },
     "LBCT": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 1,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "near",
-          "fallback": {
-            "anchor": "label_longest",
-            "position": "fractions",
-            "fractions": [
-              0.5
-            ]
-          },
           "offset_mm": 15.0
         }
       ]
     },
     "RPA": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 1,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
-          "position": "near",
-          "fallback": {
-            "anchor": "label_longest",
-            "position": "fractions",
-            "fractions": [
-              0.5
-            ]
-          },
-          "offset_mm": 15.0
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.3
+          ]
         }
       ]
     },
     "LPA": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 1,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
-          "position": "near",
-          "fallback": {
-            "anchor": "label_longest",
-            "position": "fractions",
-            "fractions": [
-              0.5
-            ]
-          },
-          "offset_mm": 15.0
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.3
+          ]
         }
       ]
     },
     "HA": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 0,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "near",
-          "fallback": {
-            "anchor": "label_longest",
-            "position": "fractions",
-            "fractions": [
-              0.5
-            ]
-          },
           "offset_mm": 5.0
         }
       ]
     },
     "SMA": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 0,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "near",
-          "fallback": {
-            "anchor": "label_longest",
-            "position": "fractions",
-            "fractions": [
-              0.5
-            ]
-          },
           "offset_mm": 5.0
         }
       ]
     },
     "LRA": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 3,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
+          "anchor": "label_reference_branch",
+          "path_selection": "all",
           "position": "fractions",
-          "fallback": {
-            "anchor": "label_longest",
-            "position": "fractions",
-            "fractions": [
-              0.5
-            ]
-          },
           "fractions": [
-            0.25,
-            0.5,
-            0.75
+            0.1,
+            0.3,
+            0.5
           ]
         }
       ]
     },
     "RRA": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 3,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
+          "anchor": "label_reference_branch",
+          "path_selection": "all",
           "position": "fractions",
-          "fallback": {
-            "anchor": "label_longest",
-            "position": "fractions",
-            "fractions": [
-              0.5
-            ]
-          },
           "fractions": [
-            0.25,
-            0.5,
-            0.75
+            0.1,
+            0.3,
+            0.5
           ]
         }
       ]
     },
     "PV": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 3,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
+          "anchor": "portal_branch",
+          "path_selection": "unique",
           "position": "fractions",
-          "fallback": {
-            "anchor": "label_terminal",
-            "path_selection": "longest",
-            "position": "fractions",
-            "fractions": [
-              0.2,
-              0.5,
-              0.8
-            ]
-          },
           "fractions": [
             0.2,
             0.5,
@@ -475,533 +198,239 @@
     },
     "SMV": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 1,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "near",
-          "fallback": {
-            "anchor": "label_terminal",
-            "path_selection": "longest",
-            "position": "before_end",
-            "offset_mm": 20.0
-          },
           "offset_mm": 15.0
         }
       ]
     },
     "SV": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 1,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "near",
-          "fallback": {
-            "anchor": "label_terminal",
-            "path_selection": "longest",
-            "position": "before_end",
-            "offset_mm": 20.0
-          },
           "offset_mm": 15.0
         }
       ]
     },
     "LICA": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
-      "plane_count": 1,
-      "spacing_ratio": 0.3,
+      "plane_count": 2,
       "placements": [
         {
-          "anchor": "label_connections",
-          "position": "near",
-          "fallback": {
-            "anchor": "label_level",
-            "level": 1,
-            "path_selection": "longest",
-            "position": "fractions",
-            "fractions": [
-              0.33,
-              0.66
-            ]
-          },
-          "offset_mm": 5.0
+          "anchor": "flow_inlet_branch",
+          "scope": "label",
+          "path_selection": "unique",
+          "position": "fractions",
+          "fractions": [
+            0.33,
+            0.66
+          ]
         }
       ]
     },
     "LVA": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
-      "plane_count": 1,
-      "spacing_ratio": 0.3,
+      "plane_count": 2,
       "placements": [
         {
-          "anchor": "label_connections",
-          "position": "near",
-          "fallback": {
-            "anchor": "label_level",
-            "level": 1,
-            "path_selection": "longest",
-            "position": "fractions",
-            "fractions": [
-              0.33,
-              0.66
-            ]
-          },
-          "offset_mm": 5.0
+          "anchor": "label_branch",
+          "scope": "label",
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.3,
+            0.5
+          ]
         }
       ]
     },
     "RVA": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
-      "plane_count": 1,
-      "spacing_ratio": 0.3,
+      "plane_count": 2,
       "placements": [
         {
-          "anchor": "label_connections",
-          "position": "near",
-          "fallback": {
-            "anchor": "label_level",
-            "level": 1,
-            "path_selection": "longest",
-            "position": "fractions",
-            "fractions": [
-              0.33,
-              0.66
-            ]
-          },
-          "offset_mm": 5.0
+          "anchor": "label_branch",
+          "scope": "label",
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.3,
+            0.5
+          ]
         }
       ]
     },
     "RICA": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
-      "plane_count": 1,
-      "spacing_ratio": 0.3,
+      "plane_count": 2,
       "placements": [
         {
-          "anchor": "label_connections",
-          "position": "near",
-          "fallback": {
-            "anchor": "label_level",
-            "level": 1,
-            "path_selection": "longest",
-            "position": "fractions",
-            "fractions": [
-              0.33,
-              0.66
-            ]
-          },
-          "offset_mm": 5.0
+          "anchor": "flow_inlet_branch",
+          "scope": "label",
+          "path_selection": "unique",
+          "position": "fractions",
+          "fractions": [
+            0.33,
+            0.66
+          ]
         }
       ]
     },
     "BA": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 1,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_level",
-          "level": 2,
+          "anchor": "label_branch",
+          "scope": "label",
           "path_selection": "longest",
           "position": "fractions",
           "fractions": [
             0.5
-          ],
-          "when_connected_to": [
-            "LVA",
-            "RVA"
-          ],
-          "otherwise_level": 1
+          ]
         }
       ]
     },
     "LTS": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 1,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_terminal",
-          "scope": "label",
+          "anchor": "label_reference_branch",
           "path_selection": "longest",
-          "position": "after_start",
-          "offset_mm": 20.0
+          "position": "fractions",
+          "fractions": [
+            0.1
+          ]
         }
       ]
     },
     "SSS": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 1,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_level",
-          "scope": "label",
-          "level": 1,
+          "anchor": "label_reference_branch",
           "path_selection": "longest",
-          "position": "before_end",
-          "offset_mm": 20.0
+          "position": "fractions",
+          "fractions": [
+            0.1
+          ]
         }
       ]
     },
     "RTS": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 1,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_terminal",
-          "scope": "label",
+          "anchor": "label_reference_branch",
           "path_selection": "longest",
-          "position": "after_start",
-          "offset_mm": 20.0
+          "position": "fractions",
+          "fractions": [
+            0.1
+          ]
         }
       ]
     },
     "StrS": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 1,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_terminal",
-          "scope": "label",
+          "anchor": "label_reference_branch",
           "path_selection": "longest",
-          "position": "after_start",
-          "offset_mm": 20.0
+          "position": "fractions",
+          "fractions": [
+            0.1
+          ]
         }
       ]
     },
     "LPCA": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 1,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
-          "position": "near",
-          "fallback": {
-            "anchor": "label_longest",
-            "position": "fractions",
-            "fractions": [
-              0.5
-            ]
-          },
-          "offset_mm": 5.0
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.1
+          ]
         }
       ]
     },
     "RPCA": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 1,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
-          "position": "near",
-          "fallback": {
-            "anchor": "label_longest",
-            "position": "fractions",
-            "fractions": [
-              0.5
-            ]
-          },
-          "offset_mm": 5.0
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.1
+          ]
         }
       ]
     },
     "LMCA": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 1,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
-          "position": "near",
-          "fallback": {
-            "anchor": "label_level",
-            "level": 1,
-            "path_selection": "longest",
-            "position": "fractions",
-            "fractions": [
-              0.5
-            ]
-          },
-          "offset_mm": 5.0
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.1
+          ]
         }
       ]
     },
     "RMCA": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 1,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
-          "position": "near",
-          "fallback": {
-            "anchor": "label_level",
-            "level": 1,
-            "path_selection": "longest",
-            "position": "fractions",
-            "fractions": [
-              0.5
-            ]
-          },
-          "offset_mm": 5.0
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.1
+          ]
         }
       ]
     },
     "ACA": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 1,
-      "spacing_ratio": 0.3,
       "placements": [
         {
-          "anchor": "label_connections",
-          "position": "near",
-          "fallback": {
-            "anchor": "label_longest",
-            "position": "fractions",
-            "fractions": [
-              0.5
-            ]
-          },
-          "offset_mm": 5.0
+          "anchor": "label_reference_branch",
+          "path_selection": "all",
+          "position": "fractions",
+          "fractions": [
+            0.1
+          ]
         }
       ]
     },
     "LIJV": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 2,
-      "spacing_ratio": 0.3333333333333333,
       "placements": [
         {
-          "anchor": "label_terminal",
+          "anchor": "label_branch",
           "scope": "label",
           "path_selection": "longest",
           "position": "fractions",
@@ -1014,24 +443,10 @@
     },
     "RIJV": {
       "plane_mode": "landmark",
-      "cross_section_distance": 5.0,
-      "start_distance": 0.0,
-      "end_distance": 0.0,
-      "anchor": "center",
-      "anchor_offset_mm": 5.0,
-      "direction": "both",
-      "spacing_mode": "fraction",
-      "segmentation_filter": null,
-      "fov_boundary_filter": null,
-      "fov_boundary_max_fraction": null,
-      "smoothing_window": null,
-      "smoothing_polyorder": null,
-      "inter_time": null,
       "plane_count": 2,
-      "spacing_ratio": 0.3333333333333333,
       "placements": [
         {
-          "anchor": "label_terminal",
+          "anchor": "label_branch",
           "scope": "label",
           "path_selection": "longest",
           "position": "fractions",

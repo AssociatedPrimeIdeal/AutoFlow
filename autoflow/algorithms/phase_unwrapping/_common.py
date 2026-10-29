@@ -27,11 +27,23 @@ def total_field_correction(to_unwrap, mask):
     if to_unwrap.shape != mask.shape:
         raise ValueError("Input array and mask have different shapes.")
 
-    energy = np.sum(to_unwrap * mask, axis=(0, 1, 2))
-    n_voxels = int(len(np.argwhere(mask)) / mask.shape[-1])
-    unwrap_energy = np.unwrap(energy, discont=np.pi * n_voxels, period=2 * np.pi * n_voxels)
-    n_wraps = np.round((unwrap_energy - energy) / (2 * np.pi * n_voxels))
-    return to_unwrap + n_wraps * np.pi * 2
+    # Normalize each phase by its own support. A changing 4D mask must not
+    # turn a constant phase into a spurious whole-cycle shift. Empty phases
+    # split the temporal alignment rather than being treated as zero phase.
+    values = np.asarray(to_unwrap)
+    weights = np.asarray(mask, dtype=np.float64)
+    valid = (weights > 0) & np.isfinite(weights) & np.isfinite(values)
+    weights = np.where(valid, weights, 0.0)
+    counts = np.sum(weights, axis=(0, 1, 2))
+    energy = np.sum(np.where(valid, values, 0.0) * weights, axis=(0, 1, 2))
+    means = np.divide(energy, counts, out=np.zeros_like(energy), where=counts > 0)
+    shifts = np.zeros(values.shape[-1], dtype=np.float64)
+    indices = np.flatnonzero(counts > 0)
+    for segment in np.split(indices, np.flatnonzero(np.diff(indices) != 1) + 1):
+        if segment.size:
+            aligned = np.unwrap(means[segment], discont=np.pi, period=2 * np.pi)
+            shifts[segment] = np.rint((aligned - means[segment]) / (2 * np.pi))
+    return values + shifts * np.pi * 2
 
 
 def _backend_spacing(value) -> tuple[float, float, float]:

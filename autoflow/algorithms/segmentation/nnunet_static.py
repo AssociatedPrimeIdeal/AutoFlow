@@ -352,4 +352,6 @@ def generate_nnunet_auto_segmentation(
             "prediction_file": "" if artifact_prediction_path is None else str(artifact_prediction_path),
             "elapsed_sec": float(elapsed_total),
         }
+        from .model_grid import collect_geometry_cache
+        provenance.update(collect_geometry_cache([prediction_path], seg_4d, resolution, origin, label_map, artifact_prefix))
         return seg_4d, provenance

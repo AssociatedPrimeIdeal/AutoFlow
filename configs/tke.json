@@ -1,6 +1,6 @@
 {
   "render": {
-    "cmap": "inferno",
+    "cmap": "plasma",
     "opacity": 1.0,
     "clim": [
       0.0,
@@ -38,6 +38,8 @@
       "blending": "composite",
       "interpolation": "linear",
       "opacity_unit_distance_scale": 1.0
-    }
+    },
+    "color_gamma": 0.55,
+    "mode": "surface"
   }
 }

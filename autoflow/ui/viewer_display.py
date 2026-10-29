@@ -32,8 +32,15 @@ class OrthoDisplayMixin:
         self._linking_views = False
 
     def display_state(self, name=None):
-        return view_display(self.workspace.render_settings.get("viewer_display", {}), name,
-                            self.combo_content.currentData() if hasattr(self, "combo_content") else None)
+        content = self.combo_content.currentData() if hasattr(self, "combo_content") else None
+        cache = getattr(self, "_refresh_display_states", None)
+        key = (name, content)
+        if cache is not None and key in cache:
+            return cache[key]
+        state = view_display(self.workspace.render_settings.get("viewer_display", {}), name, content)
+        if cache is not None:
+            cache[key] = state
+        return state
 
     def open_display_settings(self):
         if self._display_dock is None:
@@ -53,11 +60,18 @@ class OrthoDisplayMixin:
 
     def _sync_display_panel(self):
         if self._display_panel is not None:
-            self._display_panel.set_state(
-                self.workspace.render_settings.get("viewer_display", {}), self.combo_content.currentData(),
-                has_magnitude=self.workspace.mag_raw is not None, has_pcmra=self.workspace.pcmra_array is not None,
-                has_noise=self.workspace.pcmra_render_mask is not None, has_flow=self.workspace.flow_raw is not None,
-            )
+            ws = self.workspace
+            state = ws.render_settings.get("viewer_display", {})
+            signature = (id(ws), id(self._display_panel), self.combo_content.currentData(),
+                         ws.mag_raw is not None, ws.pcmra_array is not None,
+                         ws.pcmra_render_mask is not None, ws.flow_raw is not None)
+            if (getattr(self, "_display_panel_signature", None) == signature
+                    and getattr(self, "_display_panel_snapshot", None) == state):
+                return
+            self._display_panel.set_state(state, signature[2], has_magnitude=signature[3],
+                has_pcmra=signature[4], has_noise=signature[5], has_flow=signature[6])
+            self._display_panel_signature = signature
+            self._display_panel_snapshot = copy.deepcopy(state)
 
     def apply_display_settings(self, state):
         previous = self.display_state()
@@ -193,6 +207,19 @@ class OrthoDisplayMixin:
         view = self.slice_views[name]
         cfg = self.display_state(name)
         guides = cfg["guides"]
+        # Image pixels and contour objects may change independently of style.
+        # Reuse pens/LUTs when only the cardiac phase advances.
+        cmap = self._current_cmap if cfg["image"]["cmap"] == "auto" else cfg["image"]["cmap"]
+        key = (tuple(sorted(guides.items())), cfg["view"]["background"], cfg["image"]["interpolation"],
+               cmap, tuple(sorted(cfg["noise"].items())), tuple(sorted(cfg["contours"].items())),
+               tuple(view.contour_items))
+        if not guides["plane_intersection"]:
+            view.plane_line.hide()
+        if not cfg["noise"].get("visible", self._noise_overlay_visible):
+            view.noise_overlay_item.hide()
+        view.set_colormap(make_colormap(cmap))
+        if getattr(view, "_presentation_style_key", None) == key:
+            return
         view.plot.setBackground(cfg["view"]["background"])
         for line in (view.vertical_line, view.horizontal_line):
             line.setVisible(guides["crosshairs"])
@@ -204,8 +231,6 @@ class OrthoDisplayMixin:
             view.plane_line.hide()
         view.image_item.smooth = cfg["image"]["interpolation"] == "linear"
         view.image_item.update()
-        cmap = self._current_cmap if cfg["image"]["cmap"] == "auto" else cfg["image"]["cmap"]
-        view.image_item.setLookupTable(make_colormap(cmap).getLookupTable(nPts=256, alpha=True))
         view.noise_overlay_item.setOpacity(cfg["noise"].get("opacity", self._noise_overlay_opacity))
         if not cfg["noise"].get("visible", self._noise_overlay_visible):
             view.noise_overlay_item.hide()
@@ -215,6 +240,13 @@ class OrthoDisplayMixin:
                                 style=QtCore.Qt.DashLine if cfg["contours"]["dashed"] else QtCore.Qt.SolidLine))
             item.setOpacity(cfg["contours"]["opacity"])
             item.setVisible(cfg["contours"]["visible"])
+        view._presentation_style_key = key
+
+    def _style_colorbar_axis(self, axis):
+        axis.setStyle(tickFont=self._display_axis_font, tickLength=0, tickTextOffset=7)
+        axis.setPen(pg.mkPen(None))
+        axis.setTextPen(pg.mkPen("#b8c2d0"))
+        axis.label.setFont(self._display_axis_font)
 
     def _sync_velocity_colorbars(self):
         specs = []
@@ -222,8 +254,9 @@ class OrthoDisplayMixin:
         font_size = cfg["colorbars"]["font_size"]
         if getattr(self, "_display_font_size", None) != font_size:
             self._display_font_size = font_size
-            self._display_axis_font = QtGui.QFont("DejaVu Sans", font_size)
-            self.colorbar_item.axis.setStyle(tickFont=self._display_axis_font)
+            self._display_axis_font = QtGui.QFont(QtWidgets.QApplication.font())
+            self._display_axis_font.setPointSize(font_size)
+            self._style_colorbar_axis(self.colorbar_item.axis)
         for name, view in self.slice_views.items():
             state = self.display_state(name)
             if not state["colorbars"]["velocity"]:
@@ -253,16 +286,19 @@ class OrthoDisplayMixin:
                 bar = pg.ColorBarItem(values=clim, width=cfg["colorbars"]["width"], colorMap=make_colormap(cmap),
                                      interactive=False, orientation="horizontal")
                 bar.axis.setLabel("Total speed (cm/s)" if quantity == "total" else "In-plane speed (cm/s)")
-                bar.axis.setStyle(tickFont=self._display_axis_font)
+                self._style_colorbar_axis(bar.axis)
                 widget.addItem(bar)
                 self._velocity_colorbar_layout.addWidget(widget, index // 2, index % 2)
                 self._velocity_bars.append(widget)
             self._velocity_bar_specs = specs
         self.colorbar_widget.setVisible(cfg["colorbars"]["background"] and self._current_volume is not None and self._maximized_view is None)
-        self.colorbar_item.layout.setColumnFixedWidth(1, cfg["colorbars"]["width"])
-        self.colorbar_widget.setFixedWidth(cfg["colorbars"]["width"] + max(64, font_size * 6))
-        self.label_value.setVisible(cfg["guides"]["values"])
-        self.label_plane_metric.setVisible(cfg["guides"]["values"])
+        layout_key = (cfg["colorbars"]["width"], font_size, cfg["guides"]["values"])
+        if getattr(self, "_colorbar_layout_key", None) != layout_key:
+            self._colorbar_layout_key = layout_key
+            self.colorbar_item.layout.setColumnFixedWidth(1, cfg["colorbars"]["width"])
+            self.colorbar_widget.setFixedWidth(cfg["colorbars"]["width"] + max(64, font_size * 6))
+            self.label_value.setVisible(cfg["guides"]["values"])
+            self.label_plane_metric.setVisible(cfg["guides"]["values"])
         self._sync_display_panel()
 
     def _link_slice_range(self, name):

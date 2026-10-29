@@ -1,3 +1,4 @@
+from .core.plane_state import ensure_plane_identity
 import json
 import os
 
@@ -172,7 +173,9 @@ def _plane_record(ws, plane_index, label_volume=None, path_info=None):
     plane = ws.planes[int(plane_index)]
     center_local = np.asarray(plane.center, dtype=float).reshape(3)
     record = {
+        **ensure_plane_identity(plane),
         "plane_index": int(plane_index),
+        "schema_version": 2,
         "center": center_local.tolist(),
         "center_world": (center_local + origin).tolist(),
         "normal": _normalize(plane.normal).tolist(),
@@ -188,7 +191,9 @@ def _plane_record(ws, plane_index, label_volume=None, path_info=None):
         "placement_mode": "manual" if int(plane.path_index) < 0 else "path",
     }
     if plane.metrics:
-        record.update(_json_safe(plane.metrics))
+        # Old measurements must never overwrite the current edited geometry.
+        reserved = set(record)
+        record.update({key: value for key, value in _json_safe(plane.metrics).items() if key not in reserved})
     if path_info is None:
         path_info = list(getattr(ws, "path_info", []) or [])
     if 0 <= int(plane.path_index) < len(path_info):
@@ -279,6 +284,7 @@ def _make_plane_payload(ws, source_path="", plane_indices=None):
         plane = ws.planes[int(i)]
         center_local = np.asarray(plane.center, dtype=float).reshape(3)
         item = {
+            **ensure_plane_identity(plane),
             "plane_index": int(i),
             "center": center_local.tolist(),
             "center_local_mm": center_local.tolist(),
@@ -307,16 +313,16 @@ def save_plane_positions(ws, out_path, source_path="", plane_indices=None):
     parent = os.path.dirname(os.path.abspath(out_path))
     if parent:
         os.makedirs(parent, exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    from .core.output import atomic_json_write
+    atomic_json_write(out_path, payload)
     return out_path
 
 
 def save_planes_json(ws, out_path, source_path="", payload=None):
     if payload is None:
         payload = build_plane_records(ws)
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    from .core.output import atomic_json_write
+    atomic_json_write(out_path, payload)
     return out_path
 
 
@@ -388,6 +394,7 @@ def save_planes_h5(ws, out_path, source_path="", payload=None):
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with h5py.File(out_path, "w") as h5:
         h5.attrs["schema"] = "autoflow.planes.v1"
+        h5.attrs["schema_version"] = 2
         h5.attrs["source"] = str(source_path or "")
         h5.attrs["source_format"] = str(getattr(getattr(ws, "input_state", None), "source_format", "") or "")
         h5.attrs["origin"] = np.asarray(ws.origin, dtype=float).reshape(3)
@@ -633,6 +640,9 @@ def project_planes_to_workspace(plane_items, ws, mapping_mode="world", return_re
         group_name = str(item.get("group_name", "") or "")
         planes.append(
             PlaneData(
+                plane_id=item.get("plane_id", ""),
+                geometry_revision=int(item.get("geometry_revision", 0)),
+                roi_revision=int(item.get("roi_revision", 0)),
                 center=center_world - origin,
                 normal=_normalize(normal),
                 label=int(item.get("label", int(path_index) + 1)),

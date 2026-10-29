@@ -10,6 +10,7 @@ import networkx as nx
 import numpy as np
 
 from .planes import _build_plane, _sample_path_labels
+from .placement_warnings import placement_warning_codes
 
 
 PATTERNS = {
@@ -24,7 +25,8 @@ PATTERNS = {
 
 
 class ConnectionGraph:
-    def __init__(self, paths, candidates, infos, label_map):
+    def __init__(self, paths, candidates, infos, label_map, *, segmentation_labels=None,
+                 spacing=(1, 1, 1), origin=(0, 0, 0), radius_contexts=None):
         self.paths, self.infos, self.labels = paths, list(infos or []), dict(label_map or {})
         self.graph, self.edges, self.spans = nx.MultiGraph(), {}, {}
         self.cums = [np.r_[0., np.cumsum(np.linalg.norm(np.diff(p, axis=0), axis=1))] for p in paths]
@@ -48,6 +50,22 @@ class ConnectionGraph:
             for node in nodes:
                 self.components[node] = component
         self.cache = {}
+        self.trunk_spacing = np.asarray(spacing, dtype=float)
+        self.trunk_radius_contexts = radius_contexts
+        self.trunk_segmentation = segmentation_labels
+        self.trunk_origin = origin
+        self._trunk_radius_context = None
+
+    def trunk_radii(self, index, points):
+        context = (self.trunk_radius_contexts[index] if self.trunk_radius_contexts is not None
+                   and index < len(self.trunk_radius_contexts) else None)
+        if context is None and self.trunk_segmentation is not None:
+            if self._trunk_radius_context is None:
+                from .path_smoothing import PathSmoothingContext
+                self._trunk_radius_context = PathSmoothingContext(np.asarray(self.trunk_segmentation)>0,
+                    self.trunk_spacing, self.trunk_origin)
+            context = self._trunk_radius_context
+        return np.ones(len(points)) if context is None else context.radii(points)
 
     def observed_connections(self):
         """All actual cross-label arms; labels are never anatomy templates."""
@@ -87,6 +105,8 @@ class ConnectionGraph:
                     continue
                 level = max(levels)
             neighbours = set()
+            condition_satisfied = None
+            required = set()
             if spec.get("when_connected_to"):
                 for event in self.observed_connections()[0]:
                     for span, _ in event["selected"].get(value, []):
@@ -94,7 +114,8 @@ class ConnectionGraph:
                             neighbours.update(event["labels"])
                 required = {int(self.labels.get(token, int(token) if token.isdigit() else 0))
                             for token in spec["when_connected_to"]}
-                if not required <= neighbours:
+                condition_satisfied = required <= neighbours
+                if not condition_satisfied:
                     level = spec["otherwise_level"] - 1
             eligible = [(span, hierarchy) for span, hierarchy in rows if level is None or
                         hierarchy.get("label_local_levels", {}).get(str(value)) == level]
@@ -117,7 +138,10 @@ class ConnectionGraph:
                                    "label_level": None if level is None else level + 1,
                                    "component_index": component, "selection_scope":spec.get("scope","component"),
                                    "connected_labels": sorted(neighbours),
-                                   "conditional_level": bool(spec.get("when_connected_to"))})
+                                   "conditional_level": bool(spec.get("when_connected_to")),
+                                   "conditional_level_fallback": condition_satisfied is False,
+                                   "requested_label_level": spec.get("level"),
+                                   "missing_connected_labels": sorted(required - neighbours)})
         return selections, (omissions[0] if omissions else "" if selections else "no_label_path")
 
     def connection_choices(self, name, spec):
@@ -131,17 +155,7 @@ class ConnectionGraph:
                     "boundary_path_indices": sorted({row["path_index"] for row in event["boundary_ports"]}),
                     "connection_id": event["event_id"], "connection_kind": event["kind"],
                     "connected_labels": event["labels"], "connection_side": bool(reverse)})
-        connected = {self.choice_component(choice) for choice in selections}
-        fallback = spec.get("fallback")
-        reason = ""
-        components = {self.components[self.edges[index][0]] for index, label in self.spans
-                      if label == value and index in self.edges}
-        if fallback and components - connected:
-            choices, reason = self.resolve(name, dict(fallback, _components=components - connected))
-            for choice in choices:
-                if self.choice_component(choice) not in connected:
-                    selections.append(dict(choice, placement_spec=fallback, connection_fallback=True))
-        return selections, reason if reason else ("" if selections else "label_connection_not_found")
+        return selections, "" if selections else "label_connection_not_found"
 
     def boundary(self, nodes):
         nodes = set(nodes)
@@ -278,6 +292,16 @@ class ConnectionGraph:
 
     def resolve(self, name, spec):
         anchor = spec["anchor"]
+        from .label_branches import BRANCH_ANCHORS, LabelBranches
+        if anchor in BRANCH_ANCHORS:
+            if 'label_branches' not in self.cache:
+                self.cache['label_branches'] = LabelBranches(self)
+            return self.cache['label_branches'].resolve(name, spec)
+        if anchor in {"label_trunk", "label_reference"}:
+            from .label_trunks import LabelTrunks
+            if 'continuous_trunks' not in self.cache:
+                self.cache['continuous_trunks'] = LabelTrunks(self)
+            return self.cache['continuous_trunks'].resolve(name, spec)
         if anchor == "label_connections":
             return self.connection_choices(name, spec)
         if anchor == "label_longest" or (anchor in {"label_level","label_terminal"} and
@@ -388,22 +412,38 @@ class ConnectionGraph:
 
 
 def generate_landmark_label_planes(context, name, value, rule, smooth_paths, segmentation_labels, spacing,
-                                   qc, path_qc, *, origin=(0, 0, 0), mask4d=None, branch_labels=None, filter_defaults=None):
+                                   qc, path_qc, *, origin=(0, 0, 0), mask4d=None, branch_labels=None, filter_defaults=None,
+                                   support_cache=None):
     """Resolve each declarative position, recording all omissions and provenance."""
     output, seen = [], set()
     anchors = {spec["anchor"] for spec in rule["placements"]}
-    source = ("observed_label_connections" if "label_connections" in anchors else
+    from .label_branches import BRANCH_ANCHORS
+    source = ("single_label_branches" if anchors <= BRANCH_ANCHORS else
+              "continuous_label_trunks" if anchors <= {"label_trunk", "label_reference"} else
+              "observed_label_connections" if "label_connections" in anchors else
               "label_path_properties" if anchors <= {"label_level", "label_longest", "label_terminal"}
               else "anatomical_landmarks")
-    qc.update(status="selected", selection_source=source, selection_warnings=[],
+    qc.update(status="selected", selection_source=source, selection_warnings=[], placement_warnings=[],
               main_path="landmark", selected_main_paths=[], main_path_count=0, placements=[])
     filter_defaults = dict(filter_defaults or {})
-    support_cache = {}
+    support_cache = {} if support_cache is None else support_cache
     for placement_index, spec in enumerate(rule["placements"]):
         selections, reason = context.resolve(name, spec)
         count = len(spec["fractions"]) if spec["position"] == "fractions" else 1
         placement_qc = {"placement_index": placement_index, "spec": spec, "status": "resolved" if selections else "omitted",
                         "reason": reason, "resolved_count": len(selections)}
+        if spec["anchor"] in {"label_trunk","label_reference"}:
+            placement_qc["trunk_selection"] = list(context.cache['continuous_trunks'].audit)
+            if reason and selections:
+                missing = sum(row.get('failed_components',0) for row in placement_qc['trunk_selection']) or 1
+                qc["requested_plane_count"] += count*missing
+                qc.setdefault("omitted_positions", []).append({"reason":reason,"placement_index":placement_index})
+        if spec["anchor"] in BRANCH_ANCHORS:
+            placement_qc["branch_selection"] = list(context.cache['label_branches'].audit)
+            if reason and selections:
+                missing = sum(row.get('failed_origins',0) for row in placement_qc['branch_selection']) or 1
+                qc["requested_plane_count"] += count*missing
+                qc.setdefault("omitted_positions", []).append({"reason":reason,"placement_index":placement_index})
         qc["placements"].append(placement_qc)
         if not selections:
             qc["requested_plane_count"] += count
@@ -415,6 +455,10 @@ def generate_landmark_label_planes(context, name, value, rule, smooth_paths, seg
             continue
         requested_spec = spec
         for selection in selections:
+            if selection.get("connection_fallback"):
+                qc["placement_warnings"].append("connection_anchor_fallback")
+            if selection.get("conditional_level_fallback"):
+                qc["placement_warnings"].append("conditional_level_fallback")
             spec = selection.get("placement_spec", requested_spec)
             count = len(spec["fractions"]) if spec["position"] == "fractions" else 1
             qc["requested_plane_count"] += count
@@ -431,19 +475,26 @@ def generate_landmark_label_planes(context, name, value, rule, smooth_paths, seg
             if not spans or total <= 1e-8:
                 qc.setdefault("omitted_positions", []).append({"reason": "empty_landmark_interval", "placement_index": placement_index})
                 continue
-            if spec["position"] in {"before_end","after_start"} and any(
+            if (spec["position"] in {"before_end","after_start"} or spec.get("fraction_reference")) and any(
                     arm["path_index"] >= len(context.infos) or
                     context.infos[arm["path_index"]].get("hierarchy",{}).get("flow_sign") not in (-1,1)
                     for arm in spans):
                 qc.setdefault("omitted_positions", []).append({"reason":"flow_direction_unavailable",
                     "placement_index":placement_index,"anchor":spec["anchor"]})
                 continue
-            short = spec["position"] in {"near","before_end","after_start"} and total < 2 * float(spec.get("offset_mm", 5.))
-            distances = [total * fraction for fraction in spec["fractions"]] if spec["position"] == "fractions" else [
+            offset = float(spec.get("offset_mm", 5.))
+            if spec["position"] in {"near", "before_end", "after_start"} and total + 1e-8 < offset:
+                qc.setdefault("omitted_positions", []).append({"reason": "offset_exceeds_interval",
+                    "placement_index": placement_index, "anchor": spec["anchor"],
+                    "requested_offset_mm": offset, "interval_length_mm": float(total)})
+                continue
+            short = False
+            distances = [total * (1 - fraction if spec.get("fraction_reference") == "flow_end" else fraction)
+                         for fraction in spec["fractions"]] if spec["position"] == "fractions" else [
                 total / 2 if short else total-float(spec.get("offset_mm",5.)) if spec["position"]=="before_end"
                 else float(spec.get("offset_mm", 5.))]
             for nominal in distances:
-                # Search from the nominal position into the SAME label interval.
+                # Validate the declared position without moving it to a substitute.
                 arm, local = spans[-1], nominal
                 for candidate in spans:
                     arm = candidate
@@ -461,15 +512,6 @@ def generate_landmark_label_planes(context, name, value, rule, smooth_paths, seg
                     "main_path_index": main_index, "placement_index": placement_index, "anchor": spec["anchor"]})
                 step = .5 * float(np.min(spacing))
                 trials = [local]
-                if spec["position"] in {"near","after_start"}:
-                    trials.extend(np.arange(local + step, arm["length"] - .5 * step, step).tolist())
-                elif spec["position"] == "before_end":
-                    trials.extend(np.arange(local-step,.5*step,-step).tolist())
-                else:
-                    # Fractions keep their nominal coordinate unless geometry
-                    # rejects it; search nearest alternatives without crossing a fork.
-                    for delta in np.arange(step, arm["length"], step):
-                        trials.extend(x for x in (local - delta, local + delta) if 0 < x < arm["length"])
                 accepted, failure = None, "center_outside_label"
                 for distance in trials:
                     target = arm["cumulative"][arm["hi"]] - distance if arm["reverse"] else arm["cumulative"][arm["lo"]] + distance
@@ -491,7 +533,8 @@ def generate_landmark_label_planes(context, name, value, rule, smooth_paths, seg
                         kept, reports = filter_planes_by_branch_support([plane], mask4d, spacing, origin,
                             branch_labels_3d=branch_labels, segmentation_labels_3d=segmentation_labels,
                             support_cache=support_cache, check_branch_support=check,
-                            fov_boundary_max_fraction=fraction if enabled else None)
+                            fov_boundary_max_fraction=fraction if enabled else None,
+                            voxel_centered=bool(filter_defaults.get('voxel_centered', False)))
                         if not kept or (check and reports[0].get("max_cell_count", 1) == 0):
                             failure = reports[0].get("reason") or "no_label_section"
                             continue
@@ -511,23 +554,43 @@ def generate_landmark_label_planes(context, name, value, rule, smooth_paths, seg
                         "label_interval_mm": [float(arm["cumulative"][arm["lo"]]), float(arm["cumulative"][arm["hi"]])],
                         "nominal_distance_in_interval_mm": float(local), "distance_in_interval_mm": float(distance),
                         "search_shift_mm": float(distance - local), "short_interval_midpoint": bool(short),
+                        **({"trunk_placement_length_mm":float(total),"trunk_target_distance_mm":float(nominal)}
+                           if selection.get('trunk_route_schema') else {}),
                         "direction_status": hierarchy.get("direction_status", "unavailable"),
                         "label_level": selection.get("label_level"),
-                        "selection_scope":selection.get("selection_scope", "component")}
+                        "selection_scope":selection.get("selection_scope", "component"),
+                        "conditional_level_fallback": bool(selection.get("conditional_level_fallback")),
+                        "requested_label_level": selection.get("requested_label_level"),
+                        "missing_connected_labels": selection.get("missing_connected_labels", [])}
                     if spec["position"] in {"near","before_end","after_start"}:
                         plane.placement.update(requested_offset_mm=float(spec.get("offset_mm",5.)),
                             offset_reference=("flow_end" if spec["position"]=="before_end" else
                                               "flow_start" if spec["position"]=="after_start" else "anchor_side"))
                     if "path_selection" in selection:
                         plane.placement.update(path_selection=selection["path_selection"],
-                                               paths_at_level=selection["paths_at_level"])
+                                               paths_at_level=selection.get("paths_at_level", []))
+                    if selection.get('trunk_route_schema'):
+                        plane.placement.update({key: value for key, value in selection.items()
+                            if key.startswith('trunk_') or key in {'reference_labels', 'connected_labels',
+                                'connection_id', 'connection_kind', 'selection_source', 'reference_component_extent_mm'}})
+                    if selection.get('branch_route_schema'):
+                        plane.placement.update({key:value for key,value in selection.items()
+                            if key.startswith('branch_') or key in {'connection_id','connection_kind','connected_labels',
+                                'selection_source','matched_arms','reference_labels'}})
+                        plane.placement.update(branch_placement_length_mm=float(total),
+                            branch_target_distance_mm=float(nominal))
                     if requested_spec["anchor"] == "label_connections" or requested_spec.get("when_connected_to"):
                         plane.placement.update(schema="autoflow.label_connection_placement.v1",
                             requested_anchor=requested_spec["anchor"], connection_fallback=bool(selection.get("connection_fallback")),
                             connection_id=selection.get("connection_id"), connection_kind=selection.get("connection_kind"),
                             connected_labels=selection.get("connected_labels", []), near_end=bool(arm["reverse"]))
                     if spec["position"] == "fractions":
-                        plane.placement["fraction"] = float(nominal / total)
+                        plane.placement["fraction"] = float(1 - nominal / total if
+                            spec.get("fraction_reference") == "flow_end" else nominal / total)
+                        if spec.get("fraction_reference"):
+                            plane.placement["fraction_reference"] = spec["fraction_reference"]
+                    plane.placement["warnings"] = placement_warning_codes(plane.placement)
+                    qc["placement_warnings"].extend(plane.placement["warnings"])
                     plane._label_plane_rule, plane._main_path_index = rule, main_index
                     plane._main_path_fraction = float(distance / arm["length"])
                     accepted = plane
@@ -541,5 +604,8 @@ def generate_landmark_label_planes(context, name, value, rule, smooth_paths, seg
                     record["placement"] = accepted.placement
     qc["main_path_count"] = len(qc["selected_main_paths"])
     qc["actual_plane_count"] = len(output)
+    if len(output) != qc["requested_plane_count"]:
+        qc["status"] = "error"
     qc["selection_warnings"] = sorted(set(qc["selection_warnings"]))
+    qc["placement_warnings"] = sorted(set(qc["placement_warnings"]))
     return output

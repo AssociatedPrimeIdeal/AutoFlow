@@ -46,17 +46,27 @@ def merge_segmask_to_3d(segmask_binary_4d):
 
 
 def majority_vote_labels_3d(segmask_labels):
+    """Per-voxel mode with lowest-label ties and bounded spatial working memory.
+
+    Stream the sorted label counts instead of retaining an X*Y*Z*labels
+    count stack. Strict greater-than updates preserve the first (lowest) label
+    on ties, including background, exactly as the former argmax implementation.
+    """
     seg = np.asarray(segmask_labels, dtype=np.int16)
     if seg.ndim == 3:
         return seg.copy()
     if seg.ndim != 4:
-        raise ValueError(f"segmentation labels must be 3D or 4D, got {seg.shape}")
-    labels = [int(x) for x in np.unique(seg)]
-    counts = np.stack([(seg == int(label_value)).sum(axis=3) for label_value in labels], axis=-1)
-    winners = np.argmax(counts, axis=-1)
-    out = np.zeros(seg.shape[:3], dtype=np.int16)
-    for idx, label_value in enumerate(labels):
-        out[winners == idx] = int(label_value)
+        raise ValueError(f'segmentation labels must be 3D or 4D, got {seg.shape}')
+    labels = np.unique(seg)
+    if not len(labels):
+        raise ValueError('need at least one array to stack')
+    out = np.full(seg.shape[:3], labels[0], dtype=np.int16)
+    best = np.sum(seg == labels[0], axis=3)
+    for value in labels[1:]:
+        counts = np.sum(seg == value, axis=3)
+        wins = counts > best
+        out[wins] = value
+        np.maximum(best, counts, out=best)
     return out
 
 
@@ -108,16 +118,15 @@ def component_volume_threshold_mm3(mask_3d, resolution, mode="absolute", min_vol
     return float(abs_min)
 
 
-def filter_connected_components(mask_3d, resolution, mode="absolute", min_volume_mm3=50.0, rel_min_ratio=0.01, connectivity=1):
-    m = np.asarray(mask_3d, dtype=bool)
-    if m.ndim != 3:
-        raise ValueError(f"connected-component filtering expects a 3D mask, got {m.shape}")
-    lab, counts = _component_counts(m, connectivity=connectivity)
+def _component_keep_mask(counts, resolution, mode="absolute", min_volume_mm3=50.0, rel_min_ratio=0.01):
+    """Select component IDs without materializing or relabeling a binary mask."""
+    keep = np.zeros(len(counts), dtype=bool)
     if counts.size <= 1 or not np.any(counts[1:] > 0):
-        return np.zeros_like(m, dtype=bool)
+        return keep
     mode_name = str(mode or "absolute").strip().lower()
     if mode_name == "largest":
-        return lab == int(np.argmax(counts[1:]) + 1)
+        keep[int(np.argmax(counts[1:]) + 1)] = True
+        return keep
     voxel_volume = float(np.prod(np.asarray(resolution, dtype=float).reshape(3)))
     largest = float(np.max(counts[1:]) * voxel_volume)
     abs_min = max(0.0, float(min_volume_mm3))
@@ -129,6 +138,15 @@ def filter_connected_components(mask_3d, resolution, mode="absolute", min_volume
         threshold_mm3 = abs_min
     keep = counts.astype(float) * voxel_volume + 1e-12 >= float(threshold_mm3)
     keep[0] = False
+    return keep
+
+
+def filter_connected_components(mask_3d, resolution, mode="absolute", min_volume_mm3=50.0, rel_min_ratio=0.01, connectivity=1):
+    m = np.asarray(mask_3d, dtype=bool)
+    if m.ndim != 3:
+        raise ValueError(f"connected-component filtering expects a 3D mask, got {m.shape}")
+    lab, counts = _component_counts(m, connectivity=connectivity)
+    keep = _component_keep_mask(counts, resolution, mode, min_volume_mm3, rel_min_ratio)
     return keep[lab]
 
 

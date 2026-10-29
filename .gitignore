@@ -14,17 +14,20 @@ __pycache__/
 /dicom/
 /paper/
 /pics/
+/docs/
 /outputs/
 /@eaDir/
 Thumbs.db
 .DS_Store
-
+.agents/
+.codex/
 # Generated plane/QC exports
 /data/planes.json
 /data/plane_metrics.json
 /data/plane_qc.json
 /data/phantom_P.h5
 /data/
+/validation/
 TODO.md
 GIT_COMMANDS.local.md
 AGENTS.md
@@ -42,3 +45,10 @@ data/phantom_*.h5
 # Windows portable build artifacts and local build environments
 /release/
 /.venv-windows/
+
+# Keep the reusable phantom generators visible while generated datasets remain local.
+!/data/
+/data/*
+!/data/scripts/
+/data/scripts/*
+!/data/scripts/generate_analytic_phantoms.py

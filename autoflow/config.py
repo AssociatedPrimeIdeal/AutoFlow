@@ -1,3 +1,4 @@
+from .plane_rules import smoothing_options
 from .case_types import normalize_dicom_backend
 from .plane_rules import default_label_plane_rules, load_plane_rules_file, normalize_label_plane_rules
 import copy
@@ -18,14 +19,14 @@ from .core.models import (
     Workspace,
 )
 
-BACKGROUND_COLOR = "#101820"
-CONTEXT_COLOR = "#8296a8"
+BACKGROUND_COLOR = "#1d2025"
+CONTEXT_COLOR = "#8eb6c7"
 METRIC_CMAPS = {
     "wss_surface_live": "turbo",
-    "tke_volume": "inferno",
-    "pressure_gradient_volume": "magma",
+    "tke_volume": "plasma",
+    "pressure_gradient_volume": "viridis",
     "relative_pressure_volume": "RdBu_r",
-    "streamlines_live": "turbo",
+    "streamlines_live": "jet",
 }
 METRIC_OPACITIES = {
     "wss_surface_live": 1.0,
@@ -45,8 +46,8 @@ DEFAULT_QUANTITATIVE_SURFACE_STYLE = {
 }
 DEFAULT_ANATOMICAL_SURFACE_STYLE = {
     "smooth_shading": True, "lighting": True,
-    "ambient": 0.4, "diffuse": 0.6,
-    "specular": 0.08, "specular_power": 16.0,
+    "ambient": 0.30, "diffuse": 0.70,
+    "specular": 0.045, "specular_power": 25.0,
 }
 DEFAULT_METRIC_VOLUME_OPACITY_POINTS = (
     (0.0, 0.0), (0.05, 0.0), (0.2, 0.015),
@@ -70,7 +71,12 @@ DEFAULT_METRIC_RENDER_STYLES = {
     name: {"cmap": METRIC_CMAPS[key], "opacity": METRIC_OPACITIES[key]}
     for key, name in METRIC_DATA_KEYS.items()
 }
-DEFAULT_METRIC_RENDER_STYLES["streamlines"]["line_width"] = 2.0
+DEFAULT_METRIC_RENDER_STYLES["streamlines"]["line_width"] = 1.0
+for _metric_name, _style in DEFAULT_METRIC_RENDER_STYLES.items():
+    _style["color_gamma"] = (1.0 if _metric_name == "streamlines" else
+        .55 if _metric_name in {"tke", "pressure_gradient"} else
+        .65 if _metric_name in {"relative_pressure", "q_criterion"} else .8)
+DEFAULT_METRIC_RENDER_STYLES["tke"]["mode"] = "surface"
 DEFAULT_METRIC_RENDER_STYLES["tke"]["volume"] = {
     "opacity_points": [list(point) for point in DEFAULT_METRIC_VOLUME_OPACITY_POINTS],
     "shade": False, "blending": "composite", "interpolation": "linear",
@@ -80,7 +86,9 @@ for _metric_name in ("vorticity_magnitude", "q_criterion", "swirling_strength"):
     DEFAULT_METRIC_RENDER_STYLES[_metric_name].update(clim=None, show_scalar_bar=True)
 DEFAULT_RENDER_STYLE_CFG = {
     "anti_aliasing": "auto",
-    "context": {"color": CONTEXT_COLOR, "opacity": 0.15},
+    "metric_surface": {"smoothing_sigma": .7, "surface_smoothing_iterations": 60, "surface_taubin_iterations": 80,
+                       "max_projection_distance_voxels": 2.5, "scalar_smoothing_iterations": 5},
+    "context": {"color": CONTEXT_COLOR, "opacity": 0.27},
     "text": dict(DEFAULT_FOREGROUND_COLORS),
     "surfaces": {
         "anatomical": dict(DEFAULT_ANATOMICAL_SURFACE_STYLE),
@@ -137,20 +145,20 @@ DEFAULT_RELATIVE_PRESSURE_BAR_CFG = {
 DEFAULT_SHARED_COLORBAR_CFG = {
     "show": True,
     "bar_cfg": {
-        "position_x": 0.82,
-        "position_y": 0.15,
-        "height": 0.65,
-        "width": 0.045,
+        "position_x": 0.47,
+        "position_y": 0.045,
+        "height": 0.12,
+        "width": 0.48,
         "title_font_size": 14,
-        "label_font_size": 11,
+        "label_font_size": 12,
     },
 }
 
 # Common scalar-bar appearance; the JSON shared layout uses the same base.
 DEFAULT_SCALAR_BAR_STYLE = {
-    "vertical": True,
+    "vertical": False,
     **copy.deepcopy(DEFAULT_SHARED_COLORBAR_CFG["bar_cfg"]),
-    "n_labels": 5, "fmt": "%.3g", "font_family": "arial",
+    "n_labels": 2, "fmt": "%.0f", "font_family": "arial",
     "bold": False, "italic": False, "shadow": False,
 }
 
@@ -171,7 +179,7 @@ DEFAULT_PLANE_RENDER_CFG = {
         "plane_color": "yellow",
         "plane_opacity": 0.75,
     },
-    "groups": {},
+    "groups": {"single_label": {"plane_color": "#75acb2", "plane_opacity": 0.75}},
 }
 
 DEFAULT_PLANE_VIDEO_CFG = {
@@ -226,6 +234,7 @@ DEFAULT_SKELETON_LABEL_MAP = {
 DEFAULT_SPECIAL_CONTACT_LABELS = ["RBCT", "CCA", "LBCT", "HA", "SMA", "LRA", "RRA"]
 
 DEFAULT_SKELETON_LABEL_GROUPS = {
+    "single_label": {"labels": [], "path_color": "#6bb5cb", "plane_color": "#75acb2"},
     "aorta_systemic_branches": {
         "labels": ["AAO", "ARCH", "DAO", "RBCT", "CCA", "LBCT", "HA", "SMA", "LRA", "RRA"],
         "browser_color": "#c92a2a",
@@ -233,7 +242,7 @@ DEFAULT_SKELETON_LABEL_GROUPS = {
         "graph_color": "#e03131",
         "path_color": "#f76707",
         "plane_color": "#ffd43b",
-        "preprocess": {"gaussian_enabled": True, "gaussian_sigma": 0.5, "dilation_iters": 0, "erosion_iters": 0, "opening_iters": 0, "closing_iters": 0},
+        "preprocess": {"gaussian_enabled": False, "gaussian_sigma": 0.5, "dilation_iters": 0, "erosion_iters": 0, "opening_iters": 0, "closing_iters": 0},
     },
     "pulmonary_arteries": {
         "labels": ["MPA", "RPA", "LPA"],
@@ -304,7 +313,7 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "use_multithread": True,
         "reuse_planes": "",
     },
-    "ui": {"background_color": BACKGROUND_COLOR},
+    "ui": {"theme": "dark", "background_color": BACKGROUND_COLOR},
     "render_style": {key: copy.deepcopy(value) for key, value in DEFAULT_RENDER_STYLE_CFG.items()
                      if key != "metrics"},
     "loader": {
@@ -345,6 +354,7 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "write_output": True,
     },
     "skeleton": {
+        "geometry_spacing_mm": 1.0,
         "remove_small_cc": True,
         "special_handling": "three_pass_merge",
         "special_merge_radius_mm": 1.5,
@@ -353,17 +363,18 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "min_cc_volume_mm3": 50.0,
         "cc_filter_mode": "hybrid",
         "cc_rel_min_ratio": 0.10,
-        "min_edge_points": 3,
+        "min_edge_points": 9,
         "graph_connectivity": 26,
         "cycle_flow_threshold": 0.3,
         "cycle_preserve_connectivity": True,
+        "radius_tree_policy": "auto",
         "junction_cluster_enabled": True,
-        "junction_cluster_max_extent_voxels": 8.0,
+        "junction_cluster_max_extent_voxels": 0.0,
         "junction_cluster_min_cycle_rank": 2,
         "do_closing": False,
         "do_opening": False,
         "gaussian_sigma": 0.5,
-        "gaussian_enabled": True,
+        "gaussian_enabled": False,
         "dilation_iters": 0,
         "erosion_iters": 0,
         "opening_iters": 0,
@@ -371,7 +382,7 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
     },
     "labels": {
         "single_label_group_name": "single_label",
-        "single_label_browser_color": "#d9480f",
+        "single_label_browser_color": "#8eb6c7",
         "default_group_browser_color": "#1c7ed6",
         "label_map": dict(DEFAULT_SKELETON_LABEL_MAP),
         "label_groups": copy.deepcopy(DEFAULT_SKELETON_LABEL_GROUPS),
@@ -392,18 +403,33 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "segmentation_filter": True,
         "fov_boundary_filter": True,
         "fov_boundary_max_fraction": 0.25,
+        'smoothing_method': 'radius_adaptive',
+        'smoothing_radius_factor': 2.0,
+        'smoothing_max_displacement_ratio': 0.15,
+        'smoothing_sample_step_mm': 0.5,
+        'smoothing_radius_sigma_mm': 3.0,
+        'smoothing_backend': 'auto',
         "smoothing_window": 15,
         "smoothing_polyorder": 2,
         "inter_time": 10,
         "render": copy.deepcopy(DEFAULT_PLANE_RENDER_CFG),
     },
     "streamlines": {
+        "integration_backend": "auto",
         "seed_ratio": 0.1,
         "max_steps": 200,
         "min_seeds": 50,
         "terminal_speed": 0.01,
         "rng_seed": 0,
         "tube_radius": 0.05,
+        "seed_region": "segmentation",
+        "seed_distribution": "uniform",
+        "seed_mode": "ratio",
+        "seed_count": 1000,
+        "grid_spacing_mm": 0.0,
+        "integration_step_mm": None,
+        "display_style": "lines",
+        "display_min_speed_cm_s": 0.0,
         "render": {
             **copy.deepcopy(DEFAULT_METRIC_RENDER_STYLES["streamlines"]),
             "clim": None,
@@ -422,6 +448,13 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "color": "deepskyblue",
         "color_mode": "per_plane",
         "temporal_cache_mb": 512.0,
+        "seed_region": "segmentation",
+        "seed_distribution": "uniform",
+        "grid_spacing_mm": 1.0,
+        "integration_step_mm": None,
+        "display_style": "trails",
+        "display_min_speed_cm_s": 0.0,
+        "trail_duration_ms": 100.0,
     },
     "derived": {
     },
@@ -607,6 +640,17 @@ def normalize_render_style_cfg(payload):
             raise ValueError(f"render_style.{name} must be an object")
     cfg["context"]["color"] = color(cfg["context"]["color"], "context.color")
     cfg["context"]["opacity"] = number(cfg["context"]["opacity"], "context.opacity", upper=1.0)
+    if not isinstance(cfg["metric_surface"], dict):
+        raise ValueError("render_style.metric_surface must be an object")
+    for name, value in cfg["metric_surface"].items():
+        if name not in DEFAULT_RENDER_STYLE_CFG["metric_surface"]:
+            raise ValueError(f"unsupported metric_surface field: {name}")
+        value = number(value, f"metric_surface.{name}")
+        if name.endswith("iterations"):
+            if value != int(value):
+                raise ValueError(f"metric_surface.{name} must be an integer")
+            value = int(value)
+        cfg["metric_surface"][name] = value
     for name in ("dark", "light"):
         cfg["text"][name] = color(cfg["text"][name], f"text.{name}")
     allowed = {"anatomical": set(DEFAULT_ANATOMICAL_SURFACE_STYLE),
@@ -628,6 +672,9 @@ def normalize_render_style_cfg(payload):
             raise ValueError(f"unsupported metric render style: {name}")
         layer["cmap"] = color(layer["cmap"], f"{name}.cmap")
         layer["opacity"] = number(layer["opacity"], f"{name}.opacity", upper=1.0)
+        layer["color_gamma"] = number(layer["color_gamma"], f"{name}.color_gamma", lower=1e-6)
+        if "mode" in layer and layer["mode"] not in {"surface", "volume"}:
+            raise ValueError(f"unsupported {name}.mode")
         if "line_width" in layer:
             layer["line_width"] = number(layer["line_width"], f"{name}.line_width", lower=0.01)
         if "volume" not in layer:
@@ -769,6 +816,13 @@ def _pathline_model_payload(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[st
         "pathline_color": pick("color", "pathline_color", "deepskyblue"),
         "pathline_color_mode": pick("color_mode", "pathline_color_mode", "per_plane"),
         "pathline_temporal_cache_mb": pick("temporal_cache_mb", "pathline_temporal_cache_mb", 512.0),
+        "pathline_seed_region": pick("seed_region", "pathline_seed_region", "segmentation"),
+        "pathline_seed_distribution": pick("seed_distribution", "pathline_seed_distribution", "random"),
+        "pathline_grid_spacing_mm": pick("grid_spacing_mm", "pathline_grid_spacing_mm", 1.0),
+        "pathline_integration_step_mm": pick("integration_step_mm", "pathline_integration_step_mm", None),
+        "pathline_display_style": pick("display_style", "pathline_display_style", "history"),
+        "pathline_display_min_speed_cm_s": pick("display_min_speed_cm_s", "pathline_display_min_speed_cm_s", 0.0),
+        "pathline_trail_duration_ms": pick("trail_duration_ms", "pathline_trail_duration_ms", 100.0),
     }
 
 
@@ -999,6 +1053,7 @@ def apply_config_bundle_to_workspace(workspace: Workspace, config_bundle: Dict[s
     workspace.skeleton_params.default_group_browser_color = str(workspace.label_params.default_group_browser_color)
     workspace.plane_gen_params = PlaneGenerationParams.from_dict(config_bundle.get("planes", {}))
     streamline_payload = dict(config_bundle.get("streamlines", {}) or {})
+    streamline_payload.setdefault("line_width", _feature_render_cfg(streamline_payload).get("line_width", 1.0))
     streamline_payload.update(_pathline_model_payload(config_bundle))
     workspace.streamline_params = StreamlineParams.from_dict(streamline_payload)
     workspace.derived_params = DerivedMetricsParams.from_dict(_build_derived_metrics_config(config_bundle))
@@ -1074,6 +1129,7 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
         "dicom_backend": normalize_dicom_backend(loader_cfg.get("dicom_backend", "dicom2h5")),
         "dicom_h5_dir": str(loader_cfg.get("dicom_h5_dir", "")),
         "ignore_embedded_segmentation": bool(loader_cfg.get("ignore_embedded_segmentation", False)),
+        **{"path_"+key: value for key, value in smoothing_options(plane_cfg).items()},
         "plane_mode": str(plane_cfg.get("plane_mode", "by_label") or "by_label"),
         "plane_config": str(plane_cfg.get("label_rules_file", "") or ""),
         "plane_label_rules": None if plane_cfg.get("label_rules_file") else copy.deepcopy(plane_cfg.get("label_rules", default_label_plane_rules())),
@@ -1098,12 +1154,13 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
         "min_cc_volume": float(skeleton_cfg.get("min_cc_volume_mm3", 50.0)),
         "cc_filter_mode": str(skeleton_cfg.get("cc_filter_mode", "hybrid") or "hybrid"),
         "cc_rel_min_ratio": float(skeleton_cfg.get("cc_rel_min_ratio", 0.10)),
-        "min_edge_points": max(0, int(skeleton_cfg.get("min_edge_points", skeleton_cfg.get("min_edge_count", 3)) or 0)),
+        "min_edge_points": max(0, int(skeleton_cfg.get("min_edge_points", skeleton_cfg.get("min_edge_count", 9)) or 0)),
         "graph_connectivity": skeleton_cfg.get("graph_connectivity", 26),
         "cycle_flow_threshold": skeleton_cfg.get("cycle_flow_threshold", 0.3),
         "cycle_preserve_connectivity": skeleton_cfg.get("cycle_preserve_connectivity", True),
+        "radius_tree_policy": skeleton_cfg.get("radius_tree_policy", "auto"),
         "junction_cluster_enabled": skeleton_cfg.get("junction_cluster_enabled", True),
-        "junction_cluster_max_extent_voxels": skeleton_cfg.get("junction_cluster_max_extent_voxels", 8.0),
+        "junction_cluster_max_extent_voxels": skeleton_cfg.get("junction_cluster_max_extent_voxels", 0.0),
         "junction_cluster_min_cycle_rank": skeleton_cfg.get("junction_cluster_min_cycle_rank", 2),
         "seed_ratio": float(streamline_cfg.get("seed_ratio", 0.1)),
         "max_steps": int(streamline_cfg.get("max_steps", 200)),
@@ -1120,7 +1177,7 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
         "pathline_rng_seed": int(pathline_cfg["pathline_rng_seed"]),
         "pathline_tube_radius": float(pathline_cfg["pathline_tube_radius"]),
         "pathline_color": str(pathline_cfg["pathline_color"] or "deepskyblue"),
-        "pathline_color_mode": (str(pathline_cfg["pathline_color_mode"] or "per_plane").strip().lower() if str(pathline_cfg["pathline_color_mode"] or "per_plane").strip().lower() in {"uniform", "per_plane", "per_group"} else "per_plane"),
+        "pathline_color_mode": (str(pathline_cfg["pathline_color_mode"] or "per_plane").strip().lower() if str(pathline_cfg["pathline_color_mode"] or "per_plane").strip().lower() in {"uniform", "per_plane", "per_group", "velocity", "age"} else "per_plane"),
         "pathline_temporal_cache_mb": max(0.0, float(pathline_cfg["pathline_temporal_cache_mb"])),
         "pressure_method": str(derived_cfg.get("pressure_method", "ppe") or "ppe"),
         "force_recompute_seg": bool(config_bundle.get("segmentation", {}).get("force_recompute_auto_cache", False)),

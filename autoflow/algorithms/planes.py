@@ -2,6 +2,7 @@ import numpy as np
 
 from ..core.models import PlaneData
 from .paths import inter_points, smooth_path_savgol
+from .path_smoothing import PathSmoothingContext, prepare_centerline
 
 
 def _build_plane(path_smooth, cum, target, path_i):
@@ -289,7 +290,7 @@ def generate_planes_from_paths(
     cross_section_distance=5.0,
     start_distance=0.0,
     end_distance=0.0,
-    smoothing_window=15,
+    smoothing_window=None,
     smoothing_polyorder=3,
     inter_time=9,
     use_center_plane=None,
@@ -308,12 +309,22 @@ def generate_planes_from_paths(
     return_qc=False,
     fork_points=None,
     forks=None,
+    smoothing_method=None,
+    smoothing_context=None,
+    smoothing_radius_factor=2.,
+    smoothing_max_displacement_ratio=.15,
+    smoothing_sample_step_mm=.5,
+    smoothing_radius_sigma_mm=3.,
+    smoothing_backend="auto",
 ):
     if use_center_plane is not None:
         plane_mode = "count" if bool(use_center_plane) else "distance"
         if bool(use_center_plane):
             plane_count = 1
 
+    method = smoothing_method or ('savgol' if smoothing_window is not None else 'radius_adaptive')
+    if smoothing_context is None and segmentation_labels is not None and method == 'radius_adaptive':
+        smoothing_context = PathSmoothingContext(np.asarray(segmentation_labels) > 0, segmentation_spacing, segmentation_origin)
     planes = []
     smooth_paths = []
     filter_qc = []
@@ -336,7 +347,15 @@ def generate_planes_from_paths(
             smooth_paths.append(path)
             continue
 
-        path_smooth = smooth_path_savgol(path, window=smoothing_window, polyorder=smoothing_polyorder)
+        _source, path_smooth, smoothing_qc = prepare_centerline(
+            path, context=smoothing_context, smoothing_method=method,
+            smoothing_radius_factor=smoothing_radius_factor,
+            smoothing_max_displacement_ratio=smoothing_max_displacement_ratio,
+            smoothing_sample_step_mm=smoothing_sample_step_mm,
+            smoothing_radius_sigma_mm=smoothing_radius_sigma_mm, smoothing_backend=smoothing_backend,
+            smoothing_window=15 if smoothing_window is None else smoothing_window,
+            smoothing_polyorder=smoothing_polyorder, inter_time=1)
+        filter_qc[path_i]['smoothing'] = smoothing_qc
         smooth_paths.append(path_smooth)
         if len(path_smooth) < 2:
             continue

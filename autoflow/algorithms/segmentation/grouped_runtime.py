@@ -22,6 +22,37 @@ from ...task_control import check_cancelled
 _inference_lock = threading.RLock()
 
 
+def _resample_sources(sources, configuration, new_shape, original_spacing, target_spacing, device):
+    import torch
+    count = len(sources)
+    requested = int(os.environ.get("AUTOFLOW_SHARED_RESAMPLE_BATCH", "0"))
+    batch = min(count, requested) if requested > 0 else count
+    if torch.device(device).type == "cuda":
+        free, _ = torch.cuda.mem_get_info(device)
+        estimate = sources[0].nbytes + int(np.prod(new_shape))*4*3
+        budget = max(estimate, free-16*1024**3)
+        batch = max(1, min(batch, int(budget//estimate)))
+    output = None
+    position = 0
+    while position < count:
+        check_cancelled()
+        selected = sources[position:position+batch]
+        try:
+            part = np.asarray(configuration.resampling_fn_data(np.stack(selected), new_shape,
+                              original_spacing, target_spacing), dtype=np.float32)
+        except torch.cuda.OutOfMemoryError:
+            if batch == 1:
+                raise
+            batch = max(1, batch//2)
+            torch.cuda.empty_cache()
+            continue
+        if output is None:
+            output = np.empty((count,)+tuple(part.shape[1:]), dtype=np.float32)
+        output[position:position+len(part)] = part
+        position += len(part)
+    return output, batch
+
+
 def _upload_feature_pool(source, device, sample_channels):
     import torch
     if torch.device(device).type != "cuda":
@@ -77,6 +108,7 @@ def predict_grouped_iterator(predictor, iterator, export_workers=4):
     from nnunetv2.inference import export_prediction as export
     from autoflow.nnunet_runtime import _gpu_first_predict
 
+    from .model_grid import capture_model_geometry, export_prediction_with_geometry
     original_iterator = predictor.predict_from_data_iterator
     original_logits = predictor.predict_logits_from_preprocessed_data
     original_sliding = predictor.predict_sliding_window_return_logits
@@ -87,12 +119,21 @@ def predict_grouped_iterator(predictor, iterator, export_workers=4):
     if (predictor.device.type != "cuda" or iterator_function is None or logits_function is None
             or "multiprocessing" not in iterator_function.__code__.co_names
             or "convert_predicted_logits_to_segmentation_with_correct_shape" not in writer.__code__.co_names):
+        if iterator_function is not None and "export_prediction_from_logits" in iterator_function.__code__.co_names:
+            scoped = _function_with_globals(iterator_function,
+                export_prediction_from_logits=export_prediction_with_geometry)
+            return scoped(predictor, iterator, save_probabilities=False,
+                          num_processes_segmentation_export=export_workers)
         return original_iterator(iterator, save_probabilities=False,
                                  num_processes_segmentation_export=export_workers)
     fixed_torch = _FixedThreadTorch(torch)
     converter = _function_with_globals(converter, torch=fixed_torch)
     writer = _function_with_globals(writer,
         convert_predicted_logits_to_segmentation_with_correct_shape=converter)
+    native_writer = writer
+    def writer(predicted, properties, configuration, plans, dataset, output, save_probabilities=False):
+        capture_model_geometry(predicted, properties, configuration, plans, dataset, output)
+        return native_writer(predicted, properties, configuration, plans, dataset, output, save_probabilities)
     pool_runtime = SimpleNamespace(get_context=lambda *_: SimpleNamespace(Pool=ThreadPool))
     threaded = _function_with_globals(iterator_function, multiprocessing=pool_runtime,
         export_prediction_from_logits=writer,
@@ -192,10 +233,8 @@ def iter_grouped_temporal_samples(
         arrays_by_source, crop_slices, normalization_seg, preprocessor, configuration_manager,
         plans_manager.foreground_intensity_properties_per_channel,
     )
-    resampled_sources = configuration_manager.resampling_fn_data(
-        np.stack(normalized_sources, axis=0), new_shape, original_spacing, target_spacing
-    )
-    resampled_sources = np.asarray(resampled_sources, dtype=np.float32)
+    resampled_sources, feature_batch = _resample_sources(normalized_sources, configuration_manager,
+        new_shape, original_spacing, target_spacing, device)
     resident_pool = _upload_feature_pool(resampled_sources, device, expected_channels)
     source_index = {source_key: index for index, source_key in enumerate(ordered_sources)}
 
@@ -228,6 +267,7 @@ def iter_grouped_temporal_samples(
                 "total_frames": total_frames,
                 "common_bbox": common_bbox,
                 "unique_data_maps": len(ordered_sources),
+                "resample_batch": feature_batch,
             },
             "temporal_normalization": normalization_metadata,
         })

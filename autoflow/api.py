@@ -1,6 +1,6 @@
 from .config import BACKGROUND_COLOR
 from .case_types import normalize_dicom_backend
-from .plane_rules import load_plane_rules_file, normalize_label_plane_rules
+from .plane_rules import load_plane_rules_file, normalize_label_plane_rules, SMOOTHING_DEFAULTS, smoothing_options
 import copy
 from dataclasses import dataclass, field
 import json
@@ -24,9 +24,12 @@ from .config import (
     bundle_to_autoflow_kwargs,
     load_config_bundle,
 )
+from .core.models import validate_radius_tree_policy
 from .core.models import Workspace, validate_graph_connectivity, validate_cycle_cleanup_parameters, validate_junction_cluster_parameters
 from .plane_io import resolve_reuse_plane_file
 from .processing import collect_input_items, process_single
+from .batch_status import case_status, checkpoint_batch, record_batch_result
+from .task_control import TaskCancelled
 
 
 @dataclass
@@ -98,6 +101,12 @@ class AutoFlowConfig:
     segmentation_filter: bool = True
     fov_boundary_filter: bool = True
     fov_boundary_max_fraction: float = 0.25
+    path_smoothing_method: str = "radius_adaptive"
+    path_smoothing_radius_factor: float = 2.0
+    path_smoothing_max_displacement_ratio: float = 0.15
+    path_smoothing_sample_step_mm: float = 0.5
+    path_smoothing_radius_sigma_mm: float = 3.0
+    path_smoothing_backend: str = "auto"
     use_center_plane: Optional[bool] = None
 
     remove_small_cc: bool = True
@@ -108,12 +117,13 @@ class AutoFlowConfig:
     min_cc_volume: float = 50.0
     cc_filter_mode: str = "hybrid"
     cc_rel_min_ratio: float = 0.10
-    min_edge_points: int = 3
+    min_edge_points: int = 9
     graph_connectivity: int = 26
     cycle_flow_threshold: float = 0.3
     cycle_preserve_connectivity: bool = True
+    radius_tree_policy: str = "auto"
     junction_cluster_enabled: bool = True
-    junction_cluster_max_extent_voxels: float = 8.0
+    junction_cluster_max_extent_voxels: float = 0.0
     junction_cluster_min_cycle_rank: int = 2
 
     seed_ratio: float = 0.1
@@ -279,6 +289,8 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
     ws.plane_gen_params.spacing_ratio = float(getattr(cfg, "plane_spacing_ratio", 0.25))
     ws.plane_gen_params.segmentation_filter = bool(getattr(cfg, "segmentation_filter", True))
     ws.plane_gen_params.fov_boundary_filter = bool(cfg.fov_boundary_filter)
+    for key, value in smoothing_options({key: getattr(cfg, "path_"+key, default) for key, default in SMOOTHING_DEFAULTS.items()}).items():
+        setattr(ws.plane_gen_params, key, value)
     ws.plane_gen_params.fov_boundary_max_fraction = float(cfg.fov_boundary_max_fraction)
     if not np.isfinite(ws.plane_gen_params.fov_boundary_max_fraction) or not 0 <= ws.plane_gen_params.fov_boundary_max_fraction <= 1:
         raise ValueError("fov_boundary_max_fraction must be finite and between 0 and 1")
@@ -296,10 +308,11 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
     ws.skeleton_params.min_cc_volume_mm3 = float(cfg.min_cc_volume)
     ws.skeleton_params.cc_filter_mode = str(cfg.cc_filter_mode or "hybrid")
     ws.skeleton_params.cc_rel_min_ratio = float(cfg.cc_rel_min_ratio)
-    ws.skeleton_params.min_edge_points = max(0, int(getattr(cfg, "min_edge_points", 3)))
+    ws.skeleton_params.min_edge_points = max(0, int(getattr(cfg, "min_edge_points", 9)))
     ws.skeleton_params.graph_connectivity = validate_graph_connectivity(cfg.graph_connectivity)
     ws.skeleton_params.cycle_flow_threshold, ws.skeleton_params.cycle_preserve_connectivity = validate_cycle_cleanup_parameters(
         cfg.cycle_flow_threshold, cfg.cycle_preserve_connectivity)
+    ws.skeleton_params.radius_tree_policy = validate_radius_tree_policy(cfg.radius_tree_policy)
     ws.skeleton_params.junction_cluster_enabled, ws.skeleton_params.junction_cluster_max_extent_voxels, ws.skeleton_params.junction_cluster_min_cycle_rank = validate_junction_cluster_parameters(
         cfg.junction_cluster_enabled, cfg.junction_cluster_max_extent_voxels, cfg.junction_cluster_min_cycle_rank)
     ws.streamline_params.seed_ratio = float(cfg.seed_ratio)
@@ -318,7 +331,7 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
     ws.streamline_params.tube_radius = float(cfg.tube_radius)
     ws.streamline_params.pathline_color = str(cfg.pathline_color or cfg.plane_pathline_color or "deepskyblue")
     color_mode = str(cfg.pathline_color_mode or "per_plane").strip().lower()
-    ws.streamline_params.pathline_color_mode = color_mode if color_mode in {"uniform", "per_plane", "per_group"} else "per_plane"
+    ws.streamline_params.pathline_color_mode = color_mode if color_mode in {"uniform", "per_plane", "per_group", "velocity", "age"} else "per_plane"
     ws.streamline_params.pathline_temporal_cache_mb = max(0.0, float(cfg.pathline_temporal_cache_mb))
     pressure_method = str(getattr(cfg, "pressure_method", "ppe") or "ppe").strip().lower()
     if pressure_method in {"ls", "least_squares", "least-squares", "least squares", "poisson", "ppe", "poisson_pressure_equation"}:
@@ -441,6 +454,7 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
         raise ValueError("AutoFlowConfig.export_planes must be a directory when processing multiple cases.")
     base_ws = build_workspace(config)
     results: List[Dict[str, Any]] = []
+    checkpoint_batch(results, config.output_dir, len(input_cases))
     last_case_out = ""
 
     for case in input_cases:
@@ -456,7 +470,7 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
 
         if config.reuse_planes and not os.path.isfile(reuse_file):
             error = f"reuse plane file not found: {config.reuse_planes}"
-            results.append({"file": case.input_path, "case": case.display_name, "status": "error", "error": error})
+            record_batch_result(results, {"file": case.input_path, "case": case.display_name, "status": "error", "error": error}, config.output_dir, len(input_cases))
             print(f"\n[ERROR] {error}")
             continue
 
@@ -534,6 +548,7 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 graph_connectivity=config.graph_connectivity,
                 cycle_flow_threshold=config.cycle_flow_threshold,
                 cycle_preserve_connectivity=config.cycle_preserve_connectivity,
+                radius_tree_policy=config.radius_tree_policy,
                 junction_cluster_enabled=config.junction_cluster_enabled,
                 junction_cluster_max_extent_voxels=config.junction_cluster_max_extent_voxels,
                 junction_cluster_min_cycle_rank=config.junction_cluster_min_cycle_rank,
@@ -609,18 +624,20 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 streamline_bar_cfg=dict(config.streamline_bar_cfg),
             )
             summary = run_case(case, output_dir=case_out, config=case_cfg, workspace=base_ws)
-            status = "partial" if summary.get("video_errors") else "ok"
-            results.append({"file": case.input_path, "case": case.display_name, "status": status, "summary": summary})
+            status = case_status(summary)
+            result = {"file": case.input_path, "case": case.display_name, "status": status, "summary": summary}
             last_case_out = case_out
+        except TaskCancelled:
+            raise
         except Exception:
             print(f"\n[ERROR] Failed: {case.display_name or case.input_path}")
             print(traceback.format_exc())
-            results.append({"file": case.input_path, "case": case.display_name, "status": "error", "error": traceback.format_exc()})
+            result = {"file": case.input_path, "case": case.display_name, "status": "error", "error": traceback.format_exc()}
+        record_batch_result(results, result, config.output_dir, len(input_cases))
 
     os.makedirs(config.output_dir, exist_ok=True)
     batch_report = os.path.join(config.output_dir, "batch_report.json")
-    with open(batch_report, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
+    # Each completed/error case has already been atomically checkpointed.
 
     n_ok = sum(1 for item in results if item.get("status") == "ok")
     times_sec = []

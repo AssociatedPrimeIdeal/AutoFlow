@@ -7,6 +7,24 @@ repo_name: AssociatedPrimeIdeal/AutoFlow
 edit_uri: edit/main/docs/
 docs_dir: docs
 site_dir: site
+
+# Dated experiment snapshots retain their source-relative links outside the published manual.
+exclude_docs: |
+  en/developer/*2026-10-2*
+  !en/developer/gui-compact-2026-10-26/
+  !en/developer/gui-compact-2026-10-26/**
+  !en/developer/segmentation-1mm-validation-2026-10-26/
+  !en/developer/segmentation-1mm-validation-2026-10-26/**
+  !en/developer/testset-plane-review-2026-10-27/
+  !en/developer/testset-plane-review-2026-10-27/**
+  !en/developer/kimimaro-cycle-diagnostics-2026-10-27/
+  !en/developer/kimimaro-cycle-diagnostics-2026-10-27/**
+  !en/developer/aorta003-centerline-study-2026-10-27/
+  !en/developer/aorta003-centerline-study-2026-10-27/**
+  !en/developer/lee-kimimaro-all-groups-2026-10-27/
+  !en/developer/lee-kimimaro-all-groups-2026-10-27/**
+  !en/developer/lee-kimimaro-all-groups-cut3-2026-10-27/
+  !en/developer/lee-kimimaro-all-groups-cut3-2026-10-27/**
 copyright: Copyright © AutoFlow contributors
 
 theme:
@@ -86,12 +104,14 @@ nav:
       - Quickstart: en/user/quickstart.md
       - Windows portable application: en/user/windows-portable.md
       - Worked example: en/user/demo-case.md
+      - End-to-end workflow: en/user/workflow.md
       - GUI workflow: en/user/gui.md
       - CLI workflow: en/user/cli.md
       - Python API: en/user/python-api.md
       - Inputs and units: en/user/inputs.md
       - Outputs: en/user/outputs.md
       - Troubleshooting: en/user/troubleshooting.md
+      - Licensing: en/user/licensing.md
   - Features:
       - Functional workflow: en/features/index.md
       - Data preparation:
@@ -103,6 +123,7 @@ nav:
       - Vessel geometry:
           - Skeleton: en/features/skeleton.md
           - Graph and paths: en/features/graph-paths.md
+          - Centerline smoothing: en/features/centerline-smoothing.md
           - Cross-section planes: en/features/planes.md
       - Haemodynamics:
           - Plane metrics: en/features/metrics.md
@@ -116,7 +137,9 @@ nav:
           - Streamlines: en/features/streamlines.md
           - Pathlines: en/features/pathlines.md
           - Content volumes and PC-MRA: en/features/pcmra-volume-rendering.md
+          - Physical flow phantoms: en/features/analytic-phantoms.md
           - Quality control: en/features/quality-control.md
+          - Analysis reports: en/features/reports.md
           - Videos: en/features/videos.md
   - References:
       - Scientific references: en/references/index.md
@@ -132,6 +155,14 @@ nav:
       - Configuration system: en/developer/config-system.md
       - Change recipes: en/developer/change-recipes.md
       - Testing and documentation checks: en/developer/testing.md
+      - Native measurement and custom-plan validation: en/developer/native-measurement.md
+      - Interactive test-set placement review: en/developer/testset-plane-review.md
+      - Kimimaro and cycle-decision validation: en/developer/kimimaro-cycle-diagnostics.md
+      - Aorta_003 Voronoi and geometry smoothing: en/developer/aorta003-centerline-study.md
+      - Lee and Kimimaro all-group comparison: en/developer/lee-kimimaro-all-groups.md
+      - Lee and Kimimaro 75-case review: en/developer/skeleton-method-review.md
+      - Analytic phantom definitions: en/developer/analytic-phantoms.md
+      - Velocity and segmentation grids: en/developer/velocity-grid-comparison.md
       - Current pipeline performance: en/developer/performance.md
       - Pipeline audit (2026-10-07): en/developer/pipeline-audit-2026-10-07.md
       - Segmentation performance history: en/developer/segmentation-performance.md

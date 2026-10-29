@@ -66,7 +66,7 @@ class ContentRenderingMixin:
         self.invalidate_cache(key)
         self.readd_object(obj, refresh_scalar_bar=False)
         self.select_content_render(obj.uid)
-        self.plotter.render()
+        getattr(self, "request_render", self.plotter.render)()
         return obj
 
     def update_content_render(self, uid, **settings):
@@ -79,7 +79,7 @@ class ContentRenderingMixin:
         self._clear_content_widgets()
         self.readd_object(obj, refresh_scalar_bar=False)
         self._sync_content_widgets()
-        self.plotter.render()
+        getattr(self, "request_render", self.plotter.render)()
 
     def _content_slice_dataset(self, key, grid):
         cfg = self.content_render_settings(key)
@@ -183,7 +183,8 @@ class ContentRenderingMixin:
         if shape is None:
             return None
         spacing = np.asarray(self.workspace.resolution, dtype=float)
-        lower = np.asarray(self.workspace.origin, dtype=float) + 0.5 * spacing
+        offset = 0.0 if self.workspace.segmentation_labels_1mm is not None else 0.5
+        lower = np.asarray(self.workspace.origin, dtype=float) + offset * spacing
         span = np.maximum(np.asarray(shape) - 1, 0) * spacing
         return lower, span
 
@@ -290,4 +291,4 @@ class ContentRenderingMixin:
         self._position_content_widgets(obj)
         if self._content_position_callback is not None:
             self._content_position_callback(uid, list(cfg["positions"]))
-        self.plotter.render()
+        getattr(self, "request_render", self.plotter.render)()

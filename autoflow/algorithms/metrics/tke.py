@@ -1,6 +1,8 @@
 """Optional turbulent kinetic energy from measured velocity dispersion."""
 
 import numpy as np
+import os
+from ...task_control import check_cancelled
 from ..surfaces import create_uniform_grid
 
 from ._common import _ensure_mask4d
@@ -10,14 +12,17 @@ def compute_tke_array_from_sigma(sigma, rho=1060.0):
     rho = float(rho)
     if not np.isfinite(rho) or rho <= 0:
         raise ValueError('TKE density must be finite and positive (kg/m3)')
-    sigma = np.asarray(sigma, dtype=float)
+    sigma = np.asarray(sigma)
     if sigma.ndim not in (4, 5) or sigma.shape[-1] != 3:
         raise ValueError(f'sigma must be XYZ3 or XYZT3, got {sigma.shape}')
-    return (
-        0.5
-        * float(rho)
-        * np.sum((np.asarray(sigma, dtype=float) / 100.0) ** 2, axis=-1)
-    ).astype(np.float32)
+    flat = sigma.reshape(-1, 3)
+    result = np.empty(len(flat), dtype=np.float32)
+    block_size = max(1, int(os.environ.get("AUTOFLOW_TKE_BLOCK_ROWS", "262144")))
+    for start in range(0, len(flat), block_size):
+        check_cancelled()
+        block = slice(start, start+block_size)
+        result[block] = (0.5*float(rho)*np.sum((np.asarray(flat[block], dtype=float)/100.0)**2, axis=-1)).astype(np.float32)
+    return result.reshape(sigma.shape[:-1])
 
 
 def _prepare_tke_array(mask4d, tke_array=None, sigma=None, rho=1060.0):

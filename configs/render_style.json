@@ -1,8 +1,8 @@
 {
   "anti_aliasing": "auto",
   "context": {
-    "color": "#8296a8",
-    "opacity": 0.15
+    "color": "#8eb6c7",
+    "opacity": 0.27
   },
   "text": {
     "dark": "#17212b",
@@ -12,10 +12,10 @@
     "anatomical": {
       "smooth_shading": true,
       "lighting": true,
-      "ambient": 0.4,
-      "diffuse": 0.6,
-      "specular": 0.08,
-      "specular_power": 16.0
+      "ambient": 0.3,
+      "diffuse": 0.7,
+      "specular": 0.045,
+      "specular_power": 25.0
     },
     "quantitative": {
       "lighting": false,
@@ -23,5 +23,12 @@
       "nan_opacity": 0.0,
       "interpolate_before_map": true
     }
+  },
+  "metric_surface": {
+    "smoothing_sigma": 0.7,
+    "surface_smoothing_iterations": 60,
+    "max_projection_distance_voxels": 2.5,
+    "scalar_smoothing_iterations": 5,
+    "surface_taubin_iterations": 80
   }
 }

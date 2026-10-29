@@ -7,12 +7,16 @@ import numpy as np
 
 from ..plane_rules import normalize_label_plane_rules
 from .paths import inter_points, smooth_path_savgol
+from .path_smoothing import PathSmoothingContext, prepare_centerline
+from ..plane_rules import SMOOTHING_DEFAULTS
 from .planes import _build_plane, _junction_anchor_endpoint, _label_runs, _sample_path_labels, _target_distances
 
 
 def build_label_plane_candidates(paths, segmentation_labels, label_map, *,
                                  spacing=(1, 1, 1), origin=(0, 0, 0), path_info=None,
-                                 smoothing_window=15, smoothing_polyorder=2, inter_time=10):
+                                 smoothing_window=None, smoothing_polyorder=2, inter_time=10,
+                                 _prepared_centerlines=None, smoothing_contexts=None,
+                                 **smoothing_kwargs):
     """Preserve graph identity and every contiguous label-contained segment."""
     if np.asarray(segmentation_labels).ndim != 3:
         raise ValueError("Label plane placement requires a 3-D majority-voted segmentation")
@@ -24,8 +28,17 @@ def build_label_plane_candidates(paths, segmentation_labels, label_map, *,
         if len(points) < 2 or not np.all(np.isfinite(points)):
             smooth_paths.append(np.empty((0, 3), dtype=float))
             continue
-        dense = inter_points(points, time=inter_time)
-        smooth = smooth_path_savgol(dense, window=smoothing_window, polyorder=smoothing_polyorder)
+        if _prepared_centerlines is None:
+            method = smoothing_kwargs.get('smoothing_method') or ('savgol' if smoothing_window is not None else 'radius_adaptive')
+            context = (smoothing_contexts[path_index] if smoothing_contexts is not None else
+                       PathSmoothingContext(np.asarray(segmentation_labels) > 0, spacing, origin))
+            dense, smooth, _receipt = prepare_centerline(points, context=context,
+                **{**smoothing_kwargs, 'smoothing_method': method},
+                smoothing_window=15 if smoothing_window is None else smoothing_window,
+                smoothing_polyorder=smoothing_polyorder, inter_time=inter_time)
+        else:
+            dense, smooth = _prepared_centerlines[path_index]
+            smooth = smooth.copy()
         original_labels = _sample_path_labels(dense, segmentation_labels, spacing, origin)
         smoothed_labels = _sample_path_labels(smooth, segmentation_labels, spacing, origin)
         restored = (original_labels > 0) & (original_labels != smoothed_labels)
@@ -51,6 +64,10 @@ def build_label_plane_candidates(paths, segmentation_labels, label_map, *,
             end_node = int(info.get("end_node", -1)) if touches_end else -1
             candidates.setdefault(int(label), []).append({
                 "path_index": path_index, "segment_index": segment_index,
+                "label_level": (info.get("hierarchy", {}).get("label_local_levels", {}).get(str(label)) + 1
+                    if info.get("hierarchy", {}).get("label_local_levels", {}).get(str(label)) is not None else None),
+                "direction_status": info.get("hierarchy", {}).get("direction_status", "unavailable"),
+                "flow_sign": info.get("hierarchy", {}).get("flow_sign"),
                 "sample_start": int(lo), "sample_end": int(hi),
                 "start_distance_mm": float(cumulative[lo]), "end_distance_mm": float(cumulative[hi]),
                 "length_mm": float(cumulative[hi] - cumulative[lo]),
@@ -66,7 +83,40 @@ def build_label_plane_candidates(paths, segmentation_labels, label_map, *,
     return smooth_paths, candidates
 
 
-def _flow_direction(points, flow, mask, spacing, origin):
+def _matched_label_plane_candidates(paths, segmentation_labels, label_map, **kwargs):
+    """Use matched samples for unsmoothed topology and smoothed placement.
+
+    Keep the existing point-window smoothing and interpolation. Prepare each
+    path once so topology indices always address that exact placement array.
+    The candidate builder copies placement samples before label restoration.
+    """
+    prepared = []
+    contexts = kwargs.get('smoothing_contexts')
+    method = kwargs.get('smoothing_method') or ('savgol' if kwargs.get('smoothing_window') is not None else 'radius_adaptive')
+    shared = (PathSmoothingContext(np.asarray(segmentation_labels) > 0, kwargs.get('spacing',(1,1,1)), kwargs.get('origin',(0,0,0)))
+              if contexts is None and method == 'radius_adaptive' else None)
+    for path_index, raw in enumerate(paths):
+        points = np.asarray(raw, dtype=float).reshape(-1, 3)
+        if len(points) < 2 or not np.all(np.isfinite(points)):
+            empty = np.empty((0, 3), dtype=float)
+            prepared.append((empty, empty))
+            continue
+        context = contexts[path_index] if contexts is not None else shared
+        dense, smooth, _receipt = prepare_centerline(points, context=context,
+            **{key: value for key,value in kwargs.items() if key in SMOOTHING_DEFAULTS and key != 'smoothing_method'},
+            smoothing_method=method, smoothing_window=kwargs.get('smoothing_window') or 15,
+            smoothing_polyorder=kwargs.get('smoothing_polyorder',2), inter_time=kwargs.get('inter_time',10))
+        prepared.append((dense, smooth))
+    placement_paths, candidates = build_label_plane_candidates(
+        paths, segmentation_labels, label_map, **kwargs,
+        _prepared_centerlines=prepared)
+    topology_paths, topology_candidates = build_label_plane_candidates(
+        paths, segmentation_labels, label_map, **kwargs,
+        _prepared_centerlines=[(dense, dense) for dense, _smooth in prepared])
+    return placement_paths, candidates, topology_paths, topology_candidates
+
+
+def _flow_direction(points, flow, mask, spacing, origin, *, mask_spacing=None):
     """Signed tangent alignment integrated over path length and cardiac phases."""
     result = {"flow_sign": 1, "flow_confidence": None, "flow_alignment": None,
               "flow_direction_status": "flow_unavailable", "flow_signal_available": False}
@@ -83,7 +133,12 @@ def _flow_direction(points, flow, mask, spacing, origin):
     vectors = np.asarray(velocity[tuple(voxels.T)], dtype=float)
     valid = inside[:, None] & np.all(np.isfinite(vectors), axis=-1)
     if mask is not None:
-        sampled = np.asarray(mask)[tuple(voxels.T)]
+        mask_array = np.asarray(mask)
+        mask_voxels = np.rint((points-np.asarray(origin))/np.asarray(spacing if mask_spacing is None else mask_spacing)).astype(int)
+        mask_inside = np.all((mask_voxels >= 0) & (mask_voxels < np.asarray(mask_array.shape[:3])), axis=1)
+        mask_voxels = np.clip(mask_voxels, 0, np.asarray(mask_array.shape[:3])-1)
+        sampled = mask_array[tuple(mask_voxels.T)]
+        valid &= mask_inside[:, None]
         if sampled.ndim == 1:
             sampled = sampled[:, None]
         valid &= np.broadcast_to(sampled > 0, valid.shape)
@@ -114,12 +169,12 @@ def _endpoint_key(candidate, side, raw):
     return group, "point", *np.round(point, decimals=6).tolist()
 
 
-def _select_main_paths(options, paths, smooth_paths, side, flow, mask, spacing, origin):
+def _select_main_paths(options, paths, smooth_paths, side, flow, mask, spacing, origin, flow_spacing=None):
     """All directed sources/sinks; deterministic per-component fallback for bad flow."""
     keys, by_path, gap_links = {}, {}, []
     for index, candidate in enumerate(options):
         points = smooth_paths[candidate["path_index"]][candidate["sample_start"]:candidate["sample_end"] + 1]
-        candidate.update(_flow_direction(points, flow, mask, spacing, origin))
+        candidate.update(_flow_direction(points, flow, mask, spacing if flow_spacing is None else flow_spacing, origin, mask_spacing=spacing))
         keys[index] = [_endpoint_key(candidate, endpoint, paths[candidate["path_index"]])
                        for endpoint in ("start", "end")]
         by_path.setdefault(candidate["path_index"], []).append(index)
@@ -185,16 +240,17 @@ def _select_main_paths(options, paths, smooth_paths, side, flow, mask, spacing, 
 
 def generate_label_planes(paths, segmentation_labels, label_map, rules, *,
                           flow_xyzt3=None, segmask_binary_4d=None, fork_points=None,
-                          branch_labels_3d=None, filter_defaults=None, **kwargs):
+                          branch_labels_3d=None, filter_defaults=None, flow_spacing=None, **kwargs):
     """Apply the configured plane count independently to every inflow/outflow root."""
     rules = normalize_label_plane_rules(rules)
-    smooth_paths, candidates = build_label_plane_candidates(paths, segmentation_labels, label_map, **kwargs)
-    # Root identity and direction come from the unsmoothed graph. Smoothing is
-    # exclusively placement geometry and cannot manufacture additional roots.
-    topology_paths, topology_candidates = build_label_plane_candidates(
-        paths, segmentation_labels, label_map, **dict(kwargs, smoothing_window=1))
+    # Root identity and placement share sample indices. Only placement uses
+    # smoothing; root selection continues to use the unsmoothed geometry.
+    smooth_paths, candidates, topology_paths, topology_candidates = _matched_label_plane_candidates(
+        paths, segmentation_labels, label_map, **kwargs)
     from .landmark_planes import ConnectionGraph, generate_landmark_label_planes
-    connection_graph = ConnectionGraph(topology_paths, topology_candidates, kwargs.get("path_info"), label_map)
+    context_kwargs = dict(segmentation_labels=segmentation_labels, spacing=kwargs.get('spacing',(1,1,1)),
+        origin=kwargs.get('origin',(0,0,0)), radius_contexts=kwargs.get('smoothing_contexts'))
+    connection_graph = ConnectionGraph(topology_paths, topology_candidates, kwargs.get("path_info"), label_map, **context_kwargs)
     present = set(int(x) for x in np.unique(segmentation_labels) if int(x) > 0)
     planes, labels_qc = [], []
     path_qc = [{"segmentation_filter": True, "requested_plane_count": 0,
@@ -202,6 +258,9 @@ def generate_label_planes(paths, segmentation_labels, label_map, rules, *,
                     np.linalg.norm(np.diff(path, axis=0), axis=1))) if len(path) > 1 else 0.0}
                for path in smooth_paths]
     resolved_labels = set()
+    # All landmark labels in this call share the same read-only masks, branch
+    # IDs and grid. Keep preparation local to this generation, across labels.
+    landmark_support_cache = {}
     for name, rule in rules.items():
         value = dict(label_map or {}).get(name)
         if value is None:
@@ -217,18 +276,17 @@ def generate_label_planes(paths, segmentation_labels, label_map, rules, *,
         placement_paths = smooth_paths
         label_candidates, label_topology_candidates = candidates, topology_candidates
         label_topology_paths = topology_paths
-        if any(rule[key] is not None for key in ("smoothing_window", "smoothing_polyorder", "inter_time")):
+        if any(rule[key] is not None for key in ("smoothing_window", "smoothing_polyorder", "inter_time", *SMOOTHING_DEFAULTS)):
             geometry_kwargs = dict(kwargs)
             density = rule["inter_time"] or kwargs.get("inter_time", 10)
             window = (rule["smoothing_window"] if rule["smoothing_window"] is not None else
-                      kwargs.get("smoothing_window", 15) / kwargs.get("inter_time", 10))
+                      (kwargs.get("smoothing_window") or 15) / kwargs.get("inter_time", 10))
             geometry_kwargs.update(inter_time=density, smoothing_window=max(1, int(round(window * density))),
                 smoothing_polyorder=rule["smoothing_polyorder"] if rule["smoothing_polyorder"] is not None
                 else kwargs.get("smoothing_polyorder", 2))
-            placement_paths, label_candidates = build_label_plane_candidates(
+            geometry_kwargs.update({key: rule[key] for key in SMOOTHING_DEFAULTS if rule[key] is not None})
+            placement_paths, label_candidates, label_topology_paths, label_topology_candidates = _matched_label_plane_candidates(
                 paths, segmentation_labels, label_map, **geometry_kwargs)
-            label_topology_paths, label_topology_candidates = build_label_plane_candidates(
-                paths, segmentation_labels, label_map, **dict(geometry_kwargs, smoothing_window=1))
         options = label_candidates.get(value, [])
         topology_options = label_topology_candidates.get(value, [])
         for candidate in options + topology_options:
@@ -246,21 +304,27 @@ def generate_label_planes(paths, segmentation_labels, label_map, rules, *,
         if value not in present:
             continue
         if not topology_options:
-            qc.update(status="no_label_path", reason="no_label_path")
+            qc.update(status="no_label_path", reason="no_label_path", requested_plane_count=int(rule["plane_count"]))
             continue
         if rule["plane_mode"] == "landmark":
             context = connection_graph
             if label_topology_paths is not topology_paths:
-                context = ConnectionGraph(label_topology_paths, label_topology_candidates, kwargs.get("path_info"), label_map)
+                context = ConnectionGraph(label_topology_paths, label_topology_candidates, kwargs.get("path_info"), label_map, **context_kwargs)
             semantic_name = next((str(key) for key, label in dict(label_map or {}).items() if int(label) == value), name)
             planes.extend(generate_landmark_label_planes(context, semantic_name, value, rule, placement_paths,
                 segmentation_labels, kwargs.get("spacing", (1, 1, 1)), qc, path_qc,
                 origin=kwargs.get("origin", (0, 0, 0)), mask4d=segmask_binary_4d,
-                branch_labels=branch_labels_3d, filter_defaults=filter_defaults))
+                branch_labels=branch_labels_3d, filter_defaults=filter_defaults,
+                support_cache=landmark_support_cache))
             continue
         selected, warnings, gaps, components = _select_main_paths(
             topology_options, paths, label_topology_paths, rule["main_path"], flow_xyzt3, segmask_binary_4d,
-            kwargs.get("spacing", (1, 1, 1)), kwargs.get("origin", (0, 0, 0)))
+            kwargs.get("spacing", (1, 1, 1)), kwargs.get("origin", (0, 0, 0)), flow_spacing=flow_spacing)
+        if warnings:
+            qc.update(status="selection_failed", reason="legacy_fallback_disabled",
+                      requested_plane_count=max(1, int(rule["plane_count"])),
+                      selection_warnings=list(warnings), omitted_positions=[{"reason": str(reason)} for reason in warnings])
+            continue
         qc.update(status="selected", main_path_count=len(selected), component_count=components,
                   requested_plane_count=len(selected) * max(0, rule["plane_count"]),
                   selection_source="automatic_with_fallback" if warnings else "flow_topology",

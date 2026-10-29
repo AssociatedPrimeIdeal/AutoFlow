@@ -32,6 +32,12 @@ class SceneLayersMixin:
                 window.AddRenderer(renderer)
                 setattr(self, attribute, renderer)
             renderer.SetActiveCamera(main.GetActiveCamera())
+            if attribute == "_selection_renderer":
+                # Selected anatomy uses the same material even when drawn in front.
+                renderer.RemoveAllLights()
+                for light in main.GetLights():
+                    renderer.AddLight(light)
+
 
     def set_selected_layers(self, uids, on_top=None, render=True):
         self._selected_layer_uids = set(uids or ())

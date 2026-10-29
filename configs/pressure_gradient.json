@@ -4,7 +4,7 @@
   "support_erosion_iters": 1,
   "use_convective_acceleration": true,
   "render": {
-    "cmap": "magma",
+    "cmap": "viridis",
     "opacity": 1.0,
     "clim": null,
     "show_scalar_bar": true,
@@ -12,7 +12,9 @@
       "cmap": "RdBu_r",
       "opacity": 1.0,
       "clim": null,
-      "show_scalar_bar": true
-    }
+      "show_scalar_bar": true,
+      "color_gamma": 0.65
+    },
+    "color_gamma": 0.55
   }
 }

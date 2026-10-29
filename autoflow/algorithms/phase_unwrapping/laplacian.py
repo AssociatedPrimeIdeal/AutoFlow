@@ -91,15 +91,12 @@ def unwrap_4D(phi_w, real_flag=True, ts=2, **kwargs):
     if phi_w.ndim != 4:
         raise ValueError("Input array phi_w must have 4 dimensions.")
 
-    nr_reference = np.zeros(phi_w.shape)
-    phi_w = phi_w[:phi_w.shape[0] // 2 * 2, :phi_w.shape[1] // 2 * 2, :phi_w.shape[2] // 2 * 2, :]
-
     sx, sy, sz, st = phi_w.shape
 
-    X, Y, Z, T = np.meshgrid(np.arange(-sx // 2, sx // 2),
-                             np.arange(-sy // 2, sy // 2),
-                             np.arange(-sz // 2, sz // 2),
-                             np.arange(-st // 2, st // 2),
+    X, Y, Z, T = np.meshgrid(np.arange(-(sx // 2), (sx + 1) // 2),
+                             np.arange(-(sy // 2), (sy + 1) // 2),
+                             np.arange(-(sz // 2), (sz + 1) // 2),
+                             np.arange(-(st // 2), (st + 1) // 2),
                              indexing='ij')
 
     mod = 2 * np.cos(np.pi * X / sx) + 2 * np.cos(np.pi * Y / sy) + \
@@ -109,11 +106,7 @@ def unwrap_4D(phi_w, real_flag=True, ts=2, **kwargs):
     lap_phi = np.cos(phi_w) * lap4(np.sin(phi_w), 1, mod, real_flag) - np.sin(phi_w) * lap4(np.cos(phi_w), 1, mod,
                                                                                             real_flag)
     ilap_phidiff = lap4(lap_phi - lap_phiw, -1, mod, real_flag)
-    nr = np.round(ilap_phidiff / (2 * np.pi)).astype(np.int8)
-
-    nr_reference[:nr.shape[0], :nr.shape[1], :nr.shape[2], :] = nr
-
-    return nr_reference
+    return np.round(ilap_phidiff / (2 * np.pi)).astype(np.int16)
 
 
 def unwrap_3D(phi_w, real_flag=True):
@@ -133,14 +126,11 @@ def unwrap_3D(phi_w, real_flag=True):
     if phi_w.ndim != 3:
         raise ValueError("Input array phi_w must have 3 dimensions.")
 
-    nr_reference = np.zeros(phi_w.shape)
-    phi_w = phi_w[:phi_w.shape[0] // 2 * 2, :phi_w.shape[1] // 2 * 2, :phi_w.shape[2] // 2 * 2]
-
     sx, sy, sz = phi_w.shape
 
-    X, Y, Z = np.meshgrid(np.arange(-sx // 2, sx // 2),
-                          np.arange(-sy // 2, sy // 2),
-                          np.arange(-sz // 2, sz // 2),
+    X, Y, Z = np.meshgrid(np.arange(-(sx // 2), (sx + 1) // 2),
+                          np.arange(-(sy // 2), (sy + 1) // 2),
+                          np.arange(-(sz // 2), (sz + 1) // 2),
                           indexing='ij')
 
     mod = 2 * np.cos(np.pi * X / sx) + 2 * np.cos(np.pi * Y / sy) + \
@@ -150,11 +140,7 @@ def unwrap_3D(phi_w, real_flag=True):
     lap_phi = np.cos(phi_w) * lap3(np.sin(phi_w), 1, mod, real_flag) - \
               np.sin(phi_w) * lap3(np.cos(phi_w), 1, mod, real_flag)
     ilap_phidiff = lap3(lap_phi - lap_phiw, -1, mod, real_flag)
-    nr = np.round(ilap_phidiff / (2 * np.pi)).astype(np.int8)
-
-    nr_reference[:nr.shape[0], :nr.shape[1], :nr.shape[2]] = nr
-
-    return nr_reference
+    return np.round(ilap_phidiff / (2 * np.pi)).astype(np.int16)
 
 
 def _fftshift_torch(value, dims):
@@ -169,17 +155,16 @@ def _ifftshift_torch(value, dims):
     return torch.fft.ifftshift(value, dim=dims)
 
 
-def _lap4d_gpu(phi_w: np.ndarray, mask: np.ndarray, *, ts: float, device: str) -> tuple[np.ndarray, np.ndarray]:
+def _lap4d_gpu(phi_w: np.ndarray, mask: np.ndarray, *, ts: float, device: str,
+               tfc: bool = True) -> tuple[np.ndarray, np.ndarray]:
     """Torch implementation of the PUDIP 4D Laplacian unwrap."""
     import torch
 
     dev = torch.device(device)
     original_shape = tuple(int(v) for v in phi_w.shape)
-    even_shape = tuple((v // 2) * 2 for v in original_shape)
-    slices = tuple(slice(0, v) for v in even_shape)
-    phi = torch.as_tensor(np.asarray(phi_w[slices], dtype=np.float32), device=dev)
+    phi = torch.as_tensor(np.asarray(phi_w, dtype=np.float32), device=dev)
     sx, sy, sz, st = (int(v) for v in phi.shape)
-    ranges = [torch.arange(-(n // 2), n // 2, device=dev, dtype=torch.float32) for n in (sx, sy, sz, st)]
+    ranges = [torch.arange(-(n // 2), (n + 1) // 2, device=dev, dtype=torch.float32) for n in (sx, sy, sz, st)]
     X, Y, Z, T = torch.meshgrid(*ranges, indexing="ij")
     mod = 2 * torch.cos(np.pi * X / sx) + 2 * torch.cos(np.pi * Y / sy) + 2 * torch.cos(np.pi * Z / sz)
     mod = mod + float(ts) * torch.cos(np.pi * T / st) - 6.0 - float(ts)
@@ -197,13 +182,11 @@ def _lap4d_gpu(phi_w: np.ndarray, mask: np.ndarray, *, ts: float, device: str) -
     lap_phiw = lap(phi)
     lap_phi = torch.cos(phi) * lap(torch.sin(phi)) - torch.sin(phi) * lap(torch.cos(phi))
     ilap = lap(lap_phi - lap_phiw, inverse=True)
-    nr_even = torch.round(ilap / (2.0 * np.pi)).to(torch.int16).cpu().numpy()
-    nr = np.zeros(original_shape, dtype=np.int16)
-    nr[slices] = nr_even
+    nr = torch.round(ilap / (2.0 * np.pi)).to(torch.int16).cpu().numpy()
     phase = np.asarray(phi_w, dtype=np.float32) + 2.0 * np.pi * nr.astype(np.float32)
-    # The bundled total-field correction is intentionally kept identical.
-    if np.any(mask):
+    if tfc and np.any(mask):
         from ._common import total_field_correction
 
         phase = total_field_correction(phase, mask.astype(np.int16))
+    nr = np.rint((phase - np.asarray(phi_w)) / (2 * np.pi)).astype(np.int16)
     return np.asarray(phase, dtype=np.float32), nr

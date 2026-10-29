@@ -43,6 +43,7 @@ def unwrap_data(phi_w, mode='3D', real_flag=True, venc=None, full=False, tfc=Fal
         phi_u = phi_w + 2 * np.pi * nr
         if tfc:
             phi_u = total_field_correction(phi_u, mask)
+        nr = np.rint((phi_u - phi_w) / (2 * np.pi))
         if venc:
             phi_u *= venc / np.pi
         if full:
@@ -56,6 +57,7 @@ def unwrap_data(phi_w, mode='3D', real_flag=True, venc=None, full=False, tfc=Fal
         phi_u = phi_w + 2 * np.pi * nr
         if tfc:
             phi_u = total_field_correction(phi_u, mask)
+        nr = np.rint((phi_u - phi_w) / (2 * np.pi))
         if venc:
             phi_u *= venc / np.pi
         if full:
@@ -77,6 +79,7 @@ def unwrap_data(phi_w, mode='3D', real_flag=True, venc=None, full=False, tfc=Fal
         nr = np.round((phi_u - phi_w) / (2 * np.pi))
         if tfc:
             phi_u = total_field_correction(phi_u, mask)
+        nr = np.rint((phi_u - phi_w) / (2 * np.pi))
         if venc:
             phi_u *= venc / np.pi
         if full:
@@ -121,6 +124,7 @@ def unwrap_data(phi_w, mode='3D', real_flag=True, venc=None, full=False, tfc=Fal
         nr = np.round((phi_u - phi_wrapped) / (2 * np.pi))
         if tfc:
             phi_u = total_field_correction(phi_u, mask)
+        nr = np.rint((phi_u - phi_wrapped) / (2 * np.pi))
         if venc:
             phi_u *= venc / np.pi
         if full:

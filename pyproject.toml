@@ -9,6 +9,7 @@ description = "Automated processing pipeline for 4D flow MRI with optional Qt GU
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
+classifiers = ["License :: OSI Approved :: MIT License"]
 dependencies = [
   "numpy",
   "scipy",
@@ -17,6 +18,8 @@ dependencies = [
   "networkx",
   "pyvista",
   "h5py",
+  "nibabel",
+  "tqdm",
   "imageio",
   "Pillow",
   "PyMaxflow",
@@ -32,9 +35,12 @@ docs = [
 ]
 test = [
   "pytest",
+  "PySide6>=6.6,<6.12",
+  "pyqtgraph>=0.13",
+  "pyvistaqt",
 ]
 gui = [
-  "PySide6>=6.6",
+  "PySide6>=6.6,<6.12",
   "pyqtgraph>=0.13",
   "pyvistaqt",
   "matplotlib",
@@ -52,7 +58,7 @@ all = [
   "dicom2h5 @ git+https://github.com/AssociatedPrimeIdeal/4DFlow_Dicom2H5.git@d13d0a49e1debd08bb659d447de1a51c32cf6920",
   "mkdocs-material>=9.5,<10",
   "pytest",
-  "PySide6>=6.6",
+  "PySide6>=6.6,<6.12",
   "pyqtgraph>=0.13",
   "pyvistaqt",
   "matplotlib",
@@ -71,6 +77,7 @@ include = ["autoflow", "autoflow.*"]
 
 [tool.setuptools.package-data]
 autoflow = [
+  "ui/icons/*.svg",
   "segmodel/nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm/dataset.json",
   "segmodel/nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm/plans.json",
   "segmodel/nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm/fold_all/checkpoint_final.pth",

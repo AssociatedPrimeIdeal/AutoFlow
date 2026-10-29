@@ -90,6 +90,9 @@ def generate_nnunet_4d_auto_segmentation(
     pipeline_script = ""
     if str(model_folder or "").lower().endswith((".sh", ".bash")):
         pipeline_script = str(Path(model_folder).expanduser().resolve())
+    # Only an explicitly selected orchestration script chooses another Python.
+    # The implicit default script supplies helper paths for the active runtime.
+    inference_python = _python_from_4d_pipeline_script(pipeline_script) if pipeline_script else ""
     model_path = Path(resolve_nnunet_4d_model_folder(model_folder))
     resolved_device = resolve_auto_segmentation_device(device)
     mag, flow = _ensure_nnunet_mag_flow(mag, flow)
@@ -138,9 +141,10 @@ def generate_nnunet_4d_auto_segmentation(
         # grouped preprocessing. This keeps custom resampling available when a
         # caller leaves the model setting empty.
         pipeline_script = grouped_script
-    if _nnunet_4d_grouped_requested(runner, grouped_preprocessing) and grouped_script:
+    if _nnunet_4d_grouped_requested(runner, grouped_preprocessing):
         try:
-            return _generate_nnunet_4d_grouped(
+            from .shared_worker import run_shared_inference
+            return run_shared_inference(
                 mag_nnunet,
                 flow_nnunet,
                 resolution_nnunet,
@@ -156,14 +160,14 @@ def generate_nnunet_4d_auto_segmentation(
                 num_processes_segmentation_export,
                 artifact_prefix,
                 progress_callback,
-                t_total_start,
+                t_total_start, origin=origin,
             )
         except TaskCancelled:
             raise
         except Exception as exc:
             grouped_fallback_reason = f"{type(exc).__name__}: {exc}"
             token = str(os.environ.get("AUTOFLOW_NNUNET4D_GROUPED", "auto") or "auto").strip().lower()
-            if token in {"1", "true", "yes", "on", "required"}:
+            if token in {"required"}:
                 raise
             _emit_progress(
                 progress_callback,
@@ -276,7 +280,7 @@ def generate_nnunet_4d_auto_segmentation(
             num_processes_segmentation_export,
             0.5,
             True,
-            python_executable=_python_from_4d_pipeline_script(pipeline_script),
+            python_executable=inference_python,
             bootstrap_resampler_path=(
                 Path(pipeline_script).expanduser().resolve().parent.parent.parent
                 / "nnunet" / "gpu_resampling.py"
@@ -348,7 +352,7 @@ def generate_nnunet_4d_auto_segmentation(
             "backend": "nnUNet4D",
             "model_folder": str(model_path),
             "pipeline_script": pipeline_script,
-            "python_executable": str(_python_from_4d_pipeline_script(pipeline_script) or sys.executable),
+            "python_executable": str(inference_python or sys.executable),
             "checkpoint": str(checkpoint_name),
             "device": str(resolved_device),
             "folds": list(selected_folds),
@@ -367,4 +371,6 @@ def generate_nnunet_4d_auto_segmentation(
             "prediction_file": "" if artifact_prediction is None else str(artifact_prediction),
             "elapsed_sec": float(elapsed_total),
         }
+        from .model_grid import collect_geometry_cache
+        provenance.update(collect_geometry_cache([output_dir / f"{safe_case_id}_t{i:03d}{file_ending}" for i in range(time_count)], seg_4d, resolution, origin, label_map, artifact_prefix))
         return np.asarray(seg_4d, dtype=np.int16), provenance

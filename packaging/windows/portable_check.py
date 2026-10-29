@@ -73,6 +73,23 @@ def main():
             _ = predictor.configuration_manager.resampling_fn_probabilities
             result[name] = {"folder": str(folder), "checkpoint": checkpoint,
                             "channels": len(predictor.dataset_json["channel_names"])}
+            strides = getattr(getattr(predictor.network, "encoder", None), "strides", None)
+            if strides is None:
+                raise RuntimeError("Cannot determine a valid small nnUNet forward shape")
+            strides = np.asarray([([s]*3 if isinstance(s, int) else s) for s in strides], dtype=int)
+            shape = tuple((2*np.prod(strides, axis=0)).tolist())
+            old_threads = torch.get_num_threads()
+            try:
+                torch.set_num_threads(min(4, os.cpu_count() or 1))
+                predictor.network.eval()
+                with torch.inference_mode():
+                    output = predictor.network(torch.zeros((1, result[name]["channels"])+shape))
+                output = output[0] if isinstance(output, (tuple, list)) else output
+                if not torch.isfinite(output).all():
+                    raise ValueError("Non-finite nnUNet forward output")
+                result[name]["cpu_forward_shape"] = list(output.shape)
+            finally:
+                torch.set_num_threads(old_threads)
             del predictor
         previous = os.environ.get("AUTOFLOW_NNUNET_DEVICE")
         os.environ["AUTOFLOW_NNUNET_DEVICE"] = "cpu"
@@ -169,7 +186,7 @@ def main():
                 "gust_iteration_completed": True}
 
     def gui():
-        from PySide6 import QtWidgets
+        from PySide6 import QtWidgets, QtTest
         import pyvista as pv
         from autoflow.ui.app import MainWindow, configure_high_dpi, apply_application_theme
 
@@ -177,11 +194,58 @@ def main():
         application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         apply_application_theme(application)
         window = MainWindow()
+        import numpy as np
+        import h5py
+        from autoflow.core.models import PlaneData
+        workspace = window.workspace
+        temporary_case = tempfile.TemporaryDirectory(prefix="autoflow_gui_case_")
+        input_path = Path(temporary_case.name)/"case space 测试.h5"
+        with h5py.File(input_path, "w") as handle:
+            handle["mag"] = np.ones((16, 16, 16, 2), dtype=np.float32)
+            velocity = np.zeros((16, 16, 16, 2, 3), dtype=np.float32)
+            velocity[..., 1, 2] = 20.
+            handle["flow"] = velocity
+            handle["segmask"] = np.ones((16, 16, 16, 2), dtype=np.int16)
+            handle["Resolution"] = np.ones(3)
+            handle["Origin"] = np.array([10., -20., 30.])
+            handle["VENC"] = np.full(3, 150.)
+            handle["RR"] = 1000.
+        workspace.paths.output_dir = str(Path(temporary_case.name)/"outputs")
+        workspace.paths.flow_path = workspace.paths.segmask_path = str(input_path)
+        window.pipeline.load_data(workspace, lambda _: None, reuse_existing_corr=False, apply_background_correction=False)
+        workspace.planes = [PlaneData(center=np.array([8., 8., 8.]), normal=np.array([0., 0., 1.]), path_index=-1)]
+        window._rebuild_plane_objects()
+        window._refresh_all()
+        window._selected_plane_index = 0
+        window.ortho_viewer.set_selected_plane(0)
         window.show()
         application.processEvents()
+        window.scene.reset_camera()
+        window.scene.flush_render()
+        QtTest.QTest.qWait(50)
+        case_pixels = window.plotter.screenshot(return_img=True)
+        if case_pixels is None or np.ptp(case_pixels[..., :3]) == 0:
+            raise ValueError("MainWindow did not render the phantom plane")
+        if args.output:
+            from PIL import Image
+            Image.fromarray(case_pixels).save(str(args.output.with_suffix(".case.png")))
         if args.output:
             window.grab().save(str(args.output.with_suffix(".gui.png")))
+        # Verify that the shipped Chromium helper/resources can load the QC page.
+        import time
+        def document_loaded(pane, token):
+            answer = []
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                pane.view.page().runJavaScript("document.body && document.body.innerText.includes(" + json.dumps(token) + ")", lambda value: answer.append(value))
+                QtTest.QTest.qWait(100)
+                if any(answer):
+                    return True
+            raise ValueError("Bundled HTML tab did not load: " + token)
+        window._on_open_case_qc()
+        document_loaded(window._html_document_panes["qc"], "Measurement")
         window.close()
+        temporary_case.cleanup()
         application.processEvents()
         plotter = pv.Plotter(off_screen=True, window_size=(64, 64))
         plotter.add_mesh(pv.Sphere())
@@ -189,7 +253,7 @@ def main():
         plotter.close()
         if pixels is None or pixels.shape[:2] != (64, 64):
             raise ValueError("No VTK screenshot produced")
-        return {"window_created": True, "render_shape": list(pixels.shape)}
+        return {"window_created": True, "phantom_case_loaded": True, "qc_tab_loaded": True, "plane_count": 1, "render_shape": list(pixels.shape)}
 
     for name, operation in (("documentation", documentation), ("imports", imports), ("msvc_runtime", msvc_runtime), ("models", models), ("spawn_workers", workers),
                             ("subprocess_entries", commands), ("video_encoder", encoder), ("cuda", gpu)):

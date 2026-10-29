@@ -20,12 +20,13 @@ from ..algorithms import (
     generate_streamlines_at_t,
 )
 from ..config import DEFAULT_PLANE_VIDEO_CFG, BACKGROUND_COLOR
+from ..algorithms.flow_display import clip_flow_lines
 from .style import (
     configure_plotter, plane_display_size,
     metric_style, scalar_bar_args, scene_object, surface_style, configured_metric_style, render_style_settings,
     wss_display_surface, wss_scalar_range, metric_volume_kwargs, apply_metric_volume_opacity, metric_clim,
 )
-from .datasets import tke_display_mesh, display_support_surface, sample_display_field
+from .datasets import tke_display_mesh, display_support_surface, sample_display_field, metric_display_mesh
 from .video_layout import VideoOverlay
 
 WINDOW_SIZE = (1600, 1200)
@@ -291,7 +292,7 @@ def _time_and_azimuth(frame_idx, rotation_frames, n_time, time_repeat=1):
 
 def _build_union_surface(ws, smoothing_iteration=200):
     cache_key = (
-        id(getattr(ws, "segmask_binary", None)),
+        id(getattr(ws, "segmentation_analysis_binary", None) if getattr(ws, "segmentation_analysis_binary", None) is not None else ws.segmask_binary),
         id(getattr(ws, "segmask_3d", None)),
         int(smoothing_iteration),
         tuple(np.asarray(ws.resolution, dtype=float).reshape(3)),
@@ -300,11 +301,17 @@ def _build_union_surface(ws, smoothing_iteration=200):
     cache = getattr(ws, "_video_union_surface_cache", {})
     if cache_key in cache:
         return cache[cache_key]
-    if ws.segmask_binary is not None:
-        mask3d = np.any(np.asarray(ws.segmask_binary, dtype=bool), axis=3)
+    if (getattr(ws, "segmentation_analysis_binary", None) if getattr(ws, "segmentation_analysis_binary", None) is not None else ws.segmask_binary) is not None:
+        mask3d = np.asarray((getattr(ws, "segmentation_analysis_binary", None) if getattr(ws, "segmentation_analysis_binary", None) is not None else ws.segmask_binary), dtype=bool)
+        if mask3d.ndim == 4:
+            mask3d = np.any(mask3d, axis=3)
+    elif ws.segmask_3d is None:
+        return None, None
     else:
         mask3d = np.asarray(ws.segmask_3d, dtype=bool)
-    mesh = create_uniform_grid(mask3d, ws.resolution, origin=ws.origin)
+    spacing = ws.segmentation_spacing if getattr(ws, "segmentation_analysis_binary", None) is not None else ws.resolution
+    origin = np.asarray(ws.origin)-0.5*spacing if getattr(ws, "segmentation_analysis_binary", None) is not None else ws.origin
+    mesh = create_uniform_grid(mask3d, spacing, origin=origin)
     mesh = mesh.threshold(0.1)
     if mesh is None or mesh.n_cells == 0:
         return None, None
@@ -343,13 +350,14 @@ def _build_group_surfaces(ws, smoothing_iteration=200):
     groups = getattr(ws, "multilabel_groups", {}) or {}
     for group_name in group_order:
         state = groups.get(group_name, {}) or {}
-        mask = state.get("segmask_3d")
+        mask = state.get("geometry_mask_3d", state.get("segmask_3d"))
+        fine = state.get("geometry_mask_3d") is not None
         if mask is None or not np.any(mask):
             continue
         surface = build_cell_mask_surface(
             np.asarray(mask, dtype=bool),
-            ws.resolution,
-            origin=ws.origin,
+            ws.segmentation_spacing if fine else ws.resolution,
+            origin=np.asarray(ws.origin)-0.5 if fine else ws.origin,
             smooth_iter=smoothing_iteration,
         )
         if surface is None or surface.n_points == 0:
@@ -749,7 +757,7 @@ def render_wss_video(
 
             phase = min(max(0, t), len(ws.derived.wss_surfaces) - 1)
             if phase not in wss_display_cache:
-                wss_display_cache[phase] = wss_display_surface(ws.derived.wss_surfaces[phase])
+                wss_display_cache[phase] = metric_display_mesh(ws, "wss_surface_live", phase)
             surface = wss_display_cache[phase]
             if surface is not None and surface.n_points > 0 and "wss" in surface.point_data:
                 if wss_actor is None:
@@ -780,7 +788,10 @@ def render_wss_video(
 
 
 def _streamline_speed_max(ws):
-    return automatic_streamline_clim(ws.flow_raw, ws.segmask_binary)[1]
+    p = ws.streamline_params
+    mask = ((ws.segmask_binary if ws.segmask_binary is not None else ws.segmask_3d) if p.seed_region == "segmentation" else
+            ws.pcmra_render_mask if p.seed_region == "noise_free" else None)
+    return automatic_streamline_clim(ws.flow_raw, mask)[1]
 
 
 def _ensure_streamline_scalars(sl):
@@ -814,21 +825,18 @@ def render_streamlines_video(
     time_repeat=1,
     window_size=None,
 ):
-    if ws.flow_raw is None or ws.segmask_binary is None or ws.segmask_3d is None:
+    if ws.flow_raw is None:
         return None
-
-    mesh, surf = _build_union_surface(ws, smoothing_iteration=smoothing_iteration)
-    if mesh is None or surf is None or surf.n_points == 0:
-        return None
-
-    seeds = generate_seed_points(
-        ws.segmask_3d,
-        ws.resolution,
-        ws.origin,
-        ratio=ws.streamline_params.seed_ratio,
-        rng_seed=ws.streamline_params.rng_seed,
-        min_seeds=ws.streamline_params.min_seeds,
-    )
+    params = ws.streamline_params
+    segmentation = ws.segmask_binary if ws.segmask_binary is not None else ws.segmask_3d
+    surf = None
+    if segmentation is not None:
+        _, surf = _build_union_surface(ws, smoothing_iteration=smoothing_iteration)
+    camera_surface = surf
+    if params.seed_region != "segmentation" or camera_surface is None or camera_surface.n_points == 0:
+        start = np.asarray(ws.origin, float)
+        end = start + np.asarray(ws.flow_raw.shape[:3]) * np.asarray(ws.resolution)
+        camera_surface = pv.Box(bounds=tuple(np.column_stack((start, end)).reshape(-1)))
 
     v_max = _streamline_speed_max(ws)
     clim = metric_clim(ws, "streamlines_live", streamline_clim, (0.0, v_max))
@@ -848,25 +856,24 @@ def render_streamlines_video(
         total_frames = n_time * int(max(time_repeat, 1))
 
     def _build_streamline(tidx):
-        mask_t = np.asarray(
-            ws.segmask_binary[..., min(max(0, tidx), ws.segmask_binary.shape[3] - 1)],
-            dtype=bool,
-        )
-        return tidx, _ensure_streamline_scalars(
-            generate_streamlines_at_t(
+        sl = _ensure_streamline_scalars(generate_streamlines_at_t(
                 ws.flow_raw,
                 tidx,
-                seeds,
+                None,
                 ws.resolution,
                 ws.origin,
-                mask_3d=mask_t,
-                max_steps=ws.streamline_params.max_steps,
-                terminal_speed=ws.streamline_params.terminal_speed,
-                seed_ratio=ws.streamline_params.seed_ratio,
-                min_seeds=ws.streamline_params.min_seeds,
-                rng_seed=ws.streamline_params.rng_seed,
-            )
-        )
+                mask_3d=segmentation,
+                max_steps=params.max_steps, terminal_speed=params.terminal_speed,
+                seed_ratio=params.seed_ratio, min_seeds=params.min_seeds, rng_seed=params.rng_seed,
+                seed_region=params.seed_region, noise_keep=ws.pcmra_render_mask,
+                seed_distribution=params.seed_distribution, grid_spacing_mm=params.grid_spacing_mm,
+                seed_mode=params.seed_mode, seed_count=params.seed_count,
+                integration_step_mm=params.integration_step_mm,
+                integration_backend=params.integration_backend))
+        sl = clip_flow_lines(sl, params.display_min_speed_cm_s)
+        if sl is not None and sl.n_lines and params.display_style == "tubes":
+            sl = sl.tube(radius=getattr(scene_object(ws, "streamlines_live"), "tube_radius", params.tube_radius), n_sides=12)
+        return tidx, sl
 
     worker_count = min(n_time, 8, max(1, os.cpu_count() or 1))
     if worker_count > 1:
@@ -877,7 +884,8 @@ def render_streamlines_video(
 
     plotter = _make_plotter(window_size=_resolve_window_size(window_size), background=_video_background(ws), workspace=ws)
     try:
-        _add_context_surfaces(plotter, ws, surf, smoothing_iteration)
+        if surf is not None:
+            _add_context_surfaces(plotter, ws, surf, smoothing_iteration)
         streamline_actor = None
         overlay = VideoOverlay(plotter, ws, 'Velocity streamlines')
 
@@ -890,10 +898,10 @@ def render_streamlines_video(
                     n_time=n_time,
                     time_repeat=time_repeat,
                 )
-                camera_position = _orbit_camera(surf, azimuth_deg, elevation_deg, distance_scale)
+                camera_position = _orbit_camera(camera_surface, azimuth_deg, elevation_deg, distance_scale)
             else:
                 t = _time_index(frame_idx, n_time, time_repeat)
-                camera_position = _camera_from_view(surf, view, distance_scale)
+                camera_position = _camera_from_view(camera_surface, view, distance_scale)
 
             sl = streamline_cache[t]
 
@@ -906,7 +914,7 @@ def render_streamlines_video(
                             scalars="Velocity",
                             clim=clim,
                             render_lines_as_tubes=True,
-                            line_width=getattr(scene_object(ws, "streamlines_live"), "line_width", configured_metric_style(ws, "streamlines_live")["line_width"]),
+                            line_width=getattr(scene_object(ws, "streamlines_live"), "line_width", params.line_width),
                             **metric_style(ws, "streamlines_live"),
                             **_scalar_bar_mesh_kwargs(show_scalar_bar, "Velocity (m/s)", streamline_bar_cfg, ws=ws),
                         )
@@ -1007,21 +1015,25 @@ def render_tke_video(
                 camera_position = _camera_from_view(surf, view, distance_scale)
 
             if t not in tke_mesh_cache:
-                tke_mesh_cache[t] = tke_display_mesh(ws, t)
+                tke_mesh_cache[t] = (tke_display_mesh(ws, t) if configured_metric_style(ws, "tke_volume")["mode"] == "volume" else metric_display_mesh(ws, "tke_volume", t))
             tke_mesh = tke_mesh_cache[t]
             if tke_mesh is not None and tke_mesh.n_points > 0:
                 if tke_actor is None:
-                    tke_actor = plotter.add_volume(
-                        tke_mesh, scalars="TKE",
-                        **metric_volume_kwargs(ws, "tke_volume", clim),
-                        mapper='fixed_point' if plotter.render_window.GetClassName() == 'vtkOSOpenGLRenderWindow' else 'smart',
-                        **_scalar_bar_mesh_kwargs(show_scalar_bar, "TKE (J/m³)", tke_bar_cfg, ws=ws),
-                    )
+                    if configured_metric_style(ws, "tke_volume")["mode"] == "volume":
+                        tke_actor = plotter.add_volume(
+                            tke_mesh, scalars="TKE", **metric_volume_kwargs(ws, "tke_volume", clim),
+                            mapper='fixed_point' if plotter.render_window.GetClassName() == 'vtkOSOpenGLRenderWindow' else 'smart',
+                            **_scalar_bar_mesh_kwargs(show_scalar_bar, "TKE (J/m³)", tke_bar_cfg, ws=ws))
+                    else:
+                        tke_actor = plotter.add_mesh(
+                            tke_mesh, scalars="TKE", clim=clim, **metric_style(ws, "tke_volume"),
+                            **_scalar_bar_mesh_kwargs(show_scalar_bar, "TKE (J/m³)", tke_bar_cfg, ws=ws))
                 else:
                     tke_actor.SetVisibility(1)
                     tke_actor.GetMapper().dataset = tke_mesh
                     tke_actor.GetMapper().Update()
-                apply_metric_volume_opacity(tke_actor, clim, metric_style(ws, 'tke_volume')['opacity'], ws.resolution, workspace=ws)
+                if configured_metric_style(ws, 'tke_volume')['mode'] == 'volume':
+                    apply_metric_volume_opacity(tke_actor, clim, metric_style(ws, 'tke_volume')['opacity'], ws.resolution, workspace=ws)
             elif tke_actor is not None:
                 tke_actor.SetVisibility(0)
 
@@ -1137,11 +1149,7 @@ def render_pressure_gradient_video(
                 vol_t = pg_arr if pg_arr.ndim == 3 else pg_arr[..., tidx]
                 support_t = support_arr if support_arr.ndim == 3 else support_arr[..., tidx]
                 vol_t = np.where(support_t, vol_t, 0.0)
-                support_surface = _pressure_support_surface(ws, support_source, tidx, smooth_iter=80)
-                pg_mesh_cache[tidx] = sample_display_field(
-                    vol_t, support_t, support_surface, ws.resolution, origin=ws.origin,
-                    name="PressureGradient",
-                )
+                pg_mesh_cache[tidx] = metric_display_mesh(ws, "pressure_gradient_volume", tidx)
             pg_mesh = pg_mesh_cache[tidx]
             if pg_mesh is not None and pg_mesh.n_points > 0:
                 if pg_actor is None:
@@ -1246,11 +1254,7 @@ def render_relative_pressure_video(
                 vol_t = rp_arr if rp_arr.ndim == 3 else rp_arr[..., tidx]
                 support_t = support_arr if support_arr.ndim == 3 else support_arr[..., tidx]
                 vol_t = np.where(support_t, vol_t, 0.0)
-                support_surface = _pressure_support_surface(ws, support_source, tidx, smooth_iter=80)
-                rp_mesh_cache[tidx] = sample_display_field(
-                    vol_t, support_t, support_surface, ws.resolution, origin=ws.origin,
-                    name="RelativePressure",
-                )
+                rp_mesh_cache[tidx] = metric_display_mesh(ws, "relative_pressure_volume", tidx)
             rp_mesh = rp_mesh_cache[tidx]
             if rp_mesh is not None and rp_mesh.n_points > 0:
                 if rp_actor is None:

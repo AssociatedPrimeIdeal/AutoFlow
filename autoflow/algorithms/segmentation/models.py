@@ -35,9 +35,9 @@ _NNUNET_3D_MODEL_DEFAULT = Path(
 _NNUNET_3D_CHECKPOINT_DEFAULT = "checkpoint_final.pth"
 
 
-_NNUNET_4D_MODEL_DEFAULT = Path(
-    "/nas-data/ryy_rawdata/aorta_seg/nnres_noCC/Dataset7020_Aorta_4DTemporalFT/"
-    "nnUNetTrainerPartBalancedTversky__nnUNetPlansIso1mm__3d_fullres"
+# Frozen best checkpoint; training continues in a separate mutable directory.
+_NNUNET_4D_MODEL_DEFAULT = (
+    Path(__file__).resolve().parents[2] / "segmodel" / "nnunet4d_20261029_f117a02617a2"
 )
 
 
@@ -46,11 +46,11 @@ _NNUNET_4D_CHECKPOINT_DEFAULT = "checkpoint_best.pth"
 
 _NNUNET_4D_PIPELINE_DEFAULT = Path(
     "/nas-data2/ryy/CMR4DFlow2026/Segdata/scripts/nnunet/4D/"
-    "run_7020_4d_full_ssd_20260824.sh"
+    "run_7020_20260829_noCC.sh"
 )
 
 
-_NNUNET_4D_RESULTS_DEFAULT = Path("/nas-data/ryy_rawdata/aorta_seg/nnres")
+_NNUNET_4D_RESULTS_DEFAULT = Path("/nas-data2/ryy_rawdata/aorta_seg/nnres_noCC")
 
 
 _NNUNET_4D_DATASET_DEFAULT = "Dataset7020_Aorta_4DTemporalFT"
@@ -184,7 +184,7 @@ def default_nnunet_4d_pipeline_script():
 def _model_folder_from_4d_pipeline_script(script_path):
     """Resolve a Dataset7020 model directory from its shell configuration.
 
-    The supplied ``run_7020_4d_full_ssd_20260824.sh`` is a training/prediction
+    The supplied ``run_7020_20260829_noCC.sh`` is a training/prediction
     orchestrator rather than an inference executable.  Parsing its stable
     ``NNUNET_RESULTS`` and ``DATASET`` assignments lets callers point
     ``auto_model`` at that script while AutoFlow still invokes nnUNet once per
@@ -239,11 +239,18 @@ def _nnunet_4d_pipeline_assignments(script_path):
     # The shell script intentionally derives cache paths from SSD_ROOT. Expand
     # only the local assignments so ${SSD_ROOT} never leaks into child env.
     for name, value in list(values.items()):
-        for _ in range(4):
+        for _ in range(8):
+            # Parse literal defaults without executing the training script.
+            # The noCC script nests SSD_ROOT inside another shell default.
+            defaulted = re.sub(
+                r"\$\{[A-Za-z_][A-Za-z0-9_]*:-([^{}]*)\}",
+                lambda match: match.group(1),
+                value,
+            )
             replaced = re.sub(
                 r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)",
                 lambda match: values.get(match.group(1) or match.group(2), match.group(0)),
-                value,
+                defaulted,
             )
             if replaced == value:
                 break

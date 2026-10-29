@@ -6,7 +6,7 @@ import numpy as np
 from ...task_control import check_cancelled, report_progress
 
 
-def save_plane_pixelwise_h5(path, plane_payloads, rr_ms=None, source_format=""):
+def save_plane_pixelwise_h5(path, plane_payloads, rr_ms=None, source_format="", *, input_signature=""):
     """Publish a complete file, preserving the previous export on cancellation."""
     import uuid
     import stat
@@ -16,7 +16,7 @@ def save_plane_pixelwise_h5(path, plane_payloads, rr_ms=None, source_format=""):
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
     os.close(fd)
     try:
-        _write_plane_pixelwise_h5(temporary, plane_payloads, rr_ms, source_format)
+        _write_plane_pixelwise_h5(temporary, plane_payloads, rr_ms, source_format, input_signature=input_signature)
         check_cancelled()
         if os.path.isfile(path):
             os.chmod(temporary, stat.S_IMODE(os.stat(path).st_mode))
@@ -26,10 +26,12 @@ def save_plane_pixelwise_h5(path, plane_payloads, rr_ms=None, source_format=""):
             os.remove(temporary)
 
 
-def _write_plane_pixelwise_h5(path, plane_payloads, rr_ms=None, source_format=""):
+def _write_plane_pixelwise_h5(path, plane_payloads, rr_ms=None, source_format="", *, input_signature=""):
     with h5py.File(path, "w") as h5:
         meta = h5.create_group("meta")
-        meta.create_dataset("version", data=np.bytes_("1.0"))
+        meta.attrs["validity"] = "current"
+        meta.attrs["input_signature"] = input_signature
+        meta.create_dataset("version", data=np.bytes_("2.0"))
         meta.create_dataset("source_format", data=np.bytes_(str(source_format or "")))
         if rr_ms is not None:
             meta.create_dataset("rr_ms", data=float(rr_ms))
@@ -40,6 +42,9 @@ def _write_plane_pixelwise_h5(path, plane_payloads, rr_ms=None, source_format=""
                              "message": f"Writing pixelwise plane {export_index + 1}"})
             plane_idx = int(payload.get("plane_index", len(planes_group)))
             grp = planes_group.create_group(f"{plane_idx:03d}")
+            for key in ("plane_id", "geometry_revision", "roi_revision", "dependency_signature", "validity"):
+                if payload.get(key) is not None:
+                    grp.attrs[key] = payload[key]
             grp.create_dataset("center_xyz", data=np.asarray(payload.get("center", [0.0, 0.0, 0.0]), dtype=np.float32))
             grp.create_dataset("normal_xyz", data=np.asarray(payload.get("normal", [1.0, 0.0, 0.0]), dtype=np.float32))
             grp.attrs["label"] = int(payload.get("label", 0))
@@ -63,6 +68,7 @@ def load_metrics_as_table(metrics_json_path, qc_json_path=None):
     with open(metrics_json_path, "r", encoding="utf-8") as f:
         metrics = _json.load(f)
     scalar_keys = [
+        "plane_id", "geometry_revision", "roi_revision", "validity", "stale_reason", "sampling_status",
         "label", "segmentation_label", "path_index", "distance", "target_branch_label",
         "peakv_cm_s", "netflow_mL_beat", "meanv_cm_s", "path_ic", "segmentation_label_ic",
         "path_direction",
@@ -93,9 +99,17 @@ def load_metrics_as_table(metrics_json_path, qc_json_path=None):
             row[f"flowrate_t{t}"] = m["flowrate_mL_s"][t]
         for t in range(len(m.get("area_mm2", []))):
             row[f"area_t{t}"] = m["area_mm2"][t]
-        for key in ("roi_source_frame_t", "roi_carried_forward_t"):
+        for key in ("roi_source_frame_t", "roi_carried_forward_t", "roi_interpolated_t",
+                    "roi_source_frames_t", "roi_interpolation_weight_t", "roi_resolution_t"):
             for t, value in enumerate(m.get(key, [])):
                 row[f"{key}{t}"] = value
+        valid = m.get("sample_valid_t", [])
+        for t, ok in enumerate(valid):
+            row[f"sample_valid_t{t}"] = bool(ok)
+            if not ok:
+                for key in list(row):
+                    if key.endswith(f"_t{t}") and not key.startswith(("roi_", "sample_")):
+                        row[key] = None
         for t in range(len(m.get("meanv_cm_s_t", []))):
             row[f"meanv_t{t}"] = m["meanv_cm_s_t"][t]
         for t in range(len(m.get("flowrate_forward_mL_s", []))):
@@ -115,9 +129,48 @@ def load_metrics_as_table(metrics_json_path, qc_json_path=None):
             row[f"fork{fi}_id"] = fic.get("fork_id", -1)
             row[f"fork{fi}_role"] = fic.get("role", "")
             row[f"fork{fi}_ic"] = fic.get("ic", 1.0)
+        unavailable = m.get("validity") == "stale" or ("sample_valid_t" in m and (not valid or not all(valid)))
+        if unavailable:
+            geometry = {"label", "segmentation_label", "path_index", "distance", "target_branch_label", "plane_id",
+                        "geometry_revision", "roi_revision", "validity", "stale_reason", "sampling_status"}
+            for key in scalar_keys:
+                if key not in geometry and isinstance(row.get(key), (int, float, np.number)):
+                    row[key] = None
+        for t, ok in enumerate(valid):
+            if not ok or m.get("validity") == "stale":
+                for key in list(row):
+                    if key.endswith(f"_t{t}") and not key.startswith(("roi_", "sample_")):
+                        row[key] = None
+        from ...core.plane_state import metric_family
+        flags = m.get("field_validity", {})
+        row["field_validity"] = _json.dumps(flags, sort_keys=True)
+        for key in list(row):
+            if flags.get(metric_family(key)) == "stale":
+                row[key] = None
         table_rows.append(row)
     qc_data = None
     if qc_json_path is not None:
         with open(qc_json_path, "r", encoding="utf-8") as f:
             qc_data = _json.load(f)
     return table_rows, metrics, qc_data
+
+
+def refresh_pixelwise_validity(path, workspace):
+    """Keep a previous H5 explicit after mutation; revalidate matching undo."""
+    from ...core.plane_state import workspace_signature
+    if not os.path.isfile(path):
+        return False
+    with h5py.File(path, "r+") as handle:
+        meta = handle.require_group("meta")
+        groups = handle.get("planes")
+        current = meta.attrs.get("input_signature", "") == workspace_signature(workspace, include_analysis=False)
+        current = current and groups is not None and len(groups) == len(workspace.planes)
+        if current:
+            for index, plane in enumerate(workspace.planes):
+                group = groups.get(f"{index:03d}")
+                if group is None or any(group.attrs.get(key) != value for key, value in plane.identity_dict().items()):
+                    current = False
+                    break
+        meta.attrs["validity"] = "current" if current else "stale"
+        meta.attrs["checked_analysis_revision"] = int(workspace.analysis_revision)
+    return bool(current)

@@ -6,19 +6,22 @@
       "cmap": "turbo",
       "opacity": 1.0,
       "clim": null,
-      "show_scalar_bar": true
+      "show_scalar_bar": true,
+      "color_gamma": 0.8
     },
     "q_criterion": {
       "cmap": "RdBu_r",
       "opacity": 1.0,
       "clim": null,
-      "show_scalar_bar": true
+      "show_scalar_bar": true,
+      "color_gamma": 0.65
     },
     "swirling_strength": {
       "cmap": "turbo",
       "opacity": 1.0,
       "clim": null,
-      "show_scalar_bar": true
+      "show_scalar_bar": true,
+      "color_gamma": 0.8
     }
   }
 }

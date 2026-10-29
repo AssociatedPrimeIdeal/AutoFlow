@@ -48,11 +48,12 @@ def graph_edge_chains(graph):
     return chains
 
 
-def _direction(points, flow, mask, spacing):
+def _direction(points, flow, mask, spacing, flow_spacing=None):
     if flow is None:
         return {"direction_status": "flow_unavailable", "direction_confidence": None, "flow_sign": None}
     from .label_planes import _flow_direction
-    score = _flow_direction(inter_points(points, time=3), flow, mask, spacing, (0, 0, 0))
+    score = _flow_direction(inter_points(points, time=3), flow, mask,
+                            spacing if flow_spacing is None else flow_spacing, (0, 0, 0), mask_spacing=spacing)
     reliable = score["flow_direction_status"] == "reliable"
     return {"direction_status": "reliable" if reliable else "flow_direction_unreliable",
             "direction_confidence": score["flow_confidence"],
@@ -96,7 +97,7 @@ def _rank(network, inlet_paths, blocked=(), first_level=1):
 
 def analyze_group_graph(graph, node_chains, *, flow=None, mask=None, spacing=(1, 1, 1),
                         segmentation_labels=None, label_map=None, group_name="", path_indices=None,
-                        direction_paths=None):
+                        direction_paths=None, flow_spacing=None):
     """Annotate compressed graph arms before final centerline path materialization."""
     indices = list(range(len(node_chains))) if path_indices is None else list(map(int, path_indices))
     network = graph_to_networkx(graph)
@@ -115,7 +116,7 @@ def analyze_group_graph(graph, node_chains, *, flow=None, mask=None, spacing=(1,
     for local_index, (path_index, nodes) in enumerate(zip(indices, node_chains)):
         curve = points[np.asarray(nodes, dtype=int)]
         sample = curve if direction_paths is None else direction_paths[local_index]
-        direction = _direction(np.asarray(sample, dtype=float), flow, mask, spacing)
+        direction = _direction(np.asarray(sample, dtype=float), flow, mask, spacing, flow_spacing)
         component = component_of[int(nodes[0])]
         record = {"path_index": path_index, "group_name": str(group_name),
                   "component_index": component, "subgroup_index": component,
@@ -265,6 +266,9 @@ def joint_mask_graph(mask, spacing, connectivity=26, *, segmentation_labels=None
 def build_workspace_hierarchy(workspace):
     """Group reports plus a separate joint anterior/posterior arterial view."""
     ws = workspace
+    fine_labels = getattr(ws, 'segmentation_analysis_labels_3d', None)
+    geometry_spacing = ws.resolution if fine_labels is None else ws.segmentation_spacing
+    geometry_labels = ws.segmask_labels_3d if fine_labels is None else fine_labels
     groups, all_paths = [], []
     for group_name in ws.group_order:
         state = ws.multilabel_groups[group_name]
@@ -272,11 +276,12 @@ def build_workspace_hierarchy(workspace):
         # Group chains use global node ids while their graph stores local ids.
         # Use the global graph so compacted/unused node ids need no inferred offset.
         report = analyze_group_graph(ws.graph, state.get("centerline_node_paths", []), flow=ws.flow_raw,
-            mask=state.get("segmask_binary"), spacing=ws.resolution, segmentation_labels=ws.segmask_labels_3d,
-            label_map=ws.skeleton_params.label_map, group_name=group_name, path_indices=indices)
+            mask=state.get("geometry_binary", state.get("segmask_binary")), spacing=geometry_spacing, segmentation_labels=geometry_labels,
+            label_map=ws.skeleton_params.label_map, group_name=group_name, path_indices=indices, flow_spacing=ws.resolution)
         report["graph_connectivity"] = ws.skeleton_params.params_for_group(group_name).graph_connectivity
         report["cycle_cleanup"] = state.get("cycle_cleanup", {})
         report["junction_cluster_cleanup"] = state.get("junction_cluster_cleanup", {})
+        report["radius_tree_cleanup"] = state.get("radius_tree_cleanup", {})
         groups.append(report)
         all_paths.extend(report["paths"])
     joint_systems = []
@@ -287,29 +292,31 @@ def build_workspace_hierarchy(workspace):
             roles[role] = name
     if len(roles) == 2:
         names = [roles[role] for role in ("anterior", "posterior")]
-        union = np.logical_or.reduce([ws.multilabel_groups[name]["segmask_3d"] for name in names])
-        temporal = np.logical_or.reduce([ws.multilabel_groups[name]["segmask_binary"] for name in names])
-        graph = joint_mask_graph(union, ws.resolution, connectivity=ws.skeleton_params.graph_connectivity,
-            segmentation_labels=ws.segmask_labels_3d)
-        graph, junction_cleanup = simplify_junction_clusters(graph, ws.segmask_labels_3d, ws.resolution,
+        union = np.logical_or.reduce([ws.multilabel_groups[name].get("geometry_mask_3d", ws.multilabel_groups[name]["segmask_3d"]) for name in names])
+        temporal = np.logical_or.reduce([ws.multilabel_groups[name].get("geometry_binary", ws.multilabel_groups[name]["segmask_binary"]) for name in names])
+        graph = joint_mask_graph(union, geometry_spacing, connectivity=ws.skeleton_params.graph_connectivity,
+            segmentation_labels=geometry_labels)
+        graph, junction_cleanup = simplify_junction_clusters(graph, geometry_labels, geometry_spacing,
             enabled=ws.skeleton_params.junction_cluster_enabled,
             max_extent_voxels=ws.skeleton_params.junction_cluster_max_extent_voxels,
             min_cycle_rank=ws.skeleton_params.junction_cluster_min_cycle_rank)
         from .graph_cycles import remove_intralabel_cycles
-        graph, cycle_cleanup = remove_intralabel_cycles(graph, ws.segmask_labels_3d, ws.resolution,
-            support_mask=union, flow=ws.flow_raw, temporal_mask=temporal,
+        graph, cycle_cleanup = remove_intralabel_cycles(graph, geometry_labels, geometry_spacing,
+            support_mask=union, flow=ws.flow_raw,
+            temporal_mask=np.logical_or.reduce([ws.multilabel_groups[name]['segmask_binary'] for name in names]),
+            flow_spacing=ws.resolution,
             flow_threshold=ws.skeleton_params.cycle_flow_threshold,
             preserve_connectivity=ws.skeleton_params.cycle_preserve_connectivity)
         chains = graph_edge_chains(graph)
-        report = analyze_group_graph(graph, chains, flow=ws.flow_raw, mask=temporal, spacing=ws.resolution,
-            segmentation_labels=ws.segmask_labels_3d, label_map=ws.skeleton_params.label_map,
-            group_name="cerebral_arterial_system")
+        report = analyze_group_graph(graph, chains, flow=ws.flow_raw, mask=temporal, spacing=geometry_spacing,
+            segmentation_labels=geometry_labels, label_map=ws.skeleton_params.label_map,
+            group_name="cerebral_arterial_system", flow_spacing=ws.resolution)
         order = hierarchy_path_order(report)
         if order != list(range(len(chains))):
             chains = [chains[index] for index in order]
-            report = analyze_group_graph(graph, chains, flow=ws.flow_raw, mask=temporal, spacing=ws.resolution,
-                segmentation_labels=ws.segmask_labels_3d, label_map=ws.skeleton_params.label_map,
-                group_name="cerebral_arterial_system")
+            report = analyze_group_graph(graph, chains, flow=ws.flow_raw, mask=temporal, spacing=geometry_spacing,
+                segmentation_labels=geometry_labels, label_map=ws.skeleton_params.label_map,
+                group_name="cerebral_arterial_system", flow_spacing=ws.resolution)
         report.update(source_group_names=names, cycle_cleanup=cycle_cleanup, junction_cluster_cleanup=junction_cleanup,
                       graph={"points": graph.points.tolist(), "edges": graph.edges.tolist()},
                       node_chains=chains, view_only=True)

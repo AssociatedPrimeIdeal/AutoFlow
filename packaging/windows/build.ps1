@@ -102,7 +102,7 @@ if ($LASTEXITCODE -ne 0) { throw "Portable assembly failed" }
 $Compiler = Join-Path $env:WINDIR "Microsoft.NET/Framework64/v4.0.30319/csc.exe"
 & $Compiler /nologo /target:winexe /platform:x64 /reference:System.Windows.Forms.dll "/out:$PackageRoot/AutoFlow.exe" (Join-Path $PSScriptRoot "Launcher.cs")
 if ($LASTEXITCODE -ne 0) { throw "GUI launcher compilation failed" }
-& (Join-Path $PackageRoot "_runtime/python.exe") (Join-Path $PackageRoot "app/portable_check.py") --output (Join-Path $PackageRoot "build-check.json")
+& (Join-Path $PackageRoot "_runtime/python.exe") (Join-Path $PackageRoot "app/portable_check.py") --gui --output (Join-Path $PackageRoot "build-check.json")
 if ($LASTEXITCODE -ne 0) { throw "Portable runtime verification failed; see build-check.json" }
 if (-not $SkipArchive) {
     & $BuildPython (Join-Path $PSScriptRoot "assemble.py") archive --destination $PackageRoot --output (Join-Path $OutputDirectory "artifacts")

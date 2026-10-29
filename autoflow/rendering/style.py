@@ -1,11 +1,15 @@
 """Shared quantitative and anatomical styling for interactive and offline views."""
 
+from functools import lru_cache
+from pathlib import Path
+import os
+
 import numpy as np
 import pyvista as pv
 
 
 from copy import deepcopy
-from ..config import BACKGROUND_COLOR, DEFAULT_RENDER_STYLE_CFG, DEFAULT_SCALAR_BAR_STYLE, METRIC_DATA_KEYS, DEFAULT_PLANE_RENDER_CFG
+from ..config import BACKGROUND_COLOR, DEFAULT_RENDER_STYLE_CFG, DEFAULT_SCALAR_BAR_STYLE, METRIC_DATA_KEYS, DEFAULT_PLANE_RENDER_CFG, DEFAULT_METRIC_RENDER_STYLES
 
 
 def render_style_settings(workspace=None):
@@ -15,7 +19,34 @@ def render_style_settings(workspace=None):
 
 
 def configured_metric_style(workspace, data_key):
-    return deepcopy(render_style_settings(workspace)["metrics"][METRIC_DATA_KEYS[data_key]])
+    key = METRIC_DATA_KEYS[data_key]
+    return {**deepcopy(DEFAULT_METRIC_RENDER_STYLES[key]),
+            **deepcopy(render_style_settings(workspace)["metrics"].get(key, {}))}
+
+
+def metric_colormap(workspace, data_key, cmap=None):
+    """The mesh and its scalar bar share the same display transfer function."""
+    from matplotlib import colormaps
+    from matplotlib.colors import ListedColormap
+    style = configured_metric_style(workspace, data_key)
+    name = cmap or style["cmap"]
+    gamma = style["color_gamma"]
+    if gamma == 1.0:
+        return name
+    x = np.linspace(0., 1., 256)
+    if data_key in {"relative_pressure_volume", "q_criterion_volume"}:
+        x = .5 + .5*np.sign(2*x-1)*np.abs(2*x-1)**gamma
+    else:
+        x = x**gamma
+    return ListedColormap(colormaps[name](x))
+
+
+def rounded_display_clim(clim):
+    """Outward-rounded whole-number bounds for automatic 3D metric limits."""
+    lo, hi = map(float, clim)
+    magnitude = max(abs(lo), abs(hi), 1.)
+    step = max(1., 5.*10.**(np.floor(np.log10(magnitude))-1))
+    return (float(np.floor(lo/step)*step), float(max(np.ceil(hi/step)*step, np.floor(lo/step)*step+step)))
 
 
 def foreground_color(background, workspace=None):
@@ -26,15 +57,20 @@ def foreground_color(background, workspace=None):
 
 def configure_plotter(plotter, background=BACKGROUND_COLOR, workspace=None):
     plotter.set_background(background)
+    # Clearing a scene also clears its lights. Restore anatomical shading;
+    # quantitative actors explicitly disable lighting and keep their LUT colors.
+    if callable(getattr(plotter, "enable_lightkit", None)):
+        plotter.enable_lightkit()
     mode = render_style_settings(workspace)["anti_aliasing"]
-    # EGL/OSMesa use SSAA because VTK does not support FXAA on those backends.
+    # SSAA can introduce horizontal stippling in offscreen scalar surfaces.
+    # EGL/OSMesa use multisampling; native windows retain FXAA.
     try:
         if mode == "none":
             plotter.disable_anti_aliasing()
         else:
             if mode == "auto":
                 backend = plotter.render_window.GetClassName()
-                mode = "ssaa" if "EGL" in backend or "OSOpenGL" in backend else "fxaa"
+                mode = "msaa" if "EGL" in backend or "OSOpenGL" in backend else "fxaa"
             plotter.enable_anti_aliasing(mode)
     except (AttributeError, TypeError, RuntimeError):
         pass
@@ -69,7 +105,7 @@ def metric_style(workspace, data_key):
     elif data_key == "relative_pressure_volume":
         opacity = workspace.derived_params.relative_pressure_layer_opacity
     return dict(surface_style(quantitative=True, workspace=workspace),
-                cmap=(obj.cmap if obj is not None else None) or configured["cmap"],
+                cmap=metric_colormap(workspace, data_key, (obj.cmap if obj is not None else None) or configured["cmap"]),
                 opacity=float(obj.opacity if obj is not None else opacity))
 
 
@@ -81,12 +117,44 @@ def scalar_bar_args(title, feature_cfg=None, shared_cfg=None, background=BACKGRO
     cfg = dict(DEFAULT_SCALAR_BAR_STYLE, title=title.replace(" (", "\n("))
     for override in (feature_cfg, shared_cfg):
         cfg.update({k: v for k, v in (override or {}).items() if k != "stack_gap"})
-    cfg["width"] = min(max(float(cfg["width"]), 0.02), 0.4)
-    cfg["height"] = min(max(float(cfg["height"]), 0.15), 0.95)
+    vertical = bool(cfg.get("vertical", True))
+    if not vertical and cfg["title"] == title.replace(" (", "\n("):
+        cfg["title"] = title
+    width_limits, height_limits = ((.02, .4), (.15, .95)) if vertical else ((.15, .95), (.02, .4))
+    cfg["width"] = min(max(float(cfg["width"]), width_limits[0]), width_limits[1])
+    cfg["height"] = min(max(float(cfg["height"]), height_limits[0]), height_limits[1])
     cfg["position_x"] = min(max(float(cfg["position_x"]), 0.0), 0.98 - cfg["width"])
     cfg["position_y"] = min(max(float(cfg["position_y"]), 0.0), 0.98 - cfg["height"])
     cfg.setdefault("color", foreground_color(background, workspace))
     return cfg
+
+
+@lru_cache(maxsize=1)
+def render_font_file():
+    """Use an installed UI sans-serif in VTK instead of its thin built-in Arial."""
+    fonts = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
+    candidates = (
+        fonts / "segoeui.ttf",
+        Path("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
+    )
+    return next((str(path) for path in candidates if path.is_file()), None)
+
+
+def style_scalar_bar(bar):
+    """Keep quantitative mapping intact while making its legend legible."""
+    if bar is None:
+        return
+    font_file = render_font_file()
+    for prop in (bar.GetTitleTextProperty(), bar.GetLabelTextProperty(), bar.GetAnnotationTextProperty()):
+        # Explicit Times/Courier selections remain available in colorbar config.
+        if font_file and prop.GetFontFamilyAsString() == "Arial":
+            prop.SetFontFamilyAsString("File")
+            prop.SetFontFile(font_file)
+    if bar.GetOrientation() == 0:
+        bar.SetBarRatio(0.17)
+        bar.SetTextPad(5)
 
 
 def wss_display_surface(surface):

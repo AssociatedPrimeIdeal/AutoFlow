@@ -32,7 +32,7 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
                             vortex_smoothing_sigma=0.0,
                             vortex_support_erosion_iters=1,
                             pressure_method="ppe",
-                            centerline_paths=None):
+                            centerline_paths=None, wss_mask4d=None, wss_spacing=None):
     mask4d = _ensure_mask4d(mask4d)
     wss_smoothing_iteration = smoothing_iteration if wss_smoothing_iteration is None else wss_smoothing_iteration
     wss_viscosity = viscosity if wss_viscosity is None else wss_viscosity
@@ -45,7 +45,9 @@ def compute_derived_metrics(mask4d, flow, spacing, origin=(0, 0, 0),
     wss = None
     if compute_wss:
         wss = compute_wss_metrics(
-            mask4d, flow, spacing, origin=origin,
+            mask4d if wss_mask4d is None else wss_mask4d, flow,
+            spacing if wss_spacing is None else wss_spacing, origin=origin,
+            flow_spacing=None if wss_mask4d is None else spacing,
             smoothing_iteration=wss_smoothing_iteration,
             viscosity=wss_viscosity,
             inward_distance=wss_inward_distance,

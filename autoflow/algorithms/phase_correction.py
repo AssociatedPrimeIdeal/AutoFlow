@@ -315,8 +315,8 @@ def apply_background_phase_correction_to_complex(
     else:
         _emit_progress(progress_callback, "background_phase_cache_apply", message="Applying saved corr (background phase correction)")
 
-    corrected = np.asarray(arr, dtype=np.complex64).copy()
-    corrected[..., 1:4] *= np.exp(-1j * np.asarray(corr_xyzt3, dtype=np.float32))
+    from .pointwise import apply_complex_correction
+    corrected = apply_complex_correction(arr, corr_xyzt3)
     corrected = corrected.astype(arr.dtype, copy=False)
     report["applied"] = True
     report.update(background_phase_correction_cache_metadata(cfg))
@@ -360,11 +360,8 @@ def apply_background_phase_correction_to_mag_flow(
     if venc_arr.size != 3:
         raise ValueError(f"venc must have 1 or 3 entries, got {venc_arr.shape}")
 
-    img_complex = np.zeros(flow_xyzt3.shape[:4] + (4,), dtype=np.complex64)
-    ref = np.asarray(mag_xyzt, dtype=np.float32)
-    img_complex[..., 0] = ref.astype(np.complex64)
-    phase = np.pi * flow_xyzt3 / venc_arr.reshape((1, 1, 1, 1, 3))
-    img_complex[..., 1:4] = ref[..., None] * np.exp(1j * phase)
+    from .pointwise import synthetic_complex_from_mag_flow, velocity_from_complex
+    img_complex = synthetic_complex_from_mag_flow(mag_xyzt, flow_xyzt3, venc_arr)
 
     corrected_complex, stationary_mask, report = apply_background_phase_correction_to_complex(
         img_complex,
@@ -376,8 +373,7 @@ def apply_background_phase_correction_to_mag_flow(
     if not bool(report.get("applied", False)):
         return flow_xyzt3.copy(), stationary_mask, report
 
-    corrected_phase = np.angle(corrected_complex[..., 1:4] * np.conj(corrected_complex[..., 0:1]))
-    corrected_flow = (corrected_phase / np.pi) * venc_arr.reshape((1, 1, 1, 1, 3))
+    corrected_flow = velocity_from_complex(corrected_complex, venc_arr)
     return np.asarray(corrected_flow, dtype=np.float32), stationary_mask, report
 
 

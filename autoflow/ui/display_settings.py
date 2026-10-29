@@ -4,6 +4,7 @@ import copy
 import json
 
 from PySide6 import QtCore, QtGui, QtWidgets
+from .parameter_help import bind_help, compact_label, parameter_help
 
 SHARED_FIELDS = {
     ("contours", "smoothing"), ("contours", "minimum_points"), ("contours", "snap_distance"),
@@ -12,7 +13,7 @@ SHARED_FIELDS = {
 }
 
 def display_defaults():
-    stream = dict(enabled=False, color_mode="speed", quantity="total", cmap="turbo",
+    stream = dict(enabled=False, color_mode="speed", quantity="total", cmap="jet",
                   color="#00e5ff", range_mode="auto", low=0.0, high=100.0,
                   opacity=0.85, line_width=1.5, arrows=True, arrow_size=1.0,
                   arrow_spacing=8.0, min_length=0.0)
@@ -71,6 +72,7 @@ class DisplaySettingsPanel(QtWidgets.QWidget):
         self._state = merge_display(display_defaults(), settings)
         self._content = 3
         self._controls = {}
+        self._flow_rows = {}
         self.setMinimumWidth(310)
         layout = QtWidgets.QVBoxLayout(self)
         self.target = QtWidgets.QComboBox()
@@ -138,20 +140,25 @@ class DisplaySettingsPanel(QtWidgets.QWidget):
             widget = QtWidgets.QLineEdit()
             widget.editingFinished.connect(lambda: self._changed(section, key))
         self._controls[(section, key)] = (widget, kind)
-        label += " (0–1)" if key == "opacity" else ""
-        label += " (shared)" if (section, key) in SHARED_FIELDS else ""
-        self._forms[tab].addRow(label, widget)
+        text = parameter_help(section+"."+key, label)
+        if section == "image":
+            text += "\n\nImage styles are remembered separately for each Content source."
+        if (section, key) in SHARED_FIELDS:
+            text += "\n\nShared by all three slice views."
+        self._forms[tab].addRow(compact_label(label), widget)
+        bind_help(self._forms[tab], widget, text)
+        if tab == "Flow":
+            self._flow_rows[(section, key)] = widget
         return widget
 
     def _build_fields(self):
-        cmap = [(name, name) for name in ("turbo", "viridis", "plasma", "gray", "inferno", "RdBu_r")]
+        cmap = [(name, name) for name in ("jet", "turbo", "viridis", "plasma", "gray", "inferno", "RdBu_r")]
         f = self._field
         f("Image", "image", "cmap", "Colormap", "choice", [("Content default", "auto")] + cmap)
         f("Image", "image", "range_mode", "Range", "choice", [("Auto per slice", "slice"), ("Auto current phase", "frame"), ("Lock across phases", "all"), ("Manual", "manual")])
         f("Image", "image", "low", "Lower limit", "float", limits=(-1e9, 1e9))
         f("Image", "image", "high", "Upper limit", "float", limits=(-1e9, 1e9))
         f("Image", "image", "interpolation", "Interpolation", "choice", [("Nearest", "nearest"), ("Linear", "linear")])
-        self._forms["Image"].addRow(QtWidgets.QLabel("Image styles are remembered separately for each Content source."))
         self._heading("Overlays", "Segmentation")
         f("Overlays", "segmentation", "visible", "Visible", "bool")
         f("Overlays", "segmentation", "opacity", "Opacity", "float", limits=(0, 1))
@@ -176,8 +183,17 @@ class DisplaySettingsPanel(QtWidgets.QWidget):
         f("Overlays", "noise", "visible", "Visible", "bool")
         f("Overlays", "noise", "color", "Color", "color")
         f("Overlays", "noise", "opacity", "Opacity", "float", limits=(0, 1))
+        self.flow_family = QtWidgets.QComboBox()
+        self.flow_family.addItem("2D streamlines", "planar")
+        self.flow_family.addItem("3D projection", "projection")
+        self.flow_family.currentIndexChanged.connect(self._sync_flow_rows)
+        self._forms["Flow"].addRow("Overlay", self.flow_family)
+        self.flow_detail_tabs = QtWidgets.QTabBar()
+        self.flow_detail_tabs.addTab("Basic")
+        self.flow_detail_tabs.addTab("Advanced")
+        self.flow_detail_tabs.currentChanged.connect(self._sync_flow_rows)
+        self._forms["Flow"].addRow(self.flow_detail_tabs)
         for section, title in (("planar", "2D streamlines"), ("projection", "3D projection")):
-            self._heading("Flow", title)
             f("Flow", section, "enabled", "Visible", "bool")
             f("Flow", section, "color_mode", "Color", "choice", [("By speed", "speed"), ("Fixed color", "fixed")])
             f("Flow", section, "quantity", "Speed quantity", "choice", [("Total speed (cm/s)", "total"), ("In-plane speed (cm/s)", "in_plane")])
@@ -198,7 +214,6 @@ class DisplaySettingsPanel(QtWidgets.QWidget):
         f("Flow", "planar", "max_length", "2D maximum length (0 = auto)", "float", limits=(0, 1000), suffix=" mm")
         f("Flow", "projection", "fraction", "3D display fraction", "float", limits=(0.01, 1))
         f("Flow", "projection", "slab", "Full slab thickness", "float", limits=(0.1, 100), suffix=" mm")
-        self._forms["Flow"].addRow(QtWidgets.QLabel("Projection requires Generate Streamlines. Density above the existing 3D seed count requires regeneration."))
         self._heading("View", "View and guides")
         f("View", "view", "background", "Background", "color")
         f("View", "view", "zoom", "Initial FOV fraction", "float", limits=(0.1, 1))
@@ -250,6 +265,26 @@ class DisplaySettingsPanel(QtWidgets.QWidget):
                     self._controls[(section, key)][0].setEnabled(speed)
                 for key in ("arrow_size", "arrow_spacing"):
                     self._controls[(section, key)][0].setEnabled(cfg["arrows"])
+        self._sync_flow_rows()
+
+    def _sync_flow_rows(self, *_):
+        if not hasattr(self, "flow_family"):
+            return
+        family = self.flow_family.currentData()
+        advanced = self.flow_detail_tabs.currentIndex() == 1
+        details = {"arrow_size", "arrow_spacing", "min_length", "terminal_speed", "max_steps", "max_length"}
+        cfg = view_display(self._state, self.target.currentData(), self._content)[family]
+        for (section, key), widget in self._flow_rows.items():
+            visible = section == family and ((key in details) == advanced)
+            if key == "color":
+                visible &= cfg["color_mode"] == "fixed"
+            elif key in {"quantity", "cmap", "range_mode", "low", "high"}:
+                visible &= cfg["color_mode"] == "speed"
+                if key in {"low", "high"}:
+                    visible &= cfg["range_mode"] == "manual"
+            widget.setVisible(visible)
+            self._forms["Flow"].labelForField(widget).setVisible(visible)
+
     def _write(self, section, key, value):
         target = self.target.currentData()
         state = self._state if not target or (section, key) in SHARED_FIELDS else self._state["views"].setdefault(target, {})

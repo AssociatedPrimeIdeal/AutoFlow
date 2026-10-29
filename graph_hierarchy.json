@@ -1,0 +1,568 @@
+{
+  "schema": "autoflow.graph_hierarchy.v1",
+  "status": "available",
+  "grading_scope": "connected_subgroup",
+  "graph_connectivity": 26,
+  "path_numbering": "group order; subgroup order; ascending level; unresolved last; ties keep graph traversal order",
+  "level_rule": "within each connected subgroup: inlet=1; downstream=1+max(upstream); directed cycles condensed",
+  "label_local_level_rule": "first label-bearing arm=0; each subsequent label-bearing junction adds 1",
+  "direction_confidence_threshold": 0.05,
+  "groups": [
+    {
+      "group_name": "single_label",
+      "grading_scope": "connected_subgroup",
+      "subgroups": [
+        {
+          "subgroup_id": "single_label:subgroup_1",
+          "subgroup_index": 0,
+          "group_name": "single_label",
+          "path_indices": [
+            0
+          ],
+          "label_names": [
+            "Label 1"
+          ],
+          "node_count": 45,
+          "edge_count": 44,
+          "inlet_path_indices": [
+            0
+          ],
+          "outlet_path_indices": [
+            0
+          ],
+          "loop_ids": [],
+          "undirected_cycle_rank": 0,
+          "ranked_path_count": 1,
+          "unresolved_path_count": 0,
+          "maximum_level": 1
+        }
+      ],
+      "paths": [
+        {
+          "path_index": 0,
+          "group_name": "single_label",
+          "component_index": 0,
+          "subgroup_index": 0,
+          "subgroup_id": "single_label:subgroup_1",
+          "start_node": 0,
+          "end_node": 44,
+          "length_mm": 44.0,
+          "closed": false,
+          "topological_cycle": false,
+          "direction_status": "reliable",
+          "direction_confidence": 1.0,
+          "flow_sign": 1,
+          "source_node": 0,
+          "target_node": 44,
+          "is_inlet": true,
+          "is_outlet": true,
+          "labels": [
+            {
+              "label": 1,
+              "label_name": "Label 1",
+              "length_mm": 44.0
+            }
+          ],
+          "label_names": [
+            "Label 1"
+          ],
+          "group_level": 1,
+          "subgroup_level": 1,
+          "root_path_indices": [
+            0
+          ],
+          "loop_id": null,
+          "parent_path_indices": [],
+          "child_path_indices": [],
+          "display_parent_path_index": null,
+          "reference_parent_path_indices": [],
+          "level_status": "ranked",
+          "label_local_levels": {
+            "1": 0
+          }
+        }
+      ],
+      "junctions": [
+        {
+          "node": 0,
+          "point_mm": [
+            16.0,
+            16.0,
+            14.0
+          ],
+          "degree": 1,
+          "subgroup_index": 0,
+          "subgroup_id": "single_label:subgroup_1",
+          "kind": "inlet",
+          "incoming_path_indices": [],
+          "outgoing_path_indices": [
+            0
+          ],
+          "undirected_path_indices": []
+        },
+        {
+          "node": 44,
+          "point_mm": [
+            16.0,
+            16.0,
+            58.0
+          ],
+          "degree": 1,
+          "subgroup_index": 0,
+          "subgroup_id": "single_label:subgroup_1",
+          "kind": "outlet",
+          "incoming_path_indices": [
+            0
+          ],
+          "outgoing_path_indices": [],
+          "undirected_path_indices": []
+        }
+      ],
+      "loops": [],
+      "inlet_path_indices": [
+        0
+      ],
+      "outlet_path_indices": [
+        0
+      ],
+      "component_count": 1,
+      "undirected_cycle_rank": 0,
+      "graph_connectivity": 26,
+      "cycle_cleanup": {
+        "schema": "autoflow.flow_cycle_cleanup.v3",
+        "status": "unchanged",
+        "algorithm": "flow_alignment_filter",
+        "flow_threshold": 0.3,
+        "preserve_connectivity": true,
+        "stage": "before_terminal_pruning",
+        "policy": "all_positive_labels",
+        "cross_label_protection": false,
+        "cycle_rank_before": 0,
+        "cycle_rank_after": 0,
+        "protected_edge_count": 0,
+        "unknown_node_count": 0,
+        "labels": [
+          {
+            "label": 1,
+            "source_labels": [
+              1
+            ],
+            "cycle_rank_before": 0,
+            "component_count": 1,
+            "removed_path_count": 0,
+            "rejected_path_count": 0,
+            "cycle_rank_after": 0,
+            "component_connectivity_preserved": true
+          }
+        ],
+        "removed_paths": [],
+        "rejected_paths": [],
+        "path_evaluations": [
+          {
+            "audit_id": "5e11bb6fe941c023",
+            "label": 1,
+            "source_labels": [
+              1
+            ],
+            "cross_label": false,
+            "removal_unit": "flow_inconsistent_path",
+            "input_node_indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21,
+              22,
+              23,
+              24,
+              25,
+              26,
+              27,
+              28,
+              29,
+              30,
+              31,
+              32,
+              33,
+              34,
+              35,
+              36,
+              37,
+              38,
+              39,
+              40,
+              41,
+              42,
+              43,
+              44
+            ],
+            "points_mm": [
+              [
+                16.0,
+                16.0,
+                14.0
+              ],
+              [
+                16.0,
+                16.0,
+                15.0
+              ],
+              [
+                16.0,
+                16.0,
+                16.0
+              ],
+              [
+                16.0,
+                16.0,
+                17.0
+              ],
+              [
+                16.0,
+                16.0,
+                18.0
+              ],
+              [
+                16.0,
+                16.0,
+                19.0
+              ],
+              [
+                16.0,
+                16.0,
+                20.0
+              ],
+              [
+                16.0,
+                16.0,
+                21.0
+              ],
+              [
+                16.0,
+                16.0,
+                22.0
+              ],
+              [
+                16.0,
+                16.0,
+                23.0
+              ],
+              [
+                16.0,
+                16.0,
+                24.0
+              ],
+              [
+                16.0,
+                16.0,
+                25.0
+              ],
+              [
+                16.0,
+                16.0,
+                26.0
+              ],
+              [
+                16.0,
+                16.0,
+                27.0
+              ],
+              [
+                16.0,
+                16.0,
+                28.0
+              ],
+              [
+                16.0,
+                16.0,
+                29.0
+              ],
+              [
+                16.0,
+                16.0,
+                30.0
+              ],
+              [
+                16.0,
+                16.0,
+                31.0
+              ],
+              [
+                16.0,
+                16.0,
+                32.0
+              ],
+              [
+                16.0,
+                16.0,
+                33.0
+              ],
+              [
+                16.0,
+                16.0,
+                34.0
+              ],
+              [
+                16.0,
+                16.0,
+                35.0
+              ],
+              [
+                16.0,
+                16.0,
+                36.0
+              ],
+              [
+                16.0,
+                16.0,
+                37.0
+              ],
+              [
+                16.0,
+                16.0,
+                38.0
+              ],
+              [
+                16.0,
+                16.0,
+                39.0
+              ],
+              [
+                16.0,
+                16.0,
+                40.0
+              ],
+              [
+                16.0,
+                16.0,
+                41.0
+              ],
+              [
+                16.0,
+                16.0,
+                42.0
+              ],
+              [
+                16.0,
+                16.0,
+                43.0
+              ],
+              [
+                16.0,
+                16.0,
+                44.0
+              ],
+              [
+                16.0,
+                16.0,
+                45.0
+              ],
+              [
+                16.0,
+                16.0,
+                46.0
+              ],
+              [
+                16.0,
+                16.0,
+                47.0
+              ],
+              [
+                16.0,
+                16.0,
+                48.0
+              ],
+              [
+                16.0,
+                16.0,
+                49.0
+              ],
+              [
+                16.0,
+                16.0,
+                50.0
+              ],
+              [
+                16.0,
+                16.0,
+                51.0
+              ],
+              [
+                16.0,
+                16.0,
+                52.0
+              ],
+              [
+                16.0,
+                16.0,
+                53.0
+              ],
+              [
+                16.0,
+                16.0,
+                54.0
+              ],
+              [
+                16.0,
+                16.0,
+                55.0
+              ],
+              [
+                16.0,
+                16.0,
+                56.0
+              ],
+              [
+                16.0,
+                16.0,
+                57.0
+              ],
+              [
+                16.0,
+                16.0,
+                58.0
+              ]
+            ],
+            "length_mm": 44.0,
+            "direction_status": "reliable",
+            "direction_confidence": 1.0,
+            "flow_alignment": 1.0,
+            "flow_threshold": 0.3,
+            "decision": "retained",
+            "reason": "flow_C_at_or_above_threshold"
+          }
+        ],
+        "protected_edges": [],
+        "removed_edge_count": 0,
+        "cross_label_candidate_edge_count": 0,
+        "cross_label_removed_edge_count": 0,
+        "evaluated_path_count": 1,
+        "candidate_count": 0,
+        "flow_unavailable_path_count": 0,
+        "original_endpoints_preserved": true,
+        "interface_ports_preserved": true,
+        "component_connectivity_preserved": true,
+        "label_component_connectivity_preserved": true,
+        "label_presence_preserved": true,
+        "lumen_cycle_opening": {
+          "schema": "autoflow.lumen_cycle_opening.v1",
+          "status": "unchanged",
+          "cycle_rank_before": 0,
+          "cycle_rank_after": 0,
+          "removed_edge_count": 0,
+          "decisions": [],
+          "component_connectivity_preserved": true,
+          "points_unchanged": true
+        }
+      },
+      "junction_cluster_cleanup": {
+        "schema": "autoflow.junction_cluster_cleanup.v1",
+        "algorithm": "junction_cluster_shortest_paths",
+        "status": "unchanged",
+        "stage": "after_triangle_contraction_before_flow_filter",
+        "enabled": true,
+        "max_extent_voxels": 0.0,
+        "extent_limit_applied": false,
+        "min_cycle_rank": 2,
+        "minimum_node_degree": 3,
+        "cycle_rank_before": 0,
+        "cycle_rank_after": 0,
+        "detected_cluster_count": 0,
+        "candidate_count": 0,
+        "simplified_cluster_count": 0,
+        "removed_edge_count": 0,
+        "removed_node_count": 0,
+        "protected_edge_count": 0,
+        "unknown_node_count": 0,
+        "original_endpoints_preserved": true,
+        "interface_ports_preserved": true,
+        "component_connectivity_preserved": true,
+        "label_component_connectivity_preserved": true,
+        "boundary_ports_preserved": true,
+        "outside_edges_preserved": true,
+        "clusters": [],
+        "removed_edges": []
+      },
+      "radius_tree_cleanup": {
+        "schema": "autoflow.endpoint_radius_forest.v1",
+        "algorithm": "endpoint_radius_shortest_paths",
+        "policy": "auto",
+        "status": "unchanged",
+        "stage": "after_flow_before_terminal_pruning",
+        "cycle_rank_before": 0,
+        "cycle_rank_after": 0,
+        "components": [],
+        "removed_edge_count": 0,
+        "cross_label_removed_edge_count": 0,
+        "endpoint_coordinates_preserved": true,
+        "component_connectivity_preserved": true,
+        "label_presence_preserved": true,
+        "no_new_edges": true,
+        "extent_limit_applied": false
+      }
+    }
+  ],
+  "paths": [
+    {
+      "path_index": 0,
+      "group_name": "single_label",
+      "component_index": 0,
+      "subgroup_index": 0,
+      "subgroup_id": "single_label:subgroup_1",
+      "start_node": 0,
+      "end_node": 44,
+      "length_mm": 44.0,
+      "closed": false,
+      "topological_cycle": false,
+      "direction_status": "reliable",
+      "direction_confidence": 1.0,
+      "flow_sign": 1,
+      "source_node": 0,
+      "target_node": 44,
+      "is_inlet": true,
+      "is_outlet": true,
+      "labels": [
+        {
+          "label": 1,
+          "label_name": "Label 1",
+          "length_mm": 44.0
+        }
+      ],
+      "label_names": [
+        "Label 1"
+      ],
+      "group_level": 1,
+      "subgroup_level": 1,
+      "root_path_indices": [
+        0
+      ],
+      "loop_id": null,
+      "parent_path_indices": [],
+      "child_path_indices": [],
+      "display_parent_path_index": null,
+      "reference_parent_path_indices": [],
+      "level_status": "ranked",
+      "label_local_levels": {
+        "1": 0
+      }
+    }
+  ],
+  "joint_systems": []
+}

@@ -1,6 +1,10 @@
 """Segmentation support, plane geometry, ROI selection and field sampling."""
 
 import numpy as np
+import threading
+from collections.abc import MutableMapping
+from ...core.cache import cache_bytes
+from ...task_control import check_cancelled
 from ..surfaces import _build_branch_grid, _select_connected_region, create_uniform_field_grid
 
 from ._common import _ensure_mask4d
@@ -10,8 +14,88 @@ from .fov import measure_fov_boundary_contact
 # successive edits. Cache those small support meshes so each edit does not
 # rebuild an identical VTK threshold grid. The cache is intentionally bounded
 # because meshes retain VTK-owned memory.
-_LOCAL_SUPPORT_MESH_CACHE = {}
+class _ThreadLocalMeshCache(MutableMapping):
+    """Do not share VTK-owned support geometry between GUI and worker threads."""
+    def __init__(self):
+        self._local = threading.local()
+
+    @property
+    def data(self):
+        if not hasattr(self._local, "data"):
+            self._local.data = {}
+        return self._local.data
+
+    def __getitem__(self, key): return self.data[key]
+    def __setitem__(self, key, value): self.data[key] = value
+    def __delitem__(self, key): del self.data[key]
+    def __iter__(self): return iter(self.data)
+    def __len__(self): return len(self.data)
+
+
+_LOCAL_SUPPORT_MESH_CACHE = _ThreadLocalMeshCache()
 _LOCAL_SUPPORT_MESH_CACHE_MAX = 16
+
+
+class PlaneSamplingContext:
+    """Read-only geometry shared by the two passes of one metrics job.
+
+    Never reuse this object across cases, mutations or worker threads. Fields
+    retain their original numeric sampling path; only support/slice preparation
+    is shared. Missing cache entries safely rebuild using the existing path.
+    """
+    def __init__(self, mask, spacing, origin, planes, *, branch_labels_3d=None,
+                 segmentation_labels_3d=None, segmentation_labels_4d=None,
+                 max_bytes=512 * 1024 ** 2, voxel_centered=False):
+        check_cancelled()
+        self.source_mask = mask
+        self.mask = _ensure_mask4d(mask)
+        self.spacing = np.asarray(spacing, dtype=float).reshape(3)
+        self.origin = np.asarray(origin, dtype=float).reshape(3)
+        self.thread_id = threading.get_ident()
+        self.voxel_centered = bool(voxel_centered)
+        self.grid_origin = self.origin-0.5*self.spacing if self.voxel_centered else self.origin
+        self.branch_grid = _build_branch_grid(branch_labels_3d, self.spacing, self.grid_origin)
+        self.phase_lookup = _build_mask_phase_lookup(self.mask)
+        self.support_mesh_cache = _build_plane_support_mesh_cache(
+            self.mask, self.phase_lookup, self.spacing, self.grid_origin)
+        _add_labeled_plane_support_meshes(
+            self.support_mesh_cache, self.mask,
+            segmentation_labels_4d if segmentation_labels_4d is not None else segmentation_labels_3d,
+            planes, self.spacing, self.grid_origin)
+        self.slice_caches = {}
+        self.max_bytes = int(max_bytes)
+        self.hits = 0
+        self.trim()
+
+    def validate(self, mask, spacing, origin):
+        check_cancelled()
+        if threading.get_ident() != self.thread_id:
+            raise ValueError("PlaneSamplingContext cannot cross worker threads")
+        if not (mask is self.source_mask or np.shares_memory(mask, self.source_mask)):
+            raise ValueError("PlaneSamplingContext belongs to a different input mask")
+        if not np.array_equal(self.spacing, spacing) or not np.array_equal(self.origin, origin):
+            raise ValueError("PlaneSamplingContext spacing/origin changed")
+
+    def slice_cache(self, plane):
+        key = (getattr(plane, "plane_id", id(plane)),
+               int(getattr(plane, "geometry_revision", 0)), int(getattr(plane, "roi_revision", 0)))
+        if key in self.slice_caches:
+            self.hits += 1
+        return self.slice_caches.setdefault(key, {})
+
+    def trim(self):
+        # Keep metadata and allow exact on-demand fallback for evicted meshes.
+        # Alias entries are measured once by object identity.
+        while self.slice_caches and cache_bytes(self.slice_caches) > self.max_bytes // 2:
+            self.slice_caches.pop(next(iter(self.slice_caches)))
+        if cache_bytes(self.support_mesh_cache) > self.max_bytes:
+            self.support_mesh_cache = {key: value for key, value in self.support_mesh_cache.items()
+                                       if not hasattr(value, "GetActualMemorySize")}
+
+    def close(self):
+        self.support_mesh_cache.clear()
+        self.slice_caches.clear()
+        self.branch_grid = None
 
 
 def _target_label_for_plane(plane, branch_labels_3d, spacing, origin):
@@ -33,7 +117,7 @@ def _build_mask_phase_lookup(mask4d):
     lookup = []
     for tidx in range(int(mask4d.shape[3])):
         mask_t = mask4d[..., tidx]
-        mask_key = mask_t.tobytes()
+        mask_key = np.packbits(mask_t, bitorder="little").tobytes()
         rep_t = representatives.get(mask_key)
         if rep_t is None:
             rep_t = int(tidx)
@@ -98,7 +182,7 @@ def _add_labeled_plane_support_meshes(cache, mask4d, labels4d, planes, spacing, 
         for tidx in range(int(mask.shape[3])):
             label_t = 0 if labels_was_3d else min(int(tidx), int(labels.shape[3]) - 1)
             label_mask = mask[..., tidx] & (labels[..., label_t] == int(label))
-            token = label_mask.tobytes()
+            token = np.packbits(label_mask, bitorder="little").tobytes()
             rep_t = representatives.setdefault(token, int(tidx))
             mesh_key = ("seg4d", rep_t, int(label))
             if mesh_key not in cache:
@@ -120,6 +204,7 @@ def filter_planes_by_branch_support(
     support_cache=None,
     check_branch_support=True,
     fov_boundary_max_fraction=None,
+    voxel_centered=False,
 ):
     """Drop branch-unsupported planes and, when requested, FOV-truncated ROIs.
 
@@ -132,6 +217,7 @@ def filter_planes_by_branch_support(
     """
     planes = list(planes or [])
     mask = _ensure_mask4d(mask4d)
+    grid_origin = np.asarray(origin)-0.5*np.asarray(spacing) if voxel_centered else origin
     if not planes:
         return [], []
     if fov_boundary_max_fraction is not None:
@@ -150,7 +236,7 @@ def filter_planes_by_branch_support(
     phase_lookup = cache.get("phase_lookup")
     support_mesh_cache = cache.get("support_mesh_cache")
     if branch_grid is None and branch_available:
-        branch_grid = _build_branch_grid(branch_array, spacing, origin)
+        branch_grid = _build_branch_grid(branch_array, spacing, grid_origin)
         cache["branch_grid"] = branch_grid
     if not branch_available:
         branch_grid = None
@@ -167,7 +253,7 @@ def filter_planes_by_branch_support(
         cache["probe_mask"] = np.asarray(probe_mask, dtype=bool)
     probe_mesh = cache.get("probe_mesh")
     if probe_mesh is None:
-        probe_mesh = _build_plane_support_mesh(probe_mask, spacing, origin)
+        probe_mesh = _build_plane_support_mesh(probe_mask, spacing, grid_origin)
         cache["probe_mesh"] = probe_mesh
     segmentation_mesh_cache = cache.setdefault("segmentation_mesh_cache", {})
     seg3d = None
@@ -194,7 +280,7 @@ def filter_planes_by_branch_support(
             mesh_key = int(plane_seg_label)
             if mesh_key not in segmentation_mesh_cache:
                 segmentation_mesh_cache[mesh_key] = _build_plane_support_mesh(
-                    mask_t, spacing, origin
+                    mask_t, spacing, grid_origin
                 )
             support_mesh = segmentation_mesh_cache.get(mesh_key)
         else:
@@ -207,14 +293,14 @@ def filter_planes_by_branch_support(
             branch_grid=branch_grid,
             target_label=target_label if branch_available else None,
             select_connected=True,
-            support_mesh=support_mesh,
+            support_mesh=support_mesh, voxel_centered=voxel_centered,
         )
         cell_count = int(region.n_cells) if region is not None else 0
         max_cell_count = cell_count
         supported_phase_count = 1 if cell_count > 0 else 0
         valid = supported_phase_count > 0 if branch_available else True
         reason = "" if branch_available and valid else "no_branch_support" if branch_available else unavailable_reason
-        fov = measure_fov_boundary_contact(region, plane, mask.shape[:3], spacing, origin, fov_boundary_max_fraction)
+        fov = measure_fov_boundary_contact(region, plane, mask.shape[:3], spacing, grid_origin, fov_boundary_max_fraction)
         if valid and fov["status"] == "excluded":
             valid, reason = False, "fov_boundary_contact"
         record = {
@@ -250,8 +336,10 @@ def _build_plane_slice_region(
     select_connected=False,
     support_mesh=None,
     frame_index=0,
+    voxel_centered=False,
 ):
     mask_xyz = np.asarray(mask_xyz, dtype=bool)
+    grid_origin = np.asarray(origin)-0.5*np.asarray(spacing) if voxel_centered else origin
     operations = list((getattr(plane, "roi_edit_operations", {}) or {}).get(str(int(frame_index)), []) or [])
     replacement_polygon = None
     for operation in operations:
@@ -266,7 +354,7 @@ def _build_plane_slice_region(
 
     mesh = support_mesh
     if replacement_polygon is not None:
-        normal = np.asarray(plane.normal, dtype=float).reshape(3)
+        normal = np.asarray(plane.normal, dtype=float).reshape(3).copy()
         normal /= np.linalg.norm(normal) + 1e-12
         reference = np.eye(3, dtype=float)[int(np.argmin(np.abs(normal)))]
         axis_u = np.cross(reference, normal); axis_u /= np.linalg.norm(axis_u) + 1e-12
@@ -298,7 +386,7 @@ def _build_plane_slice_region(
             tuple(int(x) for x in lower),
             tuple(int(x) for x in upper),
             tuple(np.round(np.asarray(spacing, dtype=float).reshape(3), 6)),
-            tuple(np.round(np.asarray(origin, dtype=float).reshape(3), 6)),
+            tuple(np.round(np.asarray(grid_origin, dtype=float).reshape(3), 6)),
         )
         mesh = _LOCAL_SUPPORT_MESH_CACHE.get(cache_key)
         if mesh is None:
@@ -314,13 +402,13 @@ def _build_plane_slice_region(
                     mesh = candidate_mesh
                     break
         if mesh is None:
-            mesh = _build_plane_support_mesh(expanded_mask, spacing, origin)
+            mesh = _build_plane_support_mesh(expanded_mask, spacing, grid_origin)
             if mesh is not None:
                 if len(_LOCAL_SUPPORT_MESH_CACHE) >= _LOCAL_SUPPORT_MESH_CACHE_MAX:
                     _LOCAL_SUPPORT_MESH_CACHE.pop(next(iter(_LOCAL_SUPPORT_MESH_CACHE)))
                 _LOCAL_SUPPORT_MESH_CACHE[cache_key] = mesh
     if mesh is None:
-        mesh = _build_plane_support_mesh(mask_xyz, spacing, origin)
+        mesh = _build_plane_support_mesh(mask_xyz, spacing, grid_origin)
     if mesh is None or mesh.n_cells == 0:
         return None
     plane_center_world = (
@@ -350,7 +438,7 @@ def _build_plane_slice_region(
     if roi_polygon.size and replacement_polygon is None:
         if roi_polygon.ndim != 2 or roi_polygon.shape[1] != 2 or len(roi_polygon) < 3:
             return None
-        normal = np.asarray(plane.normal, dtype=float).reshape(3)
+        normal = np.asarray(plane.normal, dtype=float).reshape(3).copy()
         normal = normal / (np.linalg.norm(normal) + 1e-12)
         reference = np.eye(3, dtype=float)[int(np.argmin(np.abs(normal)))]
         axis_u = np.cross(reference, normal)
@@ -373,7 +461,7 @@ def _build_plane_slice_region(
         if pg is None or pg.n_cells == 0:
             return None
     if operations:
-        normal = np.asarray(plane.normal, dtype=float).reshape(3)
+        normal = np.asarray(plane.normal, dtype=float).reshape(3).copy()
         normal /= np.linalg.norm(normal) + 1e-12
         reference = np.eye(3, dtype=float)[int(np.argmin(np.abs(normal)))]
         axis_u = np.cross(reference, normal); axis_u /= np.linalg.norm(axis_u) + 1e-12
@@ -430,7 +518,7 @@ def _plane_roi_point_mask(points_world, plane, origin):
         return np.ones(len(points), dtype=bool)
     if roi_polygon.ndim != 2 or roi_polygon.shape[1] != 2 or len(roi_polygon) < 3:
         return np.zeros(len(points), dtype=bool)
-    normal = np.asarray(plane.normal, dtype=float).reshape(3)
+    normal = np.asarray(plane.normal, dtype=float).reshape(3).copy()
     normal = normal / (np.linalg.norm(normal) + 1e-12)
     reference = np.eye(3, dtype=float)[int(np.argmin(np.abs(normal)))]
     axis_u = np.cross(reference, normal)
@@ -454,6 +542,7 @@ def _build_plane_slice_spec(
     select_connected=False,
     support_mesh=None,
     frame_index=0,
+    voxel_centered=False,
 ):
     pg = _build_plane_slice_region(
         mask_xyz,
@@ -464,7 +553,7 @@ def _build_plane_slice_spec(
         target_label=target_label,
         select_connected=select_connected,
         support_mesh=support_mesh,
-        frame_index=frame_index,
+        frame_index=frame_index, voxel_centered=voxel_centered,
     )
     if pg is None or pg.n_cells == 0:
         return None
@@ -478,10 +567,12 @@ def _build_plane_slice_spec(
         "cell_ids": cell_ids,
         "voxel_indices": np.unravel_index(cell_ids, mask_xyz.shape, order="F"),
         "areas": areas,
+        "_region": pg,
     }
 def _get_cached_plane_slice_spec(slice_cache, cache_key, mask_xyz, plane, spacing, origin,
                                  branch_grid=None, target_label=None, *, select_connected=False,
-                                 support_mesh=None, frame_index=0):
+                                 support_mesh=None, frame_index=0, voxel_centered=False):
+    cache_key = (cache_key, bool(voxel_centered))
     if cache_key not in slice_cache:
         slice_cache[cache_key] = _build_plane_slice_spec(
             mask_xyz,
@@ -492,13 +583,16 @@ def _get_cached_plane_slice_spec(slice_cache, cache_key, mask_xyz, plane, spacin
             target_label=target_label,
             select_connected=select_connected,
             support_mesh=support_mesh,
-            frame_index=frame_index,
+            frame_index=frame_index, voxel_centered=voxel_centered,
         )
     return slice_cache[cache_key]
 
 
 
-def _resolve_plane_roi_frame(cache, plane, frame_index, build_frame):
+def _resolve_plane_roi_frame(cache, plane, frame_index, build_frame, *, time_count=None, interpolate=None):
+    if time_count is not None:
+        from ..roi_time import resolve_roi_frame
+        return resolve_roi_frame(cache, plane, frame_index, time_count, build_frame, interpolate)
     """Carry only ROI geometry forward; explicit empty edits stop propagation.
 
     The result is independent of playback/request order. Leading missing
@@ -526,25 +620,42 @@ def _resolve_plane_roi_frame(cache, plane, frame_index, build_frame):
 def _get_plane_metric_slice_spec(slice_cache, mask4d, phase_lookup, support_cache,
                                  plane, frame_index, spacing, origin, *,
                                  branch_grid=None, target_label=None,
-                                 segmentation_labels_3d=None, segmentation_labels_4d=None):
+                                 segmentation_labels_3d=None, segmentation_labels_4d=None, voxel_centered=False):
     """Use current fields with one shared, temporally resolved ROI contract."""
     def build(t):
         return _get_raw_plane_metric_slice_spec(
             slice_cache, mask4d, phase_lookup, support_cache, plane, t, spacing, origin,
             branch_grid=branch_grid, target_label=target_label,
             segmentation_labels_3d=segmentation_labels_3d,
-            segmentation_labels_4d=segmentation_labels_4d,
+            segmentation_labels_4d=segmentation_labels_4d, voxel_centered=voxel_centered,
         )
-    spec, source = _resolve_plane_roi_frame(slice_cache, plane, frame_index, build)
+    def interpolate(first, second, weight):
+        from ..roi_time import interpolate_plane_regions
+        region = interpolate_plane_regions(first['_region'], second['_region'], weight,
+                                           plane, mask4d.shape[:3], spacing, origin, voxel_centered=voxel_centered)
+        if region is None:
+            return None
+        ids = np.asarray(region.cell_data['_cell_id'], dtype=np.int64)
+        return {'_region': region, 'cell_ids': ids,
+                'voxel_indices': np.unravel_index(ids, mask4d.shape[:3], order='F'),
+                'areas': np.asarray(region.cell_data['Area'], dtype=float)}
+    spec, source = _resolve_plane_roi_frame(slice_cache, plane, frame_index, build,
+        time_count=mask4d.shape[3], interpolate=interpolate)
     if spec is None:
         return None
-    return {**spec, "roi_source_frame": int(source), "roi_carried_forward": int(source) != int(frame_index)}
+    provenance = slice_cache['_roi_frame_provenance'][int(frame_index)]
+    return {**spec, "roi_source_frame": int(source),
+            "roi_carried_forward": provenance['mode'] == 'single_source_hold',
+            "roi_interpolated": provenance['mode'] == 'interpolated',
+            "roi_source_frames": provenance['source_frames'],
+            "roi_interpolation_weight": provenance['weight'],
+            "roi_resolution": provenance['mode']}
 
 
 def _get_raw_plane_metric_slice_spec(slice_cache, mask4d, phase_lookup, support_cache,
                                     plane, frame_index, spacing, origin, *,
                                     branch_grid=None, target_label=None,
-                                    segmentation_labels_3d=None, segmentation_labels_4d=None):
+                                    segmentation_labels_3d=None, segmentation_labels_4d=None, voxel_centered=False):
     """Select the observed/edited ROI of exactly one frame without filling."""
     t = int(frame_index)
     rep_t = int(phase_lookup[t])
@@ -575,7 +686,7 @@ def _get_raw_plane_metric_slice_spec(slice_cache, mask4d, phase_lookup, support_
     return _get_cached_plane_slice_spec(
         slice_cache, key, mask_t, plane, spacing, origin,
         branch_grid=branch_grid, target_label=target_label, select_connected=True,
-        support_mesh=support, frame_index=t,
+        support_mesh=support, frame_index=t, voxel_centered=voxel_centered,
     )
 
 
@@ -604,10 +715,30 @@ def _plane_slice_point_mask(points_world, slice_spec, mask_shape, spacing, origi
     return keep
 
 
-def _sample_field_from_slice_spec(field_t, mask_shape, field_name, slice_spec):
+def _sample_field_from_slice_spec(field_t, mask_shape, field_name, slice_spec, *,
+                                  field_spacing=None, mask_spacing=None, origin=None):
     if slice_spec is None:
         return None
     field_arr = np.asarray(field_t)
+    if field_spacing is not None and (tuple(field_arr.shape[:3]) != tuple(mask_shape)
+            or not np.allclose(field_spacing, mask_spacing)):
+        # Fine segmentation cut cells define geometry/areas. Probe the acquired
+        # scalar/vector field at those physical quadrature points, without
+        # materializing a resampled velocity or pressure volume.
+        from scipy.ndimage import map_coordinates
+        region = slice_spec.get('_region')
+        if region is None:
+            raise ValueError('Cross-grid field sampling requires physical cut-cell geometry')
+        points = np.asarray(region.cell_centers().points, dtype=float)
+        coordinates = ((points-np.asarray(origin, float))/np.asarray(field_spacing, float)).T
+        order = 0 if field_arr.dtype == bool or field_name.endswith('support') else 1
+        if field_arr.ndim == 3:
+            return map_coordinates(field_arr, coordinates, order=order, mode='nearest', prefilter=False)
+        if field_arr.ndim == 4 and field_arr.shape[-1] in (1, 3):
+            values = np.column_stack([map_coordinates(field_arr[..., c], coordinates,
+                order=order, mode='nearest', prefilter=False) for c in range(field_arr.shape[-1])])
+            return values[:, 0] if field_arr.shape[-1] == 1 else values
+        raise ValueError(f'{field_name} must be a scalar or vector spatial field')
     if tuple(field_arr.shape[:3]) != tuple(mask_shape):
         raise ValueError(f"{field_name} spatial shape {field_arr.shape[:3]} does not match mask {mask_shape}")
     voxel_indices = slice_spec.get("voxel_indices")

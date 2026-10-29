@@ -1,22 +1,15 @@
-"""Regenerate all AutoFlow phantoms under ``data/``."""
-
-from __future__ import annotations
-
-import generate_phantom_P
-import generate_phantoms
-
-
+"""Generate the retained 24 analytic phantom inputs."""
+import argparse
+from pathlib import Path
+import sys
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+from autoflow.algorithms.regression_phantoms import generate_regression_matrix
 def main():
-    selected = ["S", "U", "Y"]
-    infos = generate_phantoms.generate_selected(selected)
-    for name in selected:
-        for line in generate_phantoms.summary_lines(name, infos[name]):
-            print(line)
-
-    truth = generate_phantom_P.generate_and_save()
-    for line in generate_phantom_P.summary_lines(truth, generate_phantom_P.PHANTOM_H5_PATH):
-        print(line)
-
-
-if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', type=Path, default=ROOT/'data/phantoms')
+    args = parser.parse_args()
+    rows = generate_regression_matrix(args.output)
+    print(f'Generated {len(rows)} inputs: {args.output}')
+if __name__ == '__main__':
     main()

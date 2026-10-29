@@ -84,7 +84,22 @@ class TaskProgressDialog(QtWidgets.QDialog):
         self._timer.setInterval(100)
         self._timer.timeout.connect(self._tick)
         self._timer.start()
-        QtWidgets.QApplication.instance().installEventFilter(self)
+        # Native application modality protects ordinary input. The scoped
+        # filters also block direct delivery and application shortcuts, without
+        # exposing Chromium's internal QObjects to a global Python filter.
+        targets = set()
+        root = parent.window() if isinstance(parent, QtWidgets.QWidget) else None
+        if root is not None:
+            # Enumerating all application widgets can resurrect stale native
+            # wrappers from closed VTK windows. Stay in the live owner's tree.
+            for widget in [root, *root.findChildren(QtWidgets.QWidget)]:
+                if widget.window() is not self:
+                    targets.add(widget)
+            targets.update(root.findChildren(QtGui.QShortcut))
+            targets.update(root.findChildren(QtGui.QAction))
+        self._input_filter_targets = list(targets)
+        for target in self._input_filter_targets:
+            target.installEventFilter(self)
         self._tick()
 
     def eventFilter(self, watched, event):
@@ -104,6 +119,8 @@ class TaskProgressDialog(QtWidgets.QDialog):
         }
         if not self._finished and event.type() in input_events:
             if isinstance(watched, QtWidgets.QWidget) and watched.window() is not self:
+                if event.type() == QtCore.QEvent.Type.Close:
+                    event.ignore()
                 return True
             if isinstance(watched, QtGui.QShortcut):
                 return True
@@ -178,7 +195,12 @@ class TaskProgressDialog(QtWidgets.QDialog):
     def closeEvent(self, event):
         if self._finished:
             self._timer.stop()
-            QtWidgets.QApplication.instance().removeEventFilter(self)
+            for target in self._input_filter_targets:
+                try:
+                    target.removeEventFilter(self)
+                except RuntimeError:  # A target may have closed during the task.
+                    pass
+            self._input_filter_targets.clear()
             event.accept()
             return
         if not self.cancel_token.cancelled:

@@ -452,7 +452,9 @@ def reconstruct_relative_pressure_map(pressure_gradient_array, support_mask, spa
     nt = grad.shape[3]
     pressure = np.zeros(grad.shape[:4], dtype=np.float32)
 
-    system_cache = {}
+    from ...core.cache import ByteLRUCache
+    from ...core.resources import memory_budget_bytes
+    system_cache = ByteLRUCache(min(512*1024**2, memory_budget_bytes(.1) or 512*1024**2))
     for tidx in range(nt):
         report_progress({"stage": "relative_pressure", "current": tidx, "total": nt,
                          "message": f"Reconstructing relative pressure phase {tidx + 1}/{nt}"})

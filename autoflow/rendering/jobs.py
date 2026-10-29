@@ -13,6 +13,7 @@ import time
 import joblib
 
 from ..task_control import check_cancelled, stop_process, task_scope
+from ..algorithms.flow_seeding import streamline_inputs_available
 
 
 def export_videos_in_process(workspace, out_dir, config, requested, progress_callback=None):
@@ -90,6 +91,10 @@ def export_videos_in_process(workspace, out_dir, config, requested, progress_cal
                         os.chmod(staged, stat.S_IMODE(target.stat().st_mode))
                     os.replace(staged, target)
                     result["outputs"][name] = str(target)
+                    for suffix in (".webm", ".webm.source.json"):
+                        companion = Path(staged).with_suffix(suffix)
+                        if companion.is_file():
+                            os.replace(companion, target.with_suffix(suffix))
             return result
 
 
@@ -121,11 +126,19 @@ def _render_request(request_path):
          dict(common, pressure_gradient_clim=config["pressure_gradient_clim"], show_scalar_bar=config["pressure_gradient_show_scalar_bar"], pressure_gradient_bar_cfg=config["pressure_gradient_bar_cfg"])),
         ("relative_pressure", ws.derived.relative_pressure_array is not None, videos.render_relative_pressure_video,
          dict(common, relative_pressure_clim=config["relative_pressure_clim"], show_scalar_bar=config["relative_pressure_show_scalar_bar"], relative_pressure_bar_cfg=config["relative_pressure_bar_cfg"])),
-        ("streamlines", ws.flow_raw is not None and ws.segmask_binary is not None and ws.segmask_3d is not None,
+        ("streamlines", streamline_inputs_available(ws),
          videos.render_streamlines_video, dict(common, streamline_clim=config["streamline_clim"], show_scalar_bar=config["streamline_show_scalar_bar"], streamline_bar_cfg=config["streamline_bar_cfg"])),
     ]
-    jobs = [job for job in jobs if requested.get("pg" if job[0] in {"pressure_gradient", "relative_pressure"} else job[0])]
-    outputs, timings = {}, {}
+    qc_families = set(config.get("qc_families", []))
+    if qc_families:
+        from .qc_videos import render_qc_field_video, render_qc_pathline_video
+        for field in ("velocity", "vorticity", "q_criterion", "swirling_strength", "pcmra"):
+            jobs.append((field, field in qc_families, render_qc_field_video, dict(common, field=field)))
+        jobs.append(("pathlines", bool(ws.pathline_cache), render_qc_pathline_video, common))
+        jobs = [job for job in jobs if job[0] in qc_families]
+    else:
+        jobs = [job for job in jobs if requested.get("pg" if job[0] in {"pressure_gradient", "relative_pressure"} else job[0])]
+    outputs, timings, errors = {}, {}, {}
     def emit(payload):
         with progress_path.open("a", encoding="utf-8") as output:
             output.write(json.dumps(payload) + "\n")
@@ -139,11 +152,31 @@ def _render_request(request_path):
                   "detail_current": payload.get("current", 0), "detail_total": payload.get("total", 0),
                   "detail_message": payload.get("message", "")})
         started = time.perf_counter()
-        with task_scope(progress=frame_progress):
-            outputs[name] = renderer(ws, directory, **kwargs) or ""
+        try:
+            with task_scope(progress=frame_progress):
+                outputs[name] = renderer(ws, directory, **kwargs) or ""
+                if outputs[name] and config.get("browser_companion"):
+                    from ..report_media import ensure_browser_video
+                    emit({"stage": "video", "current": index, "total": len(jobs), "message": f"Encoding browser playback for {name}…"})
+                    try:
+                        ensure_browser_video(outputs[name])
+                    except Exception as browser_exc:
+                        from ..task_control import TaskCancelled
+                        if isinstance(browser_exc, TaskCancelled):
+                            raise
+                        errors[name] = f"Browser playback: {type(browser_exc).__name__}: {browser_exc}"
+        except Exception as exc:
+            from ..task_control import TaskCancelled
+            if isinstance(exc, TaskCancelled) or not qc_families:
+                raise
+            errors[name] = f"{type(exc).__name__}: {exc}"
+            outputs[name] = ""
         timings[name] = time.perf_counter() - started
     emit({"stage": "video", "current": len(jobs), "total": len(jobs), "message": "Video rendering complete"})
-    Path(request["result"]).write_text(json.dumps({"outputs": outputs, "times": timings}))
+    result = {"outputs": outputs, "times": timings}
+    if qc_families or errors:
+        result['errors'] = errors
+    Path(request["result"]).write_text(json.dumps(result))
 
 
 if __name__ == "__main__":

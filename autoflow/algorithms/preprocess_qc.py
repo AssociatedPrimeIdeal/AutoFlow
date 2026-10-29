@@ -1,6 +1,7 @@
 """Label-preserving provenance for temporal voting and skeleton preprocessing."""
 
 import numpy as np
+from scipy.ndimage import find_objects
 
 
 def _fraction(numerator, denominator):
@@ -46,18 +47,27 @@ def build_segmentation_preprocess_qc(raw, vote_input, voted, retained, processed
                     | set(int(value) for value in np.unique(source) if int(value) > 0))
     for value in values:
         raw_presence, presence = raw == value, source == value
+        # All label-dependent output counts are supported by raw/source input,
+        # voted winners or retained labels. Include all four to keep this helper
+        # correct even when callers supply retained labels beyond source support.
+        support = np.any(raw_presence, axis=3) | np.any(presence, axis=3)
+        support |= (voted == value) | (retained == value)
+        region = find_objects(support, max_label=1)[0]
+        raw_presence = raw_presence[region].copy()
+        presence = presence[region].copy()
+        voted_local, retained_local, processed_local = voted[region], retained[region], processed[region]
         raw_counts = np.count_nonzero(raw_presence, axis=(0, 1, 2))
         counts = np.count_nonzero(presence, axis=(0, 1, 2))
         union = np.any(presence, axis=3)
         raw_union_count = int(np.count_nonzero(np.any(raw_presence, axis=3)))
         union_count = int(np.count_nonzero(union))
-        winner, kept = voted == value, retained == value
-        processed_for_label = processed
+        winner, kept = voted_local == value, retained_local == value
+        processed_for_label = processed_local
         if processed_groups is not None and groups.get(value):
-            processed_for_label = np.zeros(voted.shape, dtype=bool)
+            processed_for_label = np.zeros(voted_local.shape, dtype=bool)
             for group in groups[value]:
                 if group in processed_groups:
-                    processed_for_label |= np.asarray(processed_groups[group], dtype=bool)
+                    processed_for_label |= np.asarray(processed_groups[group], dtype=bool)[region]
         voted_count, kept_count = int(np.count_nonzero(winner)), int(np.count_nonzero(kept))
         union_lost = union & ~winner
         lost_count = int(np.count_nonzero(union_lost))
@@ -65,10 +75,10 @@ def build_segmentation_preprocess_qc(raw, vote_input, voted, retained, processed
         morphology_removed = int(np.count_nonzero(kept & ~processed_for_label))
         morphology_for_label = None
         if morphology_groups is not None:
-            morphology_for_label = np.zeros(voted.shape, dtype=bool)
+            morphology_for_label = np.zeros(voted_local.shape, dtype=bool)
             for group in groups.get(value, []):
                 if group in morphology_groups:
-                    morphology_for_label |= np.asarray(morphology_groups[group], dtype=bool)
+                    morphology_for_label |= np.asarray(morphology_groups[group], dtype=bool)[region]
             component_removed = int(np.count_nonzero(winner & morphology_for_label & ~processed_for_label))
             morphology_removed = int(np.count_nonzero(winner & ~morphology_for_label))
         component_input = voted_count if morphology_for_label is None else int(np.count_nonzero(winner & morphology_for_label))
@@ -81,14 +91,14 @@ def build_segmentation_preprocess_qc(raw, vote_input, voted, retained, processed
             removed = count - overlap
             cleanup_removed = original_count - int(np.count_nonzero(raw_presence[..., phase_index] & current))
             loss = current & ~winner
-            background = int(np.count_nonzero(loss & (voted == 0)))
+            background = int(np.count_nonzero(loss & (voted_local == 0)))
             phase_component_removed = int(np.count_nonzero(current & winner & ~kept))
             phase_component_input = overlap
             if morphology_for_label is not None:
                 phase_component_input = int(np.count_nonzero(current & winner & morphology_for_label))
                 phase_component_removed = int(np.count_nonzero(current & winner & morphology_for_label & ~processed_for_label))
             temporal_kept = None if temporal_group_mask is None else int(np.count_nonzero(
-                current & np.asarray(temporal_group_mask)[..., min(phase_index, temporal_group_mask.shape[3] - 1)]
+                current & np.asarray(temporal_group_mask)[region][..., min(phase_index, temporal_group_mask.shape[3] - 1)]
             ))
             phases.append({
                 "phase_index": int(phase_index),
@@ -100,7 +110,7 @@ def build_segmentation_preprocess_qc(raw, vote_input, voted, retained, processed
                 "vote_added_voxels": voted_count - overlap,
                 "vote_removed_to_background_voxels": background,
                 "vote_removed_to_other_labels_voxels": removed - background,
-                "vote_destinations": destinations(voted[loss], count),
+                "vote_destinations": destinations(voted_local[loss], count),
                 "component_removed_voxels": phase_component_removed,
                 "component_removed_fraction": _fraction(phase_component_removed, phase_component_input),
                 "retained_overlap_voxels": int(np.count_nonzero(current & kept)),
@@ -130,7 +140,7 @@ def build_segmentation_preprocess_qc(raw, vote_input, voted, retained, processed
             "skeleton_input_voxels": int(np.count_nonzero(kept & processed_for_label)),
             "vote_removed_union_voxels": lost_count,
             "vote_removed_union_fraction": _fraction(lost_count, union_count),
-            "vote_destinations": destinations(voted[union_lost], union_count),
+            "vote_destinations": destinations(voted_local[union_lost], union_count),
             "component_removed_voxels": component_removed,
             "component_removed_fraction": _fraction(component_removed, component_input),
             "morphology_removed_voxels": morphology_removed,

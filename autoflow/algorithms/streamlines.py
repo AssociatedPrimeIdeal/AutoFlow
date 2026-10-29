@@ -13,6 +13,8 @@ from vtkmodules.vtkCommonDataModel import (
 )
 from vtkmodules.vtkCommonExecutionModel import vtkStreamingDemandDrivenPipeline
 from vtkmodules.vtkFiltersFlowPaths import vtkParticleTracer, vtkParticleTracerBase
+from .flow_seeding import volume_seed_domain, volume_seed_points
+from ..task_control import TaskCancelled, check_cancelled
 
 from .surfaces import (
     _build_branch_grid,
@@ -76,17 +78,11 @@ def _set_streamline_velocity_scalar(streamlines):
 
 
 def generate_seed_points(mask_3d, spacing, origin, ratio=0.02, rng_seed=0,
-                         min_seeds=50):
-    idx = np.argwhere(np.asarray(mask_3d, dtype=bool))
-    K = len(idx)
-    if K == 0:
-        return np.empty((0, 3), dtype=float)
-    n = int(min(K, max(int(min_seeds), int(round(K * float(ratio))))))
-    rng = np.random.default_rng(int(rng_seed))
-    pick = idx[rng.choice(K, size=n, replace=False)]
-    sp = np.asarray(spacing, dtype=float).reshape(1, 3)
-    org = np.asarray(origin, dtype=float).reshape(1, 3)
-    return (org + pick.astype(float) * sp).astype(float)
+                         min_seeds=50, *, distribution="random", grid_spacing_mm=0.,
+                         seed_mode="ratio", seed_count=1000):
+    return volume_seed_points(mask_3d, spacing, origin, distribution=distribution,
+        grid_spacing_mm=grid_spacing_mm, mode=seed_mode, count=seed_count,
+        ratio=ratio, min_seeds=min_seeds, rng_seed=rng_seed)
 
 
 def _crop_vector_domain_to_mask(flow_t, mask_3d, spacing, origin, padding=1):
@@ -110,13 +106,23 @@ def _crop_vector_domain_to_mask(flow_t, mask_3d, spacing, origin, padding=1):
 
 def generate_streamlines_at_t(flow_xyzt3, t, seeds, spacing, origin, mask_3d=None,
                               max_steps=200, terminal_speed=0.01,
-                              seed_ratio=0.1, min_seeds=50, rng_seed=0):
-    if mask_3d is None:
-        return None
+                              seed_ratio=0.1, min_seeds=50, rng_seed=0, *,
+                              seed_region=None, noise_keep=None, seed_distribution="random",
+                              grid_spacing_mm=0., seed_mode="ratio", seed_count=1000,
+                              integration_step_mm=None, return_seed_count=False,
+                              integration_backend="auto"):
+    def finish(mesh, count=0):
+        if mesh is not None:
+            mesh.field_data["SeedCount"] = np.asarray([count], np.int64)
+        return (mesh, count) if return_seed_count else mesh
     flow_arr = np.asarray(flow_xyzt3)
-    mask_arr = np.asarray(mask_3d)
     if flow_arr.ndim != 5 or flow_arr.shape[-1] != 3:
         raise ValueError(f"flow must be XYZT3, got {flow_arr.shape}")
+    if mask_3d is None and seed_region is None:
+        return finish(None)
+    mask_arr = (volume_seed_domain(flow_arr, seed_region, segmentation=mask_3d,
+                                  noise_keep=noise_keep, phase=t)
+                if seed_region is not None else np.asarray(mask_3d))
     if mask_arr.ndim != 3 or tuple(mask_arr.shape) != tuple(flow_arr.shape[:3]):
         raise ValueError(
             f"mask_3d must match flow spatial shape {flow_arr.shape[:3]}, got {mask_arr.shape}"
@@ -138,23 +144,52 @@ def generate_streamlines_at_t(flow_xyzt3, t, seeds, spacing, origin, mask_3d=Non
     mesh = create_uniform_grid(mask_work, spacing, origin=work_origin)
     mesh = mesh.threshold(0.1)
     if mesh.n_points == 0:
-        return None
+        return finish(None)
     volume = mesh.sample(velocity)
     volume.set_active_scalars('Velocity')
     if volume.points.shape[0] == 0:
-        return None
+        return finish(None)
     if seeds is None or len(seeds) == 0:
         seeds = generate_seed_points(
-            mask_3d,
+            mask_arr,
             spacing,
             origin,
             ratio=seed_ratio,
-            rng_seed=int(rng_seed) + int(t),
+            rng_seed=int(rng_seed) + (int(t) if seed_region is None else 0),
             min_seeds=min_seeds,
+            distribution=seed_distribution, grid_spacing_mm=grid_spacing_mm,
+            seed_mode=seed_mode, seed_count=seed_count,
         )
     source = np.asarray(seeds, dtype=float)
     if source.size == 0:
-        return None
+        return finish(None)
+    options = {}
+    if integration_step_mm is not None:
+        step = float(integration_step_mm)
+        if not np.isfinite(step) or step <= 0:
+            raise ValueError("Integration step (mm) must be positive or auto")
+        options.update(step_unit="l", initial_step_length=step)
+    backend = str(integration_backend).strip().lower()
+    if backend not in {"auto", "cuda", "vtk"}:
+        raise ValueError("Integration backend must be auto, cuda or vtk")
+    fallback = None
+    if backend != "vtk":
+        try:
+            from .streamlines_cuda import trace_sampled_volume
+            sl = trace_sampled_volume(
+                volume, source, mask_work.shape, np.asarray(spacing, float), work_origin,
+                max_steps=max_steps, terminal_speed=terminal_speed,
+                integration_step_mm=integration_step_mm)
+        except TaskCancelled:
+            raise
+        except Exception as exc:
+            if backend == "cuda":
+                raise RuntimeError(f"CUDA streamline integration failed: {exc}") from exc
+            fallback = f"{type(exc).__name__}: {exc}"
+        else:
+            if sl is not None:
+                sl.field_data["IntegrationBackend"] = ["cuda"]
+            return finish(sl, len(source))
     sl = volume.streamlines_from_source(
         vectors='vector',
         source=source,
@@ -162,10 +197,14 @@ def generate_streamlines_at_t(flow_xyzt3, t, seeds, spacing, origin, mask_3d=Non
         max_steps=int(max_steps),
         terminal_speed=float(terminal_speed),
         compute_vorticity=False,
+        **options,
     )
     if sl is None or sl.n_points == 0:
-        return None
-    return _set_streamline_velocity_scalar(sl)
+        return finish(None, len(source))
+    sl.field_data["IntegrationBackend"] = ["vtk"]
+    if fallback is not None:
+        sl.field_data["IntegrationFallbackReason"] = [fallback]
+    return finish(_set_streamline_velocity_scalar(sl), len(source))
 
 
 def _plane_seeds(mask_3d, plane, spacing, origin, seed_ratio, min_seeds,
@@ -357,6 +396,7 @@ class _TemporalVelocitySource(VTKPythonAlgorithmBase):
         self._start_phase = int(start_phase) % max(self._n_time, 1)
         self._rr_seconds = max(float(rr) / 1000.0, 1e-6)
         self._times = np.linspace(0.0, self._rr_seconds, self._n_time + 1).tolist()
+        self._base_times = list(self._times)
         # vtkParticleTracer only needs consecutive time steps. Keep the
         # generated image data lazy and bounded so a large 4D case is not
         # duplicated in memory for every cardiac phase.
@@ -435,9 +475,13 @@ class _TemporalVelocitySource(VTKPythonAlgorithmBase):
         if info.Has(vtkStreamingDemandDrivenPipeline.UPDATE_TIME_STEP()):
             requested = float(info.Get(vtkStreamingDemandDrivenPipeline.UPDATE_TIME_STEP()))
         index = int(np.argmin(np.abs(np.asarray(self._times, dtype=float) - requested)))
-        phase = (self._start_phase + index) % self._n_time
+        sample_time = self._times[index]
+        base_position = sample_time / self._rr_seconds * self._n_time
+        base_index = int(np.floor(base_position + 1e-10))
+        fraction = float(np.clip(base_position - base_index, 0., 1.))
+        phase = (self._start_phase + base_index) % self._n_time
         if phase not in self._datasets:
-            self._datasets[phase] = self._build_dataset(index)
+            self._datasets[phase] = self._build_dataset(base_index)
             if not self._cache_all_phases:
                 previous_phase = (phase - 1) % self._n_time
                 self._datasets = {
@@ -450,11 +494,26 @@ class _TemporalVelocitySource(VTKPythonAlgorithmBase):
         # previous child retained by vtkParticleTracer.
         output = vtkMultiBlockDataSet.GetData(out_info)
         output.SetNumberOfBlocks(1)
-        output.SetBlock(0, self._datasets[phase])
-        output.GetInformation().Set(vtkDataObject.DATA_TIME_STEP(), self._times[index])
-        self._datasets[phase].GetInformation().Set(
-            vtkDataObject.DATA_TIME_STEP(), self._times[index]
-        )
+        dataset = self._datasets[phase]
+        if fraction > 1e-9:
+            next_phase = (phase + 1) % self._n_time
+            if next_phase not in self._datasets:
+                self._datasets[next_phase] = self._build_dataset(base_index + 1)
+            first = vtk_to_numpy(dataset.GetPointData().GetVectors())
+            second = vtk_to_numpy(self._datasets[next_phase].GetPointData().GetVectors())
+            interpolated = vtkImageData()
+            interpolated.CopyStructure(dataset)
+            vectors = numpy_to_vtk(np.ascontiguousarray(first + fraction * (second - first)), deep=True)
+            vectors.SetName("velocity")
+            interpolated.GetPointData().SetVectors(vectors)
+            dataset = interpolated
+        output.SetBlock(0, dataset)
+        output.GetInformation().Set(vtkDataObject.DATA_TIME_STEP(), sample_time)
+        dataset.GetInformation().Set(vtkDataObject.DATA_TIME_STEP(), sample_time)
+        if not self._cache_all_phases:
+            adjacent = (phase + (1 if fraction > 1e-9 else -1)) % self._n_time
+            self._datasets = {key: value for key, value in self._datasets.items()
+                              if key in {phase, adjacent}}
         return 1
 
 
@@ -562,6 +621,41 @@ def pathline_prefix_at_phase(pathline, phase):
     return result
 
 
+def pathline_sample_times(source, flow, integration_step_mm=None, max_steps=200):
+    """Bound update travel by peak speed when an explicit spatial step is set."""
+    times = np.asarray(source._base_times, float)
+    if integration_step_mm is not None:
+        step = float(integration_step_mm)
+        if not np.isfinite(step) or step <= 0:
+            raise ValueError("Integration step (mm) must be positive or auto")
+        peak = getattr(source, "_peak_speed_mm_s", None)
+        if peak is None:
+            peak = 0.
+            for phase in range(np.asarray(flow).shape[3]):
+                check_cancelled()
+                values = np.asarray(flow)[..., phase, :]
+                speed = np.sqrt(np.einsum("...i,...i->...", values, values))
+                finite = speed[np.isfinite(speed)]
+                if finite.size:
+                    peak = max(peak, float(np.max(finite)) * 10.)
+            source._peak_speed_mm_s = peak
+        count = max(1, int(np.ceil(times[-1] * peak / step)))
+        # max_steps is also the existing bound on temporal update work.
+        if count > max_steps:
+            extra = np.arange(min(count + 1, max_steps)) * (times[-1] / count)
+        else:
+            extra = np.linspace(0., times[-1], count + 1)
+        # Floating point duplicates such as .6 and .6000000000000001 can
+        # stall vtkParticleTracer's integration loop on a zero-size interval.
+        times = np.unique(np.round(np.r_[times, extra], 12))
+    # The native tracer must see these as advertised input time steps. Asking
+    # it for fractional times while the source snaps to acquisition frames
+    # can otherwise prevent its temporal executive from making progress.
+    source._times = times.tolist()
+    source.Modified()
+    return times[:max(1, int(max_steps))]
+
+
 def generate_pathlines_from_plane_at_t(flow_xyzt3, t, plane, spacing, origin,
                                        mask_4d=None, mask_3d=None, max_steps=200,
                                        terminal_speed=0.01,
@@ -570,7 +664,7 @@ def generate_pathlines_from_plane_at_t(flow_xyzt3, t, plane, spacing, origin,
                                        branch_labels_3d=None, max_seeds=250,
                                        seeds=None, progress_callback=None,
                                        seed_mode="ratio", temporal_source=None,
-                                       temporal_cache_mb=0.0):
+                                       temporal_cache_mb=0.0, integration_step_mm=None):
     flow = np.asarray(flow_xyzt3, dtype=np.float32)
     time_index = int(t)
     if mask_3d is None and mask_4d is not None:
@@ -649,8 +743,9 @@ def generate_pathlines_from_plane_at_t(flow_xyzt3, t, plane, spacing, origin,
     # exposing the fixed integration-step limit used by the retired tracer.
     # Keep max_steps meaningful as a cap on cardiac-frame updates.
     frame_limit = max(1, int(max_steps))
-    time_values = source._times[:min(len(source._times), frame_limit)]
+    time_values = pathline_sample_times(source, flow, integration_step_mm, frame_limit)
     for time_index, time_value in enumerate(time_values):
+        check_cancelled()
         tracer.UpdateTimeStep(float(time_value))
         output = tracer.GetOutputDataObject(0)
         if output is not None and output.GetNumberOfPoints() > 0:
@@ -672,4 +767,11 @@ def generate_pathlines_from_plane_at_t(flow_xyzt3, t, plane, spacing, origin,
                 tracks.setdefault(int(particle_id), []).append((point, vector, phase))
         if progress_callback is not None:
             progress_callback(time_index + 1, len(time_values))
-    return _particle_tracks_to_polydata(tracks)
+    result = _particle_tracks_to_polydata(tracks)
+    if result is not None:
+        result.point_data["ParticleAge_ms"] = np.asarray(result["PathlinePhase"], float) * rr_ms
+        result.field_data["LaunchPhase"] = np.asarray([int(t)], np.int64)
+        result.field_data["RR_ms"] = np.asarray([rr_ms], float)
+        result.field_data["SeedCount"] = np.asarray([len(seeds)], np.int64)
+        result.field_data["CompletedCycle"] = np.asarray([bool(time_values[-1] >= source._times[-1]-1e-9)], np.uint8)
+    return result

@@ -22,6 +22,14 @@ def build_exclusion_checks(workspace, make_check):
     checks = []
     labels = list(preprocessing.get("labels", []))
     if preprocessing:
+        geometry = dict(preprocessing.get("skeleton_geometry", {}) or {})
+        if geometry:
+            spacing = " / ".join(f"{float(v):g}" for v in geometry.get("spacing_mm", []))
+            checks.append(make_check("segmentation.geometry_grid", "Segmentation",
+                "warn" if geometry.get("rejected_caches") else "pass", "Skeleton geometry grid",
+                f"spacing={spacing} mm; source={geometry.get('source', 'unknown')}; "
+                f"cache accepted={bool(geometry.get('cache_hit', False))}; velocity stays native",
+                value=geometry, action="Review the geometry grid separately from native preprocessing counts."))
         voting_details, component_details, cleanup_details, morphology_details, temporal_details = [], [], [], [], []
         for label in labels:
             title = f"{label['label_name']} ({label['label']})"
@@ -68,7 +76,7 @@ def build_exclusion_checks(workspace, make_check):
             if label["morphology_removed_voxels"]:
                 morphology_details.append(_detail(title,
                     f"group-retained={label['retained_group_voxels']}; removed={label['morphology_removed_voxels']} "
-                    f"({_percent(label['morphology_removed_fraction'])}); skeleton input={label['skeleton_input_voxels']}",
+                    f"({_percent(label['morphology_removed_fraction'])}); native preprocessed input={label['skeleton_input_voxels']}",
                     status="warn" if not label["skeleton_input_voxels"] else "pass", stage=stage, value=_label_summary(label)))
             if any(phase.get("temporal_group_removed_voxels") for phase in label.get("phases", [])):
                 reason = "label unavailable after voting" if not label["voted_voxels"] else "per-phase merged-group component filtering"
@@ -91,7 +99,7 @@ def build_exclusion_checks(workspace, make_check):
             ("segmentation.group_components", "Merged-group component filtering", component_details),
             ("segmentation.temporal_group_components", "Per-phase group-mask exclusions", temporal_details),
             ("segmentation.cleanup_4d", "4D component cleanup before voting", cleanup_details),
-            ("segmentation.skeleton_preprocessing", "Skeleton-mask preprocessing", morphology_details),
+            ("segmentation.skeleton_preprocessing", "Native-grid mask preprocessing" if geometry else "Skeleton-mask preprocessing", morphology_details),
         ):
             if details:
                 check = make_check(check_id, "Segmentation",

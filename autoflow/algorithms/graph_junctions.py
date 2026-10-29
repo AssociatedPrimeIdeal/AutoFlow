@@ -29,12 +29,12 @@ def _components_preserved(original, current):
 
 def simplify_junction_clusters(graph, segmentation_labels, spacing=(1, 1, 1), *,
                                origin=(0, 0, 0), enabled=True,
-                               max_extent_voxels=8.0, min_cycle_rank=2):
+                               max_extent_voxels=0.0, min_cycle_rank=2):
     """Return the graph after conservative local junction routing and its audit.
 
     Candidates are connected components of the induced degree >= 3 node graph,
-    with >= 3 nodes, the configured internal cycle rank, and a bounded extent in
-    voxel coordinates. Every cyclic same-label edge component inside a candidate
+    with >= 3 nodes and the configured internal cycle rank. Extent is unbounded
+    by default; a positive legacy limit explicitly bounds each voxel axis. Every cyclic same-label edge component inside a candidate
     is routed independently. All boundary ports, label-interface ports and old
     endpoints must survive. Mixed/unknown edges are protected, so mixed clusters
     can retain cycles even when their individual label-owned patches are trees.
@@ -52,6 +52,7 @@ def simplify_junction_clusters(graph, segmentation_labels, spacing=(1, 1, 1), *,
         "algorithm": "junction_cluster_shortest_paths", "status": "unchanged",
         "stage": "after_triangle_contraction_before_flow_filter",
         "enabled": enabled, "max_extent_voxels": max_extent_voxels,
+        "extent_limit_applied": max_extent_voxels > 0,
         "min_cycle_rank": min_cycle_rank, "minimum_node_degree": 3,
         "cycle_rank_before": _rank(network), "cycle_rank_after": _rank(network),
         "detected_cluster_count": 0, "candidate_count": 0, "simplified_cluster_count": 0,
@@ -123,7 +124,7 @@ def simplify_junction_clusters(graph, segmentation_labels, spacing=(1, 1, 1), *,
         if record["cycle_rank_before"] < min_cycle_rank:
             record["reason"] = "cycle_rank_below_minimum"
             continue
-        if np.any(extent > max_extent_voxels + 1e-10):
+        if max_extent_voxels > 0 and np.any(extent > max_extent_voxels + 1e-10):
             record["reason"] = "extent_exceeds_limit"
             continue
         if len({key(node) for node in component}) != len(component):

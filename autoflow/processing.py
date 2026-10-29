@@ -7,9 +7,11 @@ import time
 import numpy as np
 
 from .task_control import TaskCancelled
+from .batch_status import case_status, checkpoint_batch, record_batch_result
 from .core.models import StepId, Workspace
 from .core.pipeline import PipelineEngine
 from .algorithms import collect_input_cases, resolve_input_case
+from .algorithms.flow_seeding import streamline_inputs_available
 from .algorithms.segmentation import (
     generate_nnunet_auto_segmentation,
     resolve_auto_segmentation_device,
@@ -574,6 +576,7 @@ def process_single(
             "quality_report": quality_report,
         }
         summary_path = os.path.join(out_dir, "summary.json")
+        _export_case_html_report(ws, summary, out_dir)
         _write_case_summary(summary, summary_path, t_total_start, total_time_sec)
         print(f"\nSegmentation-only run complete ({summary['total_time_sec']:.2f}s). Summary saved: {summary_path}")
         return summary
@@ -737,11 +740,13 @@ def process_single(
 
     video_paths = {}
     video_errors = {}
+    video_skips = {}
 
     def _run_video(name, enabled, runner, available=True):
         if not enabled:
             return
         if not available:
+            video_skips[name] = "upstream_data_unavailable"
             video_paths[name] = ""
             print(f"[WARN] {name} video skipped: upstream data unavailable")
             return
@@ -799,7 +804,7 @@ def process_single(
             time_repeat=dynamic_time_repeat,
             window_size=window_size,
         ),
-        available=ws.flow_raw is not None and ws.segmask_binary is not None and ws.segmask_3d is not None,
+        available=streamline_inputs_available(ws),
     )
     _run_video(
         "wss",
@@ -980,6 +985,15 @@ def process_single(
         "phase_unwrap_file": phase_unwrap_file,
         "requested_metrics": dict(metric_flags),
         "requested_videos": dict(video_flags),
+        "skip_plane_metrics": bool(skip_plane_metrics),
+        "video_skips": dict(video_skips),
+        "metric_output_status": {
+            "wss": "complete" if ws.derived.wss_surfaces else "missing",
+            "tke": "complete" if ws.derived.tke_array is not None else "unsupported",
+            "pg": "complete" if ws.derived.relative_pressure_array is not None else "missing",
+            "vortex": "complete" if ws.derived.vorticity_array is not None else "missing",
+            "pwv": "complete" if any(r.get("status") == "ok" for r in ws.derived.pwv_results) else "not_assessable",
+        },
         "total_time_sec": float(total_time_sec),
         "video_errors": video_errors,
         "stage_times_sec": _timing_payload(stage_times),
@@ -1024,23 +1038,97 @@ def process_single(
         "plane_pixelwise_file": ws.derived.plane_pixelwise_file,
     }
     summary_path = os.path.join(out_dir, "summary.json")
+    _export_case_html_report(ws, summary, out_dir)
     _write_case_summary(summary, summary_path, t_total_start, total_time_sec)
     print(f"  => Total case including outputs took {summary['total_time_sec']:.2f}s")
     print(f"\nSummary saved: {summary_path}")
     return summary
 
 
+def _export_case_html_report(workspace, summary, out_dir):
+    """Export one current case without repeating or changing its analysis.
+
+    A presentation failure is recorded separately so completed numerical
+    outputs remain usable. Cancellation still propagates to the caller.
+    """
+    from .report_snapshot import build_report_snapshot, save_report_html
+
+    started = time.perf_counter()
+    summary.update(analysis_report_file="", analysis_report_status="failed",
+                   analysis_report_error="", analysis_report_snapshot_id="",
+                   analysis_report_spatial_status="unavailable")
+    try:
+        from .report_media import register_report_videos
+        if summary.get('videos'):
+            register_report_videos(workspace, summary['videos'],
+                {'fps': workspace.render_settings.get('fps', 12)}, ensure_browser=True)
+        snapshot = build_report_snapshot(workspace, quality_report=summary["quality_report"])
+        path = save_report_html(snapshot, os.path.join(out_dir, "analysis_report.html"))
+        summary.update(
+            analysis_report_file=path,
+            analysis_report_status="complete",
+            analysis_report_snapshot_id=snapshot["snapshot_id"],
+            analysis_report_spatial_status=snapshot.get("spatial_context", {}).get("availability", "unavailable"),
+        )
+        print(f"Analysis HTML saved: {path}")
+    except TaskCancelled:
+        raise
+    except Exception as exc:
+        summary["analysis_report_error"] = f"{type(exc).__name__}: {exc}"
+        print(f"[REPORT ERROR] {summary['analysis_report_error']}")
+    finally:
+        elapsed = time.perf_counter() - started
+        summary["analysis_report_time_sec"] = elapsed
+        summary.setdefault("stage_times_sec", {})["analysis_report"] = elapsed
+
+
 def _write_case_summary(summary, summary_path, started, compute_time_sec):
+    required = ["quality_report", "analysis_report"]
+    outputs = {"quality_report": "complete" if summary.get("quality_report_file") else "missing",
+               "analysis_report": summary.get("analysis_report_status", "missing")}
+    if summary.get("segmentation_only"):
+        required.append("segmentation")
+        outputs["segmentation"] = "complete" if summary.get("segmentation_output") or summary.get("segmentation_nifti") else "missing"
+    else:
+        plane_metrics_skipped = bool(summary.get("skip_plane_metrics", False))
+        if plane_metrics_skipped:
+            outputs["plane_metrics"] = "skipped"
+        else:
+            required.append("plane_metrics")
+            outputs["plane_metrics"] = "complete" if summary.get("n_planes", 0) > 0 and len(summary.get("plane_metrics", [])) == summary.get("n_planes") else "missing"
+        tke_unavailable = summary.get("metric_output_status", {}).get("tke") == "unsupported"
+        for name, requested in summary.get("requested_metrics", {}).items():
+            if requested:
+                status = summary.get("metric_output_status", {}).get(name, "missing")
+                if name == "pwv" and plane_metrics_skipped:
+                    outputs[name] = "skipped"
+                elif name == "tke" and tke_unavailable:
+                    outputs[name] = "unsupported"  # Optional TKE remains a clean skip.
+                else:
+                    required.append(name)
+                    outputs[name] = status
+        for name, requested in summary.get("requested_videos", {}).items():
+            if requested:
+                key = "video_"+name
+                if name == "tke" and tke_unavailable and name not in summary.get("video_errors", {}):
+                    outputs[key] = "unsupported"
+                    continue
+                required.append(key)
+                outputs[key] = "failed" if name in summary.get("video_errors", {}) else ("complete" if summary.get("videos", {}).get(name) else "missing")
+    summary["required_outputs"] = required
+    summary["outputs"] = outputs
+    qc = summary.get("quality_report", {}).get("overall_status", "incomplete")
+    summary["output_status"] = "incomplete" if any(outputs[k] in {"missing", "failed"} for k in required) else (
+        "partial" if any(outputs[k] in {"unsupported", "not_assessable"} for k in required) else ("needs_review" if qc != "ready" else "complete"))
     summary["compute_time_sec"] = float(compute_time_sec)
     summary["total_time_sec"] = time.perf_counter() - started
     summary["output_time_sec"] = max(0.0, summary["total_time_sec"] - compute_time_sec)
-    with open(summary_path, "w", encoding="utf-8") as handle:
-        json.dump(summary, handle, ensure_ascii=False, indent=2)
+    from .core.output import atomic_json_write
+    atomic_json_write(summary_path, summary)
     # The final timing-field rewrite cannot include its own duration.
     summary["total_time_sec"] = time.perf_counter() - started
     summary["output_time_sec"] = max(0.0, summary["total_time_sec"] - compute_time_sec)
-    with open(summary_path, "w", encoding="utf-8") as handle:
-        json.dump(summary, handle, ensure_ascii=False, indent=2)
+    atomic_json_write(summary_path, summary)
 
 
 def collect_h5_files(inputs):
@@ -1166,6 +1254,7 @@ def run_batch():
     print(f"Found {len(input_cases)} file(s) to process.")
     base_ws = build_base_workspace()
     results = []
+    checkpoint_batch(results, output_dir, len(input_cases))
     case_out = ""
 
     for case in input_cases:
@@ -1174,14 +1263,10 @@ def run_batch():
         reuse_file = resolve_reuse_plane_file(reuse_planes, name)
 
         if reuse_planes and not os.path.isfile(reuse_file):
-            results.append(
-                {
-                    "file": case.input_path,
-                    "case": case.display_name,
-                    "status": "error",
-                    "error": f"reuse plane file not found: {reuse_planes}",
-                }
-            )
+            record_batch_result(results, {
+                "file": case.input_path, "case": case.display_name, "status": "error",
+                "error": f"reuse plane file not found: {reuse_planes}",
+            }, output_dir, len(input_cases))
             print(f"\n[ERROR] Reuse plane file not found: {reuse_planes}")
             continue
 
@@ -1226,22 +1311,25 @@ def run_batch():
                 dynamic_rotation_elevation_deg=dynamic_rotation_elevation_deg,
                 dynamic_time_repeat=dynamic_time_repeat,
             )
-            results.append({"file": case.input_path, "case": case.display_name, "status": "ok", "summary": summary})
+            status = case_status(summary)
+            result = {"file": case.input_path, "case": case.display_name, "status": status, "summary": summary}
+        except TaskCancelled:
+            raise
         except Exception:
             print(f"\n[ERROR] Failed: {case.display_name or case.input_path}")
             print(traceback.format_exc())
-            results.append({"file": case.input_path, "case": case.display_name, "status": "error", "error": traceback.format_exc()})
+            result = {"file": case.input_path, "case": case.display_name, "status": "error", "error": traceback.format_exc()}
+        record_batch_result(results, result, output_dir, len(input_cases))
 
     os.makedirs(output_dir, exist_ok=True)
     batch_report = os.path.join(output_dir, "batch_report.json")
-    with open(batch_report, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
+    # Each completed/error case has already been atomically checkpointed.
 
     n_ok = sum(1 for r in results if r["status"] == "ok")
 
     times_sec = []
     for r in results:
-        if r.get("status") == "ok":
+        if r.get("status") in {"ok", "partial"}:
             total_time_sec = r.get("summary", {}).get("total_time_sec", None)
             if total_time_sec is not None:
                 times_sec.append(float(total_time_sec))

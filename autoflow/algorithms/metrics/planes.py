@@ -27,11 +27,13 @@ def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes
                           branch_labels_3d=None, path_info=None, forks=None,
                           paths=None, return_qc=False, segmentation_labels_3d=None,
                           segmentation_labels_4d=None, skip_support_mesh=False,
-                          progress_callback=None):
+                          progress_callback=None, sampling_context=None, flow_spacing=None):
     flow = _ensure_flow5d(flow_xyzt3)
     mask = np.asarray(segmask_binary_4d, dtype=bool)
     spacing = np.asarray(spacing, dtype=float).reshape(-1)[:3]
     origin = np.asarray(origin, dtype=float).reshape(-1)[:3]
+    voxel_centered = flow_spacing is not None
+    grid_origin = origin-0.5*spacing if voxel_centered else origin
     if flow.ndim != 5 or flow.shape[-1] != 3:
         raise ValueError(f"flow must be XYZTV, got {flow.shape}")
     if mask.ndim == 3:
@@ -44,21 +46,26 @@ def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes
     # A replacement ROI is already an explicit local cut; branch ownership is
     # not sampled for that path. The frame-only contour update can therefore
     # skip constructing the full-volume branch grid as well.
-    branch_grid = None if bool(skip_support_mesh) else _build_branch_grid(branch_labels_3d, spacing, origin)
-    mask_phase_lookup = _build_mask_phase_lookup(mask)
+    if sampling_context is not None:
+        sampling_context.validate(segmask_binary_4d, spacing, origin)
+    branch_grid = (sampling_context.branch_grid if sampling_context is not None else
+                   None if bool(skip_support_mesh) else _build_branch_grid(branch_labels_3d, spacing, grid_origin))
+    mask_phase_lookup = (sampling_context.phase_lookup if sampling_context is not None else
+                         _build_mask_phase_lookup(mask))
     # ROI replacement edits build a small local support mesh inside
     # ``_build_plane_slice_region``. Avoid eagerly meshing the entire 3-D mask
     # for the common one-frame contour-edit case.
     needs_support_mesh = not bool(skip_support_mesh)
     support_mesh_cache = (
-        _build_plane_support_mesh_cache(mask, mask_phase_lookup, spacing, origin)
+        (sampling_context.support_mesh_cache if sampling_context is not None else
+         _build_plane_support_mesh_cache(mask, mask_phase_lookup, spacing, grid_origin))
         if needs_support_mesh else None
     )
-    if support_mesh_cache is not None:
+    if support_mesh_cache is not None and sampling_context is None:
         _add_labeled_plane_support_meshes(
             support_mesh_cache, mask,
             segmentation_labels_4d if segmentation_labels_4d is not None else segmentation_labels_3d,
-            planes, spacing, origin
+            planes, spacing, grid_origin
         )
     mask_static = all(int(rep_t) == 0 for rep_t in mask_phase_lookup)
     mask_template = mask[..., 0] if mask_static else None
@@ -90,7 +97,8 @@ def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes
         results.append(_compute_single_plane_metric(
             (flow, mask, spacing, origin, plane, Nt, RR,
              branch_grid, target_label, path_info, pp, mask_template, mask_phase_lookup,
-             support_mesh_cache, segmentation_labels_3d, segmentation_labels_4d)
+             support_mesh_cache, segmentation_labels_3d, segmentation_labels_4d, flow_spacing),
+            sampling_context=sampling_context,
         ))
         if progress_callback is not None:
             progress_callback({
@@ -109,10 +117,10 @@ def compute_plane_metrics(flow_xyzt3, segmask_binary_4d, spacing, origin, planes
     return results
 
 
-def _compute_single_plane_metric(args):
+def _compute_single_plane_metric(args, sampling_context=None):
     (flow, mask, spacing, origin, plane, Nt, RR, branch_grid, target_label,
      path_info, path_points, mask_template, mask_phase_lookup,
-     support_mesh_cache, segmentation_labels_3d, segmentation_labels_4d) = args
+     support_mesh_cache, segmentation_labels_3d, segmentation_labels_4d, flow_spacing) = args
     normal = np.asarray(plane.normal, dtype=float).reshape(3)
     normal = normal / (np.linalg.norm(normal) + 1e-12)
 
@@ -130,27 +138,40 @@ def _compute_single_plane_metric(args):
     meanv_t = []         
     meanv_fwd_t = []     
     meanv_rev_t = []     
-    slice_cache = {}
+    slice_cache = sampling_context.slice_cache(plane) if sampling_context is not None else {}
     roi_source_frame_t = []
     roi_carried_forward_t = []
+    roi_interpolated_t, roi_source_frames_t, roi_interpolation_weight_t, roi_resolution_t = [], [], [], []
+    sample_valid = []
+    peak_abs_t, peak_forward_t, peak_reverse_t = [], [], []
 
     for t in range(Nt):
         check_cancelled()
+        sample_valid.append(False)
+        peak_abs_t.append(0.0)
+        peak_forward_t.append(0.0)
+        peak_reverse_t.append(0.0)
         slice_spec = _get_plane_metric_slice_spec(
             slice_cache, mask, mask_phase_lookup, support_mesh_cache, plane, t,
             spacing, origin, branch_grid=branch_grid, target_label=target_label,
             segmentation_labels_3d=segmentation_labels_3d,
-            segmentation_labels_4d=segmentation_labels_4d,
+            segmentation_labels_4d=segmentation_labels_4d, voxel_centered=flow_spacing is not None,
         )
         roi_source_frame_t.append(None if slice_spec is None else slice_spec["roi_source_frame"])
         roi_carried_forward_t.append(False if slice_spec is None else slice_spec["roi_carried_forward"])
+        provenance = slice_cache.get('_roi_frame_provenance', {}).get(t, {})
+        roi_interpolated_t.append(provenance.get('mode') == 'interpolated')
+        roi_source_frames_t.append(provenance.get('source_frames', []))
+        roi_interpolation_weight_t.append(provenance.get('weight'))
+        roi_resolution_t.append(provenance.get('mode', 'missing'))
         if slice_spec is None:
             flowrate.append(0.0); flowrate_fwd.append(0.0); flowrate_rev.append(0.0)
             meanv_t.append(0.0); meanv_fwd_t.append(0.0); meanv_rev_t.append(0.0)
             area.append(0.0)
             continue
         vec = np.asarray(
-            _sample_field_from_slice_spec(flow[..., t, :], mask.shape[:3], "flow", slice_spec),
+            _sample_field_from_slice_spec(flow[..., t, :], mask.shape[:3], "flow", slice_spec,
+                                          field_spacing=flow_spacing, mask_spacing=spacing, origin=origin),
             dtype=float,
         )
         ca = np.asarray(slice_spec["areas"], dtype=float).reshape(-1)
@@ -166,6 +187,7 @@ def _compute_single_plane_metric(args):
         neg_mask = proj_fwd < 0.0
 
         area_t = float(np.sum(ca)) if len(ca) else 0.0
+        sample_valid[t] = bool(area_t > 0 and np.all(np.isfinite(vec)) and np.all(np.isfinite(ca)))
 
         fr = float(np.sum(proj * ca) / 100.0) if area_t > 0.0 else 0.0
         if area_t > 0.0:
@@ -179,12 +201,15 @@ def _compute_single_plane_metric(args):
             mv = mv_fwd = mv_rev = 0.0
 
         if len(proj):
-            peakv_abs = max(peakv_abs, float(np.max(np.abs(proj))))
+            peak_abs_t[t] = float(np.max(np.abs(proj)))
+            peakv_abs = max(peakv_abs, peak_abs_t[t])
         if len(proj_fwd):
             if np.any(pos_mask):
-                peakv_fwd = max(peakv_fwd, float(np.max(proj_fwd[pos_mask])))
+                peak_forward_t[t] = float(np.max(proj_fwd[pos_mask]))
+                peakv_fwd = max(peakv_fwd, peak_forward_t[t])
             if np.any(neg_mask):
-                peakv_rev = max(peakv_rev, float(-np.min(proj_fwd[neg_mask])))
+                peak_reverse_t[t] = float(-np.min(proj_fwd[neg_mask]))
+                peakv_rev = max(peakv_rev, peak_reverse_t[t])
 
         flowrate.append(fr)
         flowrate_fwd.append(fr_fwd)
@@ -208,6 +233,16 @@ def _compute_single_plane_metric(args):
     meanv_signed = float(np.mean(meanv_signed_t)) if meanv_signed_t else 0.0
 
     metric = {
+        "plane_id": str(getattr(plane, "plane_id", "")),
+        "geometry_revision": int(getattr(plane, "geometry_revision", 0)),
+        "roi_revision": int(getattr(plane, "roi_revision", 0)),
+        "sample_valid_t": sample_valid,
+        "rr_ms": float(RR),
+        "sample_invalid_reason_t": ["" if valid else "Empty or non-finite ROI support" for valid in sample_valid],
+        "sampling_status": "complete" if all(sample_valid) else "partial" if any(sample_valid) else "not_assessable",
+        "peakv_cm_s_t": peak_abs_t,
+        "peakv_forward_cm_s_t": peak_forward_t,
+        "peakv_reverse_cm_s_t": peak_reverse_t,
         "center": np.asarray(plane.center, dtype=float).tolist(),
         "normal": normal.tolist(),
         "label": int(plane.label),
@@ -223,6 +258,10 @@ def _compute_single_plane_metric(args):
         "area_mm2": [float(x) for x in area],
         "roi_source_frame_t": roi_source_frame_t,
         "roi_carried_forward_t": roi_carried_forward_t,
+        "roi_interpolated_t": roi_interpolated_t,
+        "roi_source_frames_t": roi_source_frames_t,
+        "roi_interpolation_weight_t": roi_interpolation_weight_t,
+        "roi_resolution_t": roi_resolution_t,
         "flowrate_forward_mL_s": [float(x) for x in flowrate_fwd],
         "flowrate_reverse_mL_s": [float(x) for x in flowrate_rev],
         "meanv_forward_cm_s_t": [float(x) for x in meanv_fwd_t],
@@ -257,13 +296,15 @@ def _compute_single_plane_metric(args):
         metric["path_end_point"] = info.get("end_point", [0.0, 0.0, 0.0])
         metric["path_fork_ids"] = info.get("fork_ids", [])
         metric["path_fork_roles"] = info.get("fork_roles", [])
+    if sampling_context is not None:
+        sampling_context.trim()
     return metric
 
 
 def _compute_plane_metrics_process_chunk(
     indexed_planes, flow, mask, spacing, origin, RR, branch_labels_3d,
     path_info, paths, segmentation_labels_3d, segmentation_labels_4d,
-    progress_path,
+    progress_path, flow_spacing=None,
 ):
     indices = [int(index) for index, _plane in indexed_planes]
     planes = [plane for _index, plane in indexed_planes]
@@ -282,7 +323,7 @@ def _compute_plane_metrics_process_chunk(
             return_qc=False,
             segmentation_labels_3d=segmentation_labels_3d,
             segmentation_labels_4d=segmentation_labels_4d,
-            progress_callback=_mark_progress if progress_path else None,
+            progress_callback=_mark_progress if progress_path else None, flow_spacing=flow_spacing,
         )
     return list(zip(indices, metrics))
 
@@ -290,7 +331,7 @@ def _compute_plane_metrics_process_chunk(
 def _run_plane_metric_processes(
     flow, mask, spacing, origin, planes, RR, branch_labels_3d, path_info,
     paths, segmentation_labels_3d, segmentation_labels_4d, max_workers,
-    progress_callback,
+    progress_callback, flow_spacing=None,
 ):
     import tempfile
     from joblib import Parallel, delayed
@@ -304,7 +345,7 @@ def _run_plane_metric_processes(
             return Parallel(n_jobs=worker_count, backend="loky", max_nbytes="10M", mmap_mode="r")(
                 delayed(_compute_plane_metrics_process_chunk)(
                     chunk, flow, mask, spacing, origin, RR, branch_labels_3d,
-                    path_info, paths, segmentation_labels_3d, segmentation_labels_4d, progress_path,
+                    path_info, paths, segmentation_labels_3d, segmentation_labels_4d, progress_path, flow_spacing,
                 ) for chunk in chunks if chunk
             )
         chunk_results = _wait_plane_processes(calculate, progress_path, len(planes), progress_callback)
@@ -319,7 +360,7 @@ def compute_plane_metrics_multithread(flow_xyzt3, segmask_binary_4d, spacing, or
                                        branch_labels_3d=None, path_info=None, forks=None,
                                        paths=None, return_qc=False, max_workers=None,
                                        segmentation_labels_3d=None, segmentation_labels_4d=None,
-                                       progress_callback=None):
+                                       progress_callback=None, flow_spacing=None):
     flow = _ensure_flow5d(flow_xyzt3)
     mask = np.asarray(segmask_binary_4d, dtype=bool)
     spacing = np.asarray(spacing, dtype=float).reshape(-1)[:3]
@@ -355,14 +396,14 @@ def compute_plane_metrics_multithread(flow_xyzt3, segmask_binary_4d, spacing, or
             forks=forks, paths=paths, return_qc=return_qc,
             segmentation_labels_3d=segmentation_labels_3d,
             segmentation_labels_4d=segmentation_labels_4d,
-            progress_callback=progress_callback,
+            progress_callback=progress_callback, flow_spacing=flow_spacing,
         )
         return result
     else:
         results = _run_plane_metric_processes(
             flow, mask, spacing, origin, planes, RR, branch_labels_3d,
             path_info, paths, segmentation_labels_3d, segmentation_labels_4d,
-            max_workers, progress_callback,
+            max_workers, progress_callback, flow_spacing,
         )
     results, qc = apply_internal_consistency_to_metrics(results, path_info=path_info, forks=forks)
     for plane_index, metric in enumerate(results):

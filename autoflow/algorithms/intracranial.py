@@ -56,8 +56,9 @@ def detect_willis_ring(
     cycle_flow_threshold=0.3,
     cycle_preserve_connectivity=True,
     junction_cluster_enabled=True,
-    junction_cluster_max_extent_voxels=8.0,
+    junction_cluster_max_extent_voxels=0.0,
     junction_cluster_min_cycle_rank=2,
+    flow_spacing=None,
 ):
     """Return a conservative topology report for a Willis ring candidate.
 
@@ -101,7 +102,7 @@ def detect_willis_ring(
         enabled=junction_cluster_enabled, max_extent_voxels=junction_cluster_max_extent_voxels,
         min_cycle_rank=junction_cluster_min_cycle_rank)
     cleaned, cycle_cleanup = remove_intralabel_cycles(junction_graph, labels, spacing,
-        support_mask=mask, flow=flow, temporal_mask=temporal_mask,
+        support_mask=mask, flow=flow, temporal_mask=temporal_mask, flow_spacing=flow_spacing,
         flow_threshold=cycle_flow_threshold, preserve_connectivity=cycle_preserve_connectivity)
     points, edges = cleaned.points, cleaned.edges
     network = nx.Graph()

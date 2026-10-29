@@ -14,10 +14,11 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-2022]
         python-version:
           - "3.11"
 
@@ -42,6 +43,7 @@ jobs:
           path: ${{ runner.temp }}/autoflow-models
           key: inference-models-${{ hashFiles('packaging/windows/models.lock.json') }}
       - name: Prepare bundled model fixture
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -72,4 +74,7 @@ jobs:
       - name: Run retained regression suite
         env:
           PYVISTA_OFF_SCREEN: "true"
+          PYTHONUTF8: "1"
+          QT_QPA_PLATFORM: "offscreen"
+          VTK_DEFAULT_OPENGL_WINDOW: ${{ runner.os == 'Linux' && 'vtkEGLRenderWindow' || '' }}
         run: pytest tests/test_smoke_phantoms.py tests/test_pressure_gradient_phantom.py -q

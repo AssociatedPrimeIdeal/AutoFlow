@@ -1,6 +1,5 @@
 """Labelled plane handles shared by native Qt and the SSH plotter."""
 
-import numpy as np
 import pyvista as pv
 from vtkmodules.vtkInteractionWidgets import vtkHandleWidget, vtkSphereHandleRepresentation
 from vtkmodules.vtkRenderingCore import vtkBillboardTextActor3D, vtkTextActor
@@ -17,8 +16,8 @@ class PlaneDragHandles:
         scene._ensure_scene_layers()
         self.renderer = scene._selection_renderer
         iren = getattr(plotter.iren, "interactor", plotter.iren)
-        for index, (callback, color, text) in enumerate(zip(
-                callbacks, ("cyan", "orange", "yellow"), ("Move", "Rotate V", "Rotate U"))):
+        for callback in callbacks:
+            color, text = "cyan", "Move"
             rep = vtkSphereHandleRepresentation()
             rep.SetHandleSize(18)
             rep.SetTolerance(12)
@@ -48,18 +47,8 @@ class PlaneDragHandles:
             prop.SetBackgroundOpacity(0.8)
             self.renderer.AddActor(label)
             self.labels.append(label)
-            if index:
-                line = pv.lines_from_points(np.zeros((65, 3)))
-                mapper = pv.DataSetMapper(dataset=line)
-                actor = pv.Actor(mapper=mapper)
-                actor.GetProperty().SetColor(pv.Color(color).float_rgb)
-                actor.GetProperty().SetLineWidth(2)
-                actor.GetProperty().LightingOff()
-                actor.PickableOff()
-                self.renderer.AddActor(actor)
-                self.guides.append((actor, line))
         self.help = vtkTextActor()
-        self.help.SetInput("Plane edit: left-drag handles\nCyan: move | Orange / yellow: rotate\nSelection locked | Finish Plane Edit to save")
+        self.help.SetInput("Drag a cyan center to move\nRotate in the lower 2D views\nApply Plane to save | Esc to cancel")
         self.help.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
         self.help.SetPosition(0.02, 0.97)
         prop = self.help.GetTextProperty()
@@ -86,18 +75,16 @@ class PlaneDragHandles:
         for widget, _ in self.handles:
             widget.On()
 
+    def set_mode(self, mode):
+        # Rotation lives in the 2D viewer; the 3D handle always translates.
+        for (widget, _), label in zip(self.handles, self.labels):
+            widget.SetEnabled(True)
+            label.SetVisibility(True)
+
     def update(self, center, axis_u, axis_v, distance):
-        normal = np.cross(axis_u, axis_v)
-        # Ring geometry only indicates the rotation path; it is not pickable.
-        angles = np.linspace(0, 2 * np.pi, 65)
-        for (_, line), axis in zip(self.guides, (axis_u, axis_v)):
-            line.points[:] = center + distance * (
-                np.cos(angles)[:, None] * axis + np.sin(angles)[:, None] * normal)
-        for (_, rep), label, direction in zip(
-                self.handles, self.labels, (np.zeros(3), axis_u, axis_v)):
-            position = center + direction * distance
-            rep.SetWorldPosition(position)
-            label.SetPosition(position)
+        for (_, rep), label in zip(self.handles, self.labels):
+            rep.SetWorldPosition(center)
+            label.SetPosition(center)
 
     def dispatch(self, event):
         """Let the remote QWidget send handle gestures before camera gestures."""

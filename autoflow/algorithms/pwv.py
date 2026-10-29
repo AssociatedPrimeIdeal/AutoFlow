@@ -608,11 +608,26 @@ def _fit_pwv(position_mm, foot_time_ms):
     ss_tot = float(np.sum((yvals - np.mean(yvals)) ** 2))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 1.0
     pwv = 1.0 / slope if slope > 0.0 else None
+    residual = yvals-pred
+    span = float(np.ptp(xvals))
+    confidence = None
+    if len(xvals) > 2 and np.sum((xvals-np.mean(xvals))**2) > 0:
+        from scipy.stats import t as student_t
+        error = np.sqrt(ss_res/(len(xvals)-2)/np.sum((xvals-np.mean(xvals))**2))
+        delta = float(student_t.ppf(.975, len(xvals)-2)*error)
+        if slope-delta > 0:
+            confidence = [float(1/(slope+delta)), float(1/(slope-delta))]
     return {
         "fit_slope_ms_per_mm": slope,
         "fit_intercept_ms": intercept,
         "fit_r2": float(r2),
         "pwv_m_s": None if pwv is None or not np.isfinite(pwv) else float(pwv),
+        "fit_residual_ms": residual.tolist(),
+        "fit_rmse_ms": float(np.sqrt(np.mean(residual**2))),
+        "effective_span_mm": span,
+        "fitted_delay_ms": float(abs(slope)*span),
+        "pwv_95ci_m_s": confidence,
+        "confidence_method": "OLS slope Student-t interval, reciprocal positive bounds" if confidence is not None else "Not assessed: insufficient points or interval includes nonpositive slope",
     }
 
 
@@ -638,6 +653,7 @@ def compute_pwv_groups(
     origin = np.asarray(origin, dtype=float).reshape(3)
     time_count = max(1, int(flow.shape[3]))
     results: List[Dict[str, Any]] = []
+    local_flow_buffer = None
     scene_planes: List[Dict[str, Any]] = []
     out_dir = str(out_dir or "")
     if out_dir:
@@ -652,6 +668,7 @@ def compute_pwv_groups(
             "enabled": True,
             "waveform_key": str(getattr(pwv_params, "waveform_key", "flowrate_mL_s") or "flowrate_mL_s"),
             "rr_ms": float(rr_ms),
+            "dependency_scope": "segmentation_centerline_generated_planes",
         }
         if not labels:
             result.update({"status": "skipped", "message": "no labels configured"})
@@ -688,7 +705,10 @@ def compute_pwv_groups(
         graph = build_graph_from_points(skeleton_points, resolution,
                                         connectivity=skeleton_params.graph_connectivity)
         group_binary = _repeat_mask_to_time(group_mask, time_count)
-        local_flow = flow * group_binary[..., None]
+        if local_flow_buffer is None:
+            local_flow_buffer = np.empty_like(flow)
+        np.multiply(flow, group_binary[..., None], out=local_flow_buffer)
+        local_flow = local_flow_buffer
         branch_labels, local_paths, _node_paths, local_path_info, _forks = segment_vessels_from_graph_and_mask(
             processed,
             graph,
@@ -864,6 +884,31 @@ def compute_pwv_groups(
                 result.update({"status": "skipped", "message": "PWV fit failed"})
             else:
                 result.update(fit)
+                dt_ms = float(rr_ms)/time_count
+                result["original_sample_interval_ms"] = dt_ms
+                result["delay_to_sample_interval_ratio"] = fit["fitted_delay_ms"]/dt_ms if dt_ms > 0 else None
+                flags = []
+                if fit["fitted_delay_ms"] < dt_ms:
+                    flags.append("delay_below_original_sample_interval")
+                if fit["fit_r2"] < .8:
+                    flags.append("low_fit_r2")
+                if fit["pwv_95ci_m_s"] is None:
+                    flags.append("confidence_interval_not_assessed")
+                result["quality_flags"] = flags
+                result["quality_status"] = "needs_review" if flags else "assessed"
+                result["temporal_resolution_note"] = "Waveform interpolation does not increase the acquired temporal resolution."
+                if len(valid_pairs) >= 2:
+                    valid_indices = [i for i, row in enumerate(plane_rows) if row["arrival_time_ms"] is not None]
+                    first, last = valid_indices[0], valid_indices[-1]
+                    delay, _ = compute_cross_correlation_delay_ms(flowrate_waveforms[first], flowrate_waveforms[last],
+                        float(rr_ms), window=xcorr_window, allow_cycle_wrap=allow_cycle_wrap, interp_factor=xcorr_interp_factor)
+                    feet = (raw_arrival_times[first], raw_arrival_times[last])
+                    foot_delay = None if any(v is None for v in feet) else (
+                        _wrap_time_to_reference_ms(float(feet[1]), float(feet[0]), float(rr_ms))-float(feet[0])
+                        if allow_cycle_wrap else float(feet[1])-float(feet[0]))
+                    result["foot_xcorr_agreement"] = {"foot_delay_ms": foot_delay, "xcorr_delay_ms": delay,
+                        "absolute_difference_ms": None if foot_delay is None or delay is None else abs(foot_delay-float(delay)),
+                        "scope": "first and last valid plane; diagnostic only"}
                 result["status"] = "ok"
                 result["message"] = f"PWV={float(fit['pwv_m_s']):.4f} m/s via {transit_time_method}"
         if out_dir:

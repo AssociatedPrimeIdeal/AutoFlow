@@ -1,6 +1,8 @@
 """Velocity-gradient vortex identifiers and swirling strength."""
 
 import numpy as np
+import os
+from ...task_control import check_cancelled
 from scipy.ndimage import binary_erosion, gaussian_filter, generate_binary_structure
 
 from ._common import _ensure_flow5d, _ensure_mask4d
@@ -144,8 +146,13 @@ def compute_vortex_metrics(mask4d, flow, spacing, *, smoothing_sigma=0.0,
 
     # λci is the positive imaginary part of the complex-conjugate eigenvalue
     # pair of the local velocity-gradient tensor.  It is zero for pure shear.
-    eigvals = np.linalg.eigvals(jacobian)
-    lambda_ci_inner = np.max(np.abs(np.imag(eigvals)), axis=1).astype(np.float32)
+    lambda_ci_inner = np.empty(len(jacobian), dtype=np.float32)
+    block_size = max(1, int(os.environ.get("AUTOFLOW_VORTEX_BLOCK_POINTS", "131072")))
+    for start in range(0, len(jacobian), block_size):
+        check_cancelled()
+        block = slice(start, start+block_size)
+        eigenvalues = np.linalg.eigvals(jacobian[block])
+        lambda_ci_inner[block] = np.max(np.abs(np.imag(eigenvalues)), axis=1).astype(np.float32)
 
     output_slices = tuple(slice(part.start + 1, part.stop - 1) for part in spatial_slices) + (slice(None),)
     vorticity[output_slices][support_inner] = vort_inner

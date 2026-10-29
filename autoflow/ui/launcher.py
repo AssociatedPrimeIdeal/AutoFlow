@@ -88,8 +88,18 @@ def validate_display() -> None:
     if os.environ.get("WAYLAND_DISPLAY") and platform != "xcb":
         return
     display = str(os.environ.get("DISPLAY", "")).strip()
+    # A VNC desktop can inherit SSH_CONNECTION from its startup shell. When
+    # VirtualGL already supplies GPU OpenGL, keep the native Qt widget instead
+    # of adding the SSH screenshot/readback path to this local X display.
+    local_virtualgl = (
+        display.split(":", 1)[0].lower() in {"", "unix"}
+        and "libvglfaker" in os.environ.get("LD_PRELOAD", "")
+        and os.environ.get("AUTOFLOW_SSH_RENDERING") != "1"
+        and os.environ.get("VTK_DEFAULT_OPENGL_WINDOW", "") in {"", "vtkXOpenGLRenderWindow"}
+    )
     forwarded = bool(display) and (
-        _is_forwarded_x11(display) or bool(os.environ.get("SSH_CONNECTION"))
+        _is_forwarded_x11(display)
+        or (bool(os.environ.get("SSH_CONNECTION")) and not local_virtualgl)
     )
     if forwarded:
         _configure_ssh_rendering()
@@ -117,6 +127,8 @@ def _run_internal_nnunet_predictor() -> None:
     sys.argv.pop(1)
     from nnunetv2.inference.predict_from_raw_data import predict_entry_point_modelfolder
 
+    from ..algorithms.segmentation.model_grid import configure_geometry_export_runtime
+    configure_geometry_export_runtime()
     predict_entry_point_modelfolder()
 
 
