@@ -1,9 +1,8 @@
-"""Detect compact junction clusters and route their label-owned interfaces.
+"""Detect junction clusters and route label interiors and contact interfaces.
 
-This stage follows isolated triangle contraction and precedes Flow-C filtering.
-It changes only existing same-positive-label edges within compact clusters of
-adjacent degree-three-or-higher nodes. It does not move points, add edges, or
-infer that a source anatomical connection is false from a loop count alone.
+This stage follows triangle contraction and precedes Flow-C filtering. It
+retains existing coordinates and edges, with transactional local checks. Cycle
+counts alone do not establish that an anatomical connection is redundant.
 """
 
 import networkx as nx
@@ -27,7 +26,7 @@ def _components_preserved(original, current):
     return True
 
 
-def simplify_junction_clusters(graph, segmentation_labels, spacing=(1, 1, 1), *,
+def _route_label_interfaces(graph, segmentation_labels, spacing=(1, 1, 1), *,
                                origin=(0, 0, 0), enabled=True,
                                max_extent_voxels=0.0, min_cycle_rank=2):
     """Return the graph after conservative local junction routing and its audit.
@@ -216,4 +215,51 @@ def simplify_junction_clusters(graph, segmentation_labels, spacing=(1, 1, 1), *,
     report.update(status="simplified", cycle_rank_after=_rank(network),
         removed_edge_count=len(removed), removed_node_count=len(points) - len(used),
         retained_input_node_indices=list(map(int, used)))
+    return cleaned, report
+
+
+def simplify_junction_clusters(graph, segmentation_labels, spacing=(1, 1, 1), *,
+                               origin=(0, 0, 0), enabled=True,
+                               max_extent_voxels=0.0, min_cycle_rank=2,
+                               flow=None, flow_spacing=None, flow_origin=(0, 0, 0)):
+    """Simplify local label interiors, terminal blobs and repeated contacts.
+
+    Required external ports and each physical label contact survive. The
+    additional pass rolls back a region if its connectivity checks fail.
+    """
+    routed, report = _route_label_interfaces(
+        graph, segmentation_labels, spacing, origin=origin, enabled=enabled,
+        max_extent_voxels=max_extent_voxels, min_cycle_rank=min_cycle_rank)
+    if not enabled or segmentation_labels is None:
+        return routed, report
+    from .junction_routes import simplify_remaining_junctions
+    cleaned, local = simplify_remaining_junctions(
+        routed, segmentation_labels, spacing, report, flow, flow_spacing,
+        origin=origin, flow_origin=flow_origin, min_cycle_rank=min_cycle_rank)
+    report['schema'] = 'autoflow.junction_cluster_cleanup.v2'
+    report['local_cleanup'] = local
+    report['algorithm'] = 'junction_label_routes_and_contact_cleanup'
+    report['interface_port_policy'] = 'preserve_external_ports_and_each_contact_patch'
+    if not local['removed_edges']:
+        return routed, report
+    report['label_routing_removed_edge_count'] = report['removed_edge_count']
+    report['removed_edge_count'] += local['removed_edges']
+    report['removed_node_count'] = len(graph.points)-len(cleaned.points)
+    original_index = {tuple(point): index for index, point in enumerate(graph.points)}
+    report['retained_input_node_indices'] = [int(original_index[tuple(point)]) for point in cleaned.points]
+    report['cycle_rank_after'] = local['after_cycles']
+    report['status'] = 'simplified'
+    lookup = {tuple(point): index for index, point in enumerate(graph.points)}
+    for points in local['removed_edge_points_mm']:
+        report['removed_edges'].append(dict(reason='local_junction_routing', points_mm=points,
+            input_node_indices=[int(lookup[tuple(p)]) for p in points]))
+    for cluster in report['clusters']:
+        detail = next((r for r in local['clusters'] if r['cluster_id'] == cluster['cluster_id']), None)
+        if detail is not None:
+            cluster['local_cleanup'] = detail
+            if detail['status'] == 'simplified':
+                cluster.update(status='simplified', cycle_rank_after=detail['after_cycles'])
+                cluster['removed_edge_count'] += detail['removed_edges']
+                cluster.pop('reason', None)
+    report['simplified_cluster_count'] = sum(c['status'] == 'simplified' for c in report['clusters'])
     return cleaned, report

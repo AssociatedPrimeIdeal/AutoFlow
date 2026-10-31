@@ -109,8 +109,7 @@
       "graph_color": "#9c36b5",
       "path_color": "#be4bdb",
       "plane_color": "#e599f7",
-      "preprocess": {},
-      "willis_ring_role": "anterior"
+      "preprocess": {}
     },
     "vertebrobasilar_arteries": {
       "labels": [
@@ -125,8 +124,7 @@
       "graph_color": "#7048e8",
       "path_color": "#9775fa",
       "plane_color": "#d0bfff",
-      "preprocess": {},
-      "willis_ring_role": "posterior"
+      "preprocess": {}
     },
     "intracranial_veins": {
       "labels": [

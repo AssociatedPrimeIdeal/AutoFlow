@@ -71,7 +71,7 @@ def default_label_placements(name):
     def branch(fractions, *, inlet=False):
         return [{"anchor":"flow_inlet_branch" if inlet else "label_branch", "scope":"label",
                  "path_selection":"unique" if inlet else "longest",
-                 "position":"fractions", "fractions":fractions}]
+                 "position":"fractions", "fractions":fractions, **({"inlet_selection":"lowest_z"} if inlet else {})}]
     def reference(*, fractions=None, offset=15., all_origins=False):
         spec={"anchor":"label_reference_branch", "path_selection":"all" if all_origins else "longest",
               "position":"fractions" if fractions is not None else "near"}
@@ -85,10 +85,14 @@ def default_label_placements(name):
     if name in {'LIJV','RIJV'}:return branch([1/3,2/3])
     if name in {'LRA','RRA'}:return reference(fractions=[.1,.3,.5],all_origins=True)
     if name=='PV':return [{"anchor":"portal_branch","path_selection":"unique",
-                          "position":"fractions","fractions":[.2,.5,.8]}]
-    if name in {'MPA','LPA','RPA'}:return reference(fractions=[.3])
+                          "position":"fractions","fractions":[.2,.5,.8],"connection_fallback":"flow_endpoint"}]
+    if name=='MPA':return [{'anchor':'label_longest', 'scope':'label',
+                            'position':'fractions', 'fractions':[.3], 'fraction_reference':'flow_end'}]
+    if name in {'LPA','RPA'}:return reference(fractions=[.3])
     if name in {'LTS','RTS','SSS','StrS'}:return reference(fractions=[.1])
-    if name in {'RBCT','CCA','LBCT','SMV','SV'}:return reference()
+    if name in {'RBCT','CCA','LBCT'}:return reference(offset=10.)
+    if name in {'SMV','SV'}:
+        rules=reference();rules[0]['connection_fallback']='flow_endpoint';return rules
     if name in {'ACA','LMCA','RMCA','LPCA','RPCA'}:return reference(fractions=[.1],all_origins=name=='ACA')
     return reference(offset=5.)
 
@@ -109,7 +113,7 @@ def default_label_plane_rules():
 
 def _validate_placement(name, placement, *, allow_fallback=True):
     fields = {"anchor","position","offset_mm","fractions","level","path_selection","scope",
-              "fallback","when_connected_to","otherwise_level","fraction_reference"}
+              "fallback","when_connected_to","otherwise_level","fraction_reference","inlet_selection","connection_fallback"}
     if not isinstance(placement,dict) or set(placement)-fields:
         raise ValueError(f"Invalid placement fields for {name}")
     anchor=placement.get("anchor")
@@ -120,6 +124,11 @@ def _validate_placement(name, placement, *, allow_fallback=True):
         raise ValueError(f"{name} placement path_selection must be unique, longest or all")
     if "path_selection" in placement and anchor not in {"label_level","label_terminal","label_trunk","label_reference","label_branch","label_reference_branch","flow_inlet_branch","portal_branch"}:
         raise ValueError(f"{name} path_selection applies only to label-level/interval anchors")
+    if "inlet_selection" in placement and (anchor != "flow_inlet_branch" or not isinstance(placement["inlet_selection"],str) or placement["inlet_selection"] not in {"any", "lowest_z"}):
+        raise ValueError(f"{name}: inlet_selection requires flow_inlet_branch and any or lowest_z")
+    if "connection_fallback" in placement and (not isinstance(placement["connection_fallback"],str) or placement["connection_fallback"] not in {"none", "flow_endpoint"} or
+            not (name == "PV" and anchor == "portal_branch" or name in {"SMV", "SV"} and anchor == "label_reference_branch")):
+        raise ValueError(f"{name}: connection_fallback applies only to PV portal_branch or SMV/SV label_reference_branch")
     position=placement.get("position")
     if not isinstance(position,str) or position not in {"near","fractions","before_end","after_start"}:
         raise ValueError(f"{name} placement position must be near, fractions, before_end or after_start")

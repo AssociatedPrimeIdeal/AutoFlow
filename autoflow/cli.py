@@ -18,7 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--reuse-planes",
         dest="reuse_planes",
         default=None,
-        help="Import a plane coordinate JSON file, or a directory containing per-case plane_positions.json files.",
+        help="Import plane positions and normals from JSON, or per-case plane_positions.json files. Saved contours and measurements are ignored.",
     )
     parser.add_argument(
         "--plane-import-mode",
@@ -29,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--export-planes",
         default=None,
-        help="Also export plane coordinates to this JSON file. For a multi-case run, provide a directory.",
+        help="Export plane positions and normals only (no contours or measurements). For a multi-case run, provide a directory.",
     )
 
     parser.add_argument("--skip-derived", action="store_true", help="Skip all WSS/TKE/relative-pressure derived metrics.")
@@ -158,8 +158,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cc-rel-min-ratio", type=float, default=None, help="Relative component threshold ratio against the largest connected component when using relative or hybrid filtering.")
     parser.add_argument("--graph-connectivity", type=int, choices=[6, 26], default=None,
                         help="Skeleton graph neighbors: 26 including edges/corners (default), or 6 face neighbors.")
-    parser.add_argument("--radius-tree-policy", choices=["auto", "forest", "preserve"], default=None,
-        help="Endpoint/radius cycle routing: auto preserves observed cerebral arterial groups, including ICA/VA; forest routes all eligible groups; preserve disables tree routing.")
     junction_group = parser.add_mutually_exclusive_group()
     junction_group.add_argument("--junction-cluster-cleanup", dest="junction_cluster_enabled", action="store_true",
         help="Simplify compact junction clusters after triangle contraction and before Flow filtering (default).")
@@ -338,7 +336,6 @@ def main() -> int:
         "graph_connectivity": args.graph_connectivity,
         "cycle_flow_threshold": args.cycle_flow_threshold,
         "cycle_preserve_connectivity": args.cycle_preserve_connectivity,
-        "radius_tree_policy": args.radius_tree_policy,
         "junction_cluster_enabled": args.junction_cluster_enabled,
         "junction_cluster_max_extent_voxels": args.junction_cluster_max_extent_voxels,
         "junction_cluster_min_cycle_rank": args.junction_cluster_min_cycle_rank,

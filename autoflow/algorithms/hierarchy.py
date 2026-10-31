@@ -9,9 +9,8 @@ from collections import defaultdict
 import networkx as nx
 import numpy as np
 
-from .graph import graph_to_networkx, build_graph_from_points
+from .graph import graph_to_networkx
 from .paths import inter_points
-from .graph_junctions import simplify_junction_clusters
 
 
 def graph_edge_chains(graph):
@@ -245,26 +244,10 @@ def analyze_group_graph(graph, node_chains, *, flow=None, mask=None, spacing=(1,
             "undirected_cycle_rank": network.number_of_edges() - network.number_of_nodes() + nx.number_connected_components(network)}
 
 
-def joint_mask_graph(mask, spacing, connectivity=26, *, segmentation_labels=None):
-    """Reskeletonize actual connected mask components; never bridge near misses."""
-    from scipy.ndimage import label
-    from .skeleton import generate_skeleton_from_mask3d
-    from ..core.models import GraphData
-    labels, count = label(np.asarray(mask, dtype=bool), structure=np.ones((3, 3, 3), dtype=bool))
-    points, edges, offset = [], [], 0
-    for index in range(1, count + 1):
-        nodes, _ = generate_skeleton_from_mask3d(labels == index, spacing)
-        graph = build_graph_from_points(nodes, spacing, connectivity=connectivity,
-            segmentation_labels=segmentation_labels)
-        points.append(graph.points)
-        edges.append(np.asarray(graph.edges, dtype=int).reshape(-1, 2) + offset)
-        offset += len(graph.points)
-    return GraphData(points=np.vstack(points) if points else np.empty((0, 3)),
-                     edges=np.vstack(edges) if edges else np.empty((0, 2), dtype=int))
 
 
 def build_workspace_hierarchy(workspace):
-    """Group reports plus a separate joint anterior/posterior arterial view."""
+    """Analyze the existing physical vessel groups without auxiliary graphs."""
     ws = workspace
     fine_labels = getattr(ws, 'segmentation_analysis_labels_3d', None)
     geometry_spacing = ws.resolution if fine_labels is None else ws.segmentation_spacing
@@ -281,46 +264,8 @@ def build_workspace_hierarchy(workspace):
         report["graph_connectivity"] = ws.skeleton_params.params_for_group(group_name).graph_connectivity
         report["cycle_cleanup"] = state.get("cycle_cleanup", {})
         report["junction_cluster_cleanup"] = state.get("junction_cluster_cleanup", {})
-        report["radius_tree_cleanup"] = state.get("radius_tree_cleanup", {})
         groups.append(report)
         all_paths.extend(report["paths"])
-    joint_systems = []
-    roles = {}
-    for name in ws.group_order:
-        role = ws.skeleton_params.label_groups.get(name, {}).get("willis_ring_role")
-        if role in {"anterior", "posterior"}:
-            roles[role] = name
-    if len(roles) == 2:
-        names = [roles[role] for role in ("anterior", "posterior")]
-        union = np.logical_or.reduce([ws.multilabel_groups[name].get("geometry_mask_3d", ws.multilabel_groups[name]["segmask_3d"]) for name in names])
-        temporal = np.logical_or.reduce([ws.multilabel_groups[name].get("geometry_binary", ws.multilabel_groups[name]["segmask_binary"]) for name in names])
-        graph = joint_mask_graph(union, geometry_spacing, connectivity=ws.skeleton_params.graph_connectivity,
-            segmentation_labels=geometry_labels)
-        graph, junction_cleanup = simplify_junction_clusters(graph, geometry_labels, geometry_spacing,
-            enabled=ws.skeleton_params.junction_cluster_enabled,
-            max_extent_voxels=ws.skeleton_params.junction_cluster_max_extent_voxels,
-            min_cycle_rank=ws.skeleton_params.junction_cluster_min_cycle_rank)
-        from .graph_cycles import remove_intralabel_cycles
-        graph, cycle_cleanup = remove_intralabel_cycles(graph, geometry_labels, geometry_spacing,
-            support_mask=union, flow=ws.flow_raw,
-            temporal_mask=np.logical_or.reduce([ws.multilabel_groups[name]['segmask_binary'] for name in names]),
-            flow_spacing=ws.resolution,
-            flow_threshold=ws.skeleton_params.cycle_flow_threshold,
-            preserve_connectivity=ws.skeleton_params.cycle_preserve_connectivity)
-        chains = graph_edge_chains(graph)
-        report = analyze_group_graph(graph, chains, flow=ws.flow_raw, mask=temporal, spacing=geometry_spacing,
-            segmentation_labels=geometry_labels, label_map=ws.skeleton_params.label_map,
-            group_name="cerebral_arterial_system", flow_spacing=ws.resolution)
-        order = hierarchy_path_order(report)
-        if order != list(range(len(chains))):
-            chains = [chains[index] for index in order]
-            report = analyze_group_graph(graph, chains, flow=ws.flow_raw, mask=temporal, spacing=geometry_spacing,
-                segmentation_labels=geometry_labels, label_map=ws.skeleton_params.label_map,
-                group_name="cerebral_arterial_system", flow_spacing=ws.resolution)
-        report.update(source_group_names=names, cycle_cleanup=cycle_cleanup, junction_cluster_cleanup=junction_cleanup,
-                      graph={"points": graph.points.tolist(), "edges": graph.edges.tolist()},
-                      node_chains=chains, view_only=True)
-        joint_systems.append(report)
     by_index = {record["path_index"]: record for record in all_paths}
     for info in ws.path_info:
         if int(info.get("path_index", -1)) in by_index:
@@ -331,5 +276,4 @@ def build_workspace_hierarchy(workspace):
             "path_numbering": "group order; subgroup order; ascending level; unresolved last; ties keep graph traversal order",
             "level_rule": "within each connected subgroup: inlet=1; downstream=1+max(upstream); directed cycles condensed",
             "label_local_level_rule": "first label-bearing arm=0; each subsequent label-bearing junction adds 1",
-            "direction_confidence_threshold": .05, "groups": groups, "paths": all_paths,
-            "joint_systems": joint_systems}
+            "direction_confidence_threshold": .05, "groups": groups, "paths": all_paths}

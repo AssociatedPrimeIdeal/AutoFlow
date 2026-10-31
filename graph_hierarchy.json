@@ -473,8 +473,8 @@
         }
       },
       "junction_cluster_cleanup": {
-        "schema": "autoflow.junction_cluster_cleanup.v1",
-        "algorithm": "junction_cluster_shortest_paths",
+        "schema": "autoflow.junction_cluster_cleanup.v2",
+        "algorithm": "junction_label_routes_and_contact_cleanup",
         "status": "unchanged",
         "stage": "after_triangle_contraction_before_flow_filter",
         "enabled": true,
@@ -498,24 +498,18 @@
         "boundary_ports_preserved": true,
         "outside_edges_preserved": true,
         "clusters": [],
-        "removed_edges": []
-      },
-      "radius_tree_cleanup": {
-        "schema": "autoflow.endpoint_radius_forest.v1",
-        "algorithm": "endpoint_radius_shortest_paths",
-        "policy": "auto",
-        "status": "unchanged",
-        "stage": "after_flow_before_terminal_pruning",
-        "cycle_rank_before": 0,
-        "cycle_rank_after": 0,
-        "components": [],
-        "removed_edge_count": 0,
-        "cross_label_removed_edge_count": 0,
-        "endpoint_coordinates_preserved": true,
-        "component_connectivity_preserved": true,
-        "label_presence_preserved": true,
-        "no_new_edges": true,
-        "extent_limit_applied": false
+        "removed_edges": [],
+        "local_cleanup": {
+          "schema": "autoflow.local_junction_routes.v1",
+          "before_cycles": 0,
+          "after_cycles": 0,
+          "removed_edges": 0,
+          "removed_nodes": 0,
+          "checks": {},
+          "clusters": [],
+          "removed_edge_points_mm": []
+        },
+        "interface_port_policy": "preserve_external_ports_and_each_contact_patch"
       }
     }
   ],
@@ -563,6 +557,5 @@
         "1": 0
       }
     }
-  ],
-  "joint_systems": []
+  ]
 }

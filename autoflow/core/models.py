@@ -135,12 +135,6 @@ def validate_cycle_cleanup_parameters(threshold, preserve_connectivity):
     return threshold, bool(preserve_connectivity)
 
 
-def validate_radius_tree_policy(value):
-    if not isinstance(value, str) or value not in {"auto", "forest", "preserve"}:
-        raise ValueError("radius_tree_policy must be auto, forest or preserve")
-    return value
-
-
 def validate_junction_cluster_parameters(enabled, max_extent_voxels, min_cycle_rank):
     if not isinstance(enabled, (bool, np.bool_)):
         raise ValueError("junction_cluster_enabled must be a boolean")
@@ -178,7 +172,6 @@ class SkeletonParams:
     graph_connectivity: int = 26
     cycle_flow_threshold: float = 0.3
     cycle_preserve_connectivity: bool = True
-    radius_tree_policy: str = "auto"
     junction_cluster_enabled: bool = True
     junction_cluster_max_extent_voxels: float = 0.0
     junction_cluster_min_cycle_rank: int = 2
@@ -216,7 +209,6 @@ class SkeletonParams:
             "graph_connectivity": validate_graph_connectivity(self.graph_connectivity),
             "cycle_flow_threshold": threshold,
             "cycle_preserve_connectivity": preserve,
-            "radius_tree_policy": validate_radius_tree_policy(self.radius_tree_policy),
             "junction_cluster_enabled": junction_enabled,
             "junction_cluster_max_extent_voxels": junction_extent,
             "junction_cluster_min_cycle_rank": junction_rank,
@@ -250,6 +242,8 @@ class SkeletonParams:
         label_groups = {}
         for group_name, raw_cfg in dict(payload.get("label_groups", {})).items():
             cfg = copy.deepcopy(raw_cfg if isinstance(raw_cfg, dict) else {"labels": raw_cfg})
+            cfg.pop("willis_ring_role", None)  # Ignore retired auxiliary-view configuration.
+            cfg.pop("radius_tree_policy", None)  # Retired graph routing stage.
             labels = []
             for item in list(cfg.get("labels", [])):
                 if isinstance(item, str):
@@ -269,6 +263,7 @@ class SkeletonParams:
             cfg["labels"] = labels
             preprocess = cfg.get("preprocess", {})
             cfg["preprocess"] = copy.deepcopy(preprocess) if isinstance(preprocess, dict) else {}
+            cfg["preprocess"].pop("radius_tree_policy", None)
             label_groups[str(group_name)] = cfg
         raw_special_labels = payload.get("special_contact_labels", ["RBCT", "CCA", "LBCT", "HA", "SMA", "LRA", "RRA"])
         if not isinstance(raw_special_labels, (list, tuple)):
@@ -311,7 +306,6 @@ class SkeletonParams:
             graph_connectivity=validate_graph_connectivity(payload.get("graph_connectivity", 26)),
             cycle_flow_threshold=threshold,
             cycle_preserve_connectivity=preserve,
-            radius_tree_policy=validate_radius_tree_policy(payload.get("radius_tree_policy", "auto")),
             junction_cluster_enabled=junction_enabled,
             junction_cluster_max_extent_voxels=junction_extent,
             junction_cluster_min_cycle_rank=junction_rank,
@@ -368,7 +362,6 @@ class SkeletonParams:
             "graph_connectivity",
             "cycle_flow_threshold",
             "cycle_preserve_connectivity",
-            "radius_tree_policy",
             "junction_cluster_enabled",
             "junction_cluster_max_extent_voxels",
             "junction_cluster_min_cycle_rank",
@@ -388,7 +381,6 @@ class SkeletonParams:
             graph_connectivity=self.graph_connectivity,
             cycle_flow_threshold=self.cycle_flow_threshold,
             cycle_preserve_connectivity=self.cycle_preserve_connectivity,
-            radius_tree_policy=self.radius_tree_policy,
             junction_cluster_enabled=self.junction_cluster_enabled,
             junction_cluster_max_extent_voxels=self.junction_cluster_max_extent_voxels,
             junction_cluster_min_cycle_rank=self.junction_cluster_min_cycle_rank,
@@ -414,7 +406,6 @@ class SkeletonParams:
             "graph_connectivity",
             "cycle_flow_threshold",
             "cycle_preserve_connectivity",
-            "radius_tree_policy",
             "junction_cluster_enabled",
             "junction_cluster_max_extent_voxels",
             "junction_cluster_min_cycle_rank",
@@ -444,7 +435,6 @@ class SkeletonParams:
         params.graph_connectivity = validate_graph_connectivity(params.graph_connectivity)
         params.cycle_flow_threshold, params.cycle_preserve_connectivity = validate_cycle_cleanup_parameters(
             params.cycle_flow_threshold, params.cycle_preserve_connectivity)
-        params.radius_tree_policy = validate_radius_tree_policy(params.radius_tree_policy)
         params.junction_cluster_enabled, params.junction_cluster_max_extent_voxels, params.junction_cluster_min_cycle_rank = validate_junction_cluster_parameters(
             params.junction_cluster_enabled, params.junction_cluster_max_extent_voxels, params.junction_cluster_min_cycle_rank)
         # Group-level configs written before the rename remain readable.
@@ -455,6 +445,8 @@ class SkeletonParams:
 
 @dataclass
 class PlaneGenerationParams:
+    positions_file: str = ""
+    import_mode: str = "world"
     plane_mode: str = "by_label"
     label_rules: Dict[str, Dict[str, Any]] = field(default_factory=default_label_plane_rules)
     label_rules_file: str = ""
@@ -482,6 +474,8 @@ class PlaneGenerationParams:
 
     def to_dict(self):
         return {
+            "positions_file": str(self.positions_file or ""),
+            "import_mode": str(self.import_mode or "world"),
             "plane_mode": str(self.plane_mode or "fixed_step"),
             "label_rules": copy.deepcopy(self.label_rules),
             "label_rules_file": str(self.label_rules_file or ""),
@@ -527,7 +521,12 @@ class PlaneGenerationParams:
         fov_fraction = float(payload.get("fov_boundary_max_fraction", 0.25))
         if not np.isfinite(fov_fraction) or not 0 <= fov_fraction <= 1:
             raise ValueError("fov_boundary_max_fraction must be finite and between 0 and 1")
+        import_mode = str(payload.get("import_mode", "world") or "world").strip().lower()
+        if import_mode not in {"world", "local", "path_relative"}:
+            raise ValueError("import_mode must be world, local, or path_relative")
         return PlaneGenerationParams(
+            positions_file=str(payload.get("positions_file", "") or ""),
+            import_mode=import_mode,
             plane_mode=plane_mode,
             label_rules=normalize_label_plane_rules(payload.get("label_rules", default_label_plane_rules())),
             label_rules_file=str(payload.get("label_rules_file", "") or ""),
@@ -856,6 +855,8 @@ class LabelParams:
             cfg["labels"] = labels
             preprocess = cfg.get("preprocess", {})
             cfg["preprocess"] = copy.deepcopy(preprocess) if isinstance(preprocess, dict) else {}
+            cfg.pop("radius_tree_policy", None)
+            cfg["preprocess"].pop("radius_tree_policy", None)
             label_groups[str(group_name)] = cfg
         return LabelParams(
             label_map=label_map,
@@ -1392,8 +1393,6 @@ class Workspace:
     multilabel_groups: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # Optional runtime topology overlay. It overlaps source labels and is
     # therefore kept outside the ordinary segmentation groups/metrics.
-    willis_ring_status: Dict[str, Any] = field(default_factory=dict)
-    willis_ring_graph: GraphData = field(default_factory=GraphData)
 
     mag_raw: Optional[np.ndarray] = None
     source_sigma: Optional[np.ndarray] = None
@@ -1676,8 +1675,6 @@ class Workspace:
         self._geometry_vote_cache = None
         self.group_order = []
         self.multilabel_groups = {}
-        self.willis_ring_status = {}
-        self.willis_ring_graph = GraphData()
         self.graph = GraphData()
         self.graph_hierarchy = {}
         self.centerline_paths = []
@@ -1757,8 +1754,6 @@ class Workspace:
         self._geometry_vote_cache = None
         self.group_order = []
         self.multilabel_groups = {}
-        self.willis_ring_status = {}
-        self.willis_ring_graph = GraphData()
         self.graph = GraphData()
         self.graph_hierarchy = {}
         self.centerline_paths = []
@@ -1862,8 +1857,6 @@ class Workspace:
             "segmentation_grid_npz": self._pack_segmentation_geometry(),
             "group_order": [str(x) for x in self.group_order],
             "multilabel_groups": group_payload,
-            "willis_ring_status": copy.deepcopy(self.willis_ring_status),
-            "willis_ring_graph": {"points": arr(self.willis_ring_graph.points), "edges": arr(self.willis_ring_graph.edges)},
             "mag_raw": arr(self.mag_raw),
             "source_sigma": arr(self.source_sigma),
             "source_tke_array": arr(self.source_tke_array),
@@ -1972,12 +1965,6 @@ class Workspace:
         self.segmask_labels_3d = nparr("segmask_labels_3d", np.int16)
         self.segmentation_preprocess_qc = copy.deepcopy(d.get("segmentation_preprocess_qc", {}))
         self.group_order = [str(x) for x in d.get("group_order", [])]
-        self.willis_ring_status = copy.deepcopy(d.get("willis_ring_status", {}))
-        wr = d.get("willis_ring_graph", {}) or {}
-        self.willis_ring_graph = GraphData(
-            points=np.asarray(wr.get("points", []), dtype=float).reshape(-1, 3) if wr.get("points") else np.empty((0, 3)),
-            edges=np.asarray(wr.get("edges", []), dtype=int).reshape(-1, 2) if wr.get("edges") else np.empty((0, 2), dtype=int),
-        )
         self.multilabel_groups = {}
         for group_name, state in dict(d.get("multilabel_groups", {})).items():
             graph_state = state.get("graph", {}) if isinstance(state, dict) else {}
@@ -2053,6 +2040,7 @@ class Workspace:
         self.centerline_paths_smooth = [np.asarray(x, dtype=float) for x in d.get("centerline_paths_smooth", [])]
         self.path_info = copy.deepcopy(d.get("path_info", []))
         self.graph_hierarchy = copy.deepcopy(d.get("graph_hierarchy", {}))
+        self.graph_hierarchy.pop("joint_systems", None)  # Retired auxiliary views from older saves.
         self.forks = copy.deepcopy(d.get("forks", []))
         self.planes = []
         for p in d.get("planes", []):
@@ -2115,6 +2103,9 @@ class Workspace:
         self.render_settings = copy.deepcopy(d.get("render_settings", {}))
         self.scene_objects = {}
         for it in d.get("scene_objects", []):
+            key = str(it.get("data_key", ""))
+            if key == "willis_ring_graph" or key.startswith("hierarchy_path_"):
+                continue
             uid = it["uid"]
             self.scene_objects[uid] = SceneObject(
                 uid=uid, name=it["name"], kind=ObjectKind(it["kind"]), data_key=it["data_key"],

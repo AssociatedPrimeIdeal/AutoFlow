@@ -23,7 +23,6 @@ from ..algorithms import (
     compute_pwv_groups,
     save_pwv_results,
     segmentation_timestamp,
-    detect_willis_ring,
 )
 from ..algorithms.phase_unwrapping import unwrap_phase, resolve_mask_source
 from ..algorithms.noise_removal import pcmra_render_mask
@@ -32,7 +31,8 @@ from ..algorithms.flow_display import pathline_color_style
 from ..algorithms.geometry_grid import measurement_segmentation, QUANTITATIVE_POLICY
 from ..case_types import InputCase
 from ..task_control import TaskCancelled, check_cancelled, report_progress
-from ..plane_io import build_plane_records, save_planes_h5, save_planes_json, save_pwv_h5
+from ..plane_io import (build_plane_records, save_planes_h5, save_planes_json, save_pwv_h5,
+                        load_plane_position_payload, project_planes_to_workspace, save_plane_positions)
 from ..algorithms.label_planes import generate_label_planes
 from ..algorithms.hierarchy import build_workspace_hierarchy
 from ..algorithms.graph_cycles import remove_intralabel_cycles
@@ -107,72 +107,6 @@ class PipelineEngine:
                 values.append(value)
         return values
 
-    def _update_willis_ring_overlay(self, ws):
-        """Detect and register the optional intracranial Willis-ring overlay.
-
-        This is intentionally outside ``group_order`` and ``multilabel_groups``:
-        the ring overlaps the source arterial labels and must not create a
-        second set of planes or metrics.
-        """
-        ws.remove_object_by_data_key("willis_ring_graph")
-        ws.willis_ring_status = {"status": "indeterminate", "reason": "intracranial_groups_unavailable"}
-        ws.willis_ring_graph = GraphData()
-        configured_groups = dict(getattr(ws.skeleton_params, "label_groups", {}) or {})
-
-        def _role_group(role, fallback):
-            for name, cfg in configured_groups.items():
-                if isinstance(cfg, dict) and str(cfg.get("willis_ring_role", "") or "").strip().lower() == role:
-                    return str(name)
-            return fallback
-
-        anterior_name = _role_group("anterior", "intracranial_anterior_arteries")
-        posterior_name = _role_group("posterior", "vertebrobasilar_arteries")
-        anterior_state = ws.multilabel_groups.get(anterior_name, {})
-        posterior_state = ws.multilabel_groups.get(posterior_name, {})
-        anterior_values = list(anterior_state.get("labels", []) or [])
-        posterior_values = list(posterior_state.get("labels", []) or [])
-        anterior_mask = anterior_state.get("geometry_mask_3d", anterior_state.get("segmask_3d"))
-        posterior_mask = posterior_state.get("geometry_mask_3d", posterior_state.get("segmask_3d"))
-        if anterior_mask is None or posterior_mask is None:
-            return
-        candidate_mask = np.asarray(anterior_mask, dtype=bool) | np.asarray(posterior_mask, dtype=bool)
-        fine_labels = ws.segmentation_analysis_labels_3d
-        report = detect_willis_ring(
-            fine_labels if fine_labels is not None else ws.segmask_labels_3d,
-            spacing=ws.segmentation_spacing if fine_labels is not None else ws.resolution,
-            flow_spacing=ws.resolution,
-            anterior_label_values=anterior_values,
-            posterior_label_values=posterior_values,
-            candidate_mask=candidate_mask,
-            connectivity=ws.skeleton_params.graph_connectivity,
-            flow=ws.flow_raw,
-            cycle_flow_threshold=ws.skeleton_params.cycle_flow_threshold,
-            cycle_preserve_connectivity=ws.skeleton_params.cycle_preserve_connectivity,
-            junction_cluster_enabled=ws.skeleton_params.junction_cluster_enabled,
-            junction_cluster_max_extent_voxels=ws.skeleton_params.junction_cluster_max_extent_voxels,
-            junction_cluster_min_cycle_rank=ws.skeleton_params.junction_cluster_min_cycle_rank,
-        )
-        ws.willis_ring_status = {
-            str(key): value
-            for key, value in report.items()
-            if key not in {"points", "edges"}
-        }
-        points = np.asarray(report.get("points", []), dtype=float).reshape(-1, 3)
-        edges = np.asarray(report.get("edges", []), dtype=int).reshape(-1, 2)
-        if str(report.get("status", "")) != "detected" or len(points) == 0 or len(edges) == 0:
-            return
-        ws.willis_ring_graph = GraphData(points=points, edges=edges)
-        ws.add_object(
-            name="Willis ring",
-            kind=ObjectKind.GRAPH,
-            data_key="willis_ring_graph",
-            group_name="willis_ring",
-            browser_color="#ff00ff",
-            visible=True,
-            opacity=1.0,
-            color="#ff00ff",
-            line_width=4,
-        )
 
     def _indexed_object_name(self, prefix, index):
         label_map = {
@@ -209,21 +143,24 @@ class PipelineEngine:
         ws.remove_object_by_data_key("pwv_planes")
 
 
-    def _clear_plane_state(self, ws):
+    def _clear_plane_state(self, ws, *, preserve_paths=False):
         """Discard measurements and scene objects tied to the old plane layout."""
         self._clear_pwv_state(ws)
         ws.planes = []
-        ws.centerline_paths_smooth = []
+        if not preserve_paths:
+            ws.centerline_paths_smooth = []
         ws.clear_pathlines()
         ws.pathline_colors = {}
         ws.derived.plane_metrics = []
         ws.derived.plane_qc = {}
         ws.derived.plane_pixelwise_file = ""
-        for prefix in ("plane_", "smooth_path_", "path_arrow_"):
+        prefixes = ("plane_",) if preserve_paths else ("plane_", "smooth_path_", "path_arrow_")
+        for prefix in prefixes:
             ws.remove_objects_by_prefix(prefix)
         for group_state in ws.multilabel_groups.values():
             group_state["planes"] = []
-            group_state["centerline_paths_smooth"] = []
+            if not preserve_paths:
+                group_state["centerline_paths_smooth"] = []
             group_state["plane_index_offset"] = 0
         for step in (StepId.GENERATE_PLANES, StepId.EDIT_PLANES,
                      StepId.COMPUTE_PLANE_METRICS, StepId.COMPUTE_PWV,
@@ -1246,8 +1183,6 @@ class PipelineEngine:
         points_all = []
         skeleton_mask = np.zeros(geometry_labels.shape, dtype=bool)
         ws.remove_object_by_data_key("willis_ring_graph")
-        ws.willis_ring_status = {"status": "indeterminate", "reason": "graph_not_generated"}
-        ws.willis_ring_graph = GraphData()
         ws.remove_object_by_data_key("skeleton_points")
         ws.remove_object_by_data_key("skeleton_mask_surface")
         ws.remove_object_by_data_key("segmask_3d_surface")
@@ -1308,7 +1243,7 @@ class PipelineEngine:
         ws.pipeline.mark_done(StepId.EDIT_SKELETON, skipped=True)
         return StepResult(StepId.EDIT_SKELETON, True, True, "Skeleton edit")
 
-    def _step_generate_graph(self, ws):
+    def _step_generate_graph(self, ws, *, rebuild_groups=None, write_output=True):
         if ws.segmask_raw is None:
             return StepResult(
                 StepId.GENERATE_GRAPH, True, True,
@@ -1322,7 +1257,7 @@ class PipelineEngine:
         ws.skeleton_params.geometry_spacing_mm = 1.
         actual_spacing = getattr(ws, "skeleton_spacing", None)
         grid_changed = actual_spacing is not None and not np.allclose(actual_spacing, expected_spacing)
-        if ws.skeleton_points is None or len(ws.skeleton_points) == 0 or grid_changed:
+        if (rebuild_groups is None and (ws.skeleton_points is None or len(ws.skeleton_points) == 0)) or grid_changed:
             skel_result = self._step_generate_skeleton(ws)
             if skel_result.skipped or not skel_result.success:
                 return StepResult(StepId.GENERATE_GRAPH, skel_result.success, True, skel_result.message)
@@ -1362,28 +1297,29 @@ class PipelineEngine:
             geometry_labels = getattr(ws, "skeleton_labels", None)
             if geometry_labels is None:
                 geometry_labels = ws.segmask_labels_3d
-            local_graph = build_graph_from_points(local_points, geometry_spacing, connectivity=group_params.graph_connectivity,
-                segmentation_labels=geometry_labels, separated_label_values=separated_values)
-            local_graph, junction_cleanup = simplify_junction_clusters(local_graph, geometry_labels,
-                geometry_spacing, enabled=group_params.junction_cluster_enabled,
-                max_extent_voxels=group_params.junction_cluster_max_extent_voxels,
-                min_cycle_rank=group_params.junction_cluster_min_cycle_rank)
-            group_state["junction_cluster_cleanup"] = junction_cleanup
-            local_graph, cycle_cleanup = remove_intralabel_cycles(local_graph, geometry_labels,
-                geometry_spacing, flow_spacing=ws.resolution, support_mask=group_state.get("skeleton_geometry_mask"), flow=ws.flow_raw,
-                temporal_mask=group_state.get("segmask_binary"), flow_threshold=group_params.cycle_flow_threshold,
-                preserve_connectivity=group_params.cycle_preserve_connectivity)
-            group_state["cycle_cleanup"] = cycle_cleanup
-            from ..algorithms.graph_forest import route_endpoint_radius_forest
-            local_graph, radius_tree_cleanup = route_endpoint_radius_forest(local_graph, geometry_labels,
-                geometry_spacing, policy=group_params.radius_tree_policy, label_map=ws.skeleton_params.label_map)
-            group_state["radius_tree_cleanup"] = radius_tree_cleanup
-            min_edge_points = max(0, int(getattr(group_params, "min_edge_points", 9)))
-            local_graph = remove_short_terminal_branches(local_graph, min_edge_points=min_edge_points)
-            from ..algorithms.cycle_opening import open_redundant_cycles
-            local_graph, opening = open_redundant_cycles(local_graph,
-                group_state.get("skeleton_geometry_mask", group_state.get("geometry_mask_3d")), geometry_spacing)
-            group_state["cycle_cleanup"]["lumen_cycle_opening"] = opening
+            rebuild = rebuild_groups is None or group_name in rebuild_groups
+            if rebuild:
+                local_graph = build_graph_from_points(local_points, geometry_spacing, connectivity=group_params.graph_connectivity,
+                    segmentation_labels=geometry_labels, separated_label_values=separated_values)
+                local_graph, junction_cleanup = simplify_junction_clusters(local_graph, geometry_labels,
+                    geometry_spacing, enabled=group_params.junction_cluster_enabled,
+                    max_extent_voxels=group_params.junction_cluster_max_extent_voxels,
+                    min_cycle_rank=group_params.junction_cluster_min_cycle_rank,
+                    flow=ws.flow_raw, flow_spacing=ws.resolution)
+                group_state["junction_cluster_cleanup"] = junction_cleanup
+                local_graph, cycle_cleanup = remove_intralabel_cycles(local_graph, geometry_labels,
+                    geometry_spacing, flow_spacing=ws.resolution, support_mask=group_state.get("skeleton_geometry_mask"), flow=ws.flow_raw,
+                    temporal_mask=group_state.get("segmask_binary"), flow_threshold=group_params.cycle_flow_threshold,
+                    preserve_connectivity=group_params.cycle_preserve_connectivity)
+                group_state["cycle_cleanup"] = cycle_cleanup
+                min_edge_points = max(0, int(getattr(group_params, "min_edge_points", 9)))
+                local_graph = remove_short_terminal_branches(local_graph, min_edge_points=min_edge_points)
+                from ..algorithms.cycle_opening import open_redundant_cycles
+                local_graph, opening = open_redundant_cycles(local_graph,
+                    group_state.get("skeleton_geometry_mask", group_state.get("geometry_mask_3d")), geometry_spacing)
+                group_state["cycle_cleanup"]["lumen_cycle_opening"] = opening
+            else:
+                local_graph = group_state.get("graph", GraphData())
             group_state["graph"] = local_graph
             local_binary = np.asarray(group_state.get("geometry_binary"), dtype=bool)
             local_labels, local_paths, local_node_paths, local_path_info, local_forks = segment_vessels_from_graph_and_mask(
@@ -1489,23 +1425,15 @@ class PipelineEngine:
                 data_key=self._group_data_key("smooth_path", group_name, index), group_name=group_name,
                 browser_color=ws.skeleton_params.browser_color_for_group(group_name), visible=True,
                 color=ws.skeleton_params.scene_color_for_group(group_name, "path"), line_width=3)
-        for report in ws.graph_hierarchy["joint_systems"]:
-            name = report["group_name"]
-            for record in report["paths"]:
-                index = record["path_index"]
-                ws.add_object(name=f"joint branch {index}", kind=ObjectKind.BRANCH,
-                    data_key=f"hierarchy_path_{name}_{index}", group_name=name,
-                    visible=False, color="#ff00ff", line_width=4)
-        with open(os.path.join(self._output_dir(ws), "graph_hierarchy.json"), "w", encoding="utf-8") as handle:
-            json.dump(ws.graph_hierarchy, handle, indent=2)
-        self._update_willis_ring_overlay(ws)
+        if write_output:
+            with open(os.path.join(self._output_dir(ws), "graph_hierarchy.json"), "w", encoding="utf-8") as handle:
+                json.dump(ws.graph_hierarchy, handle, indent=2)
 
         check_cancelled()
         ws.pipeline.mark_done(StepId.GENERATE_GRAPH)
-        willis_status = str(getattr(ws, "willis_ring_status", {}).get("status", "indeterminate"))
         return StepResult(StepId.GENERATE_GRAPH, True, False,
                           f"Graph: {len(ws.graph.points)} nodes, {len(ws.graph.edges)} edges | "
-                          f"paths={len(ws.centerline_paths)} forks={len(ws.forks)} willis_ring={willis_status}")
+                          f"paths={len(ws.centerline_paths)} forks={len(ws.forks)}")
 
     def _step_edit_graph(self, ws):
         ws.pipeline.mark_done(StepId.EDIT_GRAPH, skipped=True)
@@ -1910,7 +1838,51 @@ class PipelineEngine:
         save_planes_h5(ws, os.path.join(out_dir, "planes.h5"), source_path=source_path, payload=payload)
         return out_path
 
-    def _step_generate_planes(self, ws):
+    def _step_import_plane_positions(self, ws, *, write_output=True):
+        if not ws.data_loaded:
+            raise ValueError("Load the target data before placing planes from a file")
+        source = str(ws.plane_gen_params.positions_file).strip()
+        payload = load_plane_position_payload(source)
+        imported, report = project_planes_to_workspace(
+            payload, ws, mapping_mode=ws.plane_gen_params.import_mode, return_report=True)
+        if not imported:
+            raise ValueError("The plane positions file did not contain any importable planes")
+        check_cancelled()
+        # Validate before replacing the current layout; preserve centerline geometry.
+        from uuid import uuid4
+        for plane in imported:
+            plane.placement["source_plane_id"] = plane.plane_id
+            plane.plane_id = uuid4().hex
+        self._clear_plane_state(ws, preserve_paths=True)
+        ws.planes = imported
+        ws.analysis_revision += 1
+        for index, plane in enumerate(imported):
+            group = ws.multilabel_groups.get(plane.group_name, {})
+            if group:
+                if not group["planes"]:
+                    group["plane_index_offset"] = index
+                group["planes"].append(plane)
+            ws.add_object(name=self._indexed_object_name("plane", index), kind=ObjectKind.PLANE,
+                data_key=self._group_data_key("plane", plane.group_name, index), group_name=plane.group_name,
+                browser_color=str(group.get("browser_color", "") or ""), visible=True, opacity=.6,
+                color=ws.skeleton_params.scene_color_for_group(plane.group_name, "plane"), line_width=2)
+        ws.derived.plane_qc = {**report, "plane_mode": "imported", "source_file": source,
+                               "actual_plane_count": len(imported)}
+        if write_output:
+            self._save_planes_json(ws)
+            out_dir = self._output_dir(ws)
+            save_plane_positions(ws, os.path.join(out_dir, "plane_positions.json"), source_path=str(ws.paths.flow_path or ""))
+            from .output import atomic_json_write
+            atomic_json_write(os.path.join(out_dir, "plane_qc.json"), ws.derived.plane_qc)
+        ws.pipeline.mark_done(StepId.GENERATE_PLANES)
+        message = f"Planes: {len(imported)} from {source} | coordinates={ws.plane_gen_params.import_mode}"
+        if report["skipped_count"]:
+            message += f" | skipped={report['skipped_count']} (see plane_qc.json)"
+        return StepResult(StepId.GENERATE_PLANES, True, False, message)
+
+    def _step_generate_planes(self, ws, *, write_output=True, generate_missing_graph=True, use_position_file=True):
+        if use_position_file and str(ws.plane_gen_params.positions_file or "").strip():
+            return self._step_import_plane_positions(ws, write_output=write_output)
         if ws.segmask_raw is None:
             return StepResult(
                 StepId.GENERATE_PLANES, True, True,
@@ -1921,7 +1893,7 @@ class PipelineEngine:
                 or (previous_policy and previous_policy != QUANTITATIVE_POLICY)):
             self.preprocess(ws)
         self._clear_pwv_state(ws)
-        if ws.graph is None or len(ws.graph.points) == 0:
+        if generate_missing_graph and (ws.graph is None or len(ws.graph.points) == 0):
             graph_result = self._step_generate_graph(ws)
             if graph_result.skipped or not graph_result.success:
                 return StepResult(StepId.GENERATE_PLANES, graph_result.success, True, graph_result.message)
@@ -2214,9 +2186,11 @@ class PipelineEngine:
         plane_layout_qc.update(failure_policy="qc_error", errors=errors)
         ws.derived.plane_qc = plane_layout_qc
 
-        planes_path = self._save_planes_json(ws)
-        with open(os.path.join(os.path.dirname(planes_path), "plane_qc.json"), "w", encoding="utf-8") as handle:
-            json.dump(plane_layout_qc, handle, indent=2)
+        planes_path = "pending"
+        if write_output:
+            planes_path = self._save_planes_json(ws)
+            with open(os.path.join(os.path.dirname(planes_path), "plane_qc.json"), "w", encoding="utf-8") as handle:
+                json.dump(plane_layout_qc, handle, indent=2)
         check_cancelled()
         dropped_planes = sum(
             1 for item in plane_layout_qc.get("planes", [])

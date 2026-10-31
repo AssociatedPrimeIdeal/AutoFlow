@@ -155,6 +155,7 @@ nav:
       - Configuration system: en/developer/config-system.md
       - Change recipes: en/developer/change-recipes.md
       - Testing and documentation checks: en/developer/testing.md
+      - Paper figures and presentation videos: en/developer/paper-figures.md
       - Native measurement and custom-plan validation: en/developer/native-measurement.md
       - Interactive test-set placement review: en/developer/testset-plane-review.md
       - Kimimaro and cycle-decision validation: en/developer/kimimaro-cycle-diagnostics.md

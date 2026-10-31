@@ -1,0 +1,110 @@
+{
+  "case_name": "Vol023",
+  "config_dir": "{repo}/configs",
+  "work_dir": "/tmp/autoflow-paper-vol023",
+  "output_dir": "/tmp/autoflow-paper-vol023/output",
+  "source": {
+    "input": "/nas-data2/ryy/CMR4DFlow2026/AortaData/Cerebrovascular_Center001_Siemens_30T_VIDA_Vol023_20251130_CS8_9_VENC120.h5",
+    "input_layout": "matlab_vtzyx",
+    "workspace": "/tmp/autoflow-cerebral-Vol023-20261029/workspace.pkl",
+    "segmentation": {
+      "kind": "seg_true",
+      "path": "/nas-data2/ryy/CMR4DFlow2026/Segdata/data4seg/Cerebrovascular/Cerebrovascular_Center001_Siemens_30T_VIDA_Vol023_20251130_CS8_9_VENC120/4D/seg_true.seq.nrrd",
+      "layout": "nrrd_raw",
+      "magnitude": "/nas-data2/ryy/CMR4DFlow2026/Segdata/data4seg/Cerebrovascular/Cerebrovascular_Center001_Siemens_30T_VIDA_Vol023_20251130_CS8_9_VENC120/4D/mag.seq.nrrd",
+      "minimum_alignment_correlation": 0.99,
+      "label_mapping": {
+        "0": 0,
+        "4": 17,
+        "3": 18,
+        "2": 19,
+        "1": 20,
+        "5": 21,
+        "8": 22,
+        "7": 23,
+        "6": 24,
+        "9": 25,
+        "10": 26,
+        "11": 27,
+        "12": 28,
+        "13": 29,
+        "14": 30
+      }
+    }
+  },
+  "cleanup": {
+    "remove_small_cc": true,
+    "cc_filter_mode": "hybrid",
+    "min_cc_volume_mm3": 50.0,
+    "cc_rel_min_ratio": 0.1
+  },
+  "analysis": {
+    "unwrap": true
+  },
+  "render": {
+    "fps": 30,
+    "encoder": "libx264"
+  },
+  "workflow": {
+    "plane_spacing_mm": 20.0,
+    "selected_plane": 1,
+    "rotation_seconds": 6.0,
+    "cardiac_cycles_per_rotation": 3,
+    "step_interval_seconds": 1.2,
+    "plane_expand_seconds": 4.1,
+    "qc_detail_hold_seconds": 1.0,
+    "closing_rotations": 2,
+    "import_seconds": 3.2,
+    "font": "{repo}/paper/figs/assets/fonts/SegoeUI.ttf",
+    "bold_font": "{repo}/paper/figs/assets/fonts/SegoeUI-Semibold.ttf",
+    "camera": {
+      "center": [
+        89.48863446712494,
+        114.0340884923935,
+        43.5
+      ],
+      "segmentation_scale": 56.43737705068929,
+      "hemodynamics_scale": 55.716263023763894,
+      "gui_parallel_scale": 80.76477101564407
+    }
+  },
+  "results": {
+    "plane_spacing_mm": 20.0,
+    "fps": 24,
+    "cardiac_cycles_per_rotation": 4,
+    "rotation_seconds": 8.12,
+    "wss_clim": [
+      0,
+      5
+    ],
+    "double_clim": [
+      "relative-pressure",
+      "vorticity",
+      "q-criterion",
+      "swirling-strength"
+    ],
+    "magnitude": {
+      "positions": [
+        0.125,
+        0.77,
+        0.05
+      ],
+      "window": 0.5155,
+      "level": 0.2578,
+      "opacity": 0.85,
+      "threshold": 0.06
+    }
+  },
+  "correction": {
+    "mode": "fc_venc_simulation",
+    "slice": 42,
+    "phase": 4,
+    "component": 0,
+    "simulation_venc_cm_s": 30,
+    "amplified_background_phase": true
+  },
+  "existing_assets": {
+    "results": "{repo}/results/cerebral-Vol023-20261029/results-v3/assets",
+    "results_segmentation_kind": "seg_true"
+  }
+}

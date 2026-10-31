@@ -31,11 +31,17 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Set up headless rendering
+        uses: pyvista/setup-headless-display-action@c103a2ff45650d38cb71684b5dc6cdfeb9442c79 # v5.1.0
+        with:
+          qt: true
+          install-mesa3d-offscreen: true
+
       - name: Upgrade pip
         run: python -m pip install --upgrade pip
 
       - name: Install package and test dependencies
-        run: python -m pip install -e ".[test]"
+        run: python -m pip install -c packaging/windows/constraints.txt -e ".[test]"
 
       - name: Restore inference models for smoke coverage
         uses: actions/cache@v4
@@ -76,5 +82,5 @@ jobs:
           PYVISTA_OFF_SCREEN: "true"
           PYTHONUTF8: "1"
           QT_QPA_PLATFORM: "offscreen"
-          VTK_DEFAULT_OPENGL_WINDOW: ${{ runner.os == 'Linux' && 'vtkEGLRenderWindow' || '' }}
-        run: pytest tests/test_smoke_phantoms.py tests/test_pressure_gradient_phantom.py -q
+          VTK_DEFAULT_OPENGL_WINDOW: ${{ runner.os == 'Linux' && 'vtkEGLRenderWindow' || 'vtkOSOpenGLRenderWindow' }}
+        run: python -m pytest tests/test_smoke_phantoms.py tests/test_pressure_gradient_phantom.py -v --tb=short -ra

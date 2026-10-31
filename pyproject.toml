@@ -35,6 +35,7 @@ docs = [
 ]
 test = [
   "pytest",
+  "imageio-ffmpeg>=0.6,<1",
   "PySide6>=6.6,<6.12",
   "pyqtgraph>=0.13",
   "pyvistaqt",
@@ -58,6 +59,7 @@ all = [
   "dicom2h5 @ git+https://github.com/AssociatedPrimeIdeal/4DFlow_Dicom2H5.git@d13d0a49e1debd08bb659d447de1a51c32cf6920",
   "mkdocs-material>=9.5,<10",
   "pytest",
+  "imageio-ffmpeg>=0.6,<1",
   "PySide6>=6.6,<6.12",
   "pyqtgraph>=0.13",
   "pyvistaqt",

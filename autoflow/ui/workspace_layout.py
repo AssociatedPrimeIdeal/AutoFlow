@@ -215,7 +215,7 @@ class WorkspaceLayoutMixin(BrowserInlineMixin):
     def _sync_context_panels(self):
         if not hasattr(self, '_inline_inspector'):
             return
-        self.btn_browser_add_plane.setEnabled(bool(self.workspace.data_loaded) and not self._plane_edit_enabled)
+        self.btn_browser_add_plane.setEnabled(bool(self.workspace.data_loaded) and not self._plane_edit_enabled and self._edit_mode is None)
         items = self.tree_objects.selectedItems()
         self.btn_delete_obj.setEnabled(bool(items) and not self._plane_edit_enabled and self._edit_mode is None)
         current = self.tree_objects.currentItem()
@@ -229,7 +229,7 @@ class WorkspaceLayoutMixin(BrowserInlineMixin):
         node = item.data(0, int(QtCore.Qt.UserRole)+1)
         single = len(items) == 1
         has_plane = single and 0 <= plane < len(self.workspace.planes)
-        has_path = single and (self.workspace.selected_path_index >= 0 or node in {'path', 'path_reference', 'joint_path'})
+        has_path = single and (self.workspace.selected_path_index >= 0 or node in {'path', 'path_reference'})
         if has_plane:
             self.selection_tabs.setCurrentIndex(0)
             information = self.text_plane_info
@@ -262,7 +262,7 @@ class WorkspaceLayoutMixin(BrowserInlineMixin):
             self.appearance_toggle.setChecked(not (has_plane or has_path))
         self._refresh_layer_appearance(self._browser_selected_objects())
         self._attach_inline_inspector(item, expand=changed or item.isExpanded())
-        self.btn_browser_add_plane.setEnabled(bool(self.workspace.data_loaded) and not self._plane_edit_enabled)
+        self.btn_browser_add_plane.setEnabled(bool(self.workspace.data_loaded) and not self._plane_edit_enabled and self._edit_mode is None)
         identity = (id(self.workspace.planes[plane]), plane) if has_plane else None
         if identity is not None and identity != getattr(self, '_measurement_plane', None):
             self._show_measurements('plane_curve')

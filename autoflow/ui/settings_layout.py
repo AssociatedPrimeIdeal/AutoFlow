@@ -7,7 +7,7 @@ def compact_action_sections(action, sections):
     basic_fields = {
         StepId.GENERATE_SKELETON: {'special_handling', 'remove_small_cc'},
         StepId.GENERATE_GRAPH: {'cycle_flow_threshold', 'cycle_preserve_connectivity'},
-        StepId.GENERATE_PLANES: {'plane_mode', 'label_rules_file', 'label_rules', 'plane_count',
+        StepId.GENERATE_PLANES: {'positions_file', 'import_mode', 'plane_mode', 'label_rules_file', 'label_rules', 'plane_count',
                                'anchor', 'direction', 'spacing_mode', 'spacing_ratio',
                                'cross_section_distance', 'anchor_offset_mm', 'start_distance', 'end_distance'},
         StepId.COMPUTE_DERIVED_METRICS: {'pressure_method'},

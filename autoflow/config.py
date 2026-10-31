@@ -270,7 +270,6 @@ DEFAULT_SKELETON_LABEL_GROUPS = {
         "path_color": "#be4bdb",
         "plane_color": "#e599f7",
         "preprocess": {},
-        "willis_ring_role": "anterior",
     },
     "vertebrobasilar_arteries": {
         "labels": ["LVA", "RVA", "BA", "LPCA", "RPCA"],
@@ -280,7 +279,6 @@ DEFAULT_SKELETON_LABEL_GROUPS = {
         "path_color": "#9775fa",
         "plane_color": "#d0bfff",
         "preprocess": {},
-        "willis_ring_role": "posterior",
     },
     "intracranial_veins": {
         "labels": ["StrS", "RTS", "SSS", "LTS"],
@@ -367,7 +365,6 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "graph_connectivity": 26,
         "cycle_flow_threshold": 0.3,
         "cycle_preserve_connectivity": True,
-        "radius_tree_policy": "auto",
         "junction_cluster_enabled": True,
         "junction_cluster_max_extent_voxels": 0.0,
         "junction_cluster_min_cycle_rank": 2,
@@ -388,6 +385,8 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "label_groups": copy.deepcopy(DEFAULT_SKELETON_LABEL_GROUPS),
     },
     "planes": {
+        "positions_file": "",
+        "import_mode": "world",
         "plane_mode": "by_label",
         "label_rules": default_label_plane_rules(),
         "label_rules_file": "",
@@ -747,6 +746,11 @@ def load_config_module(module_name: str, config_dir: Optional[str] = None) -> Di
         raise ValueError(f"config file must contain a JSON object: {config_path}")
     merged = _deep_merge(defaults, payload)
     if module_name == "planes":
+        if payload.get("positions_file"):
+            positions = Path(payload["positions_file"]).expanduser()
+            if not positions.is_absolute():
+                positions = config_root / positions
+            merged["positions_file"] = str(positions.resolve())
         if payload.get("label_rules_file"):
             if "label_rules" in payload:
                 raise ValueError("Use either planes.label_rules_file or inline label_rules, not both")
@@ -1092,7 +1096,8 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
         "skip_pressure_gradient": bool(batch_cfg.get("skip_pressure_gradient", False)),
         "skip_plane_metrics": bool(batch_cfg.get("skip_plane_metrics", False)),
         "use_multithread": bool(batch_cfg.get("use_multithread", True)),
-        "reuse_planes": str(batch_cfg.get("reuse_planes", "")),
+        "reuse_planes": str(batch_cfg.get("reuse_planes") or plane_cfg.get("positions_file", "")),
+        "plane_import_mode": str(plane_cfg.get("import_mode", "world") or "world"),
         "background_phase_correction": bool(bpc_cfg.get("enabled", False)),
         "background_phase_method": str(bpc_cfg.get("method", "wrls_arto") or "wrls_arto"),
         "background_phase_corr_fit_order": int(bpc_cfg.get("corr_fit_order", 3)),
@@ -1158,7 +1163,6 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
         "graph_connectivity": skeleton_cfg.get("graph_connectivity", 26),
         "cycle_flow_threshold": skeleton_cfg.get("cycle_flow_threshold", 0.3),
         "cycle_preserve_connectivity": skeleton_cfg.get("cycle_preserve_connectivity", True),
-        "radius_tree_policy": skeleton_cfg.get("radius_tree_policy", "auto"),
         "junction_cluster_enabled": skeleton_cfg.get("junction_cluster_enabled", True),
         "junction_cluster_max_extent_voxels": skeleton_cfg.get("junction_cluster_max_extent_voxels", 0.0),
         "junction_cluster_min_cycle_rank": skeleton_cfg.get("junction_cluster_min_cycle_rank", 2),

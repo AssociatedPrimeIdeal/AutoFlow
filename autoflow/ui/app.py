@@ -65,6 +65,7 @@ from .progress import TaskProgressDialog
 from .plane_handles import PlaneDragHandles
 from .time_navigation import FrameNavigationFilter
 from .plane_editing import PlaneEditingMixin, _PlaneCommand
+from .geometry_editing import GeometryEditingMixin
 from .review import ReviewMixin
 from .report_actions import ReportActionsMixin
 from .report_actions import ReportActionsMixin
@@ -73,7 +74,7 @@ from .analysis_plotting import (update_plane_curve, move_phase_cursor,
 from ..core.plane_state import (metric_validity, mutation_snapshot, remove_planes, selected_metric,
                                 invalidate_planes, refresh_plane_consistency)
 from ..config import apply_config_bundle_to_workspace, bundle_to_autoflow_kwargs, load_config_bundle
-from ..plane_io import load_plane_position_payload, project_planes_to_workspace, save_plane_positions
+from ..plane_io import save_plane_positions
 from ..quality import build_quality_report, save_quality_report
 from ..algorithms import compute_plane_metrics, apply_internal_consistency_to_metrics, compute_plane_metrics_multithread, augment_plane_metrics_with_derived, save_plane_pixelwise_h5
 from ..algorithms.streamlines import _plane_seeds, create_pathline_temporal_source, pathline_sample_times
@@ -624,7 +625,7 @@ class _PathlineTaskWorker(_TaskWorker):
         except Exception:
             self.failed.emit(traceback.format_exc())
 
-class MainWindow(WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEditingMixin, ActionSettingsMixin, QtWidgets.QMainWindow):
+class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEditingMixin, ActionSettingsMixin, QtWidgets.QMainWindow):
     def __init__(self, config_dir=None):
         super().__init__()
         self.setWindowTitle("AutoFlow")
@@ -818,6 +819,7 @@ class MainWindow(WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEdi
         plotter_layout = QtWidgets.QVBoxLayout(plotter_panel)
         plotter_layout.setContentsMargins(0, 0, 0, 0)
         plotter_layout.setSpacing(3)
+        self._build_geometry_toolbar(plotter_layout)
         plotter_layout.addWidget(self.plotter, 1)
         range_bar = QtWidgets.QGridLayout()
         range_bar.setVerticalSpacing(2)
@@ -1009,8 +1011,8 @@ class MainWindow(WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEdi
         step_tooltips = {
             StepId.GENERATE_PCMRA: "Compute PC-MRA from current working velocity and create its 3D rendering layer.",
             StepId.UNWRAP_PHASE: "Run the selected optional phase-unwrapping method. Dual-VENC inputs are skipped.",
-            StepId.EDIT_SKELETON: "Correct skeleton points interactively. Saving clears graph, paths, planes, and downstream metrics.",
-            StepId.EDIT_GRAPH: "Move graph nodes, toggle edges, or delete graph elements. Saving clears paths, planes, and downstream metrics.",
+            StepId.EDIT_SKELETON: "Edit skeleton points. Done updates centerlines; Cancel discards this session.",
+            StepId.EDIT_GRAPH: "Edit nodes and connections. Done preserves your graph and updates paths and planes.",
             StepId.COMPUTE_PWV: "Compute PWV for the configured PWV groups.",
             StepId.PLANE_STREAMLINES: "Generate time-resolved pathlines for the selected plane or planes in a background task.",
         }
@@ -1026,18 +1028,13 @@ class MainWindow(WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEdi
             self.step_buttons[step] = button
             row, column = divmod(index, 3)
             gl.addWidget(button, row, column)
-        self.btn_import_planes_centerline = QtWidgets.QPushButton("Import Plane Coordinates...")
-        self.btn_import_planes_centerline.setIcon(standard_icon(self, "SP_DialogOpenButton"))
-        self.btn_import_planes_centerline.clicked.connect(self._on_import_plane_coordinates)
-        import_row = (len(all_steps) + 2) // 3
-        gl.addWidget(self.btn_import_planes_centerline, import_row, 0, 1, 3)
         self.btn_run_all = QtWidgets.QPushButton("Run All")
         self.btn_run_all.setIcon(standard_icon(self, "SP_MediaPlay"))
         self.btn_run_all.setProperty("role", "primary")
         self.btn_run_all.setMinimumHeight(34)
         self.btn_run_all.clicked.connect(self._run_all_pipeline)
         self._attach_action_settings(self.btn_run_all, "run_all", self._run_all_pipeline)
-        run_all_row = import_row + 1
+        run_all_row = (len(all_steps) + 2) // 3
         gl.addWidget(self.btn_run_all, run_all_row, 0, 1, 3)
         parent.addWidget(grp, 0)
 
@@ -1051,40 +1048,6 @@ class MainWindow(WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEdi
         self.btn_run_segmentation_auto.clicked.connect(self._on_run_auto_segmentation)
         self._attach_action_settings(self.btn_run_segmentation_auto, "segmentation", self._on_run_auto_segmentation)
         parent.addWidget(self.btn_run_segmentation_auto)
-
-        edit_grp = QtWidgets.QGroupBox("Interactive Edit")
-        self._edit_panel = edit_grp
-        edit_lay = QtWidgets.QVBoxLayout(edit_grp)
-        edit_lay.setContentsMargins(8, 8, 8, 8)
-        self._edit_info_label = QtWidgets.QLabel()
-        self._edit_info_label.setWordWrap(True)
-        self._edit_info_label.setStyleSheet("font-weight: 600;")
-        edit_lay.addWidget(self._edit_info_label)
-        self._edit_status_label = QtWidgets.QLabel()
-        self._edit_status_label.setWordWrap(True)
-        edit_lay.addWidget(self._edit_status_label)
-        self._edit_hint_label = QtWidgets.QLabel()
-        self._edit_hint_label.setWordWrap(True)
-        self._edit_hint_label.setStyleSheet(f"color: {theme_colors(self)['secondary']}; padding: 3px 0;")
-        edit_lay.addWidget(self._edit_hint_label)
-        edit_buttons = QtWidgets.QHBoxLayout()
-        self._edit_btn_edge = QtWidgets.QPushButton("Edge Mode: OFF")
-        self._edit_btn_edge.setToolTip("Graph mode: click two nodes to add or remove an edge")
-        self._edit_btn_edge.clicked.connect(self._toggle_edge_mode)
-        edit_buttons.addWidget(self._edit_btn_edge)
-        edit_buttons.addStretch()
-        self._edit_btn_save = QtWidgets.QPushButton("Save Changes")
-        self._edit_btn_save.setIcon(standard_icon(self, "SP_DialogSaveButton"))
-        self._edit_btn_save.setProperty("role", "primary")
-        self._edit_btn_save.clicked.connect(lambda: self._exit_interactive_edit(True))
-        edit_buttons.addWidget(self._edit_btn_save)
-        self._edit_btn_cancel = QtWidgets.QPushButton("Cancel")
-        self._edit_btn_cancel.setIcon(standard_icon(self, "SP_DialogCancelButton"))
-        self._edit_btn_cancel.clicked.connect(lambda: self._exit_interactive_edit(False))
-        edit_buttons.addWidget(self._edit_btn_cancel)
-        edit_lay.addLayout(edit_buttons)
-        edit_grp.setVisible(False)
-        parent.addWidget(edit_grp, 0)
 
     def _reset_noise_removal(self):
         if self._pipeline_running_guard("resetting noise removal"):
@@ -1194,7 +1157,7 @@ class MainWindow(WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEdi
         quality_layout.addLayout(html_buttons)
         self.params_layout.addWidget(quality_group)
 
-        self.btn_export_planes = QtWidgets.QPushButton("Export selected planes…")
+        self.btn_export_planes = QtWidgets.QPushButton("Export Planes…")
         self.btn_export_planes.clicked.connect(self._on_export_plane_coordinates)
         self._build_export_page()
 
@@ -1297,13 +1260,8 @@ class MainWindow(WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEdi
             action_row = (len(active_steps) + 1) // 2
             if stage_key in {"correction", "centerline", "hemodynamics"}:
                 step_layout.addWidget(self.btn_run_all, action_row, 0, 1, 2)
-        if stage_key == "centerline":
-            plane_row = active_steps.index(StepId.GENERATE_PLANES) // 2
-            step_layout.addWidget(self.btn_import_planes_centerline, plane_row, 1)
         for step, button in self.step_buttons.items():
             button.setVisible(step in visible_steps)
-        if hasattr(self, "btn_import_planes_centerline"):
-            self.btn_import_planes_centerline.setVisible(stage_key == "centerline")
         self.btn_run_all.setVisible(stage_key in {"correction", "centerline", "hemodynamics"})
         if stage_key in {"correction", "centerline", "hemodynamics"}:
             self.btn_run_all.setText("Run All")
@@ -1951,6 +1909,8 @@ class MainWindow(WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEdi
     def _build_menu(self):
         mb = self.menuBar()
         mf = mb.addMenu("File")
+        self.file_menu = mf
+        self._input_case_actions = []
         for label, slot in [
             ("Load H5", self._on_load_h5),
             ("Load DICOM", self._on_load_dicom),
@@ -1960,7 +1920,11 @@ class MainWindow(WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEdi
             a = QtGui.QAction(label, self)
             a.triggered.connect(slot)
             mf.addAction(a)
+            if label != "Exit":
+                self._input_case_actions.append(a)
+        self._build_geometry_edit_menu(mb)
         me = mb.addMenu("Export")
+        self.export_menu = me
         a = QtGui.QAction("Export page", self)
         a.triggered.connect(self._on_open_export_page)
         me.addAction(a)
@@ -1976,7 +1940,7 @@ class MainWindow(WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEdi
         a.setObjectName("actionExportRotatingViewVideo")
         a.triggered.connect(lambda: self._on_export_current_view_video(rotate=True))
         me.addAction(a)
-        a = QtGui.QAction("Export Plane Coordinates...", self)
+        a = QtGui.QAction("Export Planes…", self)
         a.triggered.connect(self._on_export_plane_coordinates)
         me.addAction(a)
         a = QtGui.QAction("Export QC Report...", self)
@@ -1986,6 +1950,7 @@ class MainWindow(WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEdi
         a.triggered.connect(self._on_export_analysis_report)
         me.addAction(a)
         ms = mb.addMenu("Settings")
+        self.settings_menu = ms
         a = QtGui.QAction("3D Axis Orientation...", self)
         a.triggered.connect(self._open_display_orientation_settings)
         ms.addAction(a)
@@ -2357,128 +2322,23 @@ class MainWindow(WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEdi
                     selected.append(int(plane_index))
         return sorted(set(selected))
 
-    def _plane_import_options(self):
-        dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle("Import Plane Coordinates")
-        layout = QtWidgets.QVBoxLayout(dialog)
-        form = QtWidgets.QFormLayout()
-        mode_combo = QtWidgets.QComboBox()
-        mode_combo.addItem("World coordinates", "world")
-        mode_combo.addItem("Local physical coordinates", "local")
-        mode_combo.addItem("Relative centerline position", "path_relative")
-        mode_combo.setItemData(0, "Use only when cases share a registered AutoFlow world-mm coordinate frame.", QtCore.Qt.ToolTipRole)
-        mode_combo.setItemData(1, "Use when cases share the same cropped local geometry but have different origins.", QtCore.Qt.ToolTipRole)
-        mode_combo.setItemData(2, "Map each generated plane by group, path rank, and fractional centerline distance.", QtCore.Qt.ToolTipRole)
-        operation_combo = QtWidgets.QComboBox()
-        operation_combo.addItem("Replace existing planes", "replace")
-        operation_combo.addItem("Append to existing planes", "append")
-        form.addRow("Mapping", mode_combo)
-        form.addRow("Operation", operation_combo)
-        layout.addLayout(form)
-        warning = QtWidgets.QLabel(
-            "World coordinates require registered cases. Relative centerline mapping requires target centerlines and is usually safer for unregistered cases."
-        )
-        warning.setWordWrap(True)
-        layout.addWidget(warning)
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        if dialog.exec() != QtWidgets.QDialog.Accepted:
-            return None
-        return str(mode_combo.currentData()), str(operation_combo.currentData())
-
-    def _on_import_plane_coordinates(self):
-        if self._pipeline_running_guard("importing plane coordinates") or self._autoseg_running_guard("importing plane coordinates"):
-            return
-        if not self.workspace.data_loaded:
-            self.log("Load the target case before importing plane coordinates.")
-            return
-        in_path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Import Plane Coordinates",
-            "",
-            "Plane coordinates (*.json);;JSON (*.json)",
-        )
-        if not in_path:
-            return
-        options = self._plane_import_options()
-        if options is None:
-            return
-        mapping_mode, operation = options
-        try:
-            payload = load_plane_position_payload(in_path)
-            imported, report = project_planes_to_workspace(
-                payload,
-                self.workspace,
-                mapping_mode=mapping_mode,
-                return_report=True,
-            )
-            if not imported:
-                raise ValueError("the file did not contain any importable planes")
-            old_count = len(self.workspace.planes)
-            before = mutation_snapshot(self.workspace)
-            previous_planes = list(self.workspace.planes)
-            for plane in imported:
-                plane.placement["source_plane_id"] = plane.plane_id
-                plane.plane_id = uuid.uuid4().hex
-                plane.geometry_revision = plane.roi_revision = 0
-                plane.metrics = {}
-            if operation == "append":
-                self.workspace.planes.extend(imported)
-                first_imported = old_count
-            else:
-                self.workspace.planes = list(imported)
-                first_imported = 0
-            self._last_plane_import_report = report
-            self._last_quality_report = None
-            self.workspace.analysis_revision += 1
-            refresh_plane_consistency(self.workspace)
-            self.pipeline._clear_pwv_state(self.workspace)
-            for step in (StepId.COMPUTE_PLANE_METRICS, StepId.COMPUTE_PWV):
-                self.workspace.pipeline.completed.pop(step.value, None)
-                self.workspace.pipeline.skipped.pop(step.value, None)
-            self._sync_plane_scene(previous_planes)
-            self._plane_undo_stack.push(_PlaneCommand(self, before, mutation_snapshot(self.workspace), "Import planes"))
-            self._refresh_all()
-            source_path = str(self.workspace.paths.flow_path or self.workspace.paths.segmask_path or "")
-            save_plane_positions(
-                self.workspace,
-                os.path.join(self.pipeline._output_dir(self.workspace), "plane_positions.json"),
-                source_path=source_path,
-            )
-            self._persist_plane_outputs(include_pixelwise=False)
-            if 0 <= first_imported < len(self.workspace.planes):
-                uid = self._find_uid_by_indexed_data_key("plane", first_imported)
-                self._selected_plane_index = int(first_imported)
-                self.ortho_viewer.set_selected_plane(int(first_imported))
-                self._select_browser_item_by_uid(uid)
-                self.scene.highlight_plane(uid)
-            warning_count = len(list(report.get("warnings", []) or []))
-            self.log(
-                f"Imported {len(imported)} plane coordinates from {in_path} "
-                f"mode={mapping_mode} operation={operation} warnings={warning_count}"
-            )
-            for message in list(report.get("warnings", []) or []):
-                self.log(f"[Plane Import] warning: {message}")
-            self._refresh_workflow_status()
-        except Exception as exc:
-            self.log(f"PLANE IMPORT ERROR: {type(exc).__name__}: {exc}")
-            QtWidgets.QMessageBox.critical(self, "Plane Import Failed", f"{type(exc).__name__}: {exc}")
-
     def _on_export_plane_coordinates(self):
         if self._pipeline_running_guard("exporting plane coordinates"):
+            return
+        if self._edit_mode is not None or self._plane_edit_session is not None:
+            self.statusBar().showMessage("Finish the current edit before exporting planes.", 5000)
             return
         if not self.workspace.data_loaded or not self.workspace.planes:
             self.log("No planes are available to export.")
             return
         plane_indices = self._selected_plane_indices()
+        selection_scope = "Selected" if plane_indices else "All"
         if not plane_indices:
             plane_indices = list(range(len(self.workspace.planes)))
         default_path = os.path.join(self.pipeline._output_dir(self.workspace), "plane_positions.json")
         out_path, _selected_filter = QtWidgets.QFileDialog.getSaveFileName(
             self,
-            "Export Plane Coordinates",
+            f"Export {len(plane_indices)} {selection_scope} Planes",
             default_path,
             "Plane coordinates (*.json)",
         )
@@ -3930,65 +3790,6 @@ class MainWindow(WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEdi
                 parent_loop = records[parent].get("loop_id")
                 move(item, loops[parent_loop] if parent_loop else nodes[parent])
 
-    def _browser_add_joint_hierarchies(self):
-        for report in self.workspace.graph_hierarchy.get("joint_systems", []):
-            top = QtWidgets.QTreeWidgetItem(["Joint cerebral arterial topology", "Analysis"])
-            self._browser_make_checkable(top, False)
-            top.setToolTip(0, "Combined connected mask topology; source groups, paths and measurements remain separate.")
-            self.tree_objects.addTopLevelItem(top)
-            records = {record["path_index"]: record for record in report.get("paths", [])}
-            subgroups = self._browser_subgroup_nodes(top, records, False)
-            nodes, loops = {}, {}
-            for record in records.values():
-                loop_id = record.get("loop_id")
-                if loop_id and loop_id not in loops:
-                    loops[loop_id] = QtWidgets.QTreeWidgetItem(["Loop", "Analysis loop"])
-                    self._browser_make_checkable(loops[loop_id], False)
-                    subgroups.get(record.get("subgroup_index"), top).addChild(loops[loop_id])
-            for index, record in records.items():
-                grade = record.get("group_level")
-                title = f"Branch {index} · {'/'.join(record['label_names']) or 'Unlabeled'} · G{grade if grade is not None else '?'}"
-                item = QtWidgets.QTreeWidgetItem([title, "Analysis branch"])
-                data_key = f"hierarchy_path_{report['group_name']}_{index}"
-                obj = next((obj for obj in self.workspace.scene_objects.values() if obj.data_key == data_key), None)
-                if obj is not None:
-                    item.setData(0, QtCore.Qt.UserRole, obj.uid)
-                    self._browser_make_checkable(item, obj.visible)
-                item.setData(0, _BROWSER_NODE_ROLE, "joint_path")
-                item.setData(0, _BROWSER_GROUP_ROLE, report["group_name"])
-                item.setData(0, _BROWSER_PATH_INDEX_ROLE, index)
-                item.setToolTip(0, json.dumps(record, ensure_ascii=False, indent=2))
-                top.addChild(item)
-                nodes[index] = item
-            for index, record in records.items():
-                loop_id = record.get("loop_id")
-                if loop_id:
-                    parent = loops[loop_id]
-                else:
-                    parent_index = record.get("display_parent_path_index")
-                    parent_loop = records.get(parent_index, {}).get("loop_id")
-                    base = subgroups.get(record.get("subgroup_index"), top)
-                    parent = loops.get(parent_loop, base) if parent_loop else nodes.get(parent_index, base)
-                nodes[index].parent().removeChild(nodes[index])
-                parent.addChild(nodes[index])
-                for other in record.get("reference_parent_path_indices", []):
-                    if other != index:
-                        reference = QtWidgets.QTreeWidgetItem([f"↗ Upstream Branch {other}", "Connection"])
-                        reference.setFlags(reference.flags() & ~QtCore.Qt.ItemIsUserCheckable)
-                        nodes[index].addChild(reference)
-            for loop_id, item in loops.items():
-                members = {i for i, record in records.items() if record.get("loop_id") == loop_id}
-                parents = {parent for i in members for parent in records[i]["parent_path_indices"] if parent not in members}
-                if parents:
-                    parent = min(parents, key=lambda i: (-(records[i].get("group_level") or 0), i))
-                    parent_loop = records[parent].get("loop_id")
-                    item.parent().removeChild(item)
-                    (loops[parent_loop] if parent_loop else nodes[parent]).addChild(item)
-                item.setCheckState(0, self._browser_check_state_for_item(item))
-            for item in [*subgroups.values(), top]:
-                item.setCheckState(0, self._browser_check_state_for_item(item))
-            for item in [top, *subgroups.values(), *loops.values()]:
-                item.setExpanded(True)
 
     def _browser_make_checkable(self, item, checked=True):
         item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
@@ -4144,24 +3945,25 @@ class MainWindow(WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEdi
         return max(2.0, plane_display_size(self.workspace) * 0.45)
 
     def _refresh_plane_edit_controls(self):
+        geometry_editing = self._edit_mode in {"skeleton", "graph"}
         selected = 0 <= int(self._selected_plane_index) < len(self.workspace.planes)
         editing = bool(self._plane_edit_enabled and selected)
         if hasattr(self, "btn_edit_plane"):
-            self.btn_add_plane.setEnabled(bool(self.workspace.data_loaded) and not editing)
-            self.btn_edit_plane.setEnabled(selected)
+            self.btn_add_plane.setEnabled(bool(self.workspace.data_loaded) and not editing and not geometry_editing)
+            self.btn_edit_plane.setEnabled(selected and not geometry_editing)
             self.btn_edit_plane.setText("Apply Plane")
             self.btn_edit_plane.setVisible(editing)
         if hasattr(self, "check_plane_unlocked"):
             blocker = QtCore.QSignalBlocker(self.check_plane_unlocked)
             self.check_plane_unlocked.setChecked(editing)
             self.check_plane_unlocked.setText('Editing plane' if editing else 'Edit plane')
-            self.check_plane_unlocked.setEnabled(selected)
+            self.check_plane_unlocked.setEnabled(selected and not geometry_editing)
             del blocker
         if hasattr(self, "plane_edit_tools"):
             self.btn_add_plane.setVisible(False)
             self.combo_plane_add_source.hide()
-            self.btn_undo_plane.setVisible(editing or self._plane_undo_stack.canUndo())
-            self.btn_redo_plane.setVisible(editing or self._plane_undo_stack.canRedo())
+            self.btn_undo_plane.setVisible(not geometry_editing and (editing or self._plane_undo_stack.canUndo()))
+            self.btn_redo_plane.setVisible(not geometry_editing and (editing or self._plane_undo_stack.canRedo()))
             self.btn_cancel_plane_edit.setVisible(editing)
             self.plane_edit_tools.setVisible(editing)
             self.combo_plane_add_source.setEnabled(not editing)
@@ -5357,7 +5159,6 @@ class MainWindow(WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEdi
                         child = type_item.child(k)
                         child.setExpanded(any(child.child(n).data(0, _BROWSER_NODE_ROLE) in {"path", "loop"}
                                               for n in range(child.childCount())))
-        self._browser_add_joint_hierarchies()
         self._compact_browser_types()
         self._restore_browser_view(view_state)
         self.tree_objects.blockSignals(False)
@@ -5613,22 +5414,10 @@ class MainWindow(WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEdi
         node_type = item.data(0, _BROWSER_NODE_ROLE) if item is not None else None
         if self.selection_tabs.currentIndex() != 2:
             selected_object = self.workspace.scene_objects.get(uid)
-            if node_type in {"joint_path", "path", "path_reference"} or (selected_object and selected_object.kind == ObjectKind.BRANCH):
+            if node_type in {"path", "path_reference"} or (selected_object and selected_object.kind == ObjectKind.BRANCH):
                 self.selection_tabs.setCurrentIndex(1)
             elif selected_object and (selected_object.kind == ObjectKind.PLANE or _parse_pathline_index(selected_object.data_key) is not None):
                 self.selection_tabs.setCurrentIndex(0)
-        if uid is not None and node_type == "joint_path":
-            self.workspace.selected_path_index = -1
-            self._selected_plane_index = -1
-            self._clear_plane_drag_widgets()
-            self.scene.highlight_plane(None)
-            self.scene.highlight_path(uid)
-            self.scene.show_forks_for_path(-1)
-            self.ortho_viewer.set_selected_plane(None)
-            self._set_plane_info_text("")
-            self._set_path_info_text(item.toolTip(0))
-            self._refresh_analysis_panel()
-            return
         if uid is None and node_type in {"path", "path_reference"}:
             path_idx = item.data(0, _BROWSER_PATH_INDEX_ROLE)
             try:
@@ -7169,10 +6958,6 @@ class MainWindow(WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEdi
             return np.array([float(r[0]), float(r[1]), float(r[2])], dtype=float)
         return np.array([1.0, 1.0, 1.0], dtype=float)
 
-    def _edit_widget_radius(self):
-        spacing = self._get_spacing_xyz_from_resolution()
-        return max(0.1, float(np.mean(spacing)) * 0.6)
-
     def _display_edit_points(self, points):
         values = np.asarray(points, dtype=float).reshape(-1, 3)
         if self.scene is None:
@@ -7187,503 +6972,6 @@ class MainWindow(WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEdi
         origin = np.asarray(self.workspace.origin, dtype=float).reshape(3)
         return self.scene.display_to_world_point(value + origin) - origin
 
-    def _graph_polydata(self, points, edges):
-        points = np.asarray(points, dtype=float).reshape(-1, 3)
-        poly = pv.PolyData(points)
-        edges = np.asarray(edges, dtype=int).reshape(-1, 2) if len(edges) else np.empty((0, 2), dtype=int)
-        if len(edges) > 0:
-            cells = np.empty((len(edges), 3), dtype=np.int64)
-            cells[:, 0] = 2
-            cells[:, 1] = edges[:, 0]
-            cells[:, 2] = edges[:, 1]
-            poly.lines = cells.ravel()
-        return poly
-
-    def _cleanup_edit_actors(self):
-        for actor in [self._edit_actor, self._edit_edge_actor, self._edit_sel_actor, self._edit_sel_edge_actor]:
-            if actor is not None:
-                try:
-                    self.plotter.remove_actor(actor)
-                except Exception:
-                    try:
-                        self.plotter.renderer.RemoveActor(actor)
-                    except Exception:
-                        pass
-        self._edit_actor = None
-        self._edit_edge_actor = None
-        self._edit_sel_actor = None
-        self._edit_sel_edge_actor = None
-        self._edit_poly = None
-        self._edit_edge_poly = None
-        self._edit_sel_poly = None
-        self._edit_sel_edge_poly = None
-
-    def _remove_edit_widget(self):
-        try:
-            if hasattr(self.plotter, "clear_sphere_widgets"):
-                self.plotter.clear_sphere_widgets()
-        except Exception:
-            pass
-        try:
-            if hasattr(self.plotter, "remove_widget") and self._edit_widget is not None:
-                try:
-                    self.plotter.remove_widget(self._edit_widget)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        self._edit_widget = None
-
-    def _update_edit_labels(self):
-        if self._edit_info_label is None or self._edit_status_label is None:
-            return
-        mode = self._edit_mode or "-"
-        npts = 0 if self._edit_points is None else len(self._edit_points)
-        nedges = 0 if self._edit_edges is None else len(self._edit_edges)
-        group_text = self._edit_group_name or "Global"
-        sel = "-" if self._edit_selected_idx is None else str(int(self._edit_selected_idx))
-        esel = "-" if self._edit_selected_edge_idx is None else str(int(self._edit_selected_edge_idx))
-        selected_label = "Selected Point" if mode == "skeleton" else "Selected Node"
-        self._edit_info_label.setText(
-            f"Group: {group_text}    Mode: {mode}    Points: {npts}    Edges: {nedges}    "
-            f"{selected_label}: {sel}    Selected Edge: {esel}"
-        )
-        edge_state = "ON" if self._edit_edge_mode else "OFF"
-        src = "-" if self._edit_edge_src_idx is None else str(int(self._edit_edge_src_idx))
-        if mode == "skeleton":
-            self._edit_status_label.setText("Point editing active    Keys: Delete/Backspace delete, Esc cancel")
-        else:
-            self._edit_status_label.setText(f"Edge Mode: {edge_state}    Edge Src: {src}    Keys: Delete/Backspace delete, E toggle edge mode")
-        if self._edit_btn_edge is not None:
-            self._edit_btn_edge.setText("Edge Mode: ON" if self._edit_edge_mode else "Edge Mode: OFF")
-
-    def _update_edit_points_actor(self):
-        if self._edit_points is None or len(self._edit_points) == 0:
-            if self._edit_actor is not None:
-                try:
-                    self.plotter.remove_actor(self._edit_actor)
-                except Exception:
-                    pass
-            self._edit_actor = None
-            self._edit_poly = None
-            return
-        display_points = self._display_edit_points(self._edit_points)
-        if self._edit_poly is None:
-            self._edit_poly = pv.PolyData(display_points)
-        else:
-            self._edit_poly.points = display_points
-        color = "red" if self._edit_mode == "skeleton" else "deepskyblue"
-        if self._edit_mode == "plane":
-            color = "yellow"
-        if self._edit_actor is None:
-            self._edit_actor = self.plotter.add_mesh(self._edit_poly, color=color, point_size=10, render_points_as_spheres=True, name="interactive_edit_points")
-        else:
-            try:
-                self._edit_actor.GetMapper().SetInputData(self._edit_poly)
-            except Exception:
-                try:
-                    self.plotter.remove_actor(self._edit_actor)
-                except Exception:
-                    pass
-                self._edit_actor = self.plotter.add_mesh(self._edit_poly, color=color, point_size=10, render_points_as_spheres=True, name="interactive_edit_points")
-
-    def _update_edit_edges_actor(self):
-        if self._edit_edges is None or len(self._edit_edges) == 0 or self._edit_points is None or len(self._edit_points) == 0:
-            if self._edit_edge_actor is not None:
-                try:
-                    self.plotter.remove_actor(self._edit_edge_actor)
-                except Exception:
-                    pass
-            self._edit_edge_actor = None
-            self._edit_edge_poly = None
-            return
-        poly = self._graph_polydata(self._display_edit_points(self._edit_points), self._edit_edges)
-        self._edit_edge_poly = poly
-        color = "green" if self._edit_mode == "graph" else "orange"
-        if self._edit_mode == "plane":
-            color = "yellow"
-        if self._edit_edge_actor is None:
-            self._edit_edge_actor = self.plotter.add_mesh(poly, color=color, line_width=3, name="interactive_edit_edges")
-        else:
-            try:
-                self._edit_edge_actor.GetMapper().SetInputData(poly)
-            except Exception:
-                try:
-                    self.plotter.remove_actor(self._edit_edge_actor)
-                except Exception:
-                    pass
-                self._edit_edge_actor = self.plotter.add_mesh(poly, color=color, line_width=3, name="interactive_edit_edges")
-
-    def _set_selected_idx(self, idx):
-        self._edit_selected_idx = None if idx is None else int(idx)
-        if self._edit_points is None or len(self._edit_points) == 0:
-            self._edit_selected_idx = None
-        elif self._edit_selected_idx is not None and not (0 <= self._edit_selected_idx < len(self._edit_points)):
-            self._edit_selected_idx = None
-        if self._edit_selected_idx is None:
-            if self._edit_sel_actor is not None:
-                try:
-                    self.plotter.remove_actor(self._edit_sel_actor)
-                except Exception:
-                    pass
-            self._edit_sel_actor = None
-            self._edit_sel_poly = None
-            self._remove_edit_widget()
-            self._update_edit_labels()
-            try:
-                self.plotter.render()
-            except Exception:
-                pass
-            return
-        p = self._display_edit_points(
-            np.asarray(self._edit_points[self._edit_selected_idx], dtype=float).reshape(1, 3)
-        )
-        if self._edit_sel_poly is None:
-            self._edit_sel_poly = pv.PolyData(p)
-        else:
-            self._edit_sel_poly.points = p
-        if self._edit_sel_actor is None:
-            self._edit_sel_actor = self.plotter.add_mesh(self._edit_sel_poly, color="yellow", point_size=16, render_points_as_spheres=True, name="interactive_edit_selected")
-        else:
-            try:
-                self._edit_sel_actor.GetMapper().SetInputData(self._edit_sel_poly)
-            except Exception:
-                try:
-                    self.plotter.remove_actor(self._edit_sel_actor)
-                except Exception:
-                    pass
-                self._edit_sel_actor = self.plotter.add_mesh(self._edit_sel_poly, color="yellow", point_size=16, render_points_as_spheres=True, name="interactive_edit_selected")
-        self._create_or_move_edit_widget(p[0])
-        self._update_edit_labels()
-        try:
-            self.plotter.render()
-        except Exception:
-            pass
-
-    def _create_or_move_edit_widget(self, center):
-        if self._edit_selected_idx is None or self._edit_points is None or len(self._edit_points) == 0:
-            return
-        self._remove_edit_widget()
-        radius = self._edit_widget_radius()
-        def _cb(new_center):
-            if self._edit_selected_idx is None or self._edit_points is None or len(self._edit_points) == 0:
-                return
-            c = self._display_to_edit_point(new_center)
-            self._edit_points[self._edit_selected_idx, :] = c
-            if self._edit_poly is not None:
-                try:
-                    self._edit_poly.points = self._display_edit_points(self._edit_points)
-                except Exception:
-                    pass
-            if self._edit_sel_poly is not None:
-                try:
-                    self._edit_sel_poly.points = self._display_edit_points(np.asarray([c], dtype=float))
-                except Exception:
-                    pass
-            if self._edit_edge_poly is not None:
-                try:
-                    self._edit_edge_poly.points = self._edit_points
-                except Exception:
-                    self._update_edit_edges_actor()
-            try:
-                self.plotter.render()
-            except Exception:
-                pass
-        self._edit_widget = self.plotter.add_sphere_widget(callback=_cb, center=tuple(np.asarray(center, dtype=float).tolist()), radius=radius, color="orange")
-
-    def _enable_interactive_key_events(self, enable):
-        try:
-            iren = self.plotter.iren.interactor
-        except Exception:
-            iren = None
-        if not enable:
-            if iren is not None and self._vtk_keypress_obs_id is not None:
-                try:
-                    iren.RemoveObserver(self._vtk_keypress_obs_id)
-                except Exception:
-                    pass
-            self._vtk_keypress_obs_id = None
-            return
-        if iren is None:
-            self.log("WARNING: No VTK interactor available; cannot enable key events.")
-            return
-        def _on_keypress(obj, ev):
-            key = ""
-            try:
-                key = iren.GetKeySym()
-            except Exception:
-                return
-            if key == "Escape":
-                self._force_exit_edit()
-                return
-            if self._edit_mode is None:
-                return
-            if key in ("Delete", "BackSpace"):
-                if self._edit_selected_edge_idx is not None:
-                    self._delete_selected_edge()
-                else:
-                    self._delete_selected_interactive_point()
-                return
-            if key in ("e", "E"):
-                self._toggle_edge_mode()
-                return
-        if self._vtk_keypress_obs_id is not None:
-            try:
-                iren.RemoveObserver(self._vtk_keypress_obs_id)
-            except Exception:
-                pass
-            self._vtk_keypress_obs_id = None
-        self._vtk_keypress_obs_id = iren.AddObserver("KeyPressEvent", _on_keypress)
-
-    def _enable_interactive_point_picking(self, enable):
-        self._edit_pick_enabled = bool(enable)
-        try:
-            iren = self.plotter.iren.interactor
-        except Exception:
-            iren = None
-        if not enable:
-            if iren is not None and self._vtk_left_click_obs_id is not None:
-                try:
-                    iren.RemoveObserver(self._vtk_left_click_obs_id)
-                except Exception:
-                    pass
-            self._vtk_left_click_obs_id = None
-            self._vtk_point_picker = None
-            return
-        if iren is None:
-            self.log("WARNING: No VTK interactor available; cannot enable picking.")
-            return
-        if self._vtk_point_picker is None:
-            self._vtk_point_picker = pv._vtk.vtkPointPicker()
-            self._vtk_point_picker.SetTolerance(0.02)
-        def _on_left_click(obj, ev):
-            if self._edit_mode is None:
-                try:
-                    iren.GetInteractorStyle().OnLeftButtonDown()
-                except Exception:
-                    pass
-                return
-            if self._edit_actor is None or self._edit_points is None or len(self._edit_points) == 0:
-                try:
-                    iren.GetInteractorStyle().OnLeftButtonDown()
-                except Exception:
-                    pass
-                return
-            try:
-                x, y = iren.GetEventPosition()
-            except Exception:
-                x, y = None, None
-            if x is None:
-                try:
-                    iren.GetInteractorStyle().OnLeftButtonDown()
-                except Exception:
-                    pass
-                return
-            try:
-                self._vtk_point_picker.InitializePickList()
-                self._vtk_point_picker.AddPickList(self._edit_actor)
-                if self._edit_edge_actor is not None:
-                    self._vtk_point_picker.AddPickList(self._edit_edge_actor)
-                self._vtk_point_picker.PickFromListOn()
-            except Exception:
-                pass
-            try:
-                ren = self.plotter.renderer
-                ok = self._vtk_point_picker.Pick(float(x), float(y), 0.0, ren)
-            except Exception:
-                ok = 0
-            if not ok:
-                try:
-                    iren.GetInteractorStyle().OnLeftButtonDown()
-                except Exception:
-                    pass
-                return
-            try:
-                p = self._display_to_edit_point(self._vtk_point_picker.GetPickPosition())
-            except Exception:
-                try:
-                    iren.GetInteractorStyle().OnLeftButtonDown()
-                except Exception:
-                    pass
-                return
-            pts = np.asarray(self._edit_points, dtype=float)
-            d2 = np.sum((pts - p.reshape(1, 3)) ** 2, axis=1)
-            node_idx = int(np.argmin(d2))
-            node_dist = float(np.sqrt(d2[node_idx]))
-            edge_idx, edge_dist = self._find_closest_edge(p)
-            if self._edit_edge_mode and self._edit_mode == "graph":
-                if self._edit_edge_src_idx is None:
-                    self._edit_edge_src_idx = node_idx
-                    self._set_selected_idx(node_idx)
-                    self._edit_selected_edge_idx = None
-                    self._clear_edge_selection_actor()
-                    self._update_edit_labels()
-                else:
-                    src = self._edit_edge_src_idx
-                    self._edit_edge_src_idx = None
-                    if src != node_idx:
-                        self._toggle_edge(src, node_idx)
-                    self._update_edit_labels()
-            elif self._edit_mode == "graph" and edge_idx is not None and edge_dist < node_dist * 0.7:
-                self._set_selected_edge_idx(edge_idx)
-            else:
-                self._edit_selected_edge_idx = None
-                self._clear_edge_selection_actor()
-                self._set_selected_idx(node_idx)
-            try:
-                self.plotter.render()
-            except Exception:
-                pass
-        if self._vtk_left_click_obs_id is not None:
-            try:
-                iren.RemoveObserver(self._vtk_left_click_obs_id)
-            except Exception:
-                pass
-            self._vtk_left_click_obs_id = None
-        try:
-            self._vtk_left_click_obs_id = iren.AddObserver("LeftButtonPressEvent", _on_left_click)
-        except Exception as e:
-            self.log(f"WARNING: failed to add VTK observer for picking: {e}")
-            self._vtk_left_click_obs_id = None
-
-    def _toggle_edge_mode(self):
-        if self._edit_mode != "graph":
-            return
-        self._edit_edge_mode = not self._edit_edge_mode
-        self._edit_edge_src_idx = None
-        self._update_edit_labels()
-
-    def _toggle_edge(self, i, j):
-        if self._edit_edges is None:
-            self._edit_edges = np.empty((0, 2), dtype=int)
-        edges = np.asarray(self._edit_edges, dtype=int).reshape(-1, 2)
-        found = -1
-        for k, (a, b) in enumerate(edges):
-            if (int(a) == i and int(b) == j) or (int(a) == j and int(b) == i):
-                found = k
-                break
-        if found >= 0:
-            self._edit_edges = np.delete(edges, found, axis=0)
-            self.log(f"Removed edge ({i}, {j})")
-        else:
-            self._edit_edges = np.vstack([edges, [i, j]]) if len(edges) > 0 else np.array([[i, j]], dtype=int)
-            self.log(f"Added edge ({i}, {j})")
-        self._edit_selected_edge_idx = None
-        self._clear_edge_selection_actor()
-        self._update_edit_edges_actor()
-        self._update_edit_labels()
-        try:
-            self.plotter.render()
-        except Exception:
-            pass
-
-    def _clear_edge_selection_actor(self):
-        if self._edit_sel_edge_actor is not None:
-            try:
-                self.plotter.remove_actor(self._edit_sel_edge_actor)
-            except Exception:
-                pass
-        self._edit_sel_edge_actor = None
-        self._edit_sel_edge_poly = None
-
-    def _set_selected_edge_idx(self, idx):
-        self._edit_selected_edge_idx = None if idx is None else int(idx)
-        if self._edit_edges is None or len(self._edit_edges) == 0:
-            self._edit_selected_edge_idx = None
-        elif self._edit_selected_edge_idx is not None and not (0 <= self._edit_selected_edge_idx < len(self._edit_edges)):
-            self._edit_selected_edge_idx = None
-        if self._edit_selected_edge_idx is None:
-            self._clear_edge_selection_actor()
-            self._update_edit_labels()
-            return
-        edge = self._edit_edges[self._edit_selected_edge_idx]
-        pts = self._display_edit_points(self._edit_points[edge])
-        poly = pv.PolyData(pts)
-        poly.lines = np.array([2, 0, 1], dtype=np.int64)
-        self._edit_sel_edge_poly = poly
-        if self._edit_sel_edge_actor is None:
-            self._edit_sel_edge_actor = self.plotter.add_mesh(poly, color="yellow", line_width=6, name="interactive_edit_selected_edge")
-        else:
-            try:
-                self._edit_sel_edge_actor.GetMapper().SetInputData(poly)
-            except Exception:
-                try:
-                    self.plotter.remove_actor(self._edit_sel_edge_actor)
-                except Exception:
-                    pass
-                self._edit_sel_edge_actor = self.plotter.add_mesh(poly, color="yellow", line_width=6, name="interactive_edit_selected_edge")
-        self._set_selected_idx(None)
-        self._update_edit_labels()
-        try:
-            self.plotter.render()
-        except Exception:
-            pass
-
-    def _delete_selected_edge(self):
-        if self._edit_selected_edge_idx is None or self._edit_edges is None or len(self._edit_edges) == 0:
-            return
-        idx = int(self._edit_selected_edge_idx)
-        self.log(f"Deleted edge: {idx} ({self._edit_edges[idx].tolist()})")
-        self._edit_edges = np.delete(self._edit_edges, idx, axis=0)
-        self._edit_selected_edge_idx = None
-        self._clear_edge_selection_actor()
-        self._update_edit_edges_actor()
-        self._update_edit_labels()
-        try:
-            self.plotter.render()
-        except Exception:
-            pass
-
-    def _find_closest_edge(self, pick_pos):
-        if self._edit_edges is None or len(self._edit_edges) == 0 or self._edit_points is None:
-            return None, float("inf")
-        pts = np.asarray(self._edit_points, dtype=float)
-        p = np.asarray(pick_pos, dtype=float).reshape(3)
-        best_idx = None
-        best_dist = float("inf")
-        for k, (a, b) in enumerate(self._edit_edges):
-            a_pt = pts[int(a)]
-            b_pt = pts[int(b)]
-            ab = b_pt - a_pt
-            ab_len2 = np.dot(ab, ab)
-            if ab_len2 < 1e-24:
-                d = np.linalg.norm(p - a_pt)
-            else:
-                t = np.clip(np.dot(p - a_pt, ab) / ab_len2, 0.0, 1.0)
-                proj = a_pt + t * ab
-                d = np.linalg.norm(p - proj)
-            if d < best_dist:
-                best_dist = d
-                best_idx = k
-        return best_idx, best_dist
-
-    def _delete_selected_interactive_point(self):
-        if self._edit_selected_idx is None or self._edit_points is None or len(self._edit_points) == 0:
-            return
-        idx = int(self._edit_selected_idx)
-        self._edit_points = np.delete(np.asarray(self._edit_points, dtype=float), idx, axis=0)
-        if self._edit_edges is not None and len(self._edit_edges) > 0:
-            keep_idx = [i for i in range(len(self._edit_points) + 1) if i != idx]
-            remap = {old: new for new, old in enumerate(keep_idx)}
-            new_edges = []
-            for a, b in np.asarray(self._edit_edges, dtype=int):
-                a = int(a)
-                b = int(b)
-                if a in remap and b in remap:
-                    new_edges.append([remap[a], remap[b]])
-            self._edit_edges = np.asarray(new_edges, dtype=int).reshape(-1, 2) if new_edges else np.empty((0, 2), dtype=int)
-        self._update_edit_points_actor()
-        self._update_edit_edges_actor()
-        if len(self._edit_points) == 0:
-            self._set_selected_idx(None)
-        else:
-            self._set_selected_idx(min(idx, len(self._edit_points) - 1))
-        self._update_edit_labels()
-        self.log(f"Deleted point: {idx}")
-
-    def _add_interactive_point(self):
-        return
-
     def _snapshot_edit_visibility(self):
         self._edit_segmentation_visible_snapshot = bool(
             getattr(getattr(self.workspace, "segmentation", None), "visible", True)
@@ -7696,22 +6984,6 @@ class MainWindow(WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEdi
             )
             for uid, obj in self.workspace.scene_objects.items()
         }
-
-    def _set_edit_scene_visibility(self, mode):
-        """Show only the object being edited while retaining the browser state."""
-        prefix = "skeleton_" if str(mode) == "skeleton" else "graph_"
-        edit_group = str(self._edit_group_name or "")
-        if hasattr(self.workspace, "segmentation"):
-            self.workspace.segmentation.visible = False
-        for obj in self.workspace.scene_objects.values():
-            is_target = (
-                str(getattr(obj, "data_key", "") or "").startswith(prefix)
-                and str(getattr(obj, "group_name", "") or "") == edit_group
-            )
-            obj.visible = bool(is_target)
-            self.scene.apply_object_properties(obj, render=False, refresh_scalar_bar=False)
-        self._refresh_browser()
-        self.scene.sync_from_workspace()
 
     def _restore_edit_visibility(self):
         snapshot = dict(self._edit_visibility_snapshot or {})
@@ -7736,350 +7008,6 @@ class MainWindow(WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEdi
         self._edit_visibility_snapshot = None
         self._edit_segmentation_visible_snapshot = None
         self._refresh_browser()
-
-    def _show_interactive_overlay(self):
-        mode = self._edit_mode or "-"
-        if mode == "skeleton":
-            hint = "Click a point to select it. Drag the orange sphere to move it. Delete/Backspace removes the selected point."
-        elif mode == "graph":
-            hint = "Click a node to select it, or click an edge to select it. Drag the orange sphere to move a node. Delete/Backspace removes the selection."
-        else:
-            hint = f"Edit {mode}: ESC to cancel"
-        group_text = self._edit_group_name or "Global"
-        if self._edit_panel is not None:
-            self._edit_panel.setTitle(f"Editing {mode.title()} - {group_text}")
-            self._edit_panel.setVisible(True)
-        if self.steps_group is not None:
-            self.steps_group.setVisible(False)
-        if hasattr(self, "tree_objects"):
-            self.tree_objects.setEnabled(False)
-        if hasattr(self, "btn_delete_obj"):
-            self.btn_delete_obj.setEnabled(False)
-        if hasattr(self, "workflow_tabs"):
-            self.workflow_tabs.setEnabled(False)
-        if self._edit_btn_edge is not None:
-            self._edit_btn_edge.setVisible(mode == "graph")
-        if getattr(self, "_edit_hint_label", None) is not None:
-            self._edit_hint_label.setText(
-                f"{hint}\n\nSave Changes applies the edit and rebuilds dependent objects. Cancel or Esc discards it."
-            )
-        self._update_edit_labels()
-        try:
-            self.statusBar().showMessage(hint)
-        except Exception:
-            pass
-        self.log(hint)
-
-    def _close_interactive_overlay(self):
-        if self._edit_panel is not None:
-            self._edit_panel.setVisible(False)
-        if self.steps_group is not None:
-            self.steps_group.setVisible(True)
-        if hasattr(self, "tree_objects"):
-            self.tree_objects.setEnabled(True)
-        if hasattr(self, "btn_delete_obj"):
-            self.btn_delete_obj.setEnabled(True)
-        if hasattr(self, "workflow_tabs"):
-            self.workflow_tabs.setEnabled(True)
-        try:
-            self.statusBar().clearMessage()
-        except Exception:
-            pass
-
-    def _enter_interactive_edit(self, mode, points, edges=None, *, group_name=""):
-        self._snapshot_edit_visibility()
-        self.scene.invalidate_cache()
-        self.scene.sync_from_workspace()
-        self._cleanup_edit_actors()
-        self._remove_edit_widget()
-        self._close_interactive_overlay()
-        self._edit_mode = mode
-        self._edit_group_name = str(group_name or "")
-        self._edit_points = np.asarray(points, dtype=float).reshape(-1, 3).copy()
-        if edges is None:
-            self._edit_edges = np.empty((0, 2), dtype=int)
-        else:
-            arr = np.asarray(edges, dtype=int)
-            self._edit_edges = arr.reshape(-1, 2).copy() if len(arr) else np.empty((0, 2), dtype=int)
-        self._edit_original_points = self._edit_points.copy()
-        self._edit_original_edges = self._edit_edges.copy()
-        self._edit_selected_idx = None
-        self._edit_edge_mode = False
-        self._edit_edge_src_idx = None
-        self._edit_selected_edge_idx = None
-        self._set_edit_scene_visibility(mode)
-        self._update_edit_points_actor()
-        self._update_edit_edges_actor()
-        self._enable_interactive_key_events(True)
-        self._enable_interactive_point_picking(True)
-        self._show_interactive_overlay()
-        if len(self._edit_points) > 0:
-            self._set_selected_idx(0)
-        else:
-            self._set_selected_idx(None)
-        self.log(f"Interactive edit started: {mode} group={self._edit_group_name or 'Global'}")
-        try:
-            self.plotter.render()
-        except Exception:
-            pass
-
-    def _exit_interactive_edit(self, apply_changes):
-        mode = self._edit_mode
-        if mode is None:
-            return
-        try:
-            self._enable_interactive_key_events(False)
-            self._enable_interactive_point_picking(False)
-            self._remove_edit_widget()
-            if apply_changes:
-                ws = self.workspace
-                active_group = str(self._edit_group_name or "")
-                if mode == "skeleton":
-                    edited_points = np.asarray(self._edit_points, dtype=float).reshape(-1, 3)
-                    if active_group in ws.multilabel_groups:
-                        group_state = dict(ws.multilabel_groups[active_group])
-                        group_state["skeleton_points"] = edited_points
-                        group_state["graph"] = ws.graph.__class__()
-                        ws.multilabel_groups[active_group] = group_state
-                        ws.remove_object_by_data_key(f"skeleton_{active_group}")
-                        ws.remove_object_by_data_key(f"graph_{active_group}")
-                        ws.add_object(
-                            name=f"skeleton_{active_group}",
-                            kind=ObjectKind.SKELETON,
-                            data_key=f"skeleton_{active_group}",
-                            group_name=active_group,
-                            browser_color=ws.skeleton_params.browser_color_for_group(active_group),
-                            visible=True,
-                            opacity=1.0,
-                            color=ws.skeleton_params.scene_color_for_group(active_group, "skeleton"),
-                            point_size=8,
-                        )
-                        self._rebuild_workspace_skeleton_points()
-                        self._rebuild_workspace_graph()
-                    else:
-                        ws.skeleton_points = edited_points
-                        ws.graph = ws.graph.__class__()
-                    self._clear_centerline_edit_dependents()
-                    ws.pipeline.completed.pop(StepId.GENERATE_GRAPH.value, None)
-                    ws.pipeline.skipped.pop(StepId.GENERATE_GRAPH.value, None)
-                    ws.pipeline.mark_done(StepId.EDIT_SKELETON, skipped=False)
-                    self.log(
-                        f"Skeleton edited: group={active_group or 'Global'} "
-                        f"points={len(edited_points)}"
-                    )
-                elif mode == "graph":
-                    edited_points = np.asarray(self._edit_points, dtype=float).reshape(-1, 3)
-                    raw_edges = np.asarray(self._edit_edges, dtype=int).reshape(-1, 2) if len(self._edit_edges) else np.empty((0, 2), dtype=int)
-                    valid = (
-                        (raw_edges[:, 0] >= 0) & (raw_edges[:, 1] >= 0)
-                        & (raw_edges[:, 0] < len(edited_points)) & (raw_edges[:, 1] < len(edited_points))
-                        & (raw_edges[:, 0] != raw_edges[:, 1])
-                    ) if len(raw_edges) else np.zeros(0, dtype=bool)
-                    canonical = {tuple(sorted((int(a), int(b)))) for a, b in raw_edges[valid]}
-                    edited_edges = (
-                        np.asarray(sorted(canonical), dtype=int).reshape(-1, 2)
-                        if canonical else np.empty((0, 2), dtype=int)
-                    )
-                    if active_group in ws.multilabel_groups:
-                        group_state = dict(ws.multilabel_groups[active_group])
-                        group_graph = ws.graph.__class__(points=edited_points, edges=edited_edges)
-                        group_state["graph"] = group_graph
-                        ws.multilabel_groups[active_group] = group_state
-                        ws.remove_object_by_data_key(f"graph_{active_group}")
-                        ws.add_object(
-                            name=f"graph_{active_group}",
-                            kind=ObjectKind.GRAPH,
-                            data_key=f"graph_{active_group}",
-                            group_name=active_group,
-                            browser_color=ws.skeleton_params.browser_color_for_group(active_group),
-                            visible=True,
-                            opacity=1.0,
-                            color=ws.skeleton_params.scene_color_for_group(active_group, "graph"),
-                            line_width=2,
-                        )
-                        self._rebuild_workspace_graph()
-                    else:
-                        ws.graph = ws.graph.__class__(points=edited_points, edges=edited_edges)
-                    self._clear_centerline_edit_dependents()
-                    ws.pipeline.mark_done(StepId.EDIT_GRAPH, skipped=False)
-                    self.log(
-                        f"Graph edited: group={active_group or 'Global'} "
-                        f"nodes={len(edited_points)} edges={len(edited_edges)}"
-                    )
-            else:
-                self.log(f"Interactive edit cancelled: {mode}")
-        finally:
-            self._restore_edit_visibility()
-            self._cleanup_edit_actors()
-            self._close_interactive_overlay()
-            self._edit_mode = None
-            self._edit_group_name = ""
-            self._edit_points = None
-            self._edit_edges = None
-            self._edit_selected_idx = None
-            self._edit_edge_mode = False
-            self._edit_edge_src_idx = None
-            self._edit_selected_edge_idx = None
-            self._edit_original_points = None
-            self._edit_original_edges = None
-            self.scene.invalidate_cache()
-            self.scene.sync_from_workspace()
-            self._refresh_all()
-            try:
-                self.plotter.render()
-            except Exception:
-                pass
-
-    def _rebuild_workspace_skeleton_points(self):
-        ws = self.workspace
-        point_sets = []
-        masks = []
-        for group_name in ws.group_order:
-            group_state = ws.multilabel_groups.get(group_name, {})
-            points = group_state.get("skeleton_points")
-            if points is not None and len(points):
-                point_sets.append(np.asarray(points, dtype=float).reshape(-1, 3))
-            mask = group_state.get("skeleton_mask")
-            if mask is not None:
-                masks.append(np.asarray(mask, dtype=bool))
-        ws.skeleton_points = (
-            np.vstack(point_sets) if point_sets else np.empty((0, 3), dtype=float)
-        )
-        if masks:
-            skeleton_mask = np.zeros_like(masks[0], dtype=bool)
-            for mask in masks:
-                skeleton_mask |= mask
-            ws.skeleton_mask = skeleton_mask
-
-    def _rebuild_workspace_graph(self):
-        ws = self.workspace
-        point_sets = []
-        edge_sets = []
-        node_offset = 0
-        for group_name in ws.group_order:
-            group_state = ws.multilabel_groups.get(group_name, {})
-            graph = group_state.get("graph")
-            points = np.asarray(getattr(graph, "points", np.empty((0, 3))), dtype=float).reshape(-1, 3)
-            edges = np.asarray(getattr(graph, "edges", np.empty((0, 2))), dtype=int)
-            edges = edges.reshape(-1, 2) if edges.size else np.empty((0, 2), dtype=int)
-            if len(edges):
-                valid = (
-                    (edges[:, 0] >= 0) & (edges[:, 1] >= 0)
-                    & (edges[:, 0] < len(points)) & (edges[:, 1] < len(points))
-                    & (edges[:, 0] != edges[:, 1])
-                )
-                edges = edges[valid]
-            if len(points):
-                point_sets.append(points)
-            if len(edges):
-                edge_sets.append(edges + node_offset)
-            node_offset += len(points)
-        ws.graph = ws.graph.__class__(
-            points=np.vstack(point_sets) if point_sets else np.empty((0, 3), dtype=float),
-            edges=np.vstack(edge_sets) if edge_sets else np.empty((0, 2), dtype=int),
-        )
-
-    def _clear_centerline_edit_dependents(self):
-        """Remove paths, planes, and metrics that no longer match edited topology."""
-        ws = self.workspace
-        ws.graph_hierarchy = {}
-        ws.remove_objects_by_prefix("hierarchy_path_")
-        ws.centerline_paths = []
-        ws.centerline_node_paths = []
-        ws.centerline_paths_smooth = []
-        ws.path_info = []
-        ws.forks = []
-        ws.planes = []
-        ws.selected_path_index = -1
-        if ws.segmask_3d is not None:
-            ws.branch_labels = np.zeros_like(ws.segmask_3d, dtype=np.int16)
-        for group_name in ws.group_order:
-            group_state = dict(ws.multilabel_groups.get(group_name, {}))
-            group_state["branch_labels"] = None
-            group_state["centerline_paths"] = []
-            group_state["centerline_node_paths"] = []
-            group_state["centerline_paths_smooth"] = []
-            group_state["path_info"] = []
-            group_state["forks"] = []
-            group_state["planes"] = []
-            group_state["path_index_offset"] = 0
-            group_state["plane_index_offset"] = 0
-            ws.multilabel_groups[group_name] = group_state
-        ws.clear_pathlines()
-        ws.pathline_colors = {}
-        ws.remove_object_by_data_key("branch_surface")
-        ws.remove_objects_by_prefix("forks_")
-        ws.remove_objects_by_prefix("path_")
-        ws.remove_objects_by_prefix("smooth_path_")
-        ws.remove_objects_by_prefix("path_arrow_")
-        ws.remove_objects_by_prefix("plane_")
-        ws.derived.plane_metrics = []
-        ws.derived.plane_qc = {}
-        self.pipeline._clear_pwv_state(ws)
-        for step in (
-            StepId.GENERATE_PLANES,
-            StepId.COMPUTE_PLANE_METRICS,
-            StepId.COMPUTE_PWV,
-            StepId.COMPUTE_DERIVED_METRICS,
-            StepId.PLANE_STREAMLINES,
-        ):
-            ws.pipeline.completed.pop(step.value, None)
-            ws.pipeline.skipped.pop(step.value, None)
-
-    def _force_exit_edit(self):
-        if self.ortho_viewer._roi_transaction is not None:
-            self.ortho_viewer._cancel_plane_roi()
-            return
-        if self._plane_edit_session is not None:
-            self._cancel_plane_edit()
-            return
-        if self._edit_mode is None:
-            return
-        self.log("ESC: force exit interactive edit")
-        try:
-            self._exit_interactive_edit(False)
-        except Exception as e:
-            self.log(f"Force exit cleanup error: {type(e).__name__}: {e}")
-        finally:
-            self._edit_mode = None
-            self._edit_group_name = ""
-            self._edit_points = None
-            self._edit_edges = None
-            self._edit_selected_idx = None
-            self._edit_edge_mode = False
-            self._edit_edge_src_idx = None
-            self._edit_selected_edge_idx = None
-            self._edit_original_points = None
-            self._edit_original_edges = None
-            self._edit_overlay_dialog = None
-            try:
-                self.statusBar().clearMessage()
-            except Exception:
-                pass
-            try:
-                self._cleanup_edit_actors()
-            except Exception:
-                pass
-            try:
-                self._remove_edit_widget()
-            except Exception:
-                pass
-            try:
-                self._enable_interactive_key_events(False)
-            except Exception:
-                pass
-            try:
-                self._enable_interactive_point_picking(False)
-            except Exception:
-                pass
-            try:
-                self.setEnabled(True)
-            except Exception:
-                pass
-            try:
-                self.plotter.render()
-            except Exception:
-                pass
 
     def _edit_group_candidates(self, mode):
         field = "skeleton_points" if mode == "skeleton" else "graph"
@@ -8141,6 +7069,8 @@ class MainWindow(WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEdi
             self._enter_interactive_edit("graph", self.workspace.graph.points, self.workspace.graph.edges)
             return
         self.log("Edit Graph: no graph nodes are available for a vessel group.")
+
+
 
     def closeEvent(self, event):
         if getattr(self, "_scene_export_running", False):

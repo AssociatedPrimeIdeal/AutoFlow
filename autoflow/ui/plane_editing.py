@@ -152,8 +152,8 @@ class PlaneEditingMixin:
         layout.addWidget(self.plane_edit_tools)
         self.plane_edit_tools.hide()
         row = QtWidgets.QHBoxLayout()
-        self.btn_undo_plane = QtWidgets.QPushButton("Undo plane")
-        self.btn_redo_plane = QtWidgets.QPushButton("Redo plane")
+        self.btn_undo_plane = QtWidgets.QPushButton("Undo")
+        self.btn_redo_plane = QtWidgets.QPushButton("Redo")
         self.btn_undo_plane.clicked.connect(self._undo_plane_change)
         self.btn_redo_plane.clicked.connect(self._redo_plane_change)
         row.addWidget(self.btn_undo_plane)
@@ -201,6 +201,9 @@ class PlaneEditingMixin:
         return True
 
     def _add_manual_plane(self):
+        if getattr(self, "_edit_mode", None) is not None:
+            self.statusBar().showMessage("Finish the geometry edit first.", 4000)
+            return
         if self._plane_edit_session is not None:
             self.statusBar().showMessage("Apply or cancel the current plane draft first.", 6000)
             return
@@ -243,6 +246,9 @@ class PlaneEditingMixin:
         self.log("New plane preview. Apply to save, or Cancel / Esc to discard.")
 
     def _activate_plane_drag_widgets(self, plane_idx):
+        if getattr(self, "_edit_mode", None) is not None:
+            self.statusBar().showMessage("Finish the geometry edit first.", 4000)
+            return
         index = int(plane_idx)
         if not 0 <= index < len(self.workspace.planes):
             return
@@ -510,6 +516,7 @@ class PlaneEditingMixin:
         self._plane_preview_timer.stop()
         self._plane_edit_session = None
         if changed:
+            plane.placement["manual_geometry"] = True
             invalidate_planes(self.workspace, [plane.plane_id], "Plane geometry changed", geometry=True)
             self._last_quality_report = None
             after = mutation_snapshot(self.workspace)

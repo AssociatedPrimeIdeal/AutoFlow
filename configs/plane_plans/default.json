@@ -22,12 +22,13 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_reference_branch",
-          "path_selection": "longest",
+          "anchor": "label_longest",
+          "scope": "label",
           "position": "fractions",
           "fractions": [
             0.3
-          ]
+          ],
+          "fraction_reference": "flow_end"
         }
       ]
     },
@@ -68,7 +69,7 @@
           "anchor": "label_reference_branch",
           "path_selection": "longest",
           "position": "near",
-          "offset_mm": 15.0
+          "offset_mm": 10.0
         }
       ]
     },
@@ -80,7 +81,7 @@
           "anchor": "label_reference_branch",
           "path_selection": "longest",
           "position": "near",
-          "offset_mm": 15.0
+          "offset_mm": 10.0
         }
       ]
     },
@@ -92,7 +93,7 @@
           "anchor": "label_reference_branch",
           "path_selection": "longest",
           "position": "near",
-          "offset_mm": 15.0
+          "offset_mm": 10.0
         }
       ]
     },
@@ -192,7 +193,8 @@
             0.2,
             0.5,
             0.8
-          ]
+          ],
+          "connection_fallback": "flow_endpoint"
         }
       ]
     },
@@ -204,7 +206,8 @@
           "anchor": "label_reference_branch",
           "path_selection": "longest",
           "position": "near",
-          "offset_mm": 15.0
+          "offset_mm": 15.0,
+          "connection_fallback": "flow_endpoint"
         }
       ]
     },
@@ -216,7 +219,8 @@
           "anchor": "label_reference_branch",
           "path_selection": "longest",
           "position": "near",
-          "offset_mm": 15.0
+          "offset_mm": 15.0,
+          "connection_fallback": "flow_endpoint"
         }
       ]
     },
@@ -232,7 +236,8 @@
           "fractions": [
             0.33,
             0.66
-          ]
+          ],
+          "inlet_selection": "lowest_z"
         }
       ]
     },
@@ -280,7 +285,8 @@
           "fractions": [
             0.33,
             0.66
-          ]
+          ],
+          "inlet_selection": "lowest_z"
         }
       ]
     },

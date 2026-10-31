@@ -1,7 +1,7 @@
 """Place planes on explicit labeled arms of the physical path multigraph.
 
-Landmark failures are omissions, never an invitation to pick a flow root.
-Flow can orient a plane normal; it cannot replace a missing anatomical anchor.
+Landmark failures are omissions unless an explicit portal flow-end fallback is configured.
+Fallback selections retain their requested anchor and omission reason in provenance.
 """
 
 from itertools import product
@@ -134,6 +134,7 @@ class ConnectionGraph:
                 selections.append({"chain": [{"path_index": span["path_index"], "span": span,
                                                "reverse": hierarchy.get("flow_sign") == -1}],
                                    "anchor_nodes": [], "boundary_path_indices": [], "path_selection": policy,
+                                   "route_path_indices": [span["path_index"]],
                                    "paths_at_level": sorted({row[0]["path_index"] for row in eligible}),
                                    "label_level": None if level is None else level + 1,
                                    "component_index": component, "selection_scope":spec.get("scope","component"),
@@ -576,7 +577,8 @@ def generate_landmark_label_planes(context, name, value, rule, smooth_paths, seg
                     if selection.get('branch_route_schema'):
                         plane.placement.update({key:value for key,value in selection.items()
                             if key.startswith('branch_') or key in {'connection_id','connection_kind','connected_labels',
-                                'selection_source','matched_arms','reference_labels'}})
+                                'selection_source','matched_arms','reference_labels','requested_anchor',
+                                'connection_fallback','fallback_reason','fallback_endpoint'}})
                         plane.placement.update(branch_placement_length_mm=float(total),
                             branch_target_distance_mm=float(nominal))
                     if requested_spec["anchor"] == "label_connections" or requested_spec.get("when_connected_to"):

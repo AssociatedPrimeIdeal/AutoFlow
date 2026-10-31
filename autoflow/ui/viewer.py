@@ -1943,16 +1943,6 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
                 ws.graph.edges,
             )
 
-        if data_key == "willis_ring_graph":
-            graph = getattr(ws, "willis_ring_graph", None)
-            if graph is None or len(getattr(graph, "points", [])) == 0:
-                return None
-            return graph_to_polydata(
-                np.asarray(graph.points, dtype=float)
-                + np.asarray(org, dtype=float).reshape(1, 3),
-                graph.edges,
-            )
-
         if isinstance(data_key, str) and data_key.startswith("graph_"):
             group_name = str(data_key[len("graph_"):])
             if group_name and group_name != "lines":
@@ -2007,14 +1997,6 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
                 return None
             plane_size = max(10.0, float(np.mean(np.asarray(sp, dtype=float).reshape(3))) * 12.0)
             return self._cached(data_key, 0, lambda: _pwv_planes_polydata(ws.derived.pwv_planes, org, plane_size=plane_size))
-
-        if isinstance(data_key, str) and data_key.startswith("hierarchy_path_"):
-            token, index = data_key[len("hierarchy_path_"):].rsplit("_", 1)
-            for report in ws.graph_hierarchy.get("joint_systems", []):
-                if report["group_name"] == token and int(index) < len(report["node_chains"]):
-                    points = np.asarray(report["graph"]["points"], dtype=float)
-                    return _path_polydata(points[report["node_chains"][int(index)]], org)
-            return None
 
         idx = _parse_indexed_data_key(data_key, "smooth_path")
         if idx is not None:

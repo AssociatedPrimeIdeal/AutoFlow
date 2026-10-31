@@ -265,6 +265,7 @@ def _make_plane_payload(ws, source_path="", plane_indices=None):
     shape_xyz = [] if shape_source is None else [int(x) for x in np.asarray(shape_source).shape[:3]]
     payload = {
         "schema": PLANE_POSITION_SCHEMA,
+        "content": "plane_geometry",
         "coordinate_system": "autoflow_canonical_world_mm",
         "source": source_path,
         "origin": origin.tolist(),
@@ -283,6 +284,9 @@ def _make_plane_payload(ws, source_path="", plane_indices=None):
     for i in indices:
         plane = ws.planes[int(i)]
         center_local = np.asarray(plane.center, dtype=float).reshape(3)
+        normal = np.asarray(plane.normal, dtype=float).reshape(3)
+        if not np.all(np.isfinite(center_local)) or not np.all(np.isfinite(normal)) or np.linalg.norm(normal) <= 1e-12:
+            raise ValueError(f"Plane {i} needs a finite position and a nonzero normal")
         item = {
             **ensure_plane_identity(plane),
             "plane_index": int(i),
@@ -298,9 +302,7 @@ def _make_plane_payload(ws, source_path="", plane_indices=None):
             "distance": float(plane.distance),
             "distance_mm": float(plane.distance),
             "group_name": str(getattr(plane, "group_name", "") or ""),
-        "roi_polygon_uv_mm": _json_safe(getattr(plane, "roi_polygon_uv_mm", []) or []),
-        "roi_edit_operations": _json_safe(getattr(plane, "roi_edit_operations", {}) or {}),
-        "placement": _json_safe(getattr(plane, "placement", {}) or {}),
+            "placement": _json_safe(getattr(plane, "placement", {}) or {}),
             "placement_mode": "manual" if int(plane.path_index) < 0 else "path",
         }
         item.update(_plane_path_position(ws, plane))
@@ -579,6 +581,8 @@ def project_planes_to_workspace(plane_items, ws, mapping_mode="world", return_re
         "source_coordinate_system": str(payload.get("coordinate_system", "legacy_unspecified")),
         "imported_count": 0,
         "skipped_count": 0,
+        "ignored_contour_count": 0,
+        "content": "plane_geometry",
         "warnings": [],
         "planes": [],
     }
@@ -588,7 +592,10 @@ def project_planes_to_workspace(plane_items, ws, mapping_mode="world", return_re
             report["warnings"].append(f"plane item {source_order} is not an object")
             continue
         try:
-            imported_normal = _normalize(item.get("normal_world", item.get("normal", [1.0, 0.0, 0.0])))
+            raw_normal = np.asarray(item.get("normal_world", item.get("normal", [1.0, 0.0, 0.0])), dtype=float).reshape(3)
+            if not np.all(np.isfinite(raw_normal)) or np.linalg.norm(raw_normal) <= 1e-12:
+                raise ValueError("plane normal must be finite and nonzero")
+            imported_normal = _normalize(raw_normal)
             manual_placement = str(item.get("placement_mode", "")).strip().lower() == "manual"
             path_value = item.get("path_index", -1)
             path_index = -1 if path_value is None else int(path_value)
@@ -633,6 +640,8 @@ def project_planes_to_workspace(plane_items, ws, mapping_mode="world", return_re
                     report["warnings"].append(
                         f"plane {item.get('plane_index', source_order)} imported without a target centerline"
                     )
+            if not np.all(np.isfinite(center_world)):
+                raise ValueError("plane position must be finite")
         except (TypeError, ValueError) as exc:
             report["skipped_count"] += 1
             report["warnings"].append(f"plane {item.get('plane_index', source_order)} skipped: {exc}")
@@ -641,8 +650,8 @@ def project_planes_to_workspace(plane_items, ws, mapping_mode="world", return_re
         planes.append(
             PlaneData(
                 plane_id=item.get("plane_id", ""),
-                geometry_revision=int(item.get("geometry_revision", 0)),
-                roi_revision=int(item.get("roi_revision", 0)),
+                geometry_revision=0,
+                roi_revision=0,
                 center=center_world - origin,
                 normal=_normalize(normal),
                 label=int(item.get("label", int(path_index) + 1)),
@@ -650,11 +659,13 @@ def project_planes_to_workspace(plane_items, ws, mapping_mode="world", return_re
                 path_index=int(path_index),
                 distance=float(distance),
                 group_name=group_name,
-                roi_polygon_uv_mm=_json_safe(item.get("roi_polygon_uv_mm", []) or []),
-                roi_edit_operations=_json_safe(item.get("roi_edit_operations", {}) or {}),
-                placement=_json_safe(item.get("placement", {}) or {}),
+                roi_polygon_uv_mm=[],
+                roi_edit_operations={},
+                placement={**_json_safe(item.get("placement", {}) or {}), "geometry_source": "imported", "manual_geometry": True},
             )
         )
+        if item.get("roi_polygon_uv_mm") or item.get("roi_edit_operations"):
+            report["ignored_contour_count"] += 1
         report["planes"].append(
             {
                 "source_plane_index": int(item.get("plane_index", source_order)),

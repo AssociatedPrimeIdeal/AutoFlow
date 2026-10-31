@@ -106,6 +106,10 @@ class LabelBranches:
     def choose(self, choices, spec, reason='no_label_branch'):
         if not choices:
             return [],reason
+        if spec.get('inlet_selection') == 'lowest_z':
+            lowest = min(row['branch_start_point_mm'][2] for row in choices)
+            choices = [row for row in choices if abs(row['branch_start_point_mm'][2]-lowest) <= 1e-6]
+            self.audit.append(dict(inlet_selection='lowest_z', minimum_z_mm=lowest, candidate_count=len(choices)))
         policy = spec.get('path_selection','unique')
         if policy=='all':
             return choices,''
@@ -231,6 +235,45 @@ class LabelBranches:
             choices.append(selection)
         return self.choose(choices,spec,reason or 'portal_confluence_not_found')
 
+    def flow_endpoint_fallback(self, name, value, spec, missing_reason):
+        rows = self.rows(value)
+        incoming, outgoing, uncertain = defaultdict(set), defaultdict(set), defaultdict(set)
+        for index, row in enumerate(rows):
+            if row['flow_sign'] in (-1, 1):
+                u, v = row['nodes'][::row['flow_sign']]
+                outgoing[u].add(index); incoming[v].add(index)
+            else:
+                for node in row['nodes']:
+                    uncertain[node].add(index)
+        choices = []
+        for index, row in enumerate(rows):
+            if row['flow_sign'] not in (-1, 1):
+                continue
+            reverse = row['flow_sign'] == -1
+            endpoint = row['nodes'][int(reverse) if name == 'PV' else int(not reverse)]
+            neighbours = incoming[endpoint] if name == 'PV' else outgoing[endpoint]
+            if neighbours or uncertain[endpoint]-{index}:
+                continue
+            selection = self.selection(row, reverse=reverse)
+            effective = dict(spec)
+            effective.pop('connection_fallback', None)
+            effective.update(anchor='flow_inlet_branch' if name == 'PV' else 'label_branch')
+            if name == 'PV':
+                effective['fraction_reference'] = 'flow_start'
+            else:
+                effective['position'] = 'before_end'
+            selection.update(placement_spec=effective, connection_fallback=True,
+                requested_anchor=spec['anchor'], fallback_reason=missing_reason,
+                fallback_endpoint='flow_start' if name == 'PV' else 'flow_end',
+                branch_selection_anchor='flow_inlet_branch' if name == 'PV' else 'flow_outlet_branch')
+            choices.append(selection)
+        missing = 'flow_direction_unavailable' if rows and not any(r['flow_sign'] in (-1,1) for r in rows) else 'flow_endpoint_branch_not_found'
+        effective = dict(spec, position='fractions' if name == 'PV' else 'before_end')
+        chosen, reason = self.choose(choices, effective, missing)
+        self.audit.append(dict(connection_fallback='flow_endpoint', fallback_reason=missing_reason,
+            endpoint='flow_start' if name == 'PV' else 'flow_end', candidate_count=len(choices), selected_count=len(chosen), reason=reason))
+        return chosen, reason
+
     def resolve(self, name, spec):
         self.audit = []
         value = int(self.context.labels.get(name,int(name) if str(name).isdigit() else 0))
@@ -262,6 +305,8 @@ class LabelBranches:
                 upstream = row['nodes'][int(reverse)]
                 if anchor=='flow_inlet_branch' and (incoming[upstream] or uncertain[upstream]-{index}):
                     continue
+                if spec.get('inlet_selection') == 'lowest_z' and (upstream not in self.context.graph or self.context.graph.degree(upstream) != 1):
+                    continue
                 choices.append(self.selection(row,reverse=reverse))
             missing = ('flow_direction_unavailable' if directed and not any(row['flow_sign'] in (-1,1) for row in rows) else
                 'flow_inlet_branch_not_found' if anchor=='flow_inlet_branch' else 'no_label_branch')
@@ -279,8 +324,13 @@ class LabelBranches:
                 choices,reason = chosen,reasons[0] if reasons else '' if chosen else missing
             else:
                 choices,reason = self.choose(choices,spec,missing)
+        if (not choices and spec.get('connection_fallback') == 'flow_endpoint' and
+                reason in {'portal_confluence_not_found', 'label_reference_not_found'}):
+            choices, reason = self.flow_endpoint_fallback(name, value, spec, reason)
         for selection in choices:
-            selection.update(selection_source='single_label_branch',path_selection=spec.get('path_selection','unique'),
-                branch_selection_anchor=anchor,selection_scope=spec.get('scope','label'),connection_fallback=False)
+            if spec.get('inlet_selection'):
+                selection['branch_inlet_selection'] = spec['inlet_selection']
+            selection.update(selection_source='single_label_branch' ,path_selection=spec.get('path_selection','unique'),
+                branch_selection_anchor=selection.get('branch_selection_anchor',anchor),selection_scope=spec.get('scope','label'),connection_fallback=bool(selection.get('connection_fallback')))
         self.audit.append(dict(reason=reason,selected_count=len(choices)))
         return choices,reason

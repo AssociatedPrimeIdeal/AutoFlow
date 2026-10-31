@@ -1,4 +1,6 @@
 {
+  "positions_file": "",
+  "import_mode": "world",
   "plane_mode": "by_label",
   "label_rules_file": "plane_plans/default.json",
   "plane_count": 3,

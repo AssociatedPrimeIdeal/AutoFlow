@@ -24,7 +24,6 @@ from .config import (
     bundle_to_autoflow_kwargs,
     load_config_bundle,
 )
-from .core.models import validate_radius_tree_policy
 from .core.models import Workspace, validate_graph_connectivity, validate_cycle_cleanup_parameters, validate_junction_cluster_parameters
 from .plane_io import resolve_reuse_plane_file
 from .processing import collect_input_items, process_single
@@ -121,7 +120,6 @@ class AutoFlowConfig:
     graph_connectivity: int = 26
     cycle_flow_threshold: float = 0.3
     cycle_preserve_connectivity: bool = True
-    radius_tree_policy: str = "auto"
     junction_cluster_enabled: bool = True
     junction_cluster_max_extent_voxels: float = 0.0
     junction_cluster_min_cycle_rank: int = 2
@@ -265,6 +263,8 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
     ws.segmentation.auto_folds = str(cfg.autoseg_folds or "single")
     ws.segmentation.auto_device = str(cfg.autoseg_device or "auto")
     ws.segmentation.auto_label_map = str(cfg.autoseg_label_map or "")
+    ws.plane_gen_params.positions_file = str(cfg.reuse_planes or "")
+    ws.plane_gen_params.import_mode = str(cfg.plane_import_mode or "world")
     ws.plane_gen_params.plane_mode = str(getattr(cfg, "plane_mode", "by_label") or "by_label")
     if cfg.plane_config:
         ws.plane_gen_params.label_rules = load_plane_rules_file(cfg.plane_config)
@@ -312,7 +312,6 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
     ws.skeleton_params.graph_connectivity = validate_graph_connectivity(cfg.graph_connectivity)
     ws.skeleton_params.cycle_flow_threshold, ws.skeleton_params.cycle_preserve_connectivity = validate_cycle_cleanup_parameters(
         cfg.cycle_flow_threshold, cfg.cycle_preserve_connectivity)
-    ws.skeleton_params.radius_tree_policy = validate_radius_tree_policy(cfg.radius_tree_policy)
     ws.skeleton_params.junction_cluster_enabled, ws.skeleton_params.junction_cluster_max_extent_voxels, ws.skeleton_params.junction_cluster_min_cycle_rank = validate_junction_cluster_parameters(
         cfg.junction_cluster_enabled, cfg.junction_cluster_max_extent_voxels, cfg.junction_cluster_min_cycle_rank)
     ws.streamline_params.seed_ratio = float(cfg.seed_ratio)
@@ -548,7 +547,6 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 graph_connectivity=config.graph_connectivity,
                 cycle_flow_threshold=config.cycle_flow_threshold,
                 cycle_preserve_connectivity=config.cycle_preserve_connectivity,
-                radius_tree_policy=config.radius_tree_policy,
                 junction_cluster_enabled=config.junction_cluster_enabled,
                 junction_cluster_max_extent_voxels=config.junction_cluster_max_extent_voxels,
                 junction_cluster_min_cycle_rank=config.junction_cluster_min_cycle_rank,

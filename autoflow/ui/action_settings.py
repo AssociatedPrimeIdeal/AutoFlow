@@ -167,8 +167,6 @@ def _action_sections(action, ws):
     if action == StepId.GENERATE_GRAPH:
         return [("Graph", [option(s + "graph_connectivity", "Skeleton graph connectivity",
                                   ("6 — face neighbors", 6), ("26 — face, edge and corner neighbors", 26)),
-                           option(s + "radius_tree_policy", "Cycle topology", ("Auto", "auto"),
-                                  ("Endpoint/radius forest", "forest"), ("Disable radius routing", "preserve")),
                            flag(s + "junction_cluster_enabled", "Simplify compact junction clusters"),
                            number(s + "junction_cluster_max_extent_voxels", "Optional cluster extent per axis (voxels; 0 = unlimited)", 0, 10000),
                            number(s + "junction_cluster_min_cycle_rank", "Minimum cluster cycle rank", 1, 1000000, integer=True),
@@ -323,7 +321,23 @@ def _action_sections(action, ws):
 
 def action_sections(action, ws):
     from .settings_layout import compact_action_sections
-    return compact_action_sections(action, _action_sections(action, ws))
+    sections = _action_sections(action, ws)
+    if action == StepId.GENERATE_PLANES:
+        source_key = "plane_gen_params.positions_file"
+        from_file = lambda values: bool(str(values.get(source_key, ws.plane_gen_params.positions_file) or "").strip())
+        for _, fields in sections:
+            for field in fields:
+                condition = field.visible
+                field.visible = lambda values, condition=condition: not from_file(values) and (condition is None or condition(values))
+        sections[0][1][:0] = [
+            Field(source_key, "Plane positions file", "positions_file",
+                  help="Optional coordinate JSON. Leave empty for automatic placement. A file replaces current planes using saved positions and normals; contours and measurements come from the target data."),
+            option("plane_gen_params.import_mode", "Coordinates", ("World (mm)", "world"),
+                   ("Local (mm)", "local"), ("Relative centerline", "path_relative"), visible=from_file),
+        ]
+        sections[0][1][1].help = ("World: retain coordinates in a shared registered frame. Local: retain local physical positions. "
+            "Relative centerline: legacy group/path-order mapping; requires corresponding target centerlines. No registration is performed.")
+    return compact_action_sections(action, sections)
 
 
 def input_values(ws):
@@ -455,6 +469,8 @@ class ActionSettingsDialog(QtWidgets.QDialog):
                 control.currentIndexChanged.connect(self._update_visibility)
             elif isinstance(control, QtWidgets.QCheckBox):
                 control.toggled.connect(self._update_visibility)
+            elif isinstance(control, QtWidgets.QLineEdit):
+                control.textChanged.connect(self._update_visibility)
             elif isinstance(control, QtWidgets.QListWidget):
                 control.itemChanged.connect(self._update_visibility)
             elif isinstance(control, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
@@ -522,6 +538,23 @@ class ActionSettingsDialog(QtWidgets.QDialog):
             control = QtWidgets.QPlainTextEdit()
             control.setMaximumHeight(90)
             control.setPlaceholderText('{"aorta": 1}')
+        elif field.kind == "positions_file":
+            control = QtWidgets.QLineEdit()
+            control.setPlaceholderText("Automatic")
+            control.setClearButtonEnabled(True)
+            widget = QtWidgets.QWidget()
+            row = QtWidgets.QHBoxLayout(widget)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addWidget(control, 1)
+            choose = QtWidgets.QPushButton("Choose…")
+            def choose_file():
+                path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                    self, "Plane positions file", control.text(), "Plane coordinates (*.json)")
+                if path:
+                    control.setText(path)
+            choose.clicked.connect(choose_file)
+            row.addWidget(choose)
+            return control, widget
         elif field.kind == "plane_file":
             control = QtWidgets.QLineEdit()
             control.setReadOnly(True)
@@ -709,7 +742,8 @@ class ActionSettingsDialog(QtWidgets.QDialog):
                 setattr(draft.plane_gen_params, key, global_values.get(key, getattr(draft.plane_gen_params, key))
                         if value is None else value)
         fields = [copy.copy(field) for _, group in action_sections(StepId.GENERATE_PLANES, draft) for field in group
-                  if field.kind not in {"plane_rules", "plane_file"} and not field.key.endswith(".plane_count")]
+                  if field.kind not in {"plane_rules", "plane_file", "positions_file"}
+                  and not field.key.endswith((".plane_count", ".import_mode"))]
         fields[0].choices = tuple(pair for pair in fields[0].choices if pair[1] != "by_label")
         defaults = copy.copy(draft)
         defaults.plane_gen_params = copy.copy(draft.plane_gen_params)
@@ -880,6 +914,12 @@ class ActionSettingsDialog(QtWidgets.QDialog):
             widget = self.rows[field.key]
             widget.setVisible(visible)
             form.labelForField(widget).setVisible(visible)
+        if "plane_gen_params.positions_file" in self.controls and self.tabs.count() == len(self._pages):
+            for index, fields in enumerate(self._pages):
+                self.tabs.setTabVisible(index, any(not self.rows[field.key].isHidden() for field in fields))
+            self.tabs.tabBar().setVisible(sum(self.tabs.isTabVisible(i) for i in range(self.tabs.count())) > 1)
+            if all(field.key.startswith("plane_gen_params.") for field in self.fields) and self.width() in {620, 1000}:
+                self.resize(620 if values["plane_gen_params.positions_file"] else 1000, self.height())
         if self._auto_height is None or self.height() == self._auto_height:
             pages = self._pages
             active = [fields for fields in pages if any(self.rows[field.key].isVisibleTo(self) for field in fields)]
@@ -990,7 +1030,10 @@ class ActionSettingsDialog(QtWidgets.QDialog):
             values[field.key] = value
         if "input.resolution" in values:
             normalize_input_parameters({key.split(".")[1]: value for key, value in values.items()})
-        if values.get("plane_gen_params.plane_count") == 0:
+        positions_file = values.get("plane_gen_params.positions_file", "")
+        if positions_file and not Path(positions_file).is_file():
+            raise ValueError("Plane positions file does not exist.")
+        if not positions_file and values.get("plane_gen_params.plane_count") == 0:
             raise ValueError("Plane count must be positive, or -1 for all.")
         if "pwv_params.groups" in values:
             groups = values["pwv_params.groups"]

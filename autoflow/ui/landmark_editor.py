@@ -46,6 +46,8 @@ def placement_summary(rule):
         if spec.get("fraction_reference"):
             position += " from flow-oriented " + ("end" if spec["fraction_reference"] == "flow_end" else "start")
         rows.append(title + " → " + position)
+        if spec.get('inlet_selection')=='lowest_z': rows[-1] += '; lowest Z terminal entry'
+        if spec.get('connection_fallback')=='flow_endpoint': rows[-1] += '; missing portal connection: label flow endpoint'
         if spec.get("scope")=="label":
             rows[-1] += "; whole label"
         if spec.get("when_connected_to"):
@@ -70,10 +72,10 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
         self.enabled.setChecked(rule.get("plane_count", 0) > 0)
         layout.addWidget(self.enabled)
         self.enabled.setToolTip("Each row defines a connection or path property and positions inside the target label. "
-            "Observed connections retain every real arm. Every configured placement is strict. Missing anchors/levels or rejected sections fail plane generation with per-label reasons.")
-        self.table = QtWidgets.QTableWidget(0, 9)
+            "Observed connections retain every real arm. PV/SMV/SV can explicitly use a flow-end fallback when the connection is absent. Other missing anchors/levels and rejected sections retain per-label reasons.")
+        self.table = QtWidgets.QTableWidget(0, 11)
         self.table.setObjectName("landmark_placements")
-        self.table.setHorizontalHeaderLabels(["Anchor", "Label level", "Paths at level", "Position", "Offset (mm)", "Positions (%)", "No connection", "Level condition", "Scope"])
+        self.table.setHorizontalHeaderLabels(["Anchor", "Label level", "Paths at level", "Position", "Offset (mm)", "Positions (%)", "No connection", "Level condition", "Scope", "Flow entry", "Missing portal connection"])
         for column, explanation in enumerate((
                 "Anatomical connection or path property used to locate this measurement.",
                 "Label-local level of the selected path.", "Which paths at that level receive measurements.",
@@ -219,6 +221,14 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
         scope.setCurrentIndex(scope.findData(spec.get("scope","component")))
         self.table.setCellWidget(row,8,scope)
         scope.currentIndexChanged.connect(self.refresh)
+        inlet = QtWidgets.QComboBox()
+        inlet.addItem("Any observed entry", "any"); inlet.addItem("Lowest Z terminal entry", "lowest_z")
+        inlet.setCurrentIndex(inlet.findData(spec.get("inlet_selection", "any")))
+        self.table.setCellWidget(row, 9, inlet); inlet.currentIndexChanged.connect(self.refresh)
+        portal = QtWidgets.QComboBox()
+        portal.addItem("No fallback", "none"); portal.addItem("Use label flow endpoint", "flow_endpoint")
+        portal.setCurrentIndex(portal.findData(spec.get("connection_fallback", "none")))
+        self.table.setCellWidget(row, 10, portal); portal.currentIndexChanged.connect(self.refresh)
         self.table.selectRow(row)
         self.refresh()
 
@@ -305,6 +315,11 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
                     spec["fractions"] = list(fractions.property("source_fractions"))
                 else:
                     spec["fractions"] = [float(part.strip().removesuffix("%")) / 100 for part in text.replace("，", ",").split(",")]
+            inlet, portal = self.table.cellWidget(row,9), self.table.cellWidget(row,10)
+            if spec['anchor']=='flow_inlet_branch' and inlet.currentData()!='any':
+                spec['inlet_selection']=inlet.currentData()
+            if (self.name=='PV' and spec['anchor']=='portal_branch' or self.name in {'SMV','SV'} and spec['anchor']=='label_reference_branch') and portal.currentData()!='none':
+                spec['connection_fallback']=portal.currentData()
             placements.append(spec)
         return placements
 
@@ -324,6 +339,9 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
                 fallback.setEnabled(self.allow_fallback and anchor.currentData() == "label_connections")
             if condition is not None:
                 condition.setEnabled(anchor.currentData() == "label_level")
+            inlet, portal = self.table.cellWidget(row,9), self.table.cellWidget(row,10)
+            if inlet is not None: inlet.setEnabled(anchor.currentData()=='flow_inlet_branch')
+            if portal is not None: portal.setEnabled(self.name=='PV' and anchor.currentData()=='portal_branch' or self.name in {'SMV','SV'} and anchor.currentData()=='label_reference_branch')
             offset.setEnabled(position.currentData() in {"near","before_end","after_start"})
             fractions.setEnabled(position.currentData() in {"fractions", "flow_start_fractions", "flow_end_fractions"})
         try:

@@ -21,8 +21,6 @@ from .algorithms.segmentation import (
     save_segmentation_to_source_h5,
 )
 from .plane_io import (
-    load_plane_position_payload,
-    project_planes_to_workspace,
     resolve_reuse_plane_file,
     save_plane_positions,
 )
@@ -595,6 +593,15 @@ def process_single(
     _record_timing(stage_times, "graph", elapsed)
     print(f"  -> {result.message} | time={elapsed:.2f}s")
 
+    if reuse_planes_path:
+        ws.plane_gen_params.import_mode = str(plane_import_mode or "world")
+    else:
+        plane_import_mode = ws.plane_gen_params.import_mode
+    source_spec = str(reuse_planes_path or ws.plane_gen_params.positions_file or "")
+    case_name = case.output_name or os.path.splitext(os.path.basename(case.input_path))[0]
+    reuse_planes_path = resolve_reuse_plane_file(source_spec, case_name) if source_spec else ""
+    ws.plane_gen_params.positions_file = reuse_planes_path
+
     print("[4/7] Generate Planes...")
     t_stage = _time.perf_counter()
     result = engine.run_step(ws, StepId.GENERATE_PLANES, logger)
@@ -602,25 +609,12 @@ def process_single(
     _record_timing(stage_times, "planes", elapsed)
     print(f"  -> {result.message} | time={elapsed:.2f}s")
 
-    plane_import_report = {}
-    if reuse_planes_path:
-        print(f"[5/8] Reuse Plane Positions: {reuse_planes_path}")
-        t_stage = _time.perf_counter()
-        plane_payload = load_plane_position_payload(reuse_planes_path)
-        ws.planes, plane_import_report = project_planes_to_workspace(
-            plane_payload,
-            ws,
-            mapping_mode=plane_import_mode,
-            return_report=True,
-        )
-        planes_json = engine._save_planes_json(ws)
-        elapsed = _time.perf_counter() - t_stage
-        _record_timing(stage_times, "reuse_planes", elapsed)
-        print(f"  -> Reused {len(ws.planes)} planes mode={plane_import_mode} saved={planes_json} | time={elapsed:.2f}s")
-        for warning in list(plane_import_report.get("warnings", []) or []):
-            print(f"  [WARN] {warning}")
-    else:
-        print("[5/8] Use generated planes")
+    plane_import_report = copy.deepcopy(ws.derived.plane_qc) if reuse_planes_path else {}
+    ignored = int(plane_import_report.get("ignored_contour_count", 0))
+    if ignored:
+        print(f"  -> Coordinates only: ignored saved contours on {ignored} planes")
+    for warning in list(plane_import_report.get("warnings", []) or []):
+        print(f"  [WARN] {warning}")
 
     include_plane_derived = any(metric_flags[key] for key in ("wss", "tke", "pg"))
     if skip_plane_metrics:
@@ -1004,7 +998,6 @@ def process_single(
         "n_graph_edges": len(ws.graph.edges),
         "n_paths": len(ws.centerline_paths_smooth),
         "n_forks": len(ws.forks),
-        "willis_ring": dict(getattr(ws, "willis_ring_status", {}) or {}),
         "path_info": ws.path_info,
         "graph_hierarchy": ws.graph_hierarchy,
         "forks": ws.forks,
