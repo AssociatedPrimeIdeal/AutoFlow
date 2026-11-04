@@ -180,7 +180,12 @@ class WorkspaceLayoutMixin(BrowserInlineMixin):
         for label, index in [('At cursor', 0), ('On selected path', 1)]:
             action = menu.addAction(label)
             action.triggered.connect(lambda checked=False, source=index: self._add_plane_from_browser(source))
-        self.btn_browser_add_plane.setMenu(menu)
+        coordinates = menu.addAction('At coordinates…')
+        coordinates.triggered.connect(self._add_plane_at_coordinates)
+        button = self.btn_browser_add_plane
+        button.setMenu(menu)
+        button.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        button.customContextMenuRequested.connect(lambda point: menu.exec(button.mapToGlobal(point)))
         row.addWidget(self.btn_browser_add_plane)
         self.browser_options_button = QtWidgets.QToolButton()
         self.browser_options_button.setText('…')

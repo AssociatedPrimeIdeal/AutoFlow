@@ -20,6 +20,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Import plane positions and normals from JSON, or per-case plane_positions.json files. Saved contours and measurements are ignored.",
     )
+    parser.add_argument("--add-plane", dest="manual_planes", action="append", nargs=3, type=float,
+                        metavar=("LR", "AP", "FH"), help="Place a free plane at this center in mm, normal to LR. Repeat for multiple planes.")
+    parser.add_argument("--add-plane-with-normal", dest="manual_planes", action="append", nargs=6, type=float,
+                        metavar=("LR", "AP", "FH", "N_LR", "N_AP", "N_FH"), help="Place a free plane with an explicit normal. Repeat or combine with --add-plane.")
+    parser.add_argument("--plane-coordinates", choices=("local", "world"), default="local",
+                        help="Coordinate system for explicit plane centers in mm (default: local).")
     parser.add_argument(
         "--plane-import-mode",
         choices=["world", "local", "path_relative"],
@@ -269,12 +275,18 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    if args.manual_planes and args.reuse_planes:
+        parser.error("--add-plane and --add-plane-with-normal cannot be combined with --import-planes.")
+    if args.manual_planes and args.segmentation_only:
+        parser.error("Explicit plane placement requires running beyond segmentation.")
     config = AutoFlowConfig.from_config_dir(args.config_dir, inputs=args.inputs)
 
     overrides = {
         "output_dir": args.output_dir,
         "reuse_planes": args.reuse_planes,
         "plane_import_mode": args.plane_import_mode,
+        "manual_planes": args.manual_planes,
+        "manual_plane_coordinates": args.plane_coordinates,
         "export_planes": args.export_planes,
         "use_multithread": args.use_multithread,
         "background_phase_correction": args.background_phase_correction,

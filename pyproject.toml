@@ -80,6 +80,7 @@ include = ["autoflow", "autoflow.*"]
 [tool.setuptools.package-data]
 autoflow = [
   "ui/icons/*.svg",
+  "ui/assets/orientation/*.vtp",
   "segmodel/nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm/dataset.json",
   "segmodel/nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm/plans.json",
   "segmodel/nnUNetTrainerPartBalanced__nnUNetPlans__3d_fullres_iso1mm/fold_all/checkpoint_final.pth",

@@ -7769,6 +7769,93 @@ def _smoke_qt_application(monkeypatch):
     return _qt_smoke_application
 
 
+@pytest.mark.skipif(sys.platform == 'win32', reason='SSH rendering phantom runs on Linux')
+def test_orientation_icon_phantom_vtp_import_menu_and_scene_directions(monkeypatch, tmp_path):
+    app = _smoke_qt_application(monkeypatch)
+    monkeypatch.setenv('AUTOFLOW_SSH_RENDERING', '1')
+    from PySide6 import QtCore, QtTest, QtWidgets
+    import pyvista as pv
+    from autoflow.ui.orientation_marker import AnatomicalOrientationMarker, ASSET_DIRECTORY
+    from autoflow.ui.remote_plotter import RemotePlotter
+    from autoflow.ui.viewer import SceneController
+    settings_type = QtCore.QSettings
+    monkeypatch.setattr(QtCore, 'QSettings', lambda *_: settings_type(
+        str(tmp_path / 'preferences.ini'), settings_type.IniFormat))
+    monkeypatch.setattr(AnatomicalOrientationMarker, '_custom_path', staticmethod(lambda: tmp_path / 'custom.vtp'))
+    plotter = RemotePlotter()
+    scene = SceneController(plotter, Workspace(), lambda _: None)
+    try:
+        scene.initialize()
+        plotter.resize(640, 480)
+        plotter.show()
+        app.processEvents()
+        marker = scene._orientation_marker
+        assert marker.selection == 'penguin'
+        assert marker.actor.GetParts().GetNumberOfItems() == 14
+        original_camera = np.asarray(tuple(plotter.camera_position))
+        viewport = marker.widget.GetViewport()
+        point = QtCore.QPoint(round((viewport[0]+viewport[2])/2*plotter.width()),
+            round((1-(viewport[1]+viewport[3])/2)*plotter.height()))
+        QtTest.QTest.mouseClick(plotter, QtCore.Qt.RightButton, pos=point)
+        app.processEvents()
+        assert marker._menu is not None and marker._menu.isVisible()
+        np.testing.assert_allclose(tuple(plotter.camera_position), original_camera)
+        icons = marker._menu.actions()[0].menu()
+        next(a for a in icons.actions() if a.text() == 'Rabbit').trigger()
+        assert marker.selection == 'rabbit'
+        sizes = next(a.menu() for a in marker._menu.actions() if a.text() == 'Size')
+        size_control = sizes.findChild(QtWidgets.QSpinBox)
+        size_control.setValue(150)
+        assert marker.size_percent == 150
+        np.testing.assert_allclose(marker.widget.GetViewport(), [.01, .01, .415, .475])
+        np.testing.assert_allclose(tuple(plotter.camera_position), original_camera)
+        marker._menu.close()
+        menu = marker.context_menu()
+        directions = next(a.menu() for a in menu.actions() if a.text() == 'Left / right')
+        next(a for a in directions.actions() if a.text() == 'RL').trigger()
+        menu.deleteLater()
+        marker = scene._orientation_marker
+        assert marker.selection == 'rabbit' and marker.size_percent == 150
+        assert scene.display_axis_directions() == ('RL', 'AP', 'FH')
+        world = np.array([[0., 10., 15.], [10., 10., 15.]])
+        np.testing.assert_allclose(scene.display_to_world_points(scene.world_to_display_points(world)), world)
+        marker.snap_next()
+        np.testing.assert_allclose(marker._camera_direction()[:3], [0, -1, 0])
+        marker.import_asset(ASSET_DIRECTORY / 'penguin.vtp')
+        assert marker.selection == 'custom' and marker.actor.GetParts().GetNumberOfItems() == 14
+        previous = (tmp_path / 'custom.vtp').read_bytes()
+        invalid = tmp_path / 'invalid.vtp'
+        pv.PolyData(np.zeros((1, 3))).save(invalid)
+        with pytest.raises(ValueError, match='surface'):
+            marker.import_asset(invalid)
+        assert (tmp_path / 'custom.vtp').read_bytes() == previous
+        custom = tmp_path / 'external.vtp'
+        mesh = pv.Cube(center=(50, 60, 70))
+        mesh.cell_data['RGB'] = np.tile([255, 120, 10], (mesh.n_cells, 1)).astype(np.uint8)
+        mesh.save(custom)
+        marker.import_asset(custom)
+        imported = pv.read(tmp_path / 'custom.vtp')
+        np.testing.assert_allclose(imported.center, 0, atol=1e-6)
+        assert np.ptp(imported.points, axis=0).max() == pytest.approx(2.2)
+        custom.unlink()
+        scene._add_orientation_axes()
+        assert scene._orientation_marker.selection == 'custom'
+        assert scene._orientation_marker.widget.GetEnabled()
+        scene._orientation_marker.set_asset('penguin')
+        scene._add_orientation_axes()
+        assert scene._orientation_marker.selection == 'penguin'
+        assert scene._orientation_marker.size_percent == 150
+        scene._orientation_marker._settings.setValue('viewer/orientation_marker', 'milk_frog')
+        scene._add_orientation_axes()
+        assert scene._orientation_marker.selection == 'rabbit'
+        assert scene._orientation_marker.size_percent == 150
+    finally:
+        scene._orientation_marker.close()
+        plotter.shutdown()
+        plotter.close()
+
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="Linux SSH renderer; native Windows GUI is verified by portable_check.py --gui")
 def test_browser_plane_phantom_display_controls_and_visibility_clicks(monkeypatch, tmp_path):
     app = _smoke_qt_application(monkeypatch)

@@ -1,20 +1,33 @@
 <div align="center">
 
-# AutoFlow
+<img src="assets/autoflow-logo.png" alt="AutoFlow penguin" width="120" height="120">
 
-**Automated 4D flow MRI analysis across anatomical regions.**
+<h1>AutoFlow</h1>
 
-From correction and segmentation to plane metrics, hemodynamics, and quality control.
+<p><strong>Automated 4D flow MRI analysis across anatomical regions.</strong></p>
 
-[![AutoFlow workflow](autoflow-workflow.gif)](autoflow-workflow.mp4?raw=true)
+<p>
+  <a href="https://github.com/AssociatedPrimeIdeal/AutoFlow/releases"><strong>Download for Windows</strong></a>
+  &nbsp;·&nbsp;
+  <a href="#quick-start">Quick start</a>
+</p>
 
 </div>
 
-## Install
+<p align="center">
+  <a href="autoflow-workflow.mp4?raw=true">
+    <img src="autoflow-workflow.gif" alt="AutoFlow workflow: correction, segmentation, plane metrics, hemodynamics, and quality control" width="880">
+  </a>
+</p>
+
+AutoFlow brings correction, segmentation, plane metrics, hemodynamics, and quality control into one workflow.
+It supports cardiopulmonary, cerebrovascular, carotid, portal venous, and renal artery analysis.
+
+## Quick start
 
 ### Windows
 
-[Download AutoFlow](https://github.com/AssociatedPrimeIdeal/AutoFlow/releases)
+[Download the Windows app](https://github.com/AssociatedPrimeIdeal/AutoFlow/releases) from the latest release.
 
 ### Python
 

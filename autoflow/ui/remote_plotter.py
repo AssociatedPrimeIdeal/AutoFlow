@@ -287,6 +287,12 @@ class RemotePlotter(QtWidgets.QWidget):
             preview(True)
         self._set_mouse_event(event)
         self._mouse_buttons_active = True
+        dispatch_orientation = getattr(self, "_autoflow_orientation_dispatch", None)
+        if event.button() == QtCore.Qt.RightButton and callable(dispatch_orientation) and dispatch_orientation('right_press'):
+            if callable(preview):
+                preview(False)
+            event.accept()
+            return
         interactor = self.iren
         style = interactor.GetInteractorStyle()
         shift_left = (
@@ -381,6 +387,12 @@ class RemotePlotter(QtWidgets.QWidget):
         self._mouse_buttons_active = bool(event.buttons())
         self._set_mouse_event(event)
         dispatch_orientation = getattr(self, "_autoflow_orientation_dispatch", None)
+        if event.button() == QtCore.Qt.RightButton and callable(dispatch_orientation) and dispatch_orientation('right_release'):
+            preview = getattr(self, "_autoflow_interaction_preview", None)
+            if callable(preview):
+                preview(False)
+            event.accept()
+            return
         if event.button() == QtCore.Qt.LeftButton and callable(dispatch_orientation) and dispatch_orientation("release"):
             preview = getattr(self, "_autoflow_interaction_preview", None)
             if callable(preview):

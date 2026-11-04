@@ -197,6 +197,8 @@ class AutoFlowConfig:
     streamline_show_scalar_bar: bool = True
     streamline_bar_cfg: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_STREAMLINE_BAR_CFG))
     phase_unwrap_backend_params: Dict[str, Any] = field(default_factory=dict)
+    manual_planes: Sequence[Sequence[float]] = field(default_factory=tuple)
+    manual_plane_coordinates: str = "local"
 
     @classmethod
     def from_config_dir(cls, config_dir: Optional[str] = None, **overrides):
@@ -374,6 +376,8 @@ def run_case(
         use_multithread=cfg.use_multithread,
         reuse_planes_path=cfg.reuse_planes,
         plane_import_mode=cfg.plane_import_mode,
+        manual_planes=cfg.manual_planes,
+        manual_plane_coordinates=cfg.manual_plane_coordinates,
         export_planes_path=cfg.export_planes,
         autoseg=cfg.autoseg,
         autoseg_backend=cfg.autoseg_backend,
@@ -459,7 +463,8 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
     for case in input_cases:
         case_name = case.output_name or os.path.splitext(os.path.basename(case.input_path))[0]
         case_out = os.path.join(config.output_dir, case_name)
-        reuse_file = resolve_reuse_plane_file(config.reuse_planes, case_name)
+        reuse_spec = "" if len(config.manual_planes) else config.reuse_planes
+        reuse_file = resolve_reuse_plane_file(reuse_spec, case_name)
         export_file = ""
         if config.export_planes:
             if len(input_cases) == 1 and str(config.export_planes).lower().endswith(".json"):
@@ -467,7 +472,7 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
             else:
                 export_file = os.path.join(str(config.export_planes), case_name, "plane_positions.json")
 
-        if config.reuse_planes and not os.path.isfile(reuse_file):
+        if reuse_spec and not os.path.isfile(reuse_file):
             error = f"reuse plane file not found: {config.reuse_planes}"
             record_batch_result(results, {"file": case.input_path, "case": case.display_name, "status": "error", "error": error}, config.output_dir, len(input_cases))
             print(f"\n[ERROR] {error}")
@@ -486,6 +491,8 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 use_multithread=config.use_multithread,
                 reuse_planes=reuse_file,
                 plane_import_mode=config.plane_import_mode,
+                manual_planes=config.manual_planes,
+                manual_plane_coordinates=config.manual_plane_coordinates,
                 export_planes=export_file,
                 background_phase_correction=config.background_phase_correction,
                 background_phase_method=config.background_phase_method,

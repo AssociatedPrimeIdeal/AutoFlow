@@ -444,7 +444,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         return None
 
     def _ensure_native_qt_mouse_bridge(self):
-        """Intercept only Shift+left window/level gestures.
+        """Route marker gestures and Shift+left window/level before QVTK.
 
         All other native Qt mouse events are left to QVTK's normal event
         handler so ``vtkInteractorStyleTrackballCamera`` owns the camera
@@ -493,8 +493,11 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
                 except Exception:
                     return False
                 marker = controller._orientation_marker
-                if marker is not None and (mouse_move or event.button() == QtCore.Qt.MouseButton.LeftButton):
+                if marker is not None and (mouse_move or event.button() in (
+                        QtCore.Qt.MouseButton.LeftButton, QtCore.Qt.MouseButton.RightButton)):
                     kind = "move" if mouse_move else ("press" if button_press else "release")
+                    if not mouse_move and event.button() == QtCore.Qt.MouseButton.RightButton:
+                        kind = 'right_' + kind
                     if marker.dispatch(kind):
                         return True
                 if mouse_move:

@@ -12,6 +12,29 @@ PLANE_POSITION_SCHEMA = "autoflow.plane_positions.v2"
 PLANE_IMPORT_MODES = ("world", "local", "path_relative")
 
 
+def make_manual_plane(ws, center, *, coordinate_system="local", normal=(1.0, 0.0, 0.0)):
+    """Build a free plane from canonical LR/AP/FH millimetres."""
+    center = np.asarray(center, dtype=float).reshape(3)
+    if coordinate_system == "world":
+        center = center - np.asarray(ws.origin, dtype=float)
+    elif coordinate_system != "local":
+        raise ValueError("Plane coordinates must be local or world millimetres.")
+    if not np.all(np.isfinite(center)):
+        raise ValueError("Plane center must have finite coordinates.")
+    if ws.flow_raw is not None:
+        upper = np.asarray(ws.flow_raw.shape[:3]) * np.asarray(ws.resolution)
+        tolerance = 1e-9 if coordinate_system == "world" else 0.0
+        if np.any(center < -tolerance) or np.any(center > upper + tolerance):
+            raise ValueError("Plane center is outside the loaded physical field of view.")
+        center = np.clip(center, 0, upper)
+    normal = np.asarray(normal, dtype=float).reshape(3)
+    if not np.all(np.isfinite(normal)) or not np.any(normal):
+        raise ValueError("Plane normal must be finite and nonzero.")
+    normal = normal / np.max(np.abs(normal))
+    return PlaneData(center=center, normal=normal / np.linalg.norm(normal), label=0, path_index=-1,
+                     placement={"manual_geometry": True})
+
+
 def _normalize(v):
     arr = np.asarray(v, dtype=float).reshape(3)
     n = np.linalg.norm(arr)

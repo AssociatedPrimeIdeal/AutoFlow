@@ -1951,9 +1951,6 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         me.addAction(a)
         ms = mb.addMenu("Settings")
         self.settings_menu = ms
-        a = QtGui.QAction("3D Axis Orientation...", self)
-        a.triggered.connect(self._open_display_orientation_settings)
-        ms.addAction(a)
         a = QtGui.QAction("3D Background Color...", self)
         a.triggered.connect(self._open_background_color_settings)
         ms.addAction(a)
@@ -2018,44 +2015,6 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
     def _on_content_drag_position(self, uid, positions):
         if self._selected_uid() == uid:
             self.content_render_controls.set_positions(positions)
-
-    def _open_display_orientation_settings(self):
-        if self.scene is None:
-            return
-        dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle("3D Axis Orientation")
-        dialog.setModal(True)
-        layout = QtWidgets.QVBoxLayout(dialog)
-        form = QtWidgets.QFormLayout()
-        combos = []
-        for axis, choices in (("X", ("LR", "RL")), ("Y", ("AP", "PA")), ("Z", ("FH", "HF"))):
-            combo = QtWidgets.QComboBox()
-            combo.addItems(list(choices))
-            combos.append(combo)
-            form.addRow(f"{axis} positive direction", combo)
-        current = self.scene.display_axis_directions()
-        for combo, value in zip(combos, current):
-            combo.setCurrentText(str(value))
-        layout.addLayout(form)
-        hint = QtWidgets.QLabel(
-            "The displayed 3D scene and orientation marker will be mirrored around the scene center. "
-            "Internal data and analysis coordinates are unchanged."
-        )
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
-        )
-        reset_button = buttons.addButton("Reset to default", QtWidgets.QDialogButtonBox.ResetRole)
-        reset_button.clicked.connect(lambda: [combo.setCurrentIndex(0) for combo in combos])
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        if dialog.exec() != QtWidgets.QDialog.Accepted:
-            return
-        directions = [combo.currentText() for combo in combos]
-        if self.scene.set_display_axis_directions(directions):
-            self.log(f"3D display orientation: {', '.join(directions)}")
 
     def _open_background_color_settings(self):
         if self.scene is None:

@@ -365,7 +365,11 @@ def process_single(
     noise_velocity_std_max=0.80,
     generate_pcmra=False,
     render_background_color=None,
+    manual_planes=(),
+    manual_plane_coordinates="local",
 ):
+    if len(manual_planes) and segmentation_only:
+        raise ValueError("Explicit plane placement requires running beyond segmentation.")
     loader = getattr(workspace, "loader_params", None)
     case = resolve_input_case(input_source, getattr(loader, "dicom_backend", "dicom2h5"), getattr(loader, "dicom_h5_dir", ""))
     input_label = case.display_name or case.input_path
@@ -597,14 +601,17 @@ def process_single(
         ws.plane_gen_params.import_mode = str(plane_import_mode or "world")
     else:
         plane_import_mode = ws.plane_gen_params.import_mode
-    source_spec = str(reuse_planes_path or ws.plane_gen_params.positions_file or "")
+    source_spec = "" if len(manual_planes) else str(reuse_planes_path or ws.plane_gen_params.positions_file or "")
     case_name = case.output_name or os.path.splitext(os.path.basename(case.input_path))[0]
     reuse_planes_path = resolve_reuse_plane_file(source_spec, case_name) if source_spec else ""
     ws.plane_gen_params.positions_file = reuse_planes_path
 
     print("[4/7] Generate Planes...")
     t_stage = _time.perf_counter()
-    result = engine.run_step(ws, StepId.GENERATE_PLANES, logger)
+    if len(manual_planes):
+        result = engine.place_manual_planes(ws, manual_planes, coordinate_system=manual_plane_coordinates)
+    else:
+        result = engine.run_step(ws, StepId.GENERATE_PLANES, logger)
     elapsed = _time.perf_counter() - t_stage
     _record_timing(stage_times, "planes", elapsed)
     print(f"  -> {result.message} | time={elapsed:.2f}s")

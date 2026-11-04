@@ -10,6 +10,7 @@ from ..core.models import ObjectKind, PlaneData
 from ..core.plane_state import (invalidate_planes, metric_validity, mutation_snapshot,
     plane_signature, refresh_plane_consistency, selected_metric, stamp_metric, workspace_signature)
 from ..algorithms.paths import _project_point_to_path
+from ..plane_io import make_manual_plane
 from .plane_tasks import PlaneCalculationQueue
 
 
@@ -200,7 +201,51 @@ class PlaneEditingMixin:
         self._plane_draft_undo, self._plane_draft_redo = [], []
         return True
 
-    def _add_manual_plane(self):
+    def _add_plane_at_coordinates(self):
+        ws = self.workspace
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Add Plane at Coordinates")
+        form = QtWidgets.QFormLayout(dialog)
+        frame = QtWidgets.QComboBox(dialog)
+        frame.addItems(["Local (mm)", "World (mm)"])
+        form.addRow("Coordinates", frame)
+        cursor = np.asarray(ws.ortho_cursor) * np.asarray(ws.resolution)
+        fields = []
+        for axis, value in zip(("LR", "AP", "FH"), cursor):
+            field = QtWidgets.QDoubleSpinBox(dialog)
+            field.setDecimals(6)
+            field.setRange(-1e9, 1e9)
+            field.setValue(value)
+            form.addRow(axis, field)
+            fields.append(field)
+
+        def change_frame(index):
+            for field, offset in zip(fields, ws.origin):
+                field.setValue(field.value() + (offset if index else -offset))
+
+        frame.currentIndexChanged.connect(change_frame)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.button(QtWidgets.QDialogButtonBox.Ok).setText("Preview")
+        plane = None
+
+        def preview():
+            nonlocal plane
+            try:
+                plane = make_manual_plane(ws, [field.value() for field in fields],
+                                          coordinate_system="world" if frame.currentIndex() else "local")
+            except ValueError as exc:
+                QtWidgets.QMessageBox.warning(dialog, "Add Plane at Coordinates", str(exc))
+                return
+            dialog.accept()
+
+        buttons.accepted.connect(preview)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() == QtWidgets.QDialog.Accepted and plane is not None:
+            self._add_manual_plane(initial_plane=plane)
+            self._sync_context_panels()
+
+    def _add_manual_plane(self, *, initial_plane=None):
         if getattr(self, "_edit_mode", None) is not None:
             self.statusBar().showMessage("Finish the geometry edit first.", 4000)
             return
@@ -215,8 +260,9 @@ class PlaneEditingMixin:
             return
         before = mutation_snapshot(ws)
         center = np.asarray(ws.ortho_cursor, dtype=float) * np.asarray(ws.resolution, dtype=float)
-        plane = PlaneData(center=center, normal=np.array([1., 0., 0.]), label=0, path_index=-1)
-        if self.combo_plane_add_source.currentIndex() == 1:
+        plane = initial_plane if initial_plane is not None else PlaneData(
+            center=center, normal=np.array([1., 0., 0.]), label=0, path_index=-1)
+        if initial_plane is None and self.combo_plane_add_source.currentIndex() == 1:
             paths = ws.centerline_paths_smooth or ws.centerline_paths
             index = int(ws.selected_path_index)
             if not 0 <= index < len(paths):

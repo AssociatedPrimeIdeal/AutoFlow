@@ -1797,8 +1797,9 @@ class PipelineEngine:
         ws.derived.artifact_signatures["plane_metrics"] = workspace_signature(ws)
         generated_qc = dict(ws.derived.plane_qc or {})
         generated_layout = generated_qc.get("plane_layout", generated_qc)
-        if isinstance(generated_layout, dict) and any(
-                key in generated_layout for key in ("paths", "failure_policy", "errors")):
+        if isinstance(generated_layout, dict) and (
+                generated_layout.get("plane_mode") == "manual"
+                or any(key in generated_layout for key in ("paths", "failure_policy", "errors"))):
             qc = dict(qc or {})
             plane_layout = dict(generated_layout)
             plane_layout["actual_plane_count"] = int(len(ws.planes))
@@ -1847,16 +1848,44 @@ class PipelineEngine:
             payload, ws, mapping_mode=ws.plane_gen_params.import_mode, return_report=True)
         if not imported:
             raise ValueError("The plane positions file did not contain any importable planes")
-        check_cancelled()
-        # Validate before replacing the current layout; preserve centerline geometry.
         from uuid import uuid4
         for plane in imported:
             plane.placement["source_plane_id"] = plane.plane_id
             plane.plane_id = uuid4().hex
+        qc = {**report, "plane_mode": "imported", "source_file": source}
+        self._install_plane_layout(ws, imported, qc, write_output=write_output)
+        message = f"Planes: {len(imported)} from {source} | coordinates={ws.plane_gen_params.import_mode}"
+        if report["skipped_count"]:
+            message += f" | skipped={report['skipped_count']} (see plane_qc.json)"
+        return StepResult(StepId.GENERATE_PLANES, True, False, message)
+
+    def place_manual_planes(self, ws, positions, *, coordinate_system="local"):
+        from ..plane_io import make_manual_plane
+
+        if not ws.data_loaded:
+            raise ValueError("Load the target data before placing planes.")
+        planes = []
+        for index, position in enumerate(positions, start=1):
+            if len(position) not in (3, 6):
+                raise ValueError(f"Plane {index} requires three center coordinates and optionally three normal components.")
+            normal = position[3:] if len(position) == 6 else (1.0, 0.0, 0.0)
+            try:
+                planes.append(make_manual_plane(ws, position[:3], coordinate_system=coordinate_system, normal=normal))
+            except ValueError as exc:
+                raise ValueError(f"Plane {index}. {exc}") from exc
+        if not planes:
+            raise ValueError("Supply at least one plane position.")
+        qc = {"plane_mode": "manual", "coordinate_system": coordinate_system}
+        self._install_plane_layout(ws, planes, qc, write_output=True)
+        return StepResult(StepId.GENERATE_PLANES, True, False,
+                          f"Planes: {len(planes)} at explicit {coordinate_system}-mm coordinates")
+
+    def _install_plane_layout(self, ws, planes, qc, *, write_output):
+        check_cancelled()
         self._clear_plane_state(ws, preserve_paths=True)
-        ws.planes = imported
+        ws.planes = planes
         ws.analysis_revision += 1
-        for index, plane in enumerate(imported):
+        for index, plane in enumerate(planes):
             group = ws.multilabel_groups.get(plane.group_name, {})
             if group:
                 if not group["planes"]:
@@ -1866,8 +1895,7 @@ class PipelineEngine:
                 data_key=self._group_data_key("plane", plane.group_name, index), group_name=plane.group_name,
                 browser_color=str(group.get("browser_color", "") or ""), visible=True, opacity=.6,
                 color=ws.skeleton_params.scene_color_for_group(plane.group_name, "plane"), line_width=2)
-        ws.derived.plane_qc = {**report, "plane_mode": "imported", "source_file": source,
-                               "actual_plane_count": len(imported)}
+        ws.derived.plane_qc = {**qc, "actual_plane_count": len(planes)}
         if write_output:
             self._save_planes_json(ws)
             out_dir = self._output_dir(ws)
@@ -1875,10 +1903,6 @@ class PipelineEngine:
             from .output import atomic_json_write
             atomic_json_write(os.path.join(out_dir, "plane_qc.json"), ws.derived.plane_qc)
         ws.pipeline.mark_done(StepId.GENERATE_PLANES)
-        message = f"Planes: {len(imported)} from {source} | coordinates={ws.plane_gen_params.import_mode}"
-        if report["skipped_count"]:
-            message += f" | skipped={report['skipped_count']} (see plane_qc.json)"
-        return StepResult(StepId.GENERATE_PLANES, True, False, message)
 
     def _step_generate_planes(self, ws, *, write_output=True, generate_missing_graph=True, use_position_file=True):
         if use_position_file and str(ws.plane_gen_params.positions_file or "").strip():

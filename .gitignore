@@ -11,8 +11,7 @@ __pycache__/
 /111/
 /results/
 /dicom/
-/paper/*
-!/paper/figs/
+/paper/
 /pics/
 /docs/
 /outputs/
