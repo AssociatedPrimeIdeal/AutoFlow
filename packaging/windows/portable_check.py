@@ -198,6 +198,11 @@ def main():
         application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         apply_application_theme(application)
         window = MainWindow()
+        off_screen = bool(window.plotter.render_window.GetOffScreenRendering())
+        interactor_available = window.plotter.iren is not None
+        render_window = window.plotter.render_window.GetClassName()
+        if not off_screen and not interactor_available:
+            raise RuntimeError("Interactive GUI has no mouse interactor")
         import numpy as np
         import h5py
         from autoflow.core.models import PlaneData
@@ -257,7 +262,9 @@ def main():
         plotter.close()
         if pixels is None or pixels.shape[:2] != (64, 64):
             raise ValueError("No VTK screenshot produced")
-        return {"window_created": True, "phantom_case_loaded": True, "qc_tab_loaded": True, "plane_count": 1, "render_shape": list(pixels.shape)}
+        return {"window_created": True, "phantom_case_loaded": True, "qc_tab_loaded": True,
+                "plane_count": 1, "render_shape": list(pixels.shape), "off_screen": off_screen,
+                "interactor_available": interactor_available, "render_window": render_window}
 
     for name, operation in (("imports", imports), ("msvc_runtime", msvc_runtime), ("models", models), ("spawn_workers", workers),
                             ("subprocess_entries", commands), ("video_encoder", encoder), ("cuda", gpu)):

@@ -7807,6 +7807,29 @@ def _smoke_qt_application(monkeypatch):
     return _qt_smoke_application
 
 
+def test_native_offscreen_gui_phantom_starts_without_mouse_interactor(monkeypatch, tmp_path):
+    app = _smoke_qt_application(monkeypatch)
+    import pyvista as pv
+    from pyvistaqt import QtInteractor
+    from PySide6 import QtCore
+    from autoflow.ui.app import MainWindow
+
+    monkeypatch.delenv("AUTOFLOW_SSH_RENDERING", raising=False)
+    monkeypatch.setattr(pv, "OFF_SCREEN", True)
+    settings_type = QtCore.QSettings
+    monkeypatch.setattr(QtCore, "QSettings", lambda *_: settings_type(
+        str(tmp_path / "preferences.ini"), settings_type.IniFormat))
+    window = MainWindow()
+    try:
+        assert isinstance(window.plotter, QtInteractor)
+        assert window.plotter.iren is None
+        assert window.scene._shared_pick_obs_id is None
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+
+
 @pytest.mark.skipif(sys.platform == 'win32', reason='SSH rendering phantom runs on Linux')
 def test_orientation_icon_phantom_vtp_import_menu_and_scene_directions(monkeypatch, tmp_path):
     app = _smoke_qt_application(monkeypatch)

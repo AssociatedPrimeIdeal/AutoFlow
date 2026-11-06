@@ -2429,6 +2429,9 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
             iren = self.plotter.iren
         except Exception:
             return
+        # QtInteractor deliberately has no mouse interactor in offscreen mode.
+        if iren is None:
+            return
         picker = pv._vtk.vtkCellPicker()
         picker.SetTolerance(0.005)
 
