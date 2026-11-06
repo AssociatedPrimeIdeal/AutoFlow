@@ -9,7 +9,7 @@ from ..task_control import check_cancelled
 from .label_trunks import REFERENCE_LABELS
 
 
-BRANCH_ANCHORS = {'label_branch', 'label_reference_branch', 'flow_inlet_branch', 'portal_branch'}
+BRANCH_ANCHORS = {'label_branch', 'label_reference_branch', 'flow_inlet_branch', 'flow_outlet_branch', 'portal_branch'}
 
 
 class LabelBranches:
@@ -106,10 +106,13 @@ class LabelBranches:
     def choose(self, choices, spec, reason='no_label_branch'):
         if not choices:
             return [],reason
-        if spec.get('inlet_selection') == 'lowest_z':
-            lowest = min(row['branch_start_point_mm'][2] for row in choices)
-            choices = [row for row in choices if abs(row['branch_start_point_mm'][2]-lowest) <= 1e-6]
-            self.audit.append(dict(inlet_selection='lowest_z', minimum_z_mm=lowest, candidate_count=len(choices)))
+        outlet = spec['anchor'] == 'flow_outlet_branch'
+        endpoint_selection = 'outlet_selection' if outlet else 'inlet_selection'
+        if spec.get(endpoint_selection) == 'lowest_z':
+            point = 'branch_end_point_mm' if outlet else 'branch_start_point_mm'
+            lowest = min(row[point][2] for row in choices)
+            choices = [row for row in choices if abs(row[point][2]-lowest) <= 1e-6]
+            self.audit.append({endpoint_selection: 'lowest_z', 'minimum_z_mm': lowest, 'candidate_count': len(choices)})
         policy = spec.get('path_selection','unique')
         if policy=='all':
             return choices,''
@@ -288,12 +291,17 @@ class LabelBranches:
             choices,reason = self.references(name,value,spec)
         else:
             fractions = np.asarray(spec.get('fractions',[.5]))
-            directed = anchor=='flow_inlet_branch' or spec['position'] in {'before_end','after_start'} or bool(spec.get('fraction_reference')) or (
+            outlet = anchor == 'flow_outlet_branch'
+            flow_endpoint = outlet or anchor == 'flow_inlet_branch'
+            endpoint_selection = 'outlet_selection' if outlet else 'inlet_selection'
+            directed = flow_endpoint or spec['position'] in {'before_end','after_start'} or bool(spec.get('fraction_reference')) or (
                 not np.allclose(np.sort(fractions),np.sort(1-fractions),atol=.015,rtol=0))
-            incoming,uncertain = defaultdict(set),defaultdict(set)
+            continuations, uncertain = defaultdict(set), defaultdict(set)
             for index,row in enumerate(rows):
                 if row['flow_sign'] in (-1,1):
-                    incoming[row['nodes'][row['flow_sign']==1]].add(index)
+                    flow_start = int(row['flow_sign'] == -1)
+                    continuation = flow_start if outlet else 1 - flow_start
+                    continuations[row['nodes'][continuation]].add(index)
                 else:
                     for node in row['nodes']:
                         uncertain[node].add(index)
@@ -302,14 +310,15 @@ class LabelBranches:
                 if directed and row['flow_sign'] not in (-1,1):
                     continue
                 reverse = row['flow_sign']==-1
-                upstream = row['nodes'][int(reverse)]
-                if anchor=='flow_inlet_branch' and (incoming[upstream] or uncertain[upstream]-{index}):
+                flow_start = int(reverse)
+                endpoint = row['nodes'][1 - flow_start if outlet else flow_start]
+                if flow_endpoint and (continuations[endpoint] or uncertain[endpoint] - {index}):
                     continue
-                if spec.get('inlet_selection') == 'lowest_z' and (upstream not in self.context.graph or self.context.graph.degree(upstream) != 1):
+                if spec.get(endpoint_selection) == 'lowest_z' and (endpoint not in self.context.graph or self.context.graph.degree(endpoint) != 1):
                     continue
                 choices.append(self.selection(row,reverse=reverse))
             missing = ('flow_direction_unavailable' if directed and not any(row['flow_sign'] in (-1,1) for row in rows) else
-                'flow_inlet_branch_not_found' if anchor=='flow_inlet_branch' else 'no_label_branch')
+                f'{anchor}_not_found' if flow_endpoint else 'no_label_branch')
             if spec.get('scope','label')=='component':
                 by_component = defaultdict(list)
                 for selection in choices:
@@ -328,8 +337,9 @@ class LabelBranches:
                 reason in {'portal_confluence_not_found', 'label_reference_not_found'}):
             choices, reason = self.flow_endpoint_fallback(name, value, spec, reason)
         for selection in choices:
-            if spec.get('inlet_selection'):
-                selection['branch_inlet_selection'] = spec['inlet_selection']
+            for field in ('inlet_selection', 'outlet_selection'):
+                if field in spec:
+                    selection[f'branch_{field}'] = spec[field]
             selection.update(selection_source='single_label_branch' ,path_selection=spec.get('path_selection','unique'),
                 branch_selection_anchor=selection.get('branch_selection_anchor',anchor),selection_scope=spec.get('scope','label'),connection_fallback=bool(selection.get('connection_fallback')))
         self.audit.append(dict(reason=reason,selected_count=len(choices)))

@@ -1,0 +1,249 @@
+{
+  "label_rules": {
+    "LVA": {
+      "plane_mode": "landmark",
+      "plane_count": 2,
+      "placements": [
+        {
+          "anchor": "flow_inlet_branch",
+          "scope": "label",
+          "path_selection": "unique",
+          "position": "fractions",
+          "fractions": [
+            0.3,
+            0.5
+          ],
+          "inlet_selection": "lowest_z"
+        }
+      ]
+    },
+    "RVA": {
+      "plane_mode": "landmark",
+      "plane_count": 2,
+      "placements": [
+        {
+          "anchor": "flow_inlet_branch",
+          "scope": "label",
+          "path_selection": "unique",
+          "position": "fractions",
+          "fractions": [
+            0.3,
+            0.5
+          ],
+          "inlet_selection": "lowest_z"
+        }
+      ]
+    },
+    "RICA": {
+      "plane_mode": "landmark",
+      "plane_count": 2,
+      "placements": [
+        {
+          "anchor": "flow_inlet_branch",
+          "scope": "label",
+          "path_selection": "unique",
+          "position": "fractions",
+          "fractions": [
+            0.33,
+            0.66
+          ],
+          "inlet_selection": "lowest_z"
+        }
+      ]
+    },
+    "BA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_branch",
+          "scope": "label",
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.5
+          ]
+        }
+      ]
+    },
+    "LTS": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.1
+          ]
+        }
+      ]
+    },
+    "SSS": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.1
+          ]
+        }
+      ]
+    },
+    "RTS": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.1
+          ]
+        }
+      ]
+    },
+    "StrS": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.1
+          ]
+        }
+      ]
+    },
+    "LPCA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.1
+          ]
+        }
+      ]
+    },
+    "RPCA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.1
+          ]
+        }
+      ]
+    },
+    "LMCA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.1
+          ]
+        }
+      ]
+    },
+    "RMCA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.1
+          ]
+        }
+      ]
+    },
+    "ACA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_reference_branch",
+          "path_selection": "all",
+          "position": "fractions",
+          "fractions": [
+            0.1
+          ]
+        }
+      ]
+    },
+    "LCarotid": {
+      "plane_mode": "landmark",
+      "plane_count": 2,
+      "placements": [
+        {
+          "anchor": "flow_inlet_branch",
+          "scope": "label",
+          "path_selection": "unique",
+          "position": "fractions",
+          "fractions": [
+            0.33,
+            0.66
+          ],
+          "inlet_selection": "lowest_z"
+        }
+      ]
+    },
+    "LVenousOutflow": {
+      "plane_mode": "landmark",
+      "plane_count": 2,
+      "placements": [
+        {
+          "anchor": "flow_outlet_branch",
+          "scope": "label",
+          "path_selection": "unique",
+          "position": "fractions",
+          "fractions": [
+            0.3333333333333333,
+            0.6666666666666666
+          ],
+          "fraction_reference": "flow_end",
+          "outlet_selection": "lowest_z"
+        }
+      ]
+    },
+    "RVenousOutflow": {
+      "plane_mode": "landmark",
+      "plane_count": 2,
+      "placements": [
+        {
+          "anchor": "flow_outlet_branch",
+          "scope": "label",
+          "path_selection": "unique",
+          "position": "fractions",
+          "fractions": [
+            0.3333333333333333,
+            0.6666666666666666
+          ],
+          "fraction_reference": "flow_end",
+          "outlet_selection": "lowest_z"
+        }
+      ]
+    }
+  }
+}

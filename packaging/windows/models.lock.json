@@ -1,7 +1,49 @@
 {
-  "schema_version": 1,
-  "tag": "windows-models-20261017",
+  "schema_version": 2,
+  "tag": "windows-models-20261106",
   "asset": "autoflow-models.zip",
-  "url": "https://github.com/AssociatedPrimeIdeal/AutoFlow/releases/download/windows-models-20261017/autoflow-models.zip",
-  "sha256": "e390c3adedba32eadc52fe664e0078942efe18e369cf38ec150d4822d1d3ea70"
+  "url": "https://github.com/AssociatedPrimeIdeal/AutoFlow/releases/download/windows-models-20261106/autoflow-models.zip",
+  "sha256": "943556060594672e4c8cfa4ad38abcf8ec4b6143f2d2aa70e26130579388ecfa",
+  "parts": [
+    {
+      "file": "autoflow-models.zip.part001",
+      "sha256": "531d9ae7d91024e1d90822723b6c0140d09487c262b82de37e47b5480cd5b17c",
+      "bytes": 67108864
+    },
+    {
+      "file": "autoflow-models.zip.part002",
+      "sha256": "d422662db45be92b420e23c6547b4539c491a6070b15c244d2fc30793fb9a91e",
+      "bytes": 67108864
+    },
+    {
+      "file": "autoflow-models.zip.part003",
+      "sha256": "b626d9c9f7aa577cbb716a7e66404eb816da6ae12a57232d0583c0df9f2cdb54",
+      "bytes": 67108864
+    },
+    {
+      "file": "autoflow-models.zip.part004",
+      "sha256": "4db5a6ae2f90791373633ed2af3e018b5b2fff82310e3f8959e1b892b08627cf",
+      "bytes": 67108864
+    },
+    {
+      "file": "autoflow-models.zip.part005",
+      "sha256": "839c0e3400fd2ab058d1a0db5cc7450bdf6fde989303e6162c26f82bb81d92ec",
+      "bytes": 67108864
+    },
+    {
+      "file": "autoflow-models.zip.part006",
+      "sha256": "cdb3c0a2002d1061daa4830873b8291807e8f7d46dc89668d55f70ee3f17c89b",
+      "bytes": 67108864
+    },
+    {
+      "file": "autoflow-models.zip.part007",
+      "sha256": "0d5e5cea7f720630e7bddd0e4cc5f01d7b9abc1ae111545c272f1390103dc328",
+      "bytes": 67108864
+    },
+    {
+      "file": "autoflow-models.zip.part008",
+      "sha256": "254d8f9a5c7718402a281b0df66006792e6ae706d5a63439cd43617abb5d925e",
+      "bytes": 1490334
+    }
+  ]
 }

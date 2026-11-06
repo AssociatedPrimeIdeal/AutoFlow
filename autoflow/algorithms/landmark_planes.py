@@ -428,11 +428,19 @@ def generate_landmark_label_planes(context, name, value, rule, smooth_paths, seg
               main_path="landmark", selected_main_paths=[], main_path_count=0, placements=[])
     filter_defaults = dict(filter_defaults or {})
     support_cache = {} if support_cache is None else support_cache
-    for placement_index, spec in enumerate(rule["placements"]):
+    for placement_index, declared_spec in enumerate(rule["placements"]):
+        spec = declared_spec
+        random_range = None
+        if spec["position"] == "random":
+            random_range = list(spec.get("fraction_range", [0.1, 0.9]))
+            sampled_fraction = float(np.random.default_rng().uniform(*random_range))
+            spec = dict(spec, position="fractions", fractions=[sampled_fraction])
         selections, reason = context.resolve(name, spec)
         count = len(spec["fractions"]) if spec["position"] == "fractions" else 1
-        placement_qc = {"placement_index": placement_index, "spec": spec, "status": "resolved" if selections else "omitted",
+        placement_qc = {"placement_index": placement_index, "spec": declared_spec, "status": "resolved" if selections else "omitted",
                         "reason": reason, "resolved_count": len(selections)}
+        if random_range is not None:
+            placement_qc["sampled_fraction"] = sampled_fraction
         if spec["anchor"] in {"label_trunk","label_reference"}:
             placement_qc["trunk_selection"] = list(context.cache['continuous_trunks'].audit)
             if reason and selections:
@@ -461,6 +469,10 @@ def generate_landmark_label_planes(context, name, value, rule, smooth_paths, seg
             if selection.get("conditional_level_fallback"):
                 qc["placement_warnings"].append("conditional_level_fallback")
             spec = selection.get("placement_spec", requested_spec)
+            if random_range is not None:
+                spec = dict(spec, position="fractions", fractions=[sampled_fraction])
+                if selection.get("fallback_endpoint") == "flow_end":
+                    spec["fraction_reference"] = "flow_end"
             count = len(spec["fractions"]) if spec["position"] == "fractions" else 1
             qc["requested_plane_count"] += count
             spans = []
@@ -591,6 +603,9 @@ def generate_landmark_label_planes(context, name, value, rule, smooth_paths, seg
                             spec.get("fraction_reference") == "flow_end" else nominal / total)
                         if spec.get("fraction_reference"):
                             plane.placement["fraction_reference"] = spec["fraction_reference"]
+                    if random_range is not None:
+                        plane.placement.update(position="random", fraction_range=random_range,
+                                               fraction=sampled_fraction)
                     plane.placement["warnings"] = placement_warning_codes(plane.placement)
                     qc["placement_warnings"].extend(plane.placement["warnings"])
                     plane._label_plane_rule, plane._main_path_index = rule, main_index

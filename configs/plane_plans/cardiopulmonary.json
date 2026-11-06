@@ -1,0 +1,134 @@
+{
+  "label_rules": {
+    "AAO": {
+      "plane_mode": "landmark",
+      "plane_count": 3,
+      "placements": [
+        {
+          "anchor": "label_branch",
+          "scope": "label",
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.2,
+            0.5,
+            0.8
+          ]
+        }
+      ]
+    },
+    "MPA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "fractions",
+          "fractions": [
+            0.3
+          ],
+          "fraction_reference": "flow_end"
+        }
+      ]
+    },
+    "ARCH": {
+      "plane_mode": "landmark",
+      "plane_count": 0,
+      "placements": [
+        {
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "near",
+          "offset_mm": 5.0
+        }
+      ]
+    },
+    "DAO": {
+      "plane_mode": "landmark",
+      "plane_count": 3,
+      "placements": [
+        {
+          "anchor": "label_branch",
+          "scope": "label",
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.1,
+            0.3,
+            0.5
+          ]
+        }
+      ]
+    },
+    "RPA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.3
+          ]
+        }
+      ]
+    },
+    "LPA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "fractions",
+          "fractions": [
+            0.3
+          ]
+        }
+      ]
+    },
+    "BCT": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "near",
+          "offset_mm": 10.0
+        }
+      ]
+    },
+    "LCarotid": {
+      "plane_mode": "landmark",
+      "plane_count": 2,
+      "placements": [
+        {
+          "anchor": "flow_inlet_branch",
+          "scope": "label",
+          "path_selection": "unique",
+          "position": "fractions",
+          "fractions": [
+            0.33,
+            0.66
+          ],
+          "inlet_selection": "lowest_z"
+        }
+      ]
+    },
+    "LSA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "near",
+          "offset_mm": 10.0
+        }
+      ]
+    }
+  }
+}

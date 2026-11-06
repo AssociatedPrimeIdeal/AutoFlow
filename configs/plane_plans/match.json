@@ -1,0 +1,460 @@
+{
+  "label_rules": {
+    "AAO": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "MPA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "ARCH": {
+      "plane_mode": "landmark",
+      "plane_count": 0,
+      "placements": [
+        {
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "near",
+          "offset_mm": 5.0
+        }
+      ]
+    },
+    "DAO": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "RPA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "LPA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "HA": {
+      "plane_mode": "landmark",
+      "plane_count": 0,
+      "placements": [
+        {
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "near",
+          "offset_mm": 5.0
+        }
+      ]
+    },
+    "SMA": {
+      "plane_mode": "landmark",
+      "plane_count": 0,
+      "placements": [
+        {
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "near",
+          "offset_mm": 5.0
+        }
+      ]
+    },
+    "LRA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "RRA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "PV": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "SMV": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "SV": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "LVA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "RVA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "RICA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "BA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "LTS": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "SSS": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "RTS": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "StrS": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "LPCA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "RPCA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "LMCA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "RMCA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "ACA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "BCT": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "LCarotid": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "LSA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "LVenousOutflow": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    },
+    "RVenousOutflow": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_longest",
+          "scope": "label",
+          "position": "random",
+          "fraction_range": [
+            0.1,
+            0.9
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -20,10 +20,11 @@ REFERENCE_LABELS = {
     'MPA': ('LPA', 'RPA'), 'LPA': ('MPA',), 'RPA': ('MPA',),
     'PV': ('SMV', 'SV'), 'SMV': ('PV',), 'SV': ('PV',),
     'LTS': ('SSS', 'StrS'), 'RTS': ('SSS', 'StrS'),
-    'SSS': ('LTS', 'RTS', 'StrS'), 'StrS': ('LTS', 'RTS', 'SSS'),
-    'LMCA': ('LICA',), 'RMCA': ('RICA',),
-    'LPCA': ('BA', 'LICA'), 'RPCA': ('BA', 'RICA'), 'ACA': ('LICA', 'RICA'),
-    **{name: ('AAO', 'ARCH', 'DAO') for name in ('RBCT', 'CCA', 'LBCT', 'LRA', 'RRA', 'HA', 'SMA')},
+    'SSS': ('LTS', 'RTS', 'StrS', 'LVenousOutflow', 'RVenousOutflow'),
+    'StrS': ('LTS', 'RTS', 'SSS', 'LVenousOutflow', 'RVenousOutflow'),
+    'LMCA': ('LICA', 'LCarotid'), 'RMCA': ('RICA',),
+    'LPCA': ('BA', 'LICA', 'LCarotid'), 'RPCA': ('BA', 'RICA'), 'ACA': ('LICA', 'RICA', 'LCarotid'),
+    **{name: ('AAO', 'ARCH', 'DAO') for name in ('RBCT', 'CCA', 'LBCT', 'BCT', 'LSA', 'LRA', 'RRA', 'HA', 'SMA')},
     'ARCH': ('AAO', 'DAO'),
 }
 

@@ -1,0 +1,108 @@
+{
+  "label_rules": {
+    "LVA": {
+      "plane_mode": "landmark",
+      "plane_count": 2,
+      "placements": [
+        {
+          "anchor": "flow_inlet_branch",
+          "scope": "label",
+          "path_selection": "unique",
+          "position": "fractions",
+          "fractions": [
+            0.3,
+            0.5
+          ],
+          "inlet_selection": "lowest_z"
+        }
+      ]
+    },
+    "RVA": {
+      "plane_mode": "landmark",
+      "plane_count": 2,
+      "placements": [
+        {
+          "anchor": "flow_inlet_branch",
+          "scope": "label",
+          "path_selection": "unique",
+          "position": "fractions",
+          "fractions": [
+            0.3,
+            0.5
+          ],
+          "inlet_selection": "lowest_z"
+        }
+      ]
+    },
+    "RICA": {
+      "plane_mode": "landmark",
+      "plane_count": 2,
+      "placements": [
+        {
+          "anchor": "flow_inlet_branch",
+          "scope": "label",
+          "path_selection": "unique",
+          "position": "fractions",
+          "fractions": [
+            0.33,
+            0.66
+          ],
+          "inlet_selection": "lowest_z"
+        }
+      ]
+    },
+    "LCarotid": {
+      "plane_mode": "landmark",
+      "plane_count": 2,
+      "placements": [
+        {
+          "anchor": "flow_inlet_branch",
+          "scope": "label",
+          "path_selection": "unique",
+          "position": "fractions",
+          "fractions": [
+            0.33,
+            0.66
+          ],
+          "inlet_selection": "lowest_z"
+        }
+      ]
+    },
+    "LVenousOutflow": {
+      "plane_mode": "landmark",
+      "plane_count": 2,
+      "placements": [
+        {
+          "anchor": "flow_outlet_branch",
+          "scope": "label",
+          "path_selection": "unique",
+          "position": "fractions",
+          "fractions": [
+            0.3333333333333333,
+            0.6666666666666666
+          ],
+          "fraction_reference": "flow_end",
+          "outlet_selection": "lowest_z"
+        }
+      ]
+    },
+    "RVenousOutflow": {
+      "plane_mode": "landmark",
+      "plane_count": 2,
+      "placements": [
+        {
+          "anchor": "flow_outlet_branch",
+          "scope": "label",
+          "path_selection": "unique",
+          "position": "fractions",
+          "fractions": [
+            0.3333333333333333,
+            0.6666666666666666
+          ],
+          "fraction_reference": "flow_end",
+          "outlet_selection": "lowest_z"
+        }
+      ]
+    }
+  }
+}

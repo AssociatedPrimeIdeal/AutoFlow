@@ -229,14 +229,19 @@ DEFAULT_SKELETON_LABEL_MAP = {
     "ACA": 30,
     "LIJV": 31,
     "RIJV": 32,
+    "BCT": 33,
+    "LCarotid": 34,
+    "LSA": 35,
+    "LVenousOutflow": 36,
+    "RVenousOutflow": 37,
 }
 
-DEFAULT_SPECIAL_CONTACT_LABELS = ["RBCT", "CCA", "LBCT", "HA", "SMA", "LRA", "RRA"]
+DEFAULT_SPECIAL_CONTACT_LABELS = ["BCT", "LCarotid", "LSA", "HA", "SMA", "LRA", "RRA"]
 
 DEFAULT_SKELETON_LABEL_GROUPS = {
     "single_label": {"labels": [], "path_color": "#6bb5cb", "plane_color": "#75acb2"},
     "aorta_systemic_branches": {
-        "labels": ["AAO", "ARCH", "DAO", "RBCT", "CCA", "LBCT", "HA", "SMA", "LRA", "RRA"],
+        "labels": ["AAO", "ARCH", "DAO", "RBCT", "CCA", "LBCT", "BCT", "LCarotid", "LSA", "HA", "SMA", "LRA", "RRA"],
         "browser_color": "#c92a2a",
         "skeleton_color": "#c92a2a",
         "graph_color": "#e03131",
@@ -263,7 +268,7 @@ DEFAULT_SKELETON_LABEL_GROUPS = {
         "preprocess": {},
     },
     "intracranial_anterior_arteries": {
-        "labels": ["LICA", "RICA", "LMCA", "RMCA", "ACA"],
+        "labels": ["LICA", "LCarotid", "RICA", "LMCA", "RMCA", "ACA"],
         "browser_color": "#862e9c",
         "skeleton_color": "#862e9c",
         "graph_color": "#9c36b5",
@@ -281,7 +286,7 @@ DEFAULT_SKELETON_LABEL_GROUPS = {
         "preprocess": {},
     },
     "intracranial_veins": {
-        "labels": ["StrS", "RTS", "SSS", "LTS"],
+        "labels": ["StrS", "RTS", "SSS", "LTS", "LVenousOutflow", "RVenousOutflow"],
         "browser_color": "#0b7285",
         "skeleton_color": "#0b7285",
         "graph_color": "#1098ad",

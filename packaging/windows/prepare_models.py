@@ -9,6 +9,7 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import sys
 import tempfile
 import zipfile
 
@@ -32,7 +33,7 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def export_model(source, target, profile):
+def export_model(source, target, profile, default_checkpoint="checkpoint_final.pth"):
     source, target = Path(source).resolve(), Path(target)
     target.mkdir(parents=True)
     for filename, keys in (("dataset.json", DATASET_KEYS), ("plans.json", PLANS_KEYS)):
@@ -45,6 +46,7 @@ def export_model(source, target, profile):
             original = fold / name
             if not original.is_file():
                 continue
+            source_digest = sha256(original)
             # Inputs are explicitly supplied trusted training checkpoints.
             loaded = torch.load(original, map_location="cpu", weights_only=False)
             inference = {
@@ -64,30 +66,52 @@ def export_model(source, target, profile):
             if not all(torch.equal(tensor, verified["network_weights"][key])
                        for key, tensor in loaded["network_weights"].items()):
                 raise ValueError(f"{profile}: weights changed")
+            if sha256(original) != source_digest:
+                raise ValueError(f"{profile}: source checkpoint changed during export")
             checkpoints.append({"file": f"{fold.name}/{name}", "sha256": sha256(destination),
-                                "source_sha256": sha256(original), "weights_verified_equal": True})
+                                "source_sha256": source_digest, "weights_verified_equal": True})
             del loaded, inference, verified
-    if not checkpoints or not (target / "fold_all" / "checkpoint_final.pth").is_file():
-        raise ValueError(f"{profile}: fold_all/checkpoint_final.pth is required")
-    return {"profile": profile, "checkpoints": checkpoints,
+    if not checkpoints or not (target / "fold_all" / default_checkpoint).is_file():
+        raise ValueError(f"{profile}: fold_all/{default_checkpoint} is required")
+    return {"profile": profile, "source_model": source.name,
+            "default_checkpoint": default_checkpoint, "checkpoints": checkpoints,
             "dataset_sha256": sha256(target / "dataset.json"),
             "plans_sha256": sha256(target / "plans.json")}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-3d", required=True)
-    parser.add_argument("--model-4d", required=True)
-    parser.add_argument("--model-bundled", required=True)
+    parser.add_argument("--model-3d")
+    parser.add_argument("--model-4d")
+    parser.add_argument("--model-bundled")
+    parser.add_argument("--from-current-defaults", action="store_true",
+                        help="Use the current checkout's Linux 3D/4D and legacy model defaults")
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
+    explicit = (args.model_3d, args.model_4d, args.model_bundled)
+    if args.from_current_defaults:
+        if any(explicit):
+            parser.error("--from-current-defaults cannot be combined with explicit model paths")
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from autoflow.algorithms.segmentation.models import (
+            default_nnunet_model_folder, resolve_nnunet_4d_model_folder,
+            bundled_nnunet_model_folder,
+        )
+        args.model_3d = default_nnunet_model_folder()
+        args.model_4d = resolve_nnunet_4d_model_folder()
+        args.model_bundled = bundled_nnunet_model_folder()
+    elif not all(explicit):
+        parser.error("supply --from-current-defaults or all three model paths")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="autoflow_models_") as temp:
         models = Path(temp) / "models"
-        manifest = {"schema_version": 1, "inference_only": True, "profiles": []}
-        for profile, source in (("nnunet3d", args.model_3d), ("nnunet4d", args.model_4d),
-                                ("nnunet3d-bundled", args.model_bundled)):
-            manifest["profiles"].append(export_model(source, models / profile, profile))
+        manifest = {"schema_version": 2, "inference_only": True, "profiles": []}
+        for profile, source, checkpoint in (
+            ("nnunet3d", args.model_3d, "checkpoint_final.pth"),
+            ("nnunet4d", args.model_4d, "checkpoint_best.pth"),
+            ("nnunet3d-bundled", args.model_bundled, "checkpoint_final.pth"),
+        ):
+            manifest["profiles"].append(export_model(source, models / profile, profile, checkpoint))
             print(f"Verified unchanged inference weights: {profile}", flush=True)
         (models / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         with zipfile.ZipFile(args.output, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as archive:

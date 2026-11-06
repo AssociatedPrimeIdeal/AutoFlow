@@ -4,13 +4,20 @@ on:
   push:
     branches:
       - main
+      - dev
   workflow_call:
+  workflow_dispatch:
   pull_request:
     branches:
       - main
+      - dev
 
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -53,14 +60,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          python packaging/windows/download_models.py --cache "$RUNNER_TEMP/autoflow-models" --repo "$GITHUB_REPOSITORY"
           python - <<'PY'
-          import hashlib, json, os, pathlib, subprocess, zipfile
+          import hashlib, json, os, pathlib, zipfile
           lock = json.loads(pathlib.Path('packaging/windows/models.lock.json').read_text())
           cache = pathlib.Path(os.environ['RUNNER_TEMP']) / 'autoflow-models'
           cache.mkdir(exist_ok=True)
           archive = cache / lock['asset']
-          if not archive.is_file():
-              subprocess.run(['gh', 'release', 'download', lock['tag'], '--repo', os.environ['GITHUB_REPOSITORY'], '--pattern', lock['asset'], '--dir', str(cache)], check=True)
           digest = hashlib.file_digest(archive.open('rb'), 'sha256').hexdigest()
           if digest != lock['sha256']:
               raise RuntimeError('Inference model checksum mismatch')
@@ -84,3 +90,8 @@ jobs:
           QT_QPA_PLATFORM: "offscreen"
           VTK_DEFAULT_OPENGL_WINDOW: ${{ runner.os == 'Linux' && 'vtkEGLRenderWindow' || 'vtkOSOpenGLRenderWindow' }}
         run: python -m pytest tests/test_smoke_phantoms.py tests/test_pressure_gradient_phantom.py -v --tb=short -ra
+
+  windows-portable:
+    name: Build Windows portable application
+    needs: test
+    uses: ./.github/workflows/windows-portable.yml

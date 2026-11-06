@@ -61,42 +61,6 @@
         }
       ]
     },
-    "RBCT": {
-      "plane_mode": "landmark",
-      "plane_count": 1,
-      "placements": [
-        {
-          "anchor": "label_reference_branch",
-          "path_selection": "longest",
-          "position": "near",
-          "offset_mm": 10.0
-        }
-      ]
-    },
-    "CCA": {
-      "plane_mode": "landmark",
-      "plane_count": 1,
-      "placements": [
-        {
-          "anchor": "label_reference_branch",
-          "path_selection": "longest",
-          "position": "near",
-          "offset_mm": 10.0
-        }
-      ]
-    },
-    "LBCT": {
-      "plane_mode": "landmark",
-      "plane_count": 1,
-      "placements": [
-        {
-          "anchor": "label_reference_branch",
-          "path_selection": "longest",
-          "position": "near",
-          "offset_mm": 10.0
-        }
-      ]
-    },
     "RPA": {
       "plane_mode": "landmark",
       "plane_count": 1,
@@ -224,7 +188,7 @@
         }
       ]
     },
-    "LICA": {
+    "LVA": {
       "plane_mode": "landmark",
       "plane_count": 2,
       "placements": [
@@ -234,26 +198,10 @@
           "path_selection": "unique",
           "position": "fractions",
           "fractions": [
-            0.33,
-            0.66
-          ],
-          "inlet_selection": "lowest_z"
-        }
-      ]
-    },
-    "LVA": {
-      "plane_mode": "landmark",
-      "plane_count": 2,
-      "placements": [
-        {
-          "anchor": "label_branch",
-          "scope": "label",
-          "path_selection": "longest",
-          "position": "fractions",
-          "fractions": [
             0.3,
             0.5
-          ]
+          ],
+          "inlet_selection": "lowest_z"
         }
       ]
     },
@@ -262,14 +210,15 @@
       "plane_count": 2,
       "placements": [
         {
-          "anchor": "label_branch",
+          "anchor": "flow_inlet_branch",
           "scope": "label",
-          "path_selection": "longest",
+          "path_selection": "unique",
           "position": "fractions",
           "fractions": [
             0.3,
             0.5
-          ]
+          ],
+          "inlet_selection": "lowest_z"
         }
       ]
     },
@@ -431,35 +380,80 @@
         }
       ]
     },
-    "LIJV": {
+    "BCT": {
       "plane_mode": "landmark",
-      "plane_count": 2,
+      "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_branch",
-          "scope": "label",
+          "anchor": "label_reference_branch",
           "path_selection": "longest",
-          "position": "fractions",
-          "fractions": [
-            0.3333333333333333,
-            0.6666666666666666
-          ]
+          "position": "near",
+          "offset_mm": 10.0
         }
       ]
     },
-    "RIJV": {
+    "LCarotid": {
       "plane_mode": "landmark",
       "plane_count": 2,
       "placements": [
         {
-          "anchor": "label_branch",
+          "anchor": "flow_inlet_branch",
           "scope": "label",
+          "path_selection": "unique",
+          "position": "fractions",
+          "fractions": [
+            0.33,
+            0.66
+          ],
+          "inlet_selection": "lowest_z"
+        }
+      ]
+    },
+    "LSA": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_reference_branch",
           "path_selection": "longest",
+          "position": "near",
+          "offset_mm": 10.0
+        }
+      ]
+    },
+    "LVenousOutflow": {
+      "plane_mode": "landmark",
+      "plane_count": 2,
+      "placements": [
+        {
+          "anchor": "flow_outlet_branch",
+          "scope": "label",
+          "path_selection": "unique",
           "position": "fractions",
           "fractions": [
             0.3333333333333333,
             0.6666666666666666
-          ]
+          ],
+          "fraction_reference": "flow_end",
+          "outlet_selection": "lowest_z"
+        }
+      ]
+    },
+    "RVenousOutflow": {
+      "plane_mode": "landmark",
+      "plane_count": 2,
+      "placements": [
+        {
+          "anchor": "flow_outlet_branch",
+          "scope": "label",
+          "path_selection": "unique",
+          "position": "fractions",
+          "fractions": [
+            0.3333333333333333,
+            0.6666666666666666
+          ],
+          "fraction_reference": "flow_end",
+          "outlet_selection": "lowest_z"
         }
       ]
     }

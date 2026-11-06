@@ -741,9 +741,36 @@ def test_flow_cycle_phantom_requires_boolean_connectivity_parameter():
         SkeletonParams.from_dict({'cycle_preserve_connectivity': 'false'})
 
 
+@pytest.mark.parametrize('present,owner', [
+    ([1, 3, 4, 33, 34, 35], 'aorta_systemic_branches'),
+    ([20, 28, 29, 30, 34], 'intracranial_anterior_arteries'),
+    ([20, 34], 'intracranial_anterior_arteries'),
+    ([1, 3, 4, 20, 28, 34], 'aorta_systemic_branches'),
+])
+def test_shared_carotid_phantom_has_one_group_and_preserves_arterial_connections(present, owner):
+    ws = build_workspace(AutoFlowConfig.from_config_dir())
+    engine = PipelineEngine()
+    labels = np.asarray(present, dtype=np.int16).reshape(-1, 1, 1)
+    specs = engine._build_group_specs(ws, labels)
+    carotid_groups = [spec for spec in specs if 34 in spec['labels']]
+    assert len(carotid_groups) == 1
+    assert carotid_groups[0]['name'] == owner
+    assert set(carotid_groups[0]['labels']) == set(present)
+    assert len([value for spec in specs for value in spec['labels']]) == len(present)
+
+
+def test_special_branch_phantom_resolves_merged_and_legacy_names_without_protecting_lica():
+    ws = build_workspace(AutoFlowConfig.from_config_dir())
+    engine = PipelineEngine()
+    available = [1, 5, 6, 7, 17, 33, 34, 35]
+    for names in (['BCT', 'LCarotid', 'LSA'], ['RBCT', 'CCA', 'LBCT']):
+        params = SkeletonParams(special_contact_labels=names)
+        assert set(engine._special_label_values(ws, params, available)) == {5, 6, 7, 33, 34, 35}
+
+
 def test_special_branch_phantom_protects_abdominal_contacts_and_retains_trunk_interfaces():
     from autoflow.algorithms.graph import build_graph_from_points, _sample_graph_labels
-    expected = {'RBCT', 'CCA', 'LBCT', 'HA', 'SMA', 'LRA', 'RRA'}
+    expected = {'BCT', 'LCarotid', 'LSA', 'HA', 'SMA', 'LRA', 'RRA'}
     cfg = AutoFlowConfig.from_config_dir()
     ws = build_workspace(cfg)
     assert set(cfg.special_contact_labels) == set(SkeletonParams.from_dict({}).special_contact_labels) == expected
@@ -1367,7 +1394,7 @@ def test_label_plane_phantom_unified_defaults_and_qc_omissions():
 
     rules = default_label_plane_rules()
     counts = dict.fromkeys(rules, 0)
-    counts.update(AAO=3, DAO=3, MPA=1, BA=1, LIJV=2, RIJV=2, LICA=2, RICA=2, LVA=2, RVA=2, PV=3, SMV=1, SV=1)
+    counts.update(AAO=3, DAO=3, MPA=1, BA=1, LVenousOutflow=2, RVenousOutflow=2, LCarotid=2, RICA=2, LVA=2, RVA=2, PV=3, SMV=1, SV=1)
     label_map = {name: i + 1 for i, name in enumerate(counts)}
     labels = np.zeros((35, len(counts) * 4 + 5, 5), dtype=np.int16)
     paths = []
@@ -1388,13 +1415,13 @@ def test_label_plane_phantom_unified_defaults_and_qc_omissions():
                     else [.1, .3, .5] if name == "DAO"
                     else [.1] if name in {"LTS", "RTS"} else [.9] if name in {"SSS", "StrS"}
                     else [.7] if name == "MPA" else [.5] if name in {"LPA", "RPA"}
-                    else [1 / 3, 2 / 3] if name in {"LIJV", "RIJV"}
-                    else [.3, .5] if name in {"LVA", "RVA"} else [.33, .66] if name in {"LICA", "RICA"} else [.5])
+                    else [2 / 3, 1 / 3] if name in {"LVenousOutflow", "RVenousOutflow"}
+                    else [.3, .5] if name in {"LVA", "RVA"} else [.33, .66] if name in {"LCarotid", "RICA"} else [.5])
         assert len(selected) == len(expected) == count
         assert [p.distance / 30 for p in selected] == pytest.approx(expected)
         assert all(np.allclose(p.normal, [1, 0, 0]) for p in selected)
     assert rules["LPCA"]["plane_count"] == rules["RPCA"]["plane_count"] == 1
-    assert rules["LICA"]["plane_count"] == rules["RICA"]["plane_count"] == 2
+    assert rules["LCarotid"]["plane_count"] == rules["RICA"]["plane_count"] == 2
     assert rules["ACA"]["plane_count"] == 1
     assert all(rules[name]["plane_count"] == 0 for name in ("ARCH", "HA", "SMA"))
     assert len(smooth) == len(paths)
@@ -1406,15 +1433,26 @@ def test_label_plane_phantom_unified_defaults_and_qc_omissions():
     assert build_workspace(config).plane_gen_params.label_rules == default_label_plane_rules()
     from autoflow.plane_rules import load_plane_rules_file
     plan_dir = DATA_DIR.parent / "configs" / "plane_plans"
-    assert {p.name for p in plan_dir.glob('*.json')} == {'default.json'}
-    assert load_plane_rules_file(plan_dir/'default.json') == rules
-    assert sum(rule['plane_count'] for rule in rules.values()) == 45
-    for name in ('LICA','RICA','LVA','RVA'):
+    assert load_plane_rules_file(plan_dir / "default.json") == rules
+    regional_labels = {
+        "cardiopulmonary": {"AAO", "ARCH", "DAO", "BCT", "LCarotid", "LSA", "MPA", "RPA", "LPA"},
+        "neck": {"RICA", "LVA", "RVA", "LCarotid", "LVenousOutflow", "RVenousOutflow"},
+        "brain": {"RICA", "LVA", "RVA", "BA", "LPCA", "RPCA", "LMCA", "RMCA", "ACA",
+                  "LTS", "RTS", "SSS", "StrS", "LCarotid", "LVenousOutflow", "RVenousOutflow"},
+        "portal": {"PV", "SMV", "SV"},
+        "renal": {"LRA", "RRA"},
+    }
+    for region, labels in regional_labels.items():
+        plan = plan_dir / f"{region}.json"
+        regional = build_workspace(AutoFlowConfig(plane_config=str(plan))).plane_gen_params.label_rules
+        assert regional == {name: rules[name] for name in labels}
+    assert sum(rule['plane_count'] for rule in rules.values()) == 44
+    for name in ('LCarotid','RICA','LVA','RVA'):
         spec=rules[name]['placements'][0]
-        assert spec['anchor']==('flow_inlet_branch' if name in ('LICA','RICA') else 'label_branch') and 'level' not in spec
+        assert spec['anchor'] == 'flow_inlet_branch' and spec['inlet_selection'] == 'lowest_z' and 'level' not in spec
         assert spec['scope']=='label'
-        assert spec['path_selection']==('unique' if name in ('LICA','RICA') else 'longest')
-        assert spec['fractions']==([.33,.66] if name in ('LICA','RICA') else [.3,.5])
+        assert spec['path_selection'] == 'unique'
+        assert spec['fractions']==([.33,.66] if name in ('LCarotid','RICA') else [.3,.5])
     from autoflow.core.models import PlaneGenerationParams
     assert PlaneGenerationParams.from_dict({"use_center_plane": False}).plane_mode == "distance"
 
@@ -1467,7 +1505,7 @@ def test_connection_default_phantom_retains_two_same_label_renal_arms():
     assert {row["selection_source"] for row in qc} == {"single_label_branches"}
 
 
-@pytest.mark.parametrize("name", ["PV", "SMV", "SV", "RBCT", "CCA", "LBCT"])
+@pytest.mark.parametrize("name", ["PV", "SMV", "SV", "BCT", "LSA"])
 @pytest.mark.parametrize("length", [6, 12, 40])
 def test_connection_default_phantom_positions_stay_inside_short_label(name, length):
     from autoflow.algorithms.label_planes import generate_label_planes
@@ -1485,7 +1523,7 @@ def test_connection_default_phantom_positions_stay_inside_short_label(name, leng
         # A PV branch now requires the actual SMV/SV/PV confluence.
         assert not planes and qc[0]["selection_warnings"] == ["portal_confluence_not_found"]
         return
-    distance = 10. if name in {"RBCT", "CCA", "LBCT"} else 15.
+    distance = 10. if name in {"RBCT", "CCA", "LBCT", "BCT", "LSA"} else 15.
     if length < distance:
         assert not planes and qc[0]["omitted_positions"][0]["reason"] == "offset_exceeds_interval"
         return
@@ -1674,7 +1712,7 @@ def test_connection_default_gui_phantom_preserves_strict_levels(tmp_path):
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     rules = default_label_plane_rules()
     edited = {}
-    for name in ("LICA", "BA", "RIJV", "StrS", "LTS", "RTS", "SSS"):
+    for name in ("LCarotid", "BA", "RVenousOutflow", "StrS", "LTS", "RTS", "SSS"):
         dialog = LandmarkPlanDialog(name, rules[name])
         try:
             dialog.accept()
@@ -1851,9 +1889,9 @@ def test_landmark_unified_defaults_gui_phantom_roundtrips(tmp_path):
         assert table.isColumnHidden(2) and table.isColumnHidden(3)
         rules = dialog.values()["plane_gen_params.label_rules"]
         assert rules==default_label_plane_rules()
-        for name in ('LICA','RICA','LVA','RVA'):
+        for name in ('LCarotid','RICA','LVA','RVA'):
             row=next(i for i in range(table.rowCount()) if table.item(i,0).text()==name)
-            assert ('Flow-entry branch' if name in ('LICA','RICA') else 'Label branch') in table.item(row,6).text() and 'L1' not in table.item(row,6).text()
+            assert 'Flow-entry branch' in table.item(row,6).text() and 'L1' not in table.item(row,6).text()
             assert rules[name]['plane_count']==2
         filename = tmp_path / "planes.json"
         save_plane_rules_file(filename, rules)
@@ -11620,14 +11658,19 @@ def test_continuous_reference_phantom_rejects_an_unrelated_parent_without_fallba
 def test_clinical_default_plan_phantom_has_no_path_level_or_cross_vessel_plane_reference():
     from autoflow.plane_rules import default_label_plane_rules,normalize_label_plane_rules
     rules=default_label_plane_rules()
-    assert len(rules)==32 and sum(r['plane_count'] for r in rules.values())==45
-    assert {s['anchor'] for r in rules.values() for s in r['placements']}=={'label_branch','label_reference_branch','flow_inlet_branch','portal_branch','label_longest'}
+    assert len(rules) == 31 and sum(rule["plane_count"] for rule in rules.values()) == 44
+    assert {"RBCT", "CCA", "LBCT", "LICA", "LIJV", "RIJV"}.isdisjoint(rules)
+    for name in ("LVenousOutflow", "RVenousOutflow"):
+        spec, = rules[name]["placements"]
+        assert rules[name]["plane_count"] == 2
+        assert spec["outlet_selection"] == "lowest_z" and spec["fraction_reference"] == "flow_end"
+    assert {s['anchor'] for r in rules.values() for s in r['placements']}=={'label_branch','label_reference_branch','flow_inlet_branch','flow_outlet_branch','portal_branch','label_longest'}
     assert all('level' not in s and 'fallback' not in s for r in rules.values() for s in r['placements'])
     assert all(rules[n]['placements'][0]['path_selection']=='all' for n in ('LRA','RRA','ACA'))
     assert normalize_label_plane_rules(rules)==rules
 
 
-@pytest.mark.parametrize('name',['LICA','MPA','LRA','SSS','PV','SMV','SV'])
+@pytest.mark.parametrize('name',['LCarotid','LVenousOutflow','MPA','LRA','SSS','PV','SMV','SV'])
 def test_continuous_trunk_gui_phantom_roundtrips_clinical_anchors(name):
     from PySide6 import QtWidgets
     from autoflow.ui.landmark_editor import LandmarkPlanDialog
@@ -12084,10 +12127,9 @@ def _legacy_label_route_placements(name):
 
 
 def _legacy_label_route_rule(name):
-    from autoflow.plane_rules import default_label_plane_rules
-    rule = default_label_plane_rules()[name]
-    rule['placements'] = _legacy_label_route_placements(name)
-    return rule
+    placements = _legacy_label_route_placements(name)
+    count = sum(len(spec["fractions"]) if spec["position"] == "fractions" else 1 for spec in placements)
+    return {"plane_mode": "landmark", "plane_count": count, "placements": placements}
 
 
 
@@ -12160,7 +12202,7 @@ def test_single_branch_vertebral_phantom_uses_thirty_and_fifty_percent_in_flow_d
         np.testing.assert_allclose([p.center[0] for p in planes],[20.,30.] if sign==1 else [40.,30.])
 
 
-@pytest.mark.parametrize('name',['LICA','RICA'])
+@pytest.mark.parametrize('name',['LCarotid','RICA','LVA','RVA'])
 @pytest.mark.parametrize('reverse',[False,True])
 def test_single_branch_carotid_phantom_selects_the_flow_entry_before_longer_daughters(name,reverse):
     from autoflow.algorithms.label_planes import generate_label_planes
@@ -12176,7 +12218,7 @@ def test_single_branch_carotid_phantom_selects_the_flow_entry_before_longer_daug
     planes,_,_,qc=generate_label_planes(paths,volume,{name:17},{name:default_label_plane_rules()[name]},
         path_info=infos,smoothing_window=1,inter_time=1)
     assert len(planes)==2 and all(p.path_index==0 for p in planes)
-    np.testing.assert_allclose([p.center[0] for p in planes],[9.95,14.9])
+    np.testing.assert_allclose([p.center[0] for p in planes], [9.5,12.5] if name in {'LVA','RVA'} else [9.95,14.9])
     assert all(p.placement['anchor']=='flow_inlet_branch' and p.placement['route_path_indices']==[0] for p in planes)
 
 
@@ -12184,8 +12226,8 @@ def test_single_branch_carotid_phantom_multiple_flow_entries_are_not_selected_by
     from autoflow.algorithms.label_planes import generate_label_planes
     from autoflow.plane_rules import default_label_plane_rules
     paths=[np.column_stack((np.arange(5.,26.),np.full(21,y),np.full(21,10.))) for y in (10.,30.)]
-    volume,infos=_landmark_phantom(paths,[np.full(21,17)]*2,[(0,1),(2,3)],{'LICA':17},[{'flow_sign':1}]*2)
-    planes,_,_,qc=generate_label_planes(paths,volume,{'LICA':17},{'LICA':default_label_plane_rules()['LICA']},
+    volume,infos=_landmark_phantom(paths,[np.full(21,34)]*2,[(0,1),(2,3)],{'LCarotid':34},[{'flow_sign':1}]*2)
+    planes,_,_,qc=generate_label_planes(paths,volume,{'LCarotid':34},{'LCarotid':default_label_plane_rules()['LCarotid']},
         path_info=infos,smoothing_window=1,inter_time=1)
     assert not planes and qc[0]['selection_warnings']==['ambiguous_label_branch']
 
@@ -12272,29 +12314,33 @@ def test_single_branch_pulmonary_phantom_uses_longest_mpa_from_downstream(sign, 
 
 @pytest.mark.parametrize('reverse',[False,True])
 @pytest.mark.parametrize('permuted',[False,True])
-def test_lowest_inlet_phantom_uses_physical_z_not_path_number(reverse,permuted):
+@pytest.mark.parametrize('name,value', [('LCarotid',34), ('LVenousOutflow',36), ('RVenousOutflow',37)])
+def test_lowest_flow_endpoint_phantom_uses_physical_z_not_path_number(reverse,permuted,name,value):
     from autoflow.algorithms.label_planes import generate_label_planes
     from autoflow.plane_rules import default_label_plane_rules
     paths=[np.column_stack((np.arange(5.,46.),np.full(41,20.),np.full(41,z))) for z in (18.,10.)]
     nodes=[(0,1),(2,3)];signs=[1,1]
     if reverse: paths=[p[::-1] for p in paths];nodes=[n[::-1] for n in nodes];signs=[-1,-1]
     if permuted: paths=paths[::-1];nodes=nodes[::-1]
-    volume,infos=_landmark_phantom(paths,[np.full(41,17)]*2,nodes,{'LICA':17},[{'flow_sign':v} for v in signs])
-    planes,_,_,qc=generate_label_planes(paths,volume,{'LICA':17},{'LICA':default_label_plane_rules()['LICA']},path_info=infos,smoothing_window=1,inter_time=1)
+    volume,infos=_landmark_phantom(paths,[np.full(41,value)]*2,nodes,{name:value},[{'flow_sign':v} for v in signs])
+    planes,_,_,qc=generate_label_planes(paths,volume,{name:value},{name:default_label_plane_rules()[name]},path_info=infos,smoothing_window=1,inter_time=1)
     assert len(planes)==2
-    np.testing.assert_allclose([p.center for p in planes],[[18.2,20.,10.],[31.4,20.,10.]])
-    assert all(p.placement['branch_inlet_selection']=='lowest_z' for p in planes)
+    outlet = name != 'LCarotid'
+    x = [45-40/3,45-80/3] if outlet else [18.2,31.4]
+    np.testing.assert_allclose([p.center for p in planes],[[v,20.,10.] for v in x])
+    key = 'branch_outlet_selection' if outlet else 'branch_inlet_selection'
+    assert all(p.placement[key]=='lowest_z' for p in planes)
 
 
 def test_lowest_inlet_phantom_does_not_promote_an_internal_label_fragment():
     from autoflow.algorithms.label_planes import generate_label_planes
     from autoflow.plane_rules import default_label_plane_rules
     path=np.column_stack((np.arange(5.,56.),np.full(51,20.),np.linspace(18.,3.,51)))
-    values=np.full(51,17);values[24:28]=0
-    volume,infos=_landmark_phantom([path],[values],[(0,1)],{'LICA':17},[{'flow_sign':1}])
+    values=np.full(51,34);values[24:28]=0
+    volume,infos=_landmark_phantom([path],[values],[(0,1)],{'LCarotid':34},[{'flow_sign':1}])
     from scipy.ndimage import maximum_filter
     volume=maximum_filter(volume,size=3)
-    planes,_,_,qc=generate_label_planes([path],volume,{'LICA':17},{'LICA':default_label_plane_rules()['LICA']},path_info=infos,smoothing_window=1,inter_time=1)
+    planes,_,_,qc=generate_label_planes([path],volume,{'LCarotid':34},{'LCarotid':default_label_plane_rules()['LCarotid']},path_info=infos,smoothing_window=1,inter_time=1)
     assert len(planes)==2 and all(p.placement['branch_segment_index']==0 for p in planes)
     assert all(p.center[2]>10 for p in planes)
 
@@ -12758,3 +12804,65 @@ def test_plane_coordinates_batch_phantom_uses_file_in_placement_stage(tmp_path):
     np.testing.assert_allclose(payload['planes'][0]['center_world_mm'],[1,2,3])
     qc=json.loads((output/'plane_qc.json').read_text())
     assert qc['plane_mode']=='imported' and qc['actual_plane_count']==1
+
+
+def test_match_random_position_phantom_draws_on_each_generation(monkeypatch):
+    import copy
+    from autoflow.algorithms import landmark_planes
+    from autoflow.algorithms.label_planes import generate_label_planes
+    from autoflow.plane_rules import load_plane_rules_file
+
+    plan = DATA_DIR.parent / "configs" / "plane_plans" / "match.json"
+    rules = load_plane_rules_file(plan)
+    assert all(rule["plane_count"] == 1 for rule in rules.values() if rule["plane_count"])
+    assert all(rule["plane_count"] == 0 for name, rule in rules.items() if name in {"ARCH", "HA", "SMA"})
+    assert build_workspace(AutoFlowConfig(plane_config=str(plan))).plane_gen_params.label_rules == rules
+    original = copy.deepcopy(rules)
+    paths = [np.column_stack((np.arange(5., 56.), np.full(51, 20.), np.full(51, 10.))),
+             np.column_stack((np.arange(5., 26.), np.full(21, 30.), np.full(21, 10.)))]
+    volume, infos = _landmark_phantom(paths, [np.full(len(path), 12) for path in paths],
+                                     [(0, 1), (2, 3)], {"LRA": 12})
+    draws = iter([.2, .8])
+    class Generator:
+        def uniform(self, lower, upper):
+            assert (lower, upper) == (.1, .9)
+            return next(draws)
+    monkeypatch.setattr(landmark_planes.np.random, "default_rng", Generator)
+    centers = []
+    for fraction in (.2, .8):
+        planes, _, _, qc = generate_label_planes(paths, volume, {"LRA": 12}, {"LRA": rules["LRA"]},
+            path_info=infos, smoothing_window=1, inter_time=1)
+        assert len(planes) == 1 and planes[0].path_index == 0
+        assert planes[0].placement["position"] == "random"
+        assert planes[0].placement["fraction_range"] == [.1, .9]
+        assert planes[0].placement["fraction"] == pytest.approx(fraction)
+        assert qc[0]["placements"][0]["sampled_fraction"] == pytest.approx(fraction)
+        centers.append(planes[0].center)
+    np.testing.assert_allclose(centers, [[15., 20., 10.], [45., 20., 10.]])
+    assert rules == original
+
+
+def test_random_position_phantom_plan_validation_and_gui_roundtrip():
+    from PySide6 import QtWidgets
+    from autoflow.plane_rules import normalize_label_plane_rules, load_plane_rules_file
+    from autoflow.ui.landmark_editor import LandmarkPlanDialog, placement_summary
+
+    plan = DATA_DIR.parent / "configs" / "plane_plans" / "match.json"
+    rule = load_plane_rules_file(plan)["AAO"]
+    for bounds in ([.9, .1], [0, .9], [.1, 1], [True, .9], [.1], [.1, float("nan")]):
+        invalid = dict(rule, placements=[dict(rule["placements"][0], fraction_range=bounds)])
+        with pytest.raises(ValueError, match="fraction_range"):
+            normalize_label_plane_rules({"AAO": invalid})
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    dialog = LandmarkPlanDialog("AAO", rule)
+    try:
+        assert dialog.table.cellWidget(0, 3).currentData() == "random"
+        assert "Random 10%–90%" in placement_summary(rule)
+        dialog.accept()
+        assert dialog.result() == QtWidgets.QDialog.Accepted
+        assert dialog.rule["placements"] == rule["placements"]
+        assert dialog.rule["plane_count"] == 1
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        app.processEvents()

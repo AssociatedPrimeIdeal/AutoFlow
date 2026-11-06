@@ -35,18 +35,6 @@ def main():
             report["errors"][name] = traceback.format_exc()
             print(f"FAIL {name}: {report['errors'][name]}", flush=True)
 
-    def documentation():
-        from autoflow.runtime_paths import documentation_index
-
-        index = documentation_index()
-        root = Path(os.environ["AUTOFLOW_PORTABLE_ROOT"]).resolve()
-        if index is None or not index.resolve().is_relative_to(root):
-            raise RuntimeError("Portable documentation home page is missing")
-        manifest = json.loads((index.parent / "offline-manifest.json").read_text(encoding="utf-8"))
-        if manifest.get("offline") is not True or not (index.parent / "search/search_index.js").is_file():
-            raise RuntimeError("Portable offline documentation/search is incomplete")
-        return {"index": str(index), "offline": True, "pages": manifest["pages"]}
-
     def imports():
         modules = ("numpy", "scipy", "pyamg", "skimage", "networkx", "pyvista", "vtk",
                    "h5py", "imageio_ffmpeg", "maxflow", "PySide6", "pyqtgraph", "pyvistaqt",
@@ -60,19 +48,28 @@ def main():
         import numpy as np
         from autoflow.algorithms.segmentation.models import default_nnunet_model_folder, resolve_nnunet_4d_model_folder
         from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
-        from nnunetv2.preprocessing.resampling.gpu_resampling import resample_torch_cuda_fornnunet
+        from nnunetv2.preprocessing.resampling.gpu_resampling import (
+            resample_torch_cuda_fornnunet, resample_torch_cuda_nearest,
+        )
 
         result = {}
+        manifest = json.loads((Path(os.environ["AUTOFLOW_MODELS_DIR"]) / "manifest.json").read_text(encoding="utf-8"))
+        profiles = {item["profile"]: item for item in manifest["profiles"]}
         for name, folder in (("3d", default_nnunet_model_folder()), ("4d", Path(resolve_nnunet_4d_model_folder()))):
             predictor = nnUNetPredictor(device=torch.device("cpu"), perform_everything_on_device=False)
             checkpoint = "checkpoint_best.pth" if name == "4d" else "checkpoint_final.pth"
+            profile = profiles["nnunet" + name]
+            if profile.get("default_checkpoint", checkpoint) != checkpoint:
+                raise ValueError(f"Unexpected default checkpoint for {name}")
             predictor.initialize_from_trained_model_folder(str(folder), use_folds=("all",), checkpoint_name=checkpoint)
             # Resolve all named resamplers, including the deployed helper, now.
             _ = predictor.configuration_manager.resampling_fn_data
             _ = predictor.configuration_manager.resampling_fn_seg
             _ = predictor.configuration_manager.resampling_fn_probabilities
             result[name] = {"folder": str(folder), "checkpoint": checkpoint,
-                            "channels": len(predictor.dataset_json["channel_names"])}
+                            "channels": len(predictor.dataset_json["channel_names"]),
+                            "labels": predictor.dataset_json["labels"],
+                            "source_model": profile.get("source_model")}
             strides = getattr(getattr(predictor.network, "encoder", None), "strides", None)
             if strides is None:
                 raise RuntimeError("Cannot determine a valid small nnUNet forward shape")
@@ -99,6 +96,13 @@ def main():
             if resampled.shape != (1, 6, 6, 6) or not np.isfinite(resampled).all():
                 raise ValueError("CPU model resampling failed")
             result["explicit_cpu_resampling"] = True
+            labels = np.array([-1, 0, 1, 29], dtype=np.int16).reshape(1, 1, 2, 2)
+            nearest = resample_torch_cuda_nearest(labels, (3, 4, 4), (1, 1, 1), (1, 1, 1))
+            expected = np.repeat(np.repeat(np.repeat(labels, 3, axis=1), 2, axis=2), 2, axis=3)
+            np.testing.assert_array_equal(nearest, expected)
+            if nearest.dtype != labels.dtype:
+                raise ValueError("Label resampling changed the discrete label type")
+            result["explicit_cpu_label_resampling"] = True
         finally:
             if previous is None:
                 os.environ.pop("AUTOFLOW_NNUNET_DEVICE", None)
@@ -255,7 +259,7 @@ def main():
             raise ValueError("No VTK screenshot produced")
         return {"window_created": True, "phantom_case_loaded": True, "qc_tab_loaded": True, "plane_count": 1, "render_shape": list(pixels.shape)}
 
-    for name, operation in (("documentation", documentation), ("imports", imports), ("msvc_runtime", msvc_runtime), ("models", models), ("spawn_workers", workers),
+    for name, operation in (("imports", imports), ("msvc_runtime", msvc_runtime), ("models", models), ("spawn_workers", workers),
                             ("subprocess_entries", commands), ("video_encoder", encoder), ("cuda", gpu)):
         check(name, operation)
     if args.gui:

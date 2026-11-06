@@ -162,7 +162,7 @@ class SkeletonParams:
     special_handling: str = "three_pass_merge"
     special_merge_radius_mm: float = 1.5
     separate_special_label_contacts: bool = True
-    special_contact_labels: List[str] = field(default_factory=lambda: ["RBCT", "CCA", "LBCT", "HA", "SMA", "LRA", "RRA"])
+    special_contact_labels: List[str] = field(default_factory=lambda: ["BCT", "LCarotid", "LSA", "HA", "SMA", "LRA", "RRA"])
     min_cc_volume_mm3: float = 50.0
     cc_filter_mode: str = "hybrid"
     cc_rel_min_ratio: float = 0.10
@@ -265,7 +265,7 @@ class SkeletonParams:
             cfg["preprocess"] = copy.deepcopy(preprocess) if isinstance(preprocess, dict) else {}
             cfg["preprocess"].pop("radius_tree_policy", None)
             label_groups[str(group_name)] = cfg
-        raw_special_labels = payload.get("special_contact_labels", ["RBCT", "CCA", "LBCT", "HA", "SMA", "LRA", "RRA"])
+        raw_special_labels = payload.get("special_contact_labels", ["BCT", "LCarotid", "LSA", "HA", "SMA", "LRA", "RRA"])
         if not isinstance(raw_special_labels, (list, tuple)):
             raw_special_labels = [raw_special_labels]
         special_labels = [str(value).strip() for value in raw_special_labels if str(value).strip()]

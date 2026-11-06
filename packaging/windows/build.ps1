@@ -4,7 +4,6 @@ param(
     [string]$EnvironmentDirectory = "",
     [string]$OutputDirectory = "",
     [string]$ModelsArchive = "",
-    [string]$DocumentationDirectory = "",
     [string]$Version = "",
     [switch]$SkipArchive,
     [switch]$SkipDependencyInstall
@@ -39,25 +38,6 @@ if (-not $SkipDependencyInstall) {
     if ($LASTEXITCODE -ne 0) { throw "Full application dependencies could not be installed" }
 }
 
-# Documentation build tools stay outside the application runtime environment.
-if (-not $DocumentationDirectory) {
-    $DocsEnvironment = Join-Path $OutputDirectory "build-docs-env"
-    $DocsPython = Join-Path $DocsEnvironment "Scripts/python.exe"
-    if (-not (Test-Path -LiteralPath $DocsPython)) {
-        & $BuildPython -m venv $DocsEnvironment
-        if ($LASTEXITCODE -ne 0) { throw "Could not create the documentation build environment" }
-    }
-    & $DocsPython -m pip install -r (Join-Path $PSScriptRoot "../docs/requirements.txt")
-    if ($LASTEXITCODE -ne 0) { throw "Documentation build tools could not be installed" }
-    $DocumentationDirectory = Join-Path $OutputDirectory "build-docs"
-    & $DocsPython (Join-Path $PSScriptRoot "../docs/build_offline.py") --repo $ProjectRoot --output $DocumentationDirectory
-    if ($LASTEXITCODE -ne 0) { throw "Offline documentation build failed" }
-}
-$DocumentationDirectory = (Resolve-Path -LiteralPath $DocumentationDirectory).ProviderPath
-if (-not (Test-Path -LiteralPath (Join-Path $DocumentationDirectory "offline-manifest.json"))) {
-    throw "DocumentationDirectory must contain verified offline documentation"
-}
-
 # Build each optional package from this checkout, including local edits.
 $SourceStage = Join-Path $OutputDirectory "build-sources"
 New-Item -ItemType Directory -Path $SourceStage -Force | Out-Null
@@ -80,7 +60,8 @@ if (-not $ModelsArchive) { $ModelsArchive = Join-Path $ProjectRoot "build/window
 if (-not (Test-Path -LiteralPath $ModelsArchive)) {
     $Lock = Get-Content -LiteralPath (Join-Path $PSScriptRoot "models.lock.json") -Raw | ConvertFrom-Json
     $ModelsArchive = Join-Path $OutputDirectory $Lock.asset
-    Invoke-WebRequest -Uri $Lock.url -OutFile $ModelsArchive
+    & $BuildPython (Join-Path $PSScriptRoot "download_models.py") --cache $OutputDirectory
+    if ($LASTEXITCODE -ne 0) { throw "Inference model download failed" }
 }
 $Lock = Get-Content -LiteralPath (Join-Path $PSScriptRoot "models.lock.json") -Raw | ConvertFrom-Json
 if ((Get-FileHash -LiteralPath $ModelsArchive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $Lock.sha256) {
@@ -97,7 +78,7 @@ $PackageName = "AutoFlow-$Version-windows-x64"
 $PackageRoot = [IO.Path]::GetFullPath((Join-Path $OutputDirectory $PackageName))
 if (-not $PackageRoot.StartsWith($OutputDirectory + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw "Unsafe package output path" }
 if (Test-Path -LiteralPath $PackageRoot) { Remove-Item -LiteralPath $PackageRoot -Recurse -Force }
-& $BuildPython (Join-Path $PSScriptRoot "assemble.py") stage --repo $ProjectRoot --destination $PackageRoot --models (Join-Path $ModelsStage "models") --version $Version --docs-site $DocumentationDirectory
+& $BuildPython (Join-Path $PSScriptRoot "assemble.py") stage --repo $ProjectRoot --destination $PackageRoot --models (Join-Path $ModelsStage "models") --version $Version
 if ($LASTEXITCODE -ne 0) { throw "Portable assembly failed" }
 $Compiler = Join-Path $env:WINDIR "Microsoft.NET/Framework64/v4.0.30319/csc.exe"
 & $Compiler /nologo /target:winexe /platform:x64 /reference:System.Windows.Forms.dll "/out:$PackageRoot/AutoFlow.exe" (Join-Path $PSScriptRoot "Launcher.cs")

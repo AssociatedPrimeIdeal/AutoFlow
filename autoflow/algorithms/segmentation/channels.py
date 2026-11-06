@@ -328,9 +328,8 @@ def _parse_nnunet_label_map(label_map_spec, model_labels):
 
 
 def _apply_label_map(segmentation, label_map):
-    seg = np.asarray(segmentation, dtype=np.int16).copy()
-    if not label_map:
-        return seg
+    source = np.asarray(segmentation, dtype=np.int16)
+    seg = source.copy()
     for source_id, target_id in label_map.items():
-        seg[seg == int(source_id)] = int(target_id)
+        seg[source == int(source_id)] = int(target_id)
     return seg

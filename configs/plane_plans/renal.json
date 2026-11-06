@@ -1,0 +1,36 @@
+{
+  "label_rules": {
+    "LRA": {
+      "plane_mode": "landmark",
+      "plane_count": 3,
+      "placements": [
+        {
+          "anchor": "label_reference_branch",
+          "path_selection": "all",
+          "position": "fractions",
+          "fractions": [
+            0.1,
+            0.3,
+            0.5
+          ]
+        }
+      ]
+    },
+    "RRA": {
+      "plane_mode": "landmark",
+      "plane_count": 3,
+      "placements": [
+        {
+          "anchor": "label_reference_branch",
+          "path_selection": "all",
+          "position": "fractions",
+          "fractions": [
+            0.1,
+            0.3,
+            0.5
+          ]
+        }
+      ]
+    }
+  }
+}

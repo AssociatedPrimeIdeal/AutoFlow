@@ -95,16 +95,24 @@ class PipelineEngine:
             label_map = dict(getattr(getattr(ws, "label_params", None), "label_map", {}) or {})
         group_values = {int(value) for value in (group_label_values or [])}
         values = []
+        # Resolve old source IDs and saved pre-merge settings in either direction.
+        # LICA remains a normal cerebral label in legacy data, not a CCA alias.
+        aliases = {"BCT": "RBCT", "RBCT": "BCT", "LCarotid": "CCA",
+                   "CCA": "LCarotid", "LSA": "LBCT", "LBCT": "LSA"}
         for token in list(getattr(group_params, "special_contact_labels", []) or []):
-            value = label_map.get(str(token).strip())
-            if value is None:
-                try:
-                    value = int(token)
-                except (TypeError, ValueError):
+            name = str(token).strip()
+            for candidate in (name, aliases.get(name)):
+                if candidate is None:
                     continue
-            value = int(value)
-            if value in group_values and value not in values:
-                values.append(value)
+                value = label_map.get(candidate)
+                if value is None:
+                    try:
+                        value = int(candidate)
+                    except (TypeError, ValueError):
+                        continue
+                value = int(value)
+                if value in group_values and value not in values:
+                    values.append(value)
         return values
 
 
@@ -292,6 +300,24 @@ class PipelineEngine:
                 "labels": sorted(set(labels)),
             })
             used.update(labels)
+        # A merged label may belong to either field of view. Drop a redundant
+        # shared-label-only group, then combine overlapping active groups so
+        # its voxels and graph paths have one owner. Both aortic and cerebral
+        # branches can then retain their real shared carotid connection.
+        active_sets = [set(spec["labels"]) for spec in specs]
+        specs = [spec for index, spec in enumerate(specs) if not any(
+            active_sets[index] < other or (active_sets[index] == other and other_index < index)
+            for other_index, other in enumerate(active_sets) if other_index != index)]
+        merged_specs = []
+        for spec in specs:
+            overlaps = [old for old in merged_specs if set(old["labels"]) & set(spec["labels"])]
+            if not overlaps:
+                merged_specs.append(spec)
+                continue
+            owner = overlaps[0]
+            owner["labels"] = sorted(set(spec["labels"]).union(*(old["labels"] for old in overlaps)))
+            merged_specs = [old for old in merged_specs if old is owner or old not in overlaps]
+        specs = merged_specs
         leftovers = [int(x) for x in positive if int(x) not in used]
         for label_value in leftovers:
             name = self._label_name_for_value(ws, label_value)

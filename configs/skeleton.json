@@ -5,9 +5,9 @@
   "special_merge_radius_mm": 1.5,
   "separate_special_label_contacts": true,
   "special_contact_labels": [
-    "RBCT",
-    "CCA",
-    "LBCT",
+    "BCT",
+    "LCarotid",
+    "LSA",
     "HA",
     "SMA",
     "LRA",

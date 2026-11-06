@@ -35,7 +35,12 @@
     "RMCA": 29,
     "ACA": 30,
     "LIJV": 31,
-    "RIJV": 32
+    "RIJV": 32,
+    "BCT": 33,
+    "LCarotid": 34,
+    "LSA": 35,
+    "LVenousOutflow": 36,
+    "RVenousOutflow": 37
   },
   "label_groups": {
     "single_label": {
@@ -51,6 +56,9 @@
         "RBCT",
         "CCA",
         "LBCT",
+        "BCT",
+        "LCarotid",
+        "LSA",
         "HA",
         "SMA",
         "LRA",
@@ -99,6 +107,7 @@
     "intracranial_anterior_arteries": {
       "labels": [
         "LICA",
+        "LCarotid",
         "RICA",
         "LMCA",
         "RMCA",
@@ -131,7 +140,9 @@
         "StrS",
         "RTS",
         "SSS",
-        "LTS"
+        "LTS",
+        "LVenousOutflow",
+        "RVenousOutflow"
       ],
       "browser_color": "#0b7285",
       "skeleton_color": "#0b7285",

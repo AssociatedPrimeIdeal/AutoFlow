@@ -121,29 +121,16 @@ def validate_models(models):
             path = folder / item["file"]
             if not path.resolve().is_relative_to(folder.resolve()) or digest(path) != item["sha256"]:
                 raise ValueError(f"Model checkpoint checksum mismatch: {name}")
-        if not (folder / "fold_all" / "checkpoint_final.pth").is_file():
-            raise ValueError(f"Missing final checkpoint: {name}")
+        default = "checkpoint_best.pth" if name == "nnunet4d" else "checkpoint_final.pth"
+        checkpoint = profile.get("default_checkpoint", default)
+        if checkpoint != default or not (folder / "fold_all" / checkpoint).is_file():
+            raise ValueError(f"Missing or incompatible default checkpoint: {name}/{checkpoint}")
     return manifest
 
 
-def validate_documentation(documentation):
-    manifest = json.loads((documentation / "offline-manifest.json").read_text(encoding="utf-8"))
-    if manifest.get("offline") is not True or not manifest.get("files"):
-        raise ValueError("Build the offline documentation with packaging/docs/build_offline.py")
-    for relative in ("index.html", "search/search_index.js"):
-        if relative not in manifest["files"]:
-            raise ValueError(f"Missing offline documentation entry: {relative}")
-    for relative, expected in manifest["files"].items():
-        path = documentation / relative
-        if not path.resolve().is_relative_to(documentation.resolve()) or digest(path) != expected:
-            raise ValueError(f"Offline documentation checksum mismatch: {relative}")
-    return manifest
-
-
-def stage(repo, destination, models, version, documentation, resume=False):
+def stage(repo, destination, models, version, resume=False):
     if sys.platform != "win32" or sys.version_info[:2] != (3, 11):
         raise RuntimeError("Build with Windows x64 CPython 3.11")
-    validate_documentation(documentation)
     validate_models(models)
     destination.mkdir(parents=True, exist_ok=True)
     # Extended paths allow assembly without changing Windows' global long-path
@@ -189,18 +176,16 @@ def stage(repo, destination, models, version, documentation, resume=False):
         shutil.copy2(packaging / name, app / name)
     shutil.copytree(repo / "configs", destination / "configs", ignore=IGNORED)
     shutil.copytree(models, destination / "models", ignore=IGNORED)
-    shutil.copytree(repo / "docs" / "en", destination / "docs" / "en", ignore=IGNORED)
-    shutil.copy2(repo / "docs" / "index.md", destination / "docs" / "index.md")
-    shutil.copytree(documentation, destination / "docs" / "site", ignore=IGNORED)
     shutil.copy2(repo / "LICENSE", destination / "LICENSE")
     shutil.copy2(repo / "README.md", destination / "README.md")
     # Preserve complete application/build sources, including dirty submodule code.
     source = destination / "source"
     source.mkdir()
-    for name in ("pyproject.toml", "README.md", "LICENSE", "mkdocs.yml", "mkdocs.offline.yml"):
+    for name in ("pyproject.toml", "README.md", "LICENSE"):
         shutil.copy2(repo / name, source / name)
-    for name in ("autoflow", "configs", "packaging", ".github", "docs"):
+    for name in ("autoflow", "configs", ".github"):
         shutil.copytree(repo / name, source / name, ignore=IGNORED)
+    shutil.copytree(packaging, source / "packaging" / "windows", ignore=IGNORED)
     for project in SUBPROJECTS:
         src, target = repo / "third_party" / project, source / "third_party" / project
         shutil.copytree(src / "src", target / "src", ignore=IGNORED)
@@ -215,7 +200,7 @@ def stage(repo, destination, models, version, documentation, resume=False):
                               "dirty": bool(git(repo / "third_party" / name, "status", "--porcelain"))}
                        for name in SUBPROJECTS},
         "models_manifest_sha256": digest(models / "manifest.json"),
-        "documentation_manifest_sha256": digest(documentation / "offline-manifest.json"),
+        "documentation_bundled": False,
         "packages": sorted([{"name": item.metadata["Name"], "version": item.version}
                             for item in importlib.metadata.distributions()], key=lambda item: item["name"].lower()),
     }
@@ -274,16 +259,13 @@ def main():
     parser.add_argument("--repo", type=Path)
     parser.add_argument("--destination", required=True, type=Path)
     parser.add_argument("--models", type=Path)
-    parser.add_argument("--docs-site", type=Path)
     parser.add_argument("--version", default="dev")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--resume", action="store_true", help="Resume a runtime copy with unchanged dependencies")
     args = parser.parse_args()
     if args.action == "stage":
-        if args.docs_site is None:
-            parser.error("stage requires --docs-site from packaging/docs/build_offline.py")
         stage(args.repo.resolve(), args.destination.resolve(), args.models.resolve(), args.version,
-              args.docs_site.resolve(), args.resume)
+              args.resume)
     else:
         archive(args.destination.resolve(), args.output.resolve())
 

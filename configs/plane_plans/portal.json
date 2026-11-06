@@ -1,0 +1,47 @@
+{
+  "label_rules": {
+    "PV": {
+      "plane_mode": "landmark",
+      "plane_count": 3,
+      "placements": [
+        {
+          "anchor": "portal_branch",
+          "path_selection": "unique",
+          "position": "fractions",
+          "fractions": [
+            0.2,
+            0.5,
+            0.8
+          ],
+          "connection_fallback": "flow_endpoint"
+        }
+      ]
+    },
+    "SMV": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "near",
+          "offset_mm": 15.0,
+          "connection_fallback": "flow_endpoint"
+        }
+      ]
+    },
+    "SV": {
+      "plane_mode": "landmark",
+      "plane_count": 1,
+      "placements": [
+        {
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
+          "position": "near",
+          "offset_mm": 15.0,
+          "connection_fallback": "flow_endpoint"
+        }
+      ]
+    }
+  }
+}

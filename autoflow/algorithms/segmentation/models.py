@@ -35,7 +35,12 @@ _NNUNET_3D_MODEL_DEFAULT = Path(
 _NNUNET_3D_CHECKPOINT_DEFAULT = "checkpoint_final.pth"
 
 
-# Frozen best checkpoint; training continues in a separate mutable directory.
+# Frozen best checkpoints; training continues in separate mutable directories.
+_NNUNET_4D_LABELS30_MODEL = (
+    Path(__file__).resolve().parents[2] / "segmodel" / "nnunet4d_labels30_20261102_af40f6a7f3d4"
+)
+
+
 _NNUNET_4D_MODEL_DEFAULT = (
     Path(__file__).resolve().parents[2] / "segmodel" / "nnunet4d_20261029_f117a02617a2"
 )
@@ -306,6 +311,8 @@ def resolve_nnunet_4d_model_folder(model_folder=""):
             f"portable 4D nnUNet model folder is missing: {portable}. "
             "Extract the matching models archive beside AutoFlow.exe or set an explicit model folder."
         )
+    if (_NNUNET_4D_LABELS30_MODEL / "fold_all" / _NNUNET_4D_CHECKPOINT_DEFAULT).is_file():
+        return str(_NNUNET_4D_LABELS30_MODEL)
     if _NNUNET_4D_MODEL_DEFAULT.is_dir():
         return str(_NNUNET_4D_MODEL_DEFAULT)
     model = _model_folder_from_4d_pipeline_script(_NNUNET_4D_PIPELINE_DEFAULT)

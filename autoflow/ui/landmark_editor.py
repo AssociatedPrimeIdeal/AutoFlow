@@ -11,6 +11,7 @@ ANCHORS = (
     ("Label branch", "label_branch"),
     ("Branch at vessel connection", "label_reference_branch"),
     ("Flow-entry branch", "flow_inlet_branch"),
+    ("Flow-exit branch", "flow_outlet_branch"),
     ("PV branch at SMV / SV confluence", "portal_branch"),
     ("Saved multi-branch label route", "label_trunk"),
     ("Saved route from vessel reference", "label_reference"),
@@ -37,16 +38,19 @@ def placement_summary(rule):
         title = ANCHOR_TITLES.get(spec["anchor"], spec["anchor"])
         if spec["anchor"] == "label_level":
             title += f" L{spec.get('level', 1)}"
-        if spec["anchor"] in {"label_level", "label_terminal", "label_trunk", "label_reference", "label_branch", "label_reference_branch", "flow_inlet_branch", "portal_branch"}:
+        if spec["anchor"] in {"label_level", "label_terminal", "label_trunk", "label_reference", "label_branch", "label_reference_branch", "flow_inlet_branch", "flow_outlet_branch", "portal_branch"}:
             title += "; " + dict((value, label) for label, value in PATH_CHOICES)[spec.get("path_selection", "unique")]
         position = ("before flow-oriented end " + f"{spec.get('offset_mm',5):g} mm" if spec["position"]=="before_end" else
                     "after flow-oriented start " + f"{spec.get('offset_mm',5):g} mm" if spec["position"]=="after_start" else
                     "inside label +" + f"{spec.get('offset_mm', 5):g} mm" if spec["position"] == "near" else
+                    "Random " + "–".join(f"{100 * float(x):.6g}%" for x in spec.get("fraction_range", [.1,.9]))
+                    if spec["position"] == "random" else
                     ", ".join(f"{100 * float(x):.6g}%" for x in spec["fractions"]))
         if spec.get("fraction_reference"):
             position += " from flow-oriented " + ("end" if spec["fraction_reference"] == "flow_end" else "start")
         rows.append(title + " → " + position)
-        if spec.get('inlet_selection')=='lowest_z': rows[-1] += '; lowest Z terminal entry'
+        if spec.get('inlet_selection') == 'lowest_z': rows[-1] += '; lowest Z terminal entry'
+        if spec.get('outlet_selection') == 'lowest_z': rows[-1] += '; lowest Z terminal exit'
         if spec.get('connection_fallback')=='flow_endpoint': rows[-1] += '; missing portal connection: label flow endpoint'
         if spec.get("scope")=="label":
             rows[-1] += "; whole label"
@@ -75,12 +79,12 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
             "Observed connections retain every real arm. PV/SMV/SV can explicitly use a flow-end fallback when the connection is absent. Other missing anchors/levels and rejected sections retain per-label reasons.")
         self.table = QtWidgets.QTableWidget(0, 11)
         self.table.setObjectName("landmark_placements")
-        self.table.setHorizontalHeaderLabels(["Anchor", "Label level", "Paths at level", "Position", "Offset (mm)", "Positions (%)", "No connection", "Level condition", "Scope", "Flow entry", "Missing portal connection"])
+        self.table.setHorizontalHeaderLabels(["Anchor", "Label level", "Paths at level", "Position", "Offset (mm)", "Positions / range (%)", "No connection", "Level condition", "Scope", "Flow endpoint", "Missing portal connection"])
         for column, explanation in enumerate((
                 "Anatomical connection or path property used to locate this measurement.",
                 "Label-local level of the selected path.", "Which paths at that level receive measurements.",
                 "Placement by physical offset or fractional positions.", "Physical offset in millimetres from the chosen anchor.",
-                "Positions as percentages along the resolved label-local path.",
+                "Fixed positions, or two bounds for Random, as percentages along the selected label interval.",
                 "Fallback used only when the requested anatomical connection is absent.",
                 "Apply a level condition when the specified labels connect in the same physical component.",
                 "Resolve this plan for each component or across the complete label.")):
@@ -187,6 +191,7 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
         position = QtWidgets.QComboBox()
         position.addItem("Offset inside label", "near")
         position.addItem("Fractions of label interval", "fractions")
+        position.addItem("Random within label interval", "random")
         position.addItem("Before flow-oriented end", "before_end")
         position.addItem("After flow-oriented start", "after_start")
         position.addItem("Fractions from flow-oriented start", "flow_start_fractions")
@@ -197,15 +202,20 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
         offset.setDecimals(3)
         offset.setRange(0, 10000)
         offset.setValue(spec.get("offset_mm", 5.))
-        fractions = QtWidgets.QLineEdit(", ".join(f"{100 * float(x):.15g}" for x in spec.get("fractions", [.5])))
-        fractions.setToolTip("Comma-separated percentages strictly between 0 and 100, for example 20, 50, 80")
+        source_positions = spec.get("fraction_range", [.1,.9]) if spec["position"] == "random" else spec.get("fractions", [.5])
+        fractions = QtWidgets.QLineEdit(", ".join(f"{100 * float(x):.15g}" for x in source_positions))
+        fractions.setToolTip("Fixed percentages such as 20, 50, 80. Random takes two bounds such as 10, 90 and draws a fresh position on every generation.")
         fractions.setProperty("source_text", fractions.text())
-        fractions.setProperty("source_fractions", list(spec.get("fractions", [.5])))
+        fractions.setProperty("source_fractions", list(source_positions))
         for column, control in enumerate((anchor, level, paths, position, offset, fractions)):
             self.table.setCellWidget(row, column, control)
             signal = (control.currentIndexChanged if isinstance(control, QtWidgets.QComboBox) else
                       control.textChanged if isinstance(control, QtWidgets.QLineEdit) else control.valueChanged)
             signal.connect(self.refresh)
+        def update_random_bounds():
+            if position.currentData() == "random":
+                fractions.setText("10, 90")
+        position.currentIndexChanged.connect(update_random_bounds)
         fallback = QtWidgets.QPushButton("Edit fallback…" if spec.get("fallback") else "No fallback")
         fallback.setProperty("fallback_spec", copy.deepcopy(spec.get("fallback")))
         fallback.clicked.connect(lambda *_args, widget=fallback: self.edit_fallback(widget))
@@ -222,8 +232,9 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
         self.table.setCellWidget(row,8,scope)
         scope.currentIndexChanged.connect(self.refresh)
         inlet = QtWidgets.QComboBox()
-        inlet.addItem("Any observed entry", "any"); inlet.addItem("Lowest Z terminal entry", "lowest_z")
-        inlet.setCurrentIndex(inlet.findData(spec.get("inlet_selection", "any")))
+        inlet.addItem("Any observed endpoint", "any")
+        inlet.addItem("Lowest Z terminal endpoint", "lowest_z")
+        inlet.setCurrentIndex(inlet.findData(spec.get("outlet_selection", spec.get("inlet_selection", "any"))))
         self.table.setCellWidget(row, 9, inlet); inlet.currentIndexChanged.connect(self.refresh)
         portal = QtWidgets.QComboBox()
         portal.addItem("No fallback", "none"); portal.addItem("Use label flow endpoint", "flow_endpoint")
@@ -293,12 +304,12 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
                 spec["fraction_reference"] = value.removesuffix("_fractions")
             if spec["anchor"] == "label_level":
                 spec["level"] = level.value()
-            if spec["anchor"] in {"label_level", "label_terminal", "label_trunk", "label_reference", "label_branch", "label_reference_branch", "flow_inlet_branch", "portal_branch"}:
+            if spec["anchor"] in {"label_level", "label_terminal", "label_trunk", "label_reference", "label_branch", "label_reference_branch", "flow_inlet_branch", "flow_outlet_branch", "portal_branch"}:
                 choice = paths.currentData()
-                if choice != "unique" or spec["anchor"] in {"label_branch","label_reference_branch","flow_inlet_branch","portal_branch"}:
+                if choice != "unique" or spec["anchor"] in {"label_branch","label_reference_branch","flow_inlet_branch","flow_outlet_branch","portal_branch"}:
                     spec["path_selection"] = choice
             scope=self.table.cellWidget(row,8)
-            if spec["anchor"] in {"label_level","label_terminal","label_longest","label_trunk","label_branch","flow_inlet_branch"} and scope.currentData()=="label":
+            if spec["anchor"] in {"label_level","label_terminal","label_longest","label_trunk","label_branch","flow_inlet_branch","flow_outlet_branch"} and scope.currentData()=="label":
                 spec["scope"]="label"
             fallback = self.table.cellWidget(row, 6)
             if self.allow_fallback and spec["anchor"] == "label_connections" and fallback.property("fallback_spec"):
@@ -311,13 +322,17 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
                 spec["offset_mm"] = offset.value()
             else:
                 text = fractions.text().strip()
+                key = "fraction_range" if spec["position"] == "random" else "fractions"
                 if text == fractions.property("source_text"):
-                    spec["fractions"] = list(fractions.property("source_fractions"))
+                    spec[key] = list(fractions.property("source_fractions"))
                 else:
-                    spec["fractions"] = [float(part.strip().removesuffix("%")) / 100 for part in text.replace("，", ",").split(",")]
+                    spec[key] = [float(part.strip().removesuffix("%")) / 100 for part in text.replace("，", ",").split(",")]
             inlet, portal = self.table.cellWidget(row,9), self.table.cellWidget(row,10)
-            if spec['anchor']=='flow_inlet_branch' and inlet.currentData()!='any':
-                spec['inlet_selection']=inlet.currentData()
+            if inlet.currentData() != 'any':
+                if spec['anchor'] == 'flow_inlet_branch':
+                    spec['inlet_selection'] = inlet.currentData()
+                elif spec['anchor'] == 'flow_outlet_branch':
+                    spec['outlet_selection'] = inlet.currentData()
             if (self.name=='PV' and spec['anchor']=='portal_branch' or self.name in {'SMV','SV'} and spec['anchor']=='label_reference_branch') and portal.currentData()!='none':
                 spec['connection_fallback']=portal.currentData()
             placements.append(spec)
@@ -329,21 +344,21 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
             if fractions is None:
                 continue
             level.setEnabled(anchor.currentData() == "label_level")
-            paths.setEnabled(anchor.currentData() in {"label_level", "label_terminal", "label_trunk", "label_reference", "label_branch", "label_reference_branch", "flow_inlet_branch", "portal_branch"})
+            paths.setEnabled(anchor.currentData() in {"label_level", "label_terminal", "label_trunk", "label_reference", "label_branch", "label_reference_branch", "flow_inlet_branch", "flow_outlet_branch", "portal_branch"})
             fallback = self.table.cellWidget(row, 6)
             condition = self.table.cellWidget(row, 7)
             scope=self.table.cellWidget(row,8)
             if scope is not None:
-                scope.setEnabled(anchor.currentData() in {"label_level","label_terminal","label_longest","label_trunk","label_branch","flow_inlet_branch"})
+                scope.setEnabled(anchor.currentData() in {"label_level","label_terminal","label_longest","label_trunk","label_branch","flow_inlet_branch","flow_outlet_branch"})
             if fallback is not None:
                 fallback.setEnabled(self.allow_fallback and anchor.currentData() == "label_connections")
             if condition is not None:
                 condition.setEnabled(anchor.currentData() == "label_level")
             inlet, portal = self.table.cellWidget(row,9), self.table.cellWidget(row,10)
-            if inlet is not None: inlet.setEnabled(anchor.currentData()=='flow_inlet_branch')
+            if inlet is not None: inlet.setEnabled(anchor.currentData() in {'flow_inlet_branch', 'flow_outlet_branch'})
             if portal is not None: portal.setEnabled(self.name=='PV' and anchor.currentData()=='portal_branch' or self.name in {'SMV','SV'} and anchor.currentData()=='label_reference_branch')
             offset.setEnabled(position.currentData() in {"near","before_end","after_start"})
-            fractions.setEnabled(position.currentData() in {"fractions", "flow_start_fractions", "flow_end_fractions"})
+            fractions.setEnabled(position.currentData() in {"fractions", "random", "flow_start_fractions", "flow_end_fractions"})
         try:
             placements = self.placements()
             count = sum(len(spec["fractions"]) if spec["position"] == "fractions" else 1 for spec in placements)

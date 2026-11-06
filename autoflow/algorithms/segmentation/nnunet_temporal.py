@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import numpy as np
+from ...config import DEFAULT_SKELETON_LABEL_MAP
 from ...task_control import TaskCancelled
 
 from ._common import segmentation_timestamp
@@ -109,7 +110,18 @@ def generate_nnunet_4d_auto_segmentation(
     file_ending = str(dataset_json.get("file_ending", ".nii.gz"))
     if not file_ending.startswith("."):
         file_ending = f".{file_ending}"
-    label_map = _parse_nnunet_label_map(auto_label_map, dataset_json.get("labels", {}))
+    model_labels = dataset_json.get("labels", {})
+    label_map = _parse_nnunet_label_map(auto_label_map, model_labels)
+    merged_labels = {"LCarotid", "RCarotid", "LVenousOutflow", "RVenousOutflow"}
+    if not label_map and len(model_labels) == 30 and merged_labels <= model_labels.keys():
+        # Keep existing AutoFlow IDs for equivalent labels and give the changed
+        # anatomy separate IDs so existing masks and rules remain readable.
+        aliases = {"RCarotid": "RICA", "StraightSinus": "StrS",
+                   "LPCA_P1P2": "LPCA", "RPCA_P1P2": "RPCA"}
+        for name, source_id in model_labels.items():
+            target_id = DEFAULT_SKELETON_LABEL_MAP[aliases.get(name, name)]
+            if int(source_id) != target_id:
+                label_map[int(source_id)] = target_id
     selected_folds = _resolve_nnunet_folds(model_path, folds)
     checkpoint_name = _resolve_nnunet_checkpoint(
         model_path,

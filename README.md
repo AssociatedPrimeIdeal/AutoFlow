@@ -7,7 +7,7 @@
 <p><strong>Automated 4D flow MRI analysis across anatomical regions.</strong></p>
 
 <p>
-  <a href="https://github.com/AssociatedPrimeIdeal/AutoFlow/releases"><strong>Download for Windows</strong></a>
+  <a href="https://github.com/AssociatedPrimeIdeal/AutoFlow/releases"><strong>Windows downloads</strong></a>
   &nbsp;·&nbsp;
   <a href="#quick-start">Quick start</a>
 </p>
@@ -27,7 +27,7 @@ It supports cardiopulmonary, cerebrovascular, carotid, portal venous, and renal 
 
 ### Windows
 
-[Download the Windows app](https://github.com/AssociatedPrimeIdeal/AutoFlow/releases) from the latest release.
+CI automatically builds a Windows portable package after Linux and Windows regression tests pass on pushes and pull requests to `main` or `dev`. Download `AutoFlow-windows-x64` from the successful run's **Actions → CI → Artifacts**, extract the complete package to a short ASCII path, and double-click `AutoFlow.exe`. The package uses the current application code and locked Linux segmentation models, without bundled documentation. Builds do not publish application releases.
 
 ### Python
 
