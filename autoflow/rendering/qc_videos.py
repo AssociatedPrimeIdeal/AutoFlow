@@ -5,6 +5,7 @@ import numpy as np
 import pyvista as pv
 
 from ..task_control import check_cancelled, report_progress
+from ..algorithms.noise_removal import pcmra_display_frame
 from ..algorithms.flow_display import pathline_display, pathline_color_style
 from . import videos
 from .video_layout import VideoOverlay
@@ -22,6 +23,9 @@ FIELDS = {
 def _field_at(ws, field, phase):
     if field == 'velocity':
         return np.linalg.norm(np.asarray(ws.flow_raw[..., phase, :], np.float32), axis=-1)
+    if field == 'pcmra':
+        return pcmra_display_frame(ws.pcmra_array, phase, mask=ws.pcmra_render_mask,
+                                   weight=ws.pcmra_render_weight)
     source = ws.pcmra_array if field == 'pcmra' else getattr(ws.derived, FIELDS[field][0])
     return np.asarray(source[..., min(phase, source.shape[3] - 1)] if source.ndim == 4 else source, np.float32)
 
@@ -64,7 +68,8 @@ def render_qc_field_video(ws, out_dir, *, field, fps=12, smoothing_iteration=80,
                     n_time=count, time_repeat=max(1, int(time_repeat))) if rotate else (videos._time_index(index, count, time_repeat), 0.)
                 if phase != current:
                     volume = _field_at(ws, field, phase)
-                    support = ws.derived.vortex_support_mask if field in {'vorticity', 'q_criterion', 'swirling_strength'} else ws.segmask_binary
+                    support = (None if field == 'pcmra' else ws.derived.vortex_support_mask
+                               if field in {'vorticity', 'q_criterion', 'swirling_strength'} else ws.segmask_binary)
                     if support is not None:
                         mask = np.asarray(support[..., min(phase, support.shape[3]-1)] if support.ndim == 4 else support, bool)
                     else:

@@ -359,10 +359,12 @@ def process_single(
     shared_colorbar_bar_cfg=None,
     phase_unwrap_backend_params=None,
     correction_all=False,
-    noise_removal=False,
+    noise_removal=True,
     noise_removal_method="magnitude_temporal",
     noise_magnitude_fraction=0.05,
     noise_velocity_std_max=0.80,
+    noise_coherence_enabled=True,
+    noise_coherence_strength="strong",
     generate_pcmra=False,
     render_background_color=None,
     manual_planes=(),
@@ -421,7 +423,8 @@ def process_single(
     from .case_types import NoiseRemovalConfig
     from .algorithms.phase_unwrapping import resolve_mask_source
     ws.noise_removal_params = NoiseRemovalConfig(enabled=noise_removal, method=noise_removal_method,
-        magnitude_fraction=noise_magnitude_fraction, velocity_std_max=noise_velocity_std_max)
+        magnitude_fraction=noise_magnitude_fraction, velocity_std_max=noise_velocity_std_max,
+        coherence_enabled=noise_coherence_enabled, coherence_strength=noise_coherence_strength)
     if correction_all and str(ws.phase_unwrap_params.method).lower() in {"", "none", "disabled"}:
         ws.phase_unwrap_params.method = "lap4D"
     ws.phase_unwrap_params.device = str(phase_unwrap_device or "auto")
@@ -458,22 +461,19 @@ def process_single(
         if not result.success:
             raise RuntimeError(result.message)
 
-    if correction_all or noise_removal:
-        run_correction_step(StepId.REMOVE_NOISE, "noise_removal")
     unwrap_enabled = str(ws.phase_unwrap_params.method).lower() not in {"", "none", "disabled"}
     unwrap_needs_seg = unwrap_enabled and resolve_mask_source(ws.phase_unwrap_params.method, ws.phase_unwrap_params.mask_source) == "segmask" and ws.segmask_raw is None
     if correction_all and unwrap_needs_seg:
         raise ValueError("Correction before segmentation cannot use unavailable segmask; use none/PCMRA or run segmentation first")
     if unwrap_enabled and not unwrap_needs_seg:
         run_correction_step(StepId.UNWRAP_PHASE, "phase_unwrap")
+    if ws.uses_dual_venc_reconstruction():
+        run_correction_step(StepId.RECONSTRUCT_DUAL_VENC,
+                            "dual_venc_reconstruction_initial" if unwrap_needs_seg else "dual_venc_reconstruction")
+    if noise_removal and not unwrap_needs_seg:
+        run_correction_step(StepId.REMOVE_NOISE, "noise_removal")
     if (correction_all or generate_pcmra) and not unwrap_needs_seg:
         run_correction_step(StepId.GENERATE_PCMRA, "pcmra")
-    noise_removal_file = ""
-    if ws.pcmra_render_mask is not None:
-        noise_removal_file = os.path.join(out_dir, "pcmra_noise_mask.npz")
-        np.savez_compressed(noise_removal_file, mask=ws.pcmra_render_mask,
-                            resolution=ws.resolution, origin=ws.origin)
-
     auto_seg_cache_bypassed = bool(getattr(ws.segmentation, "force_recompute_auto_cache", False) and ws.segmask_raw is None)
     segmentation_output = ""
     if ws.segmask_raw is None and autoseg:
@@ -496,8 +496,23 @@ def process_single(
 
     if unwrap_needs_seg:
         run_correction_step(StepId.UNWRAP_PHASE, "phase_unwrap")
+        if ws.uses_dual_venc_reconstruction():
+            run_correction_step(StepId.RECONSTRUCT_DUAL_VENC, "dual_venc_reconstruction")
+        if noise_removal:
+            run_correction_step(StepId.REMOVE_NOISE, "noise_removal")
         if generate_pcmra:
             run_correction_step(StepId.GENERATE_PCMRA, "pcmra")
+
+    # The correction group can change HV/DV after its Noise Removal action.
+    # Refresh only the display weights from the final working velocity.
+    noise_removal_file = ""
+    if ws.pcmra_render_mask is not None:
+        engine._refresh_noise_coherence(ws)
+        noise_removal_file = os.path.join(out_dir, "pcmra_noise_mask.npz")
+        noise_payload = dict(mask=ws.pcmra_render_mask, resolution=ws.resolution, origin=ws.origin)
+        if ws.pcmra_render_weight is not None:
+            noise_payload["display_weight"] = ws.pcmra_render_weight
+        np.savez_compressed(noise_removal_file, **noise_payload)
 
     pcmra_file = ""
     if ws.pcmra_array is not None:
@@ -526,7 +541,8 @@ def process_single(
             phase_unwrap_file = os.path.join(out_dir, "phase_unwrap.npz")
             np.savez(
                 phase_unwrap_file,
-                phase_wrapped=np.asarray(ws.phase_wrapped, dtype=np.float32),
+                phase_wrapped=np.asarray(ws.phase_wrapped_high if ws.uses_dual_venc_reconstruction() else ws.phase_wrapped, dtype=np.float32),
+                target="hv" if ws.uses_dual_venc_reconstruction() else "selected",
                 phase_unwrapped=np.asarray(phase_info["phase_unwrapped"], dtype=np.float32),
                 flow_unwrapped=np.asarray(phase_info["flow_unwrapped"], dtype=np.float32),
                 wrap_count=np.asarray(phase_info["wrap_count"], dtype=np.int16),
@@ -544,12 +560,14 @@ def process_single(
             "source_format": ws.input_state.source_format,
             "source_group": ws.input_state.source_group,
             "capabilities": ws.input_state.capabilities.to_dict(),
+            "dual_venc": dict(ws.input_state.metadata.get("dual_venc", {})),
             "segmentation_only": True,
             "noise_removal": dict(ws.noise_removal_result),
             "noise_removal_file": noise_removal_file,
             "pcmra_file": pcmra_file,
             "phase_unwrap": {
                 "method": phase_info.get("method"),
+                "target": phase_info.get("target", "selected"),
                 "mask_source": phase_info.get("mask_source"),
                 "diagnostic_scope": phase_info.get("diagnostic_scope", "latest_masked_run"),
                 "device": phase_info.get("device"),
@@ -947,6 +965,7 @@ def process_single(
     if ws.phase_unwrap_result:
         phase_unwrap_summary = {
             "method": ws.phase_unwrap_result.get("method"),
+            "target": ws.phase_unwrap_result.get("target", "selected"),
             "mask_source": ws.phase_unwrap_result.get("mask_source"),
             "diagnostic_scope": ws.phase_unwrap_result.get("diagnostic_scope", "latest_masked_run"),
             "device": ws.phase_unwrap_result.get("device"),
@@ -960,7 +979,8 @@ def process_single(
             phase_unwrap_file = os.path.join(out_dir, "phase_unwrap.npz")
             np.savez(
                 phase_unwrap_file,
-                phase_wrapped=np.asarray(ws.phase_wrapped, dtype=np.float32),
+                phase_wrapped=np.asarray(ws.phase_wrapped_high if ws.uses_dual_venc_reconstruction() else ws.phase_wrapped, dtype=np.float32),
+                target="hv" if ws.uses_dual_venc_reconstruction() else "selected",
                 phase_unwrapped=np.asarray(ws.phase_unwrap_result["phase_unwrapped"], dtype=np.float32),
                 flow_unwrapped=np.asarray(ws.phase_unwrap_result["flow_unwrapped"], dtype=np.float32),
                 wrap_count=np.asarray(ws.phase_unwrap_result["wrap_count"], dtype=np.int16),
@@ -979,6 +999,7 @@ def process_single(
         "source_format": ws.input_state.source_format,
         "source_group": ws.input_state.source_group,
         "capabilities": ws.input_state.capabilities.to_dict(),
+        "dual_venc": dict(ws.input_state.metadata.get("dual_venc", {})),
         "phase_unwrap": phase_unwrap_summary,
         "noise_removal": dict(ws.noise_removal_result),
         "noise_removal_file": noise_removal_file,

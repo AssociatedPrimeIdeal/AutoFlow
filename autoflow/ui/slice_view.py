@@ -578,6 +578,10 @@ class SliceView(QtWidgets.QFrame):
     def set_plane_translation(self, enabled):
         enabled = bool(enabled)
         previously_enabled = self.view_box.plane_translation_enabled
+        # A completed drag reslices about the new plane center (view origin).
+        # Reset every guide even when editing remains enabled between gestures.
+        if enabled and not self.view_box._translating_plane:
+            self.set_plane_drag_center(0, 0)
         if enabled == previously_enabled:
             return
         self.view_box.plane_translation_enabled = bool(enabled)

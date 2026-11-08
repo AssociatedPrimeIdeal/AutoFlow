@@ -22,6 +22,8 @@
 
 AutoFlow brings correction, segmentation, plane metrics, hemodynamics, and quality control into one workflow.
 It supports cardiopulmonary, cerebrovascular, carotid, portal venous, and renal artery analysis.
+For dual-VENC input, the [reconstruction workflow](docs/en/features/dual-venc.md) keeps loading, HV unwrapping and DV synthesis as separate steps.
+PC-MRA [noise removal](docs/en/features/noise-removal.md) defaults to the **Strong** display coherence filter. Right-click **Correction → Noise Removal** to select Medium or turn coherence off. Display filtering preserves acquired data, measurement ROI and quantitative results.
 
 ## Quick start
 

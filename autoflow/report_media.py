@@ -25,7 +25,7 @@ VIDEO_TITLES = {
 }
 
 
-def media_signature(ws):
+def media_signature(ws, *, family=None):
     def token(value):
         return None if value is None else (id(value), np.shape(value), str(getattr(value, 'dtype', 'mesh')))
     payload = [str(ws.paths.flow_path), ws.analysis_revision, ws.segmentation.revision,
@@ -33,6 +33,8 @@ def media_signature(ws):
                list(np.asarray(ws.resolution)), list(np.asarray(ws.origin)), float(ws.rr),
                [plane_signature(p) for p in ws.planes], ws.derived.artifact_signatures,
                ws.derived_params.to_dict(), ws.streamline_params.to_dict(), ws.plane_gen_params.to_dict()]
+    if family in {"pcmra", "current_view"}:
+        payload += [token(ws.pcmra_array), token(ws.pcmra_render_mask), token(ws.pcmra_render_weight)]
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 
@@ -136,7 +138,6 @@ def ensure_browser_video(filename):
 
 def register_report_videos(ws, outputs, config, *, camera_behavior='rotation', phase_behavior='cardiac_cycle', ensure_browser=False):
     records = ws.input_state.metadata.setdefault('report_videos', {})
-    signature = media_signature(ws)
     config_signature = video_config_signature(config)
     for key, filename in outputs.items():
         if not filename:
@@ -146,7 +147,7 @@ def register_report_videos(ws, outputs, config, *, camera_behavior='rotation', p
             continue
         stat = p.stat()
         records[key] = dict(family=key, title=VIDEO_TITLES.get(key, key), path=str(p),
-            data_signature=signature, config_signature=config_signature,
+            data_signature=media_signature(ws, family=key), config_signature=config_signature,
             sha256=hashlib.sha256(p.read_bytes()).hexdigest(), bytes=stat.st_size, mtime_ns=stat.st_mtime_ns,
             camera_behavior=camera_behavior, phase_behavior=phase_behavior,
             fps=config.get('fps'), analysis_revision=ws.analysis_revision)
@@ -173,7 +174,6 @@ def register_report_videos(ws, outputs, config, *, camera_behavior='rotation', p
 
 
 def report_video_records(ws):
-    signature = media_signature(ws)
     source = copy.deepcopy(ws.input_state.metadata.get('report_videos', {}))
     jobs = available_video_jobs(ws)
     records = []
@@ -183,7 +183,7 @@ def report_video_records(ws):
         state = 'missing'
         if record.get('path') and path.is_file():
             stat = path.stat()
-            state = 'current' if (record.get('data_signature') == signature and
+            state = 'current' if (record.get('data_signature') == media_signature(ws, family=key) and
                 record.get('bytes') == stat.st_size and record.get('mtime_ns') == stat.st_mtime_ns) else 'stale'
         record['validity'] = state
         records.append(record)

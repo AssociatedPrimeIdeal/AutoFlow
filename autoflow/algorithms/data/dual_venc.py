@@ -18,8 +18,6 @@ from .normalization import normalize_loaded_case
 from .orientation import _reorient_component_signed, reorient
 from .venc import (
     _coerce_dual_venc_mode,
-    _dual_alias_shift_unique_values,
-    _dual_venc_correct_alias,
     _dual_venc_triplet_ratio,
     _split_dual_venc_triplets,
 )
@@ -185,7 +183,7 @@ def _load_legacy_dual_venc_h5(
         return_velocity=True,
     )
     # Preserve canonical wrapped phases for the optional traditional unwrap
-    # stage.  The public loaded flow remains the dual-VENC reconstruction.
+    # stage. DV exposes HV preview until the explicit reconstruction step.
     phase_lv, _m_phase, _s_phase, _v_phase, _r_phase = reorient(
         mag, flow_lv_raw, segmask_for_reorient,
         venc=lv_venc, resolution=resolution,
@@ -203,23 +201,13 @@ def _load_legacy_dual_venc_h5(
         return_velocity=False,
     )
 
-    flow_lv_vtzyx = np.transpose(flow_lv, (4, 3, 2, 1, 0))
-    flow_hv_vtzyx = np.transpose(flow_hv, (4, 3, 2, 1, 0))
     lv_triplet = np.asarray(lv_venc_new, dtype=np.float32)
     hv_triplet = np.asarray(hv_venc_new, dtype=np.float32)
     ratio_hv_lv = _dual_venc_triplet_ratio(lv_triplet, hv_triplet)
     ratio1 = np.full(3, float(cfg.dual_venc_ratio1), dtype=np.float32)
     ratio2 = np.full(3, float(cfg.dual_venc_ratio2), dtype=np.float32)
-
-    flow_dual_vtzyx, dual_alias_corr_vtzyx = _dual_venc_correct_alias(
-        flow_lv_vtzyx,
-        flow_hv_vtzyx,
-        lv_triplet,
-        ratio1,
-        ratio2,
-    )
-    flow_dual = np.transpose(flow_dual_vtzyx, (4, 3, 2, 1, 0)).astype(np.float32)
-    dual_alias_corr = np.transpose(dual_alias_corr_vtzyx, (4, 3, 2, 1, 0)).astype(np.float32)
+    # DV loading exposes HV for preview. Reconstruction is an explicit pipeline
+    # step, after optional background correction and HV phase unwrapping.
     correction_low = None
     if isinstance(lv_report, dict) and lv_report.get("corr") is not None:
         correction_low = _reorient_component_signed(
@@ -242,7 +230,7 @@ def _load_legacy_dual_venc_h5(
     selected_flow = {
         "lv": flow_lv,
         "hv": flow_hv,
-        "dv": flow_dual,
+        "dv": flow_hv,
     }[dual_venc_mode]
     selected_venc = {
         "lv": lv_triplet,
@@ -276,7 +264,8 @@ def _load_legacy_dual_venc_h5(
             "ratio1": ratio1.astype(float).tolist(),
             "ratio2": ratio2.astype(float).tolist(),
             "hv_lv_ratio": ratio_hv_lv.astype(float).tolist(),
-            "alias_shift_unique_cm_s": _dual_alias_shift_unique_values(dual_alias_corr, lv_triplet),
+            "reconstructed": False,
+            "working_source": "lv" if dual_venc_mode == "lv" else "hv",
             "display_correction": {
                 "low": correction_low is not None,
                 "high": correction_high is not None,
@@ -297,6 +286,8 @@ def _load_legacy_dual_venc_h5(
         correction_high=correction_high,
         phase_wrapped=np.asarray(selected_phase, dtype=np.float32),
         phase_wrapped_high=np.asarray(phase_hv, dtype=np.float32),
+        flow_low=flow_lv if dual_venc_mode == "dv" else None,
+        flow_high=flow_hv if dual_venc_mode == "dv" else None,
         tke_array=None,
         metadata=meta,
         source_format="legacy_h5_dual_venc",

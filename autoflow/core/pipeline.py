@@ -25,7 +25,8 @@ from ..algorithms import (
     segmentation_timestamp,
 )
 from ..algorithms.phase_unwrapping import unwrap_phase, resolve_mask_source
-from ..algorithms.noise_removal import pcmra_render_mask
+from ..algorithms.noise_removal import pcmra_render_mask, pcmra_coherence_weight
+from ..algorithms.data.venc import _dual_venc_correct_alias, _dual_alias_shift_unique_values
 from ..algorithms.flow_seeding import volume_seed_domain
 from ..algorithms.flow_display import pathline_color_style
 from ..algorithms.geometry_grid import measurement_segmentation, QUANTITATIVE_POLICY
@@ -489,9 +490,11 @@ class PipelineEngine:
         ws._loaded_input_source = copy.deepcopy(load_target)
         ws._loaded_input_kwargs = dict(load_kwargs)
         ws.pcmra_render_mask = None
+        ws.pcmra_render_weight = None
+        ws._noise_coherence_signature = None
         ws.pcmra_array = None
         ws.noise_removal_result = {}
-        for step in (StepId.BACKGROUND_CORRECTION, StepId.REMOVE_NOISE, StepId.UNWRAP_PHASE, StepId.GENERATE_PCMRA):
+        for step in (StepId.BACKGROUND_CORRECTION, StepId.REMOVE_NOISE, StepId.UNWRAP_PHASE, StepId.RECONSTRUCT_DUAL_VENC, StepId.GENERATE_PCMRA):
             ws.pipeline.completed.pop(step.value, None)
             ws.pipeline.skipped.pop(step.value, None)
         flow = np.asarray(data.flow, dtype=np.float32)
@@ -563,6 +566,8 @@ class PipelineEngine:
         ws.current_t = 0
         ws.flow_raw = flow
         ws.flow_input = np.array(flow, copy=True)
+        ws.flow_low = None if getattr(data, "flow_low", None) is None else np.asarray(data.flow_low, dtype=np.float32)
+        ws.flow_high = None if getattr(data, "flow_high", None) is None else np.asarray(data.flow_high, dtype=np.float32)
         phase_loaded = getattr(data, "phase_wrapped", None)
         phase_reconstructed = False
         if phase_loaded is None and str(data.source_format or "").lower() != "legacy_h5_dual_venc":
@@ -898,6 +903,7 @@ class PipelineEngine:
             StepId.REMOVE_NOISE: self._step_remove_noise,
             StepId.GENERATE_PCMRA: self._step_generate_pcmra,
             StepId.UNWRAP_PHASE: self._step_unwrap_phase,
+            StepId.RECONSTRUCT_DUAL_VENC: self._step_reconstruct_dual_venc,
             StepId.GENERATE_SKELETON: self._step_generate_skeleton,
             StepId.EDIT_SKELETON: self._step_edit_skeleton,
             StepId.GENERATE_GRAPH: self._step_generate_graph,
@@ -913,7 +919,11 @@ class PipelineEngine:
         if not hasattr(ws.pipeline, "errors"):
             ws.pipeline.errors = {}
         try:
-            result = dispatch[step](ws)
+            correction_steps = {StepId.BACKGROUND_CORRECTION, StepId.UNWRAP_PHASE, StepId.RECONSTRUCT_DUAL_VENC}
+            if ws.needs_dual_venc_reconstruction() and step not in correction_steps:
+                result = StepResult(step, False, False, "Run Dual-VENC Reconstruction before Noise Removal, analysis or PC-MRA")
+            else:
+                result = dispatch[step](ws)
         except TaskCancelled:
             raise
         except Exception as exc:
@@ -976,6 +986,8 @@ class PipelineEngine:
         check_cancelled()
         ws.flow_raw = flow
         ws.flow_input = flow.copy()
+        ws.flow_low = None if getattr(data, "flow_low", None) is None else np.asarray(data.flow_low, dtype=np.float32)
+        ws.flow_high = None if getattr(data, "flow_high", None) is None else np.asarray(data.flow_high, dtype=np.float32)
         phase = getattr(data, "phase_wrapped", None)
         if phase is None:
             venc = np.asarray(ws.venc, dtype=np.float32).reshape(1, 1, 1, 1, 3)
@@ -987,6 +999,7 @@ class PipelineEngine:
         for key in ("background_phase_correction", "dual_venc"):
             if key in data.metadata:
                 ws.input_state.metadata[key] = copy.deepcopy(data.metadata[key])
+        self._invalidate_dual_venc_reconstruction(ws)
         ws.loader_params.background_phase_correction.enabled = True
         ws.phase_unwrap_result = {}
         ws.remove_object_by_data_key("phase_wrap_mask")
@@ -996,6 +1009,80 @@ class PipelineEngine:
         ws.pipeline.mark_done(StepId.BACKGROUND_CORRECTION)
         return StepResult(StepId.BACKGROUND_CORRECTION, True, False,
                           "Background correction applied to working flow; existing downstream results retained. Rerun them manually.")
+
+    def _invalidate_dual_venc_reconstruction(self, ws):
+        if not ws.uses_dual_venc_reconstruction():
+            return
+        info = ws.input_state.metadata["dual_venc"]
+        info.update(reconstructed=False, working_source="hv")
+        info.pop("alias_shift_unique_cm_s", None)
+        ws.flow_raw = ws.flow_high
+        self._mark_dual_venc_downstream_pending(ws, include_reconstruction=True)
+
+    def _mark_dual_venc_downstream_pending(self, ws, *, include_reconstruction=False):
+        # Preserve reviewed segmentation/geometry and measurements, but do not
+        # present results from a previous velocity field as completed analysis.
+        steps = [StepId.GENERATE_PCMRA, StepId.COMPUTE_PLANE_METRICS,
+                 StepId.COMPUTE_DERIVED_METRICS, StepId.COMPUTE_PWV,
+                 StepId.GENERATE_STREAMLINES, StepId.PLANE_STREAMLINES]
+        if include_reconstruction:
+            steps.insert(0, StepId.RECONSTRUCT_DUAL_VENC)
+        pending = set(ws.input_state.metadata.get("gui_pending_settings", []))
+        for step in steps:
+            ws.pipeline.completed.pop(step.value, None)
+            ws.pipeline.skipped.pop(step.value, None)
+            pending.add(step.value)
+        ws.input_state.metadata["gui_pending_settings"] = sorted(pending)
+        for plane in ws.planes:
+            if plane.metrics:
+                plane.metrics = dict(plane.metrics, validity="stale", stale_reason="DV velocity changed")
+        ws.derived.plane_metrics = [dict(plane.metrics) for plane in ws.planes]
+        for result in ws.derived.pwv_results:
+            result.update(validity="stale", stale_reason="DV velocity changed")
+        ws.analysis_revision += 1
+
+    def _step_reconstruct_dual_venc(self, ws):
+        if not ws.uses_dual_venc_reconstruction():
+            return StepResult(StepId.RECONSTRUCT_DUAL_VENC, True, True, "Dual-VENC Reconstruction requires DV selection")
+        if ws.flow_low is None or ws.flow_high is None:
+            return StepResult(StepId.RECONSTRUCT_DUAL_VENC, False, False, "Reload the DV input to obtain LV and HV velocity")
+        info = ws.input_state.metadata["dual_venc"]
+        lv = np.asarray(info["lv_venc"], dtype=np.float32).reshape(3)
+        low, high = np.asarray(ws.flow_low), np.asarray(ws.flow_high)
+        if low.shape != high.shape or low.ndim != 5 or low.shape[-1] != 3:
+            return StepResult(StepId.RECONSTRUCT_DUAL_VENC, False, False, "LV/HV velocity dimensions do not match")
+        cfg = ws.loader_params.background_phase_correction
+        ratio1 = np.full(3, float(cfg.dual_venc_ratio1), dtype=np.float32)
+        ratio2 = np.full(3, float(cfg.dual_venc_ratio2), dtype=np.float32)
+        if not np.all(np.isfinite(np.r_[lv, ratio1, ratio2])) or np.any(lv <= 0):
+            return StepResult(StepId.RECONSTRUCT_DUAL_VENC, False, False, "DV ratios must be finite and LV VENC positive")
+        result, shifts = _dual_venc_correct_alias(
+            np.transpose(low, (4, 3, 2, 1, 0)), np.transpose(high, (4, 3, 2, 1, 0)), lv, ratio1, ratio2)
+        check_cancelled()
+        ws.flow_raw = np.transpose(result, (4, 3, 2, 1, 0)).astype(np.float32)
+        info.update(reconstructed=True, working_source="dv", ratio1=ratio1.astype(float).tolist(),
+                    ratio2=ratio2.astype(float).tolist(),
+                    alias_shift_unique_cm_s=_dual_alias_shift_unique_values(shifts, lv),
+                    unwrap_target="hv")
+        self._mark_dual_venc_downstream_pending(ws)
+        ws.pipeline.mark_done(StepId.RECONSTRUCT_DUAL_VENC)
+        return StepResult(StepId.RECONSTRUCT_DUAL_VENC, True, False,
+                          "Dual-VENC reconstructed from LV and current HV; rerun downstream results manually")
+
+    def _refresh_noise_coherence(self, ws, *, force=False):
+        """Update display-only state; no analysis revisions or data/ROI changes."""
+        cfg = ws.noise_removal_params
+        signature = (id(ws.mag_raw), id(ws.flow_raw), bool(cfg.coherence_enabled), cfg.coherence_strength)
+        if not force and getattr(ws, "_noise_coherence_signature", None) == signature:
+            return
+        if cfg.coherence_enabled:
+            weight, report = pcmra_coherence_weight(ws.mag_raw, ws.flow_raw, strength=cfg.coherence_strength)
+        else:
+            weight, report = None, {"coherence_enabled": False, "coherence_strength": cfg.coherence_strength}
+        check_cancelled()
+        ws.pcmra_render_weight = weight
+        ws.noise_removal_result = dict(ws.noise_removal_result, **report, parameters=cfg.to_dict())
+        ws._noise_coherence_signature = signature
 
     def _step_remove_noise(self, ws):
         if not ws.data_loaded or ws.mag_raw is None or ws.flow_raw is None:
@@ -1008,12 +1095,14 @@ class PipelineEngine:
             return StepResult(StepId.REMOVE_NOISE, False, False, f"Noise removal failed: {exc}")
         ws.pcmra_render_mask = mask
         ws.noise_removal_result = report
+        self._refresh_noise_coherence(ws, force=True)
         ws.remove_object_by_data_key("noise_region")
         ws.add_object(name="Noise Region", kind=ObjectKind.AUX, data_key="noise_region",
                       group_name="Global", visible=False, opacity=0.3, point_size=2.0, color="#ff0000", dynamic=False)
         ws.pipeline.mark_done(StepId.REMOVE_NOISE)
         return StepResult(StepId.REMOVE_NOISE, True, False,
-                          f"PC-MRA rendering region retained {report['retained_fraction']:.1%}; magnitude and flow unchanged")
+                          f"PC-MRA rendering region retained {report['retained_fraction']:.1%}; "
+                          f"coherence {'off' if not cfg.coherence_enabled else cfg.coherence_strength}; quantitative data unchanged")
 
     def _step_generate_pcmra(self, ws):
         """Materialize PC-MRA only when requested, after all correction actions."""
@@ -1026,6 +1115,14 @@ class PipelineEngine:
         if (flow.ndim != 5 or flow.shape[-1] != 3 or magnitude.ndim != 4
                 or magnitude.shape[:3] != flow.shape[:3] or magnitude.shape[3] not in (1, flow.shape[3])):
             return StepResult(StepId.GENERATE_PCMRA, False, False, "Magnitude/velocity dimensions do not match for PC-MRA")
+        if ws.noise_removal_params.enabled:
+            if ws.pcmra_render_mask is None:
+                result = self._step_remove_noise(ws)
+                if not result.success:
+                    return StepResult(StepId.GENERATE_PCMRA, False, False, result.message)
+            else:
+                # Generation is explicit, so also catch caller-owned in-place edits.
+                self._refresh_noise_coherence(ws, force=True)
         pcmra = np.empty(flow.shape[:4], dtype=np.float32)
         for tidx in range(flow.shape[3]):
             report_progress({"stage": "pcmra", "current": tidx, "total": flow.shape[3],
@@ -1044,7 +1141,7 @@ class PipelineEngine:
             obj.dynamic = True
         ws.pipeline.mark_done(StepId.GENERATE_PCMRA)
         return StepResult(StepId.GENERATE_PCMRA, True, False,
-                          "Generated PC-MRA from current working velocity; noise mask applies to 3D rendering only")
+                          "Generated unweighted PC-MRA; noise mask/coherence apply only to rendering")
 
     def _step_unwrap_phase(self, ws):
         """Optional traditional or learned phase unwrapping with diagnostics."""
@@ -1057,20 +1154,10 @@ class PipelineEngine:
             ws.phase_unwrap_result = {"skipped": True, "reason": "disabled"}
             ws.pipeline.mark_done(StepId.UNWRAP_PHASE, skipped=True)
             return StepResult(StepId.UNWRAP_PHASE, True, True, "Phase unwrapping skipped: disabled")
-        metadata = dict(ws.input_state.metadata or {})
-        dual_info = metadata.get("dual_venc", {})
-        if not isinstance(dual_info, dict):
-            dual_info = {}
-        dual_mode = str(dual_info.get("selected_mode", dual_info.get("mode", "dv")) or "dv").lower()
-        dual = (
-            (bool(dual_info.get("enabled", False)) or str(ws.input_state.source_format).lower() == "legacy_h5_dual_venc")
-            and dual_mode == "dv"
-        )
-        if dual:
-            ws.phase_unwrap_result = {"skipped": True, "reason": "dual_venc"}
-            ws.pipeline.mark_done(StepId.UNWRAP_PHASE, skipped=True)
-            return StepResult(StepId.UNWRAP_PHASE, True, True, "Phase unwrapping skipped: dual-VENC input")
-        if ws.phase_wrapped is None:
+        dual = ws.uses_dual_venc_reconstruction()
+        phase_input = ws.phase_wrapped_high if dual else ws.phase_wrapped
+        current_flow = ws.flow_high if dual else ws.flow_raw
+        if phase_input is None or (dual and current_flow is None):
             ws.phase_unwrap_result = {"skipped": True, "reason": "wrapped_phase_unavailable"}
             ws.pipeline.mark_done(StepId.UNWRAP_PHASE, skipped=True)
             return StepResult(StepId.UNWRAP_PHASE, True, True, "Phase unwrapping skipped: wrapped phase unavailable")
@@ -1078,7 +1165,7 @@ class PipelineEngine:
             mask_source = resolve_mask_source(method, getattr(cfg, "mask_source", "auto"))
         except ValueError as exc:
             return StepResult(StepId.UNWRAP_PHASE, False, False, str(exc))
-        phase = np.asarray(ws.phase_wrapped, dtype=np.float32)
+        phase = np.asarray(phase_input, dtype=np.float32)
         phase_shape = phase.shape[:4]
         # A segmentation is used only when selected, never implicitly by a PCMRA source.
         if mask_source == "segmask":
@@ -1138,7 +1225,7 @@ class PipelineEngine:
             )
         try:
             result = unwrap_phase(
-                ws.phase_wrapped, mask, ws.venc, str(cfg.method),
+                phase_input, mask, ws.venc, str(cfg.method),
                 params=params, device=str(getattr(cfg, "device", "auto")),
                 backend_weightmask=backend_weightmask,
                 backend_center_confidence=backend_center_confidence,
@@ -1149,13 +1236,20 @@ class PipelineEngine:
             ws.pipeline.completed.pop(StepId.UNWRAP_PHASE.value, None)
             ws.pipeline.skipped.pop(StepId.UNWRAP_PHASE.value, None)
             return StepResult(StepId.UNWRAP_PHASE, False, False, f"Phase unwrapping failed: {exc}")
+        if current_flow is None:
+            current_flow = phase * np.asarray(ws.venc, dtype=np.float32) / np.pi
         if ws.flow_input is None:
-            ws.flow_input = np.array(ws.flow_raw, copy=True) if ws.flow_raw is not None else None
-        result["flow_unwrapped"] = np.where(mask[..., None], result["flow_unwrapped"], ws.flow_raw).astype(np.float32)
+            ws.flow_input = np.array(current_flow, copy=True)
+        result["flow_unwrapped"] = np.where(mask[..., None], result["flow_unwrapped"], current_flow).astype(np.float32)
         venc = np.asarray(ws.venc, dtype=np.float32).reshape(1, 1, 1, 1, 3)
         result["phase_unwrapped"] = result["flow_unwrapped"] * np.pi / venc
         result["diagnostic_scope"] = "latest_masked_run"
-        ws.flow_raw = result["flow_unwrapped"]
+        result["target"] = "hv" if dual else "selected"
+        if dual:
+            ws.flow_high = result["flow_unwrapped"]
+            self._invalidate_dual_venc_reconstruction(ws)
+        else:
+            ws.flow_raw = result["flow_unwrapped"]
         ws.phase_unwrap_result = result
         # Existing segmentation, geometry, metrics and trajectories remain until manually rerun.
         ws.remove_object_by_data_key("phase_wrap_mask")
@@ -1175,7 +1269,11 @@ class PipelineEngine:
         """Restore loaded flow without discarding wrap diagnostics for review."""
         if ws.flow_input is None or "flow_unwrapped" not in (ws.phase_unwrap_result or {}):
             return StepResult(StepId.UNWRAP_PHASE, True, True, "Revert skipped: no active phase-unwrapping result")
-        ws.flow_raw = np.asarray(ws.flow_input, dtype=np.float32).copy()
+        if ws.uses_dual_venc_reconstruction():
+            ws.flow_high = np.asarray(ws.flow_input, dtype=np.float32).copy()
+            self._invalidate_dual_venc_reconstruction(ws)
+        else:
+            ws.flow_raw = np.asarray(ws.flow_input, dtype=np.float32).copy()
         ws.pipeline.completed.pop(StepId.UNWRAP_PHASE.value, None)
         ws.pipeline.skipped.pop(StepId.UNWRAP_PHASE.value, None)
         return StepResult(StepId.UNWRAP_PHASE, True, False, "Restored pre-unwrapping flow; diagnostics and downstream results retained")

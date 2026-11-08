@@ -13,12 +13,19 @@ class SceneLayersMixin:
         self._hud_renderer = None
         self._front_props = {}
         self._hud_props = []
+        self._clipping_renderer = None
+        self._clipping_observer = None
 
     def _ensure_scene_layers(self):
         window = getattr(self.plotter, "render_window", None)
         main = getattr(self.plotter, "renderer", None)
         if window is None or main is None:
             return
+        if self._clipping_renderer is not main:
+            if self._clipping_renderer is not None:
+                self._clipping_renderer.RemoveObserver(self._clipping_observer)
+            self._clipping_renderer = main
+            self._clipping_observer = main.AddObserver("StartEvent", self._update_scene_clipping_range)
         window.SetNumberOfLayers(max(4, window.GetNumberOfLayers()))
         for attribute, layer in (("_selection_renderer", 2), ("_hud_renderer", 3)):
             renderer = getattr(self, attribute)
@@ -37,6 +44,24 @@ class SceneLayersMixin:
                 renderer.RemoveAllLights()
                 for light in main.GetLights():
                     renderer.AddLight(light)
+
+    def _update_scene_clipping_range(self, *_args):
+        # Camera gestures only reset clipping from the interactive renderer.
+        # Selected volumes and plane outlines live in noninteractive layers
+        # sharing that camera, so include their bounds before any layer draws.
+        bounds = []
+        for renderer in (self.plotter.renderer, self._plane_overlay_renderer, self._selection_renderer):
+            if renderer is None or not renderer.GetDraw():
+                continue
+            value = np.asarray(renderer.ComputeVisiblePropBounds(), dtype=float)
+            if np.all(np.isfinite(value)) and np.all(value[::2] <= value[1::2]):
+                bounds.append(value)
+        if bounds:
+            rows = np.asarray(bounds)
+            combined = np.empty(6)
+            combined[::2] = rows[:, ::2].min(axis=0)
+            combined[1::2] = rows[:, 1::2].max(axis=0)
+            self.plotter.renderer.ResetCameraClippingRange(combined)
 
 
     def set_selected_layers(self, uids, on_top=None, render=True):

@@ -231,7 +231,7 @@ _WORKFLOW_STAGES = [
 _WORKFLOW_STEPS = {
     "input": set(),
     "segmentation": set(),
-    "correction": {StepId.BACKGROUND_CORRECTION, StepId.REMOVE_NOISE, StepId.UNWRAP_PHASE, StepId.GENERATE_PCMRA},
+    "correction": {StepId.BACKGROUND_CORRECTION, StepId.UNWRAP_PHASE, StepId.RECONSTRUCT_DUAL_VENC, StepId.REMOVE_NOISE, StepId.GENERATE_PCMRA},
     "centerline": {
         StepId.GENERATE_SKELETON,
         StepId.EDIT_SKELETON,
@@ -260,12 +260,15 @@ _WORKFLOW_RUN_ALL_STEPS = {
         StepId.COMPUTE_PLANE_METRICS,
         StepId.COMPUTE_DERIVED_METRICS,
     ),
-    "correction": (StepId.BACKGROUND_CORRECTION, StepId.REMOVE_NOISE, StepId.UNWRAP_PHASE, StepId.GENERATE_PCMRA),
+    "correction": (StepId.BACKGROUND_CORRECTION, StepId.UNWRAP_PHASE, StepId.RECONSTRUCT_DUAL_VENC, StepId.REMOVE_NOISE, StepId.GENERATE_PCMRA),
 }
 
 
-def _workflow_run_all_steps(stage_key):
-    return list(_WORKFLOW_RUN_ALL_STEPS.get(str(stage_key), ()))
+def _workflow_run_all_steps(stage_key, workspace=None):
+    steps = list(_WORKFLOW_RUN_ALL_STEPS.get(str(stage_key), ()))
+    if workspace is None or not workspace.uses_dual_venc_reconstruction():
+        steps = [step for step in steps if step != StepId.RECONSTRUCT_DUAL_VENC]
+    return steps
 
 
 @dataclass
@@ -1001,7 +1004,7 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         gl = QtWidgets.QGridLayout(grp)
         self.step_buttons = {}
         all_steps = [
-            StepId.BACKGROUND_CORRECTION, StepId.REMOVE_NOISE, StepId.UNWRAP_PHASE, StepId.GENERATE_PCMRA,
+            StepId.BACKGROUND_CORRECTION, StepId.UNWRAP_PHASE, StepId.RECONSTRUCT_DUAL_VENC, StepId.REMOVE_NOISE, StepId.GENERATE_PCMRA,
             StepId.GENERATE_SKELETON, StepId.EDIT_SKELETON,
             StepId.GENERATE_GRAPH, StepId.EDIT_GRAPH,
             StepId.GENERATE_PLANES, StepId.COMPUTE_PLANE_METRICS,
@@ -1010,7 +1013,8 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         ]
         step_tooltips = {
             StepId.GENERATE_PCMRA: "Compute PC-MRA from current working velocity and create its 3D rendering layer.",
-            StepId.UNWRAP_PHASE: "Run the selected optional phase-unwrapping method. Dual-VENC inputs are skipped.",
+            StepId.UNWRAP_PHASE: "Run phase unwrapping. DV selection unwraps only HV before reconstruction.",
+            StepId.RECONSTRUCT_DUAL_VENC: "Reconstruct DV from LV and current HV after optional HV unwrapping.",
             StepId.EDIT_SKELETON: "Edit skeleton points. Done updates centerlines; Cancel discards this session.",
             StepId.EDIT_GRAPH: "Edit nodes and connections. Done preserves your graph and updates paths and planes.",
             StepId.COMPUTE_PWV: "Compute PWV for the configured PWV groups.",
@@ -1023,7 +1027,7 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
             button = QtWidgets.QPushButton(label)
             button.setToolTip(step_tooltips.get(step, step.label))
             button.clicked.connect(partial(self._run_single_step, step))
-            if action_sections(step, self.workspace):
+            if step == StepId.RECONSTRUCT_DUAL_VENC or action_sections(step, self.workspace):
                 self._attach_action_settings(button, step, partial(self._run_single_step, step))
             self.step_buttons[step] = button
             row, column = divmod(index, 3)
@@ -1053,6 +1057,8 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         if self._pipeline_running_guard("resetting noise removal"):
             return
         self.workspace.pcmra_render_mask = None
+        self.workspace.pcmra_render_weight = None
+        self.workspace._noise_coherence_signature = None
         self.workspace.noise_removal_result = {}
         self.workspace.remove_object_by_data_key("noise_region")
         self.workspace.pipeline.completed.pop(StepId.REMOVE_NOISE.value, None)
@@ -1183,7 +1189,9 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         if stage_key == "correction":
             if not ws.data_loaded:
                 return "Not ready"
-            steps = _WORKFLOW_RUN_ALL_STEPS["correction"]
+            if ws.needs_dual_venc_reconstruction():
+                return "Needs review"
+            steps = _workflow_run_all_steps("correction", ws)
             return "Ready" if all(ws.pipeline.is_done(step) for step in steps) else "Optional"
         if stage_key == "centerline":
             if len(ws.planes) > 0:
@@ -1223,7 +1231,9 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         self.review_panel.setVisible(stage_key == "review")
         self.btn_reload_input.setVisible(stage_key == "input")
         self.btn_run_segmentation_auto.setVisible(stage_key == "segmentation")
-        visible_steps = _WORKFLOW_STEPS.get(stage_key, set())
+        visible_steps = set(_WORKFLOW_STEPS.get(stage_key, set()))
+        if not self.workspace.uses_dual_venc_reconstruction():
+            visible_steps.discard(StepId.RECONSTRUCT_DUAL_VENC)
         # Reflow the action grid for the active stage so hidden stages do not
         # leave an empty first row or a confusing button order.
         step_layout = self.steps_group.layout()
@@ -1233,7 +1243,7 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
             if widget is not None:
                 widget.setVisible(False)
         ordered_steps = [
-            StepId.BACKGROUND_CORRECTION, StepId.REMOVE_NOISE, StepId.UNWRAP_PHASE, StepId.GENERATE_PCMRA,
+            StepId.BACKGROUND_CORRECTION, StepId.UNWRAP_PHASE, StepId.RECONSTRUCT_DUAL_VENC, StepId.REMOVE_NOISE, StepId.GENERATE_PCMRA,
             StepId.GENERATE_SKELETON, StepId.EDIT_SKELETON,
             StepId.GENERATE_GRAPH, StepId.EDIT_GRAPH, StepId.GENERATE_PLANES,
             StepId.COMPUTE_PLANE_METRICS, StepId.COMPUTE_PWV,
@@ -1257,8 +1267,10 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         else:
             for idx, step in enumerate(active_steps):
                 step_layout.addWidget(self.step_buttons[step], idx // 2, idx % 2)
-            action_row = (len(active_steps) + 1) // 2
-            if stage_key in {"correction", "centerline", "hemodynamics"}:
+            if stage_key == "correction" and self.workspace.uses_dual_venc_reconstruction():
+                step_layout.addWidget(self.btn_run_all, 2, 1)
+            elif stage_key in {"correction", "centerline", "hemodynamics"}:
+                action_row = (len(active_steps) + 1) // 2
                 step_layout.addWidget(self.btn_run_all, action_row, 0, 1, 2)
         for step, button in self.step_buttons.items():
             button.setVisible(step in visible_steps)
@@ -2668,6 +2680,9 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
 
     def _run_threshold_segmentation(self):
         ws = self.workspace
+        if ws.needs_dual_venc_reconstruction():
+            self.log("Run Dual-VENC Reconstruction before generating segmentation.")
+            return False
         seg_state = ws.segmentation
         if ws.segmentation.dirty:
             self.log("Apply or cancel segmentation edits before running threshold segmentation.")
@@ -2710,6 +2725,9 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
 
     def _run_auto_segmentation(self):
         ws = self.workspace
+        if ws.needs_dual_venc_reconstruction():
+            self.log("Run Dual-VENC Reconstruction before generating segmentation.")
+            return False
         seg_state = ws.segmentation
         if self._autoseg_thread is not None:
             self.log("Auto segmentation is already running.")
@@ -3939,7 +3957,8 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         self._plane_handles.update(
             self.scene.world_to_display_point(np.asarray(plane.center) + self.workspace.origin),
             self.scene.world_to_display_vector(self._plane_axis_u),
-            self.scene.world_to_display_vector(self._plane_axis_v), self._plane_widget_distance())
+            self.scene.world_to_display_vector(self._plane_axis_v), self._plane_widget_distance(),
+            normal=self.scene.world_to_display_vector(plane.normal))
 
     def _legacy_add_manual_plane(self):
         if self._pipeline_running_guard("adding a plane") or self._autoseg_running_guard("adding a plane"):
@@ -4973,6 +4992,10 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         self.scene.sync_from_workspace()
 
     def _refresh_all(self):
+        dv_button = self.step_buttons.get(StepId.RECONSTRUCT_DUAL_VENC)
+        show_dv = self._workflow_stage_key() == "correction" and self.workspace.uses_dual_venc_reconstruction()
+        if dv_button is not None and dv_button.isHidden() == show_dv:
+            self._on_workflow_stage_changed(self.workflow_tabs.currentIndex(), open_report=False)
         self._sync_segmentation_scene_object()
         self._refresh_browser()
         self._refresh_render_range_control()
@@ -6132,7 +6155,6 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
             "path": str(getattr(self._active_input_case, "input_path", "") or ws.paths.flow_path),
             "kind": str(getattr(self._active_input_case, "input_kind", "")),
             "group": getattr(self._active_input_case, "source_group", None),
-            "dual_venc_ratios": [ws.loader_params.background_phase_correction.dual_venc_ratio1, ws.loader_params.background_phase_correction.dual_venc_ratio2],
             "parameters": self._input_parameters_from_ui(),
             "dual_venc_mode": dict(getattr(self._active_input_case, "metadata", {}) or {}).get("dual_venc_mode", "dv"),
         }, sort_keys=True, default=str)
@@ -6772,7 +6794,7 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
             self.log(f"{self._pipeline_task_label} cancelled; completed steps were retained.")
             self.statusBar().showMessage("Task cancelled", 8000)
             return
-        correction_steps = {StepId.BACKGROUND_CORRECTION, StepId.REMOVE_NOISE, StepId.UNWRAP_PHASE, StepId.GENERATE_PCMRA}
+        correction_steps = {StepId.BACKGROUND_CORRECTION, StepId.UNWRAP_PHASE, StepId.RECONSTRUCT_DUAL_VENC, StepId.REMOVE_NOISE, StepId.GENERATE_PCMRA}
         partial_steps = correction_steps.intersection(getattr(self, "_pipeline_task_steps", []))
         if partial_steps:
             self._finish_pipeline_scene_refresh(partial_steps)
@@ -6833,6 +6855,9 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
             return
         try:
             self._sync_params_to_ws()
+            if self.workspace.needs_dual_venc_reconstruction() and (step == StepId.REMOVE_NOISE or step not in _WORKFLOW_STEPS["correction"]):
+                self.log("Run Dual-VENC Reconstruction before Noise Removal or analysis.")
+                return
             if step == StepId.UNWRAP_PHASE:
                 self._prepare_unwrap_action()
             if step == StepId.COMPUTE_PWV:
@@ -6889,7 +6914,10 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         self._sync_params_to_ws()
         self._clear_plane_drag_widgets()
         stage_key = self._workflow_stage_key()
-        all_steps = _workflow_run_all_steps(stage_key)
+        if stage_key != "correction" and self.workspace.needs_dual_venc_reconstruction():
+            self.log("Run Dual-VENC Reconstruction before analysis.")
+            return
+        all_steps = _workflow_run_all_steps(stage_key, self.workspace)
         if StepId.UNWRAP_PHASE in all_steps:
             self._prepare_unwrap_action()
         if not all_steps:

@@ -144,10 +144,10 @@ def _validate_placement(name, placement, *, allow_fallback=True):
                                   or not isinstance(placement["scope"],str)
                                   or placement["scope"] not in {"component","label"}):
         raise ValueError(f"{name} scope must be component or label for path-property anchors")
-    if "fraction_reference" in placement and (position != "fractions" or
+    if "fraction_reference" in placement and (position not in {"fractions", "random"} or
             anchor not in {"label_level", "label_terminal", "label_longest", "label_trunk", "label_branch", "flow_inlet_branch", "flow_outlet_branch"} or
             placement["fraction_reference"] not in {"flow_start", "flow_end"}):
-        raise ValueError(f"{name} fraction_reference requires fractions on a label path and flow_start or flow_end")
+        raise ValueError(f"{name} fraction_reference requires fractions or random on a label path and flow_start or flow_end")
     if "fraction_range" in placement and position != "random":
         raise ValueError(f"{name}: fraction_range requires position=random")
     if position == "random":

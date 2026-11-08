@@ -184,15 +184,20 @@ class PhaseUnwrappingConfig:
 
 @dataclass
 class NoiseRemovalConfig:
-    """Magnitude/temporal-velocity screening, restricted to PC-MRA rendering."""
-    enabled: bool = False
+    """PC-MRA display screening and coherence weighting; no quantitative changes."""
+    enabled: bool = True
     method: str = "magnitude_temporal"
     magnitude_fraction: float = 0.05
     velocity_std_max: float = 0.80
+    coherence_enabled: bool = True
+    coherence_strength: str = "strong"
 
     def __post_init__(self):
         if self.method not in {"magnitude_temporal", "magnitude"}:
             raise ValueError("noise removal method must be magnitude_temporal or magnitude")
+        self.coherence_strength = str(self.coherence_strength).strip().lower()
+        if self.coherence_strength not in {"medium", "strong"}:
+            raise ValueError("coherence_strength must be medium or strong")
         for name in ("magnitude_fraction", "velocity_std_max"):
             value = float(getattr(self, name))
             if not np.isfinite(value) or not 0.0 <= value <= 1.0:
@@ -201,13 +206,14 @@ class NoiseRemovalConfig:
 
     def to_dict(self):
         return {"enabled": bool(self.enabled), "method": self.method,
-                "magnitude_fraction": self.magnitude_fraction, "velocity_std_max": self.velocity_std_max}
+                "magnitude_fraction": self.magnitude_fraction, "velocity_std_max": self.velocity_std_max,
+                "coherence_enabled": bool(self.coherence_enabled), "coherence_strength": self.coherence_strength}
 
     @staticmethod
     def from_dict(d):
         payload = dict(d or {})
         return NoiseRemovalConfig(**{name: payload[name] for name in
-            ("enabled", "method", "magnitude_fraction", "velocity_std_max") if name in payload})
+            ("enabled", "method", "magnitude_fraction", "velocity_std_max", "coherence_enabled", "coherence_strength") if name in payload})
 
 
 @dataclass
@@ -229,6 +235,8 @@ class LoadedCase:
     source_format: str = ""
     source_group: Optional[str] = None
     capabilities: LoaderCapabilities = field(default_factory=LoaderCapabilities)
+    flow_low: Optional[np.ndarray] = None
+    flow_high: Optional[np.ndarray] = None
 
     @property
     def segmask(self):

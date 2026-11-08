@@ -297,7 +297,10 @@ class LabelBranches:
             directed = flow_endpoint or spec['position'] in {'before_end','after_start'} or bool(spec.get('fraction_reference')) or (
                 not np.allclose(np.sort(fractions),np.sort(1-fractions),atol=.015,rtol=0))
             continuations, uncertain = defaultdict(set), defaultdict(set)
+            label_degree = defaultdict(int)
             for index,row in enumerate(rows):
+                for node in row['nodes']:
+                    label_degree[node] += 1
                 if row['flow_sign'] in (-1,1):
                     flow_start = int(row['flow_sign'] == -1)
                     continuation = flow_start if outlet else 1 - flow_start
@@ -314,8 +317,24 @@ class LabelBranches:
                 endpoint = row['nodes'][1 - flow_start if outlet else flow_start]
                 if flow_endpoint and (continuations[endpoint] or uncertain[endpoint] - {index}):
                     continue
-                if spec.get(endpoint_selection) == 'lowest_z' and (endpoint not in self.context.graph or self.context.graph.degree(endpoint) != 1):
-                    continue
+                if spec.get(endpoint_selection) == 'lowest_z':
+                    # Other labels at a junction do not extend this label.
+                    if label_degree[endpoint] != 1:
+                        continue
+                    if endpoint not in self.context.graph:
+                        # A real label transition may lie inside a graph path.
+                        # Background gaps do not create new physical entries.
+                        from .planes import _sample_path_labels
+                        side = 1 - flow_start if outlet else flow_start
+                        sample = row['span']['sample_end' if side else 'sample_start'] + (1 if side else -1)
+                        points = self.context.paths[row['path_index']]
+                        if self.context.trunk_segmentation is None or not 0 <= sample < len(points):
+                            continue
+                        neighbour = int(_sample_path_labels(points[sample:sample+1],
+                            self.context.trunk_segmentation, self.context.trunk_spacing,
+                            self.context.trunk_origin)[0])
+                        if neighbour <= 0 or neighbour == value:
+                            continue
                 choices.append(self.selection(row,reverse=reverse))
             missing = ('flow_direction_unavailable' if directed and not any(row['flow_sign'] in (-1,1) for row in rows) else
                 f'{anchor}_not_found' if flow_endpoint else 'no_label_branch')

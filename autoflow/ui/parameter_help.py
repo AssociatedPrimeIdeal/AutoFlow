@@ -31,6 +31,10 @@ FLOW_HELP = {
 }
 
 SHARED_HELP = {
+    'coherence_enabled': 'Suppress clutter with a continuous PC-MRA display weight. Enabled by default. Acquired magnitude, velocity, segmentation, measurement ROI and all quantitative results are unchanged.',
+    'coherence_strength': 'Strong is the default (smooth transition 0.70–0.98); Medium retains more visible signal (0.55–0.92). These are coherence scores, not probabilities. Save and run Noise Removal to refresh the display.',
+    'dual_venc_ratio1': 'DV reconstruction only. The +2 LV shift accepts HV-LV between LV*(1-ratio1) and LV*(3+ratio1); negative differences use symmetric limits. Zero uses those nominal limits.',
+    'dual_venc_ratio2': 'DV reconstruction only. The +4 LV shift accepts HV-LV between LV*(3-ratio2) and LV*(5+ratio2); negative differences use symmetric limits. This branch takes priority in overlapping ranges.',
     'min_edge_points': 'Minimum retained terminal-branch length in graph edges, not millimetres or a point-deletion quota. Default 9 removes arms with 1 to 8 edges and retains 9-edge arms; junction-to-junction links stay. Set 0 or 1 to disable. Regenerate Graph and Planes after changing this value.',
     'cmap': 'Colormap used to map the displayed scalar quantity to colour. It changes appearance only.',
     'opacity': 'Display opacity: 0 is transparent and 1 is fully opaque.',

@@ -45,6 +45,7 @@ class StepId(Enum):
     BACKGROUND_CORRECTION = "step_background_correction"
     REMOVE_NOISE = "step_noise_removal"
     UNWRAP_PHASE = "step_unwrap_phase"
+    RECONSTRUCT_DUAL_VENC = "step_dual_venc"
     GENERATE_PCMRA = "step_pcmra"
     GENERATE_SKELETON = "step_skeleton"
     EDIT_SKELETON = "step_edit_skeleton"
@@ -64,6 +65,7 @@ class StepId(Enum):
             StepId.BACKGROUND_CORRECTION: "Background Correction",
             StepId.REMOVE_NOISE: "Noise Removal",
             StepId.UNWRAP_PHASE: "Unwrap Phase",
+            StepId.RECONSTRUCT_DUAL_VENC: "Dual-VENC Reconstruction",
             StepId.GENERATE_PCMRA: "Generate PC-MRA",
             StepId.GENERATE_SKELETON: "Generate Skeleton",
             StepId.EDIT_SKELETON: "Edit Skeleton",
@@ -1355,6 +1357,7 @@ class Workspace:
     phase_unwrap_params: PhaseUnwrappingConfig = field(default_factory=PhaseUnwrappingConfig)
     noise_removal_params: NoiseRemovalConfig = field(default_factory=NoiseRemovalConfig)
     pcmra_render_mask: Optional[np.ndarray] = None
+    pcmra_render_weight: Optional[np.ndarray] = None
     pcmra_array: Optional[np.ndarray] = None
     noise_removal_result: Dict[str, Any] = field(default_factory=dict)
     preprocess_params: PreprocessParams = field(default_factory=PreprocessParams)
@@ -1418,6 +1421,8 @@ class Workspace:
 
     flow_raw: Optional[np.ndarray] = None
     flow_input: Optional[np.ndarray] = None
+    flow_low: Optional[np.ndarray] = None
+    flow_high: Optional[np.ndarray] = None
     phase_wrapped: Optional[np.ndarray] = None
     phase_wrapped_high: Optional[np.ndarray] = None
     phase_unwrap_result: Dict[str, Any] = field(default_factory=dict)
@@ -1583,6 +1588,14 @@ class Workspace:
             return []
         return sorted(int(x) for x in np.unique(display) if int(x) != 0)
 
+    def uses_dual_venc_reconstruction(self):
+        info = self.input_state.metadata.get("dual_venc", {})
+        return (isinstance(info, dict) and bool(info.get("enabled", False))
+                and str(info.get("selected_mode", info.get("mode", "dv"))).lower() == "dv")
+
+    def needs_dual_venc_reconstruction(self):
+        return self.uses_dual_venc_reconstruction() and not self.pipeline.is_done(StepId.RECONSTRUCT_DUAL_VENC)
+
     def has_flow(self):
         return self.flow_raw is not None
 
@@ -1744,7 +1757,7 @@ class Workspace:
         self.rr = 1000.0
         for attr in ["segmask_raw", "segmask_labels", "segmask_labels_3d", "segmask_binary", "segmask_3d",
                       "skeleton_points", "skeleton_mask", "branch_labels", "flow_raw", "flow_input",
-                      "phase_wrapped", "phase_wrapped_high",
+                      "phase_wrapped", "phase_wrapped_high", "flow_low", "flow_high",
                       "streamline_seeds", "mag_raw", "source_sigma", "source_tke_array", "correction_raw", "correction_high_raw"]:
             setattr(self, attr, None)
         self.skeleton_labels = None
@@ -1779,6 +1792,8 @@ class Workspace:
         self.noise_removal_params = NoiseRemovalConfig()
         self.noise_removal_result = {}
         self.pcmra_render_mask = None
+        self.pcmra_render_weight = None
+        self._noise_coherence_signature = None
         self.pcmra_array = None
         self._loaded_input_source = None
         self._loaded_input_kwargs = {}
@@ -1830,6 +1845,7 @@ class Workspace:
             "phase_unwrap_params": self.phase_unwrap_params.to_dict(),
             "noise_removal_params": self.noise_removal_params.to_dict(),
             "pcmra_render_mask": arr(self.pcmra_render_mask),
+            "pcmra_render_weight": arr(self.pcmra_render_weight),
             "pcmra_array": arr(self.pcmra_array),
             "noise_removal_result": copy.deepcopy(self.noise_removal_result),
             "preprocess_params": self.preprocess_params.to_dict(),
@@ -1885,6 +1901,8 @@ class Workspace:
                         "metrics": copy.deepcopy(p.metrics)} for p in self.planes],
             "flow_raw": arr(self.flow_raw),
             "flow_input": arr(self.flow_input),
+            "flow_low": arr(self.flow_low),
+            "flow_high": arr(self.flow_high),
             "phase_wrapped": arr(self.phase_wrapped),
             "phase_wrapped_high": arr(self.phase_wrapped_high),
             "phase_unwrap_result": {
@@ -1937,6 +1955,8 @@ class Workspace:
         self.noise_removal_params = NoiseRemovalConfig.from_dict(d.get("noise_removal_params", {}))
         self.noise_removal_result = copy.deepcopy(d.get("noise_removal_result", {}))
         self.pcmra_render_mask = None if d.get("pcmra_render_mask") is None else np.asarray(d["pcmra_render_mask"], dtype=bool)
+        self.pcmra_render_weight = None if d.get("pcmra_render_weight") is None else np.asarray(d["pcmra_render_weight"], dtype=np.float32)
+        self._noise_coherence_signature = None
         self.pcmra_array = None if d.get("pcmra_array") is None else np.asarray(d["pcmra_array"], dtype=np.float32)
         self.preprocess_params = PreprocessParams.from_dict(d.get("preprocess_params", {}))
         self.skeleton_params = SkeletonParams.from_dict(d.get("skeleton_params", {}))
@@ -2066,9 +2086,23 @@ class Workspace:
                         group_plane.plane_id = matches[0].plane_id
         self.flow_raw = nparr("flow_raw")
         self.flow_input = nparr("flow_input")
+        self.flow_low = nparr("flow_low", np.float32)
+        self.flow_high = nparr("flow_high", np.float32)
         self.phase_wrapped = nparr("phase_wrapped", np.float32)
         self.phase_wrapped_high = nparr("phase_wrapped_high", np.float32)
         self.phase_unwrap_result = copy.deepcopy(d.get("phase_unwrap_result", {}))
+        if (self.uses_dual_venc_reconstruction() and (self.flow_low is None or self.flow_high is None)
+                and self.phase_wrapped is not None and self.phase_wrapped_high is not None):
+            # Older workspaces stored eagerly reconstructed DV and both wrapped
+            # phases. Recover the two inputs and require the new explicit step.
+            info = self.input_state.metadata["dual_venc"]
+            self.flow_low = self.phase_wrapped * np.asarray(info["lv_venc"], dtype=np.float32) / np.pi
+            self.flow_high = self.phase_wrapped_high * np.asarray(info["hv_venc"], dtype=np.float32) / np.pi
+            self.flow_input = self.flow_high.copy()
+            self.flow_raw = self.flow_high
+            info.update(reconstructed=False, working_source="hv")
+            self.pipeline.completed.pop(StepId.RECONSTRUCT_DUAL_VENC.value, None)
+            self.pipeline.completed.pop(StepId.GENERATE_PCMRA.value, None)
         self.streamline_seeds = nparr("streamline_seeds")
         self.streamline_cache = {}
         self.streamline_active = bool(d.get("streamline_active", False))

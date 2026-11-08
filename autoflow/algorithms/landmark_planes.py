@@ -433,14 +433,13 @@ def generate_landmark_label_planes(context, name, value, rule, smooth_paths, seg
         random_range = None
         if spec["position"] == "random":
             random_range = list(spec.get("fraction_range", [0.1, 0.9]))
-            sampled_fraction = float(np.random.default_rng().uniform(*random_range))
-            spec = dict(spec, position="fractions", fractions=[sampled_fraction])
+            # Resolve anatomical eligibility and competing branches before RNG.
+            # Fixed probes keep selection independent of the realized position.
+            spec = dict(spec, position="fractions", fractions=[.1, .5, .9])
         selections, reason = context.resolve(name, spec)
-        count = len(spec["fractions"]) if spec["position"] == "fractions" else 1
+        count = 1 if random_range is not None else len(spec["fractions"]) if spec["position"] == "fractions" else 1
         placement_qc = {"placement_index": placement_index, "spec": declared_spec, "status": "resolved" if selections else "omitted",
                         "reason": reason, "resolved_count": len(selections)}
-        if random_range is not None:
-            placement_qc["sampled_fraction"] = sampled_fraction
         if spec["anchor"] in {"label_trunk","label_reference"}:
             placement_qc["trunk_selection"] = list(context.cache['continuous_trunks'].audit)
             if reason and selections:
@@ -470,6 +469,9 @@ def generate_landmark_label_planes(context, name, value, rule, smooth_paths, seg
                 qc["placement_warnings"].append("conditional_level_fallback")
             spec = selection.get("placement_spec", requested_spec)
             if random_range is not None:
+                sampled_fraction = float(np.random.default_rng().uniform(*random_range))
+                placement_qc.setdefault("sampled_fractions", []).append(sampled_fraction)
+                placement_qc["sampled_fraction"] = sampled_fraction
                 spec = dict(spec, position="fractions", fractions=[sampled_fraction])
                 if selection.get("fallback_endpoint") == "flow_end":
                     spec["fraction_reference"] = "flow_end"

@@ -5,8 +5,9 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
+          "anchor": "label_branch",
           "scope": "label",
+          "path_selection": "longest",
           "position": "random",
           "fraction_range": [
             0.1,
@@ -23,6 +24,7 @@
           "anchor": "label_longest",
           "scope": "label",
           "position": "random",
+          "fraction_reference": "flow_end",
           "fraction_range": [
             0.1,
             0.9
@@ -47,8 +49,9 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
+          "anchor": "label_branch",
           "scope": "label",
+          "path_selection": "longest",
           "position": "random",
           "fraction_range": [
             0.1,
@@ -62,8 +65,8 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
-          "scope": "label",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "random",
           "fraction_range": [
             0.1,
@@ -77,8 +80,8 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
-          "scope": "label",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "random",
           "fraction_range": [
             0.1,
@@ -116,8 +119,8 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
-          "scope": "label",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "random",
           "fraction_range": [
             0.1,
@@ -131,8 +134,8 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
-          "scope": "label",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "random",
           "fraction_range": [
             0.1,
@@ -146,9 +149,10 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
-          "scope": "label",
+          "anchor": "portal_branch",
+          "path_selection": "unique",
           "position": "random",
+          "connection_fallback": "flow_endpoint",
           "fraction_range": [
             0.1,
             0.9
@@ -161,9 +165,10 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
-          "scope": "label",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "random",
+          "connection_fallback": "flow_endpoint",
           "fraction_range": [
             0.1,
             0.9
@@ -176,9 +181,10 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
-          "scope": "label",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "random",
+          "connection_fallback": "flow_endpoint",
           "fraction_range": [
             0.1,
             0.9
@@ -191,9 +197,11 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
+          "anchor": "flow_inlet_branch",
           "scope": "label",
+          "path_selection": "unique",
           "position": "random",
+          "inlet_selection": "lowest_z",
           "fraction_range": [
             0.1,
             0.9
@@ -206,9 +214,11 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
+          "anchor": "flow_inlet_branch",
           "scope": "label",
+          "path_selection": "unique",
           "position": "random",
+          "inlet_selection": "lowest_z",
           "fraction_range": [
             0.1,
             0.9
@@ -221,9 +231,11 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
+          "anchor": "flow_inlet_branch",
           "scope": "label",
+          "path_selection": "unique",
           "position": "random",
+          "inlet_selection": "lowest_z",
           "fraction_range": [
             0.1,
             0.9
@@ -236,8 +248,9 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
+          "anchor": "label_branch",
           "scope": "label",
+          "path_selection": "longest",
           "position": "random",
           "fraction_range": [
             0.1,
@@ -251,8 +264,8 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
-          "scope": "label",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "random",
           "fraction_range": [
             0.1,
@@ -266,8 +279,8 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
-          "scope": "label",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "random",
           "fraction_range": [
             0.1,
@@ -281,8 +294,8 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
-          "scope": "label",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "random",
           "fraction_range": [
             0.1,
@@ -296,8 +309,8 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
-          "scope": "label",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "random",
           "fraction_range": [
             0.1,
@@ -311,8 +324,8 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
-          "scope": "label",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "random",
           "fraction_range": [
             0.1,
@@ -326,8 +339,8 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
-          "scope": "label",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "random",
           "fraction_range": [
             0.1,
@@ -341,8 +354,8 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
-          "scope": "label",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "random",
           "fraction_range": [
             0.1,
@@ -356,8 +369,8 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
-          "scope": "label",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "random",
           "fraction_range": [
             0.1,
@@ -371,8 +384,8 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
-          "scope": "label",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "random",
           "fraction_range": [
             0.1,
@@ -386,8 +399,8 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
-          "scope": "label",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "random",
           "fraction_range": [
             0.1,
@@ -401,9 +414,11 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
+          "anchor": "flow_inlet_branch",
           "scope": "label",
+          "path_selection": "unique",
           "position": "random",
+          "inlet_selection": "lowest_z",
           "fraction_range": [
             0.1,
             0.9
@@ -416,8 +431,8 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
-          "scope": "label",
+          "anchor": "label_reference_branch",
+          "path_selection": "longest",
           "position": "random",
           "fraction_range": [
             0.1,
@@ -431,9 +446,12 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
+          "anchor": "flow_outlet_branch",
           "scope": "label",
+          "path_selection": "unique",
           "position": "random",
+          "fraction_reference": "flow_end",
+          "outlet_selection": "lowest_z",
           "fraction_range": [
             0.1,
             0.9
@@ -446,9 +464,12 @@
       "plane_count": 1,
       "placements": [
         {
-          "anchor": "label_longest",
+          "anchor": "flow_outlet_branch",
           "scope": "label",
+          "path_selection": "unique",
           "position": "random",
+          "fraction_reference": "flow_end",
+          "outlet_selection": "lowest_z",
           "fraction_range": [
             0.1,
             0.9

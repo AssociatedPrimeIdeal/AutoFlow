@@ -1,5 +1,6 @@
 """Labelled plane handles shared by native Qt and the SSH plotter."""
 
+import numpy as np
 import pyvista as pv
 from vtkmodules.vtkInteractionWidgets import vtkHandleWidget, vtkSphereHandleRepresentation
 from vtkmodules.vtkRenderingCore import vtkBillboardTextActor3D, vtkTextActor
@@ -13,6 +14,7 @@ class PlaneDragHandles:
         self.handles = []
         self.guides = []
         self.labels = []
+        self.axis_labels = []
         scene._ensure_scene_layers()
         self.renderer = scene._selection_renderer
         iren = getattr(plotter.iren, "interactor", plotter.iren)
@@ -47,6 +49,27 @@ class PlaneDragHandles:
             prop.SetBackgroundOpacity(0.8)
             self.renderer.AddActor(label)
             self.labels.append(label)
+        for text, color in (("U", "#ff6b6b"), ("V", "#69db7c"), ("N", "#74c0fc")):
+            mesh = pv.Arrow(tip_length=0.23, tip_radius=0.06, shaft_radius=0.016)
+            mapper = pv._vtk.vtkPolyDataMapper()
+            mapper.SetInputData(mesh)
+            actor = pv._vtk.vtkActor()
+            actor.SetMapper(mapper)
+            actor.GetProperty().SetColor(pv.Color(color).float_rgb)
+            actor.GetProperty().LightingOff()
+            actor.PickableOff()
+            actor.UseBoundsOff()
+            self.renderer.AddActor(actor)
+            self.guides.append((actor, mesh))
+            label = vtkBillboardTextActor3D()
+            label.SetInput(text)
+            label.SetDisplayOffset(5, 5)
+            label.GetTextProperty().SetFontSize(14)
+            label.GetTextProperty().SetColor(pv.Color(color).float_rgb)
+            label.PickableOff()
+            label.UseBoundsOff()
+            self.renderer.AddActor(label)
+            self.axis_labels.append(label)
         self.help = vtkTextActor()
         self.help.SetInput("Drag a cyan center to move\nRotate in the lower 2D views\nApply Plane to save | Esc to cancel")
         self.help.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
@@ -81,10 +104,23 @@ class PlaneDragHandles:
             widget.SetEnabled(True)
             label.SetVisibility(True)
 
-    def update(self, center, axis_u, axis_v, distance):
+    def update(self, center, axis_u, axis_v, distance, normal):
         for (_, rep), label in zip(self.handles, self.labels):
             rep.SetWorldPosition(center)
             label.SetPosition(center)
+        for (actor, _), label, direction in zip(self.guides, self.axis_labels, (axis_u, axis_v, normal)):
+            direction = np.asarray(direction, dtype=float)
+            direction = direction / np.linalg.norm(direction)
+            side = np.cross(direction, np.eye(3)[np.argmin(np.abs(direction))])
+            side /= np.linalg.norm(side)
+            matrix = pv._vtk.vtkMatrix4x4()
+            basis = np.column_stack((direction, side, np.cross(direction, side))) * distance
+            for row in range(3):
+                for column in range(3):
+                    matrix.SetElement(row, column, basis[row, column])
+                matrix.SetElement(row, 3, center[row])
+            actor.SetUserMatrix(matrix)
+            label.SetPosition(np.asarray(center) + direction * distance)
 
     def dispatch(self, event):
         """Let the remote QWidget send handle gestures before camera gestures."""
@@ -108,10 +144,11 @@ class PlaneDragHandles:
             widget.Off()
             widget.RemoveAllObservers()
             widget.SetInteractor(None)
-        for actor in self.labels + [actor for actor, _ in self.guides]:
+        for actor in self.labels + self.axis_labels + [actor for actor, _ in self.guides]:
             self.renderer.RemoveActor(actor)
         self.scene._hud_renderer.RemoveViewProp(self.help)
         self.handles.clear()
         self.labels.clear()
+        self.axis_labels.clear()
         self.guides.clear()
         self.plotter._autoflow_plane_widget_dispatch = None

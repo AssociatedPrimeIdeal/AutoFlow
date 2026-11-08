@@ -79,7 +79,7 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
             "Observed connections retain every real arm. PV/SMV/SV can explicitly use a flow-end fallback when the connection is absent. Other missing anchors/levels and rejected sections retain per-label reasons.")
         self.table = QtWidgets.QTableWidget(0, 11)
         self.table.setObjectName("landmark_placements")
-        self.table.setHorizontalHeaderLabels(["Anchor", "Label level", "Paths at level", "Position", "Offset (mm)", "Positions / range (%)", "No connection", "Level condition", "Scope", "Flow endpoint", "Missing portal connection"])
+        self.table.setHorizontalHeaderLabels(["Branch selection", "Label level", "Candidate policy", "Position method", "Offset (mm)", "Positions / range (%)", "No connection", "Level condition", "Scope", "Flow endpoint", "Missing portal connection"])
         for column, explanation in enumerate((
                 "Anatomical connection or path property used to locate this measurement.",
                 "Label-local level of the selected path.", "Which paths at that level receive measurements.",
@@ -191,12 +191,14 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
         position = QtWidgets.QComboBox()
         position.addItem("Offset inside label", "near")
         position.addItem("Fractions of label interval", "fractions")
-        position.addItem("Random within label interval", "random")
+        position.addItem("Random within selected branch", "random")
+        position.addItem("Random from flow-oriented start", "flow_start_random")
+        position.addItem("Random from flow-oriented end", "flow_end_random")
         position.addItem("Before flow-oriented end", "before_end")
         position.addItem("After flow-oriented start", "after_start")
         position.addItem("Fractions from flow-oriented start", "flow_start_fractions")
         position.addItem("Fractions from flow-oriented end", "flow_end_fractions")
-        position.setCurrentIndex(position.findData(spec["fraction_reference"] + "_fractions"
+        position.setCurrentIndex(position.findData(spec["fraction_reference"] + "_" + spec["position"]
             if spec.get("fraction_reference") else spec["position"]))
         offset = QtWidgets.QDoubleSpinBox()
         offset.setDecimals(3)
@@ -213,7 +215,7 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
                       control.textChanged if isinstance(control, QtWidgets.QLineEdit) else control.valueChanged)
             signal.connect(self.refresh)
         def update_random_bounds():
-            if position.currentData() == "random":
+            if position.currentData() in {"random", "flow_start_random", "flow_end_random"}:
                 fractions.setText("10, 90")
         position.currentIndexChanged.connect(update_random_bounds)
         fallback = QtWidgets.QPushButton("Edit fallback…" if spec.get("fallback") else "No fallback")
@@ -298,10 +300,10 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
         for row in range(self.table.rowCount()):
             anchor, level, paths, position, offset, fractions = [self.table.cellWidget(row, i) for i in range(6)]
             value = position.currentData()
-            spec = {"anchor": anchor.currentData(), "position": "fractions" if value in
-                    {"flow_start_fractions", "flow_end_fractions"} else value}
-            if value in {"flow_start_fractions", "flow_end_fractions"}:
-                spec["fraction_reference"] = value.removesuffix("_fractions")
+            spec = {"anchor": anchor.currentData(), "position": value.rsplit("_", 1)[-1]
+                    if value.startswith(("flow_start_", "flow_end_")) else value}
+            if value.startswith(("flow_start_", "flow_end_")):
+                spec["fraction_reference"] = value.rsplit("_", 1)[0]
             if spec["anchor"] == "label_level":
                 spec["level"] = level.value()
             if spec["anchor"] in {"label_level", "label_terminal", "label_trunk", "label_reference", "label_branch", "label_reference_branch", "flow_inlet_branch", "flow_outlet_branch", "portal_branch"}:

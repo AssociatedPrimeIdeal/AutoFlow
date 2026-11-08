@@ -116,15 +116,18 @@ def _action_sections(action, ws):
             Field("segmentation.auto_label_map", "Label map (JSON)", "json"),
         ])]
     if action == StepId.BACKGROUND_CORRECTION:
-        dual_info = ws.input_state.metadata.get("dual_venc", {})
-        dual = isinstance(dual_info, dict) and bool(dual_info.get("enabled", False))
         return [("Background correction", [
             option(b + "method", "Method", ("WRLS + ARTO", "wrls_arto"), ("MSAC", "msac")),
             number(b + "corr_fit_order", "Fit order", 0, 3, integer=True),
             number(b + "threshold", "MSAC threshold", .001, 10,
                    visible=lambda v: v[b + "method"] == "msac"),
-            number(b + "dual_venc_ratio1", "Dual-VENC ratio 1", -10, 10, visible=lambda v: dual),
-            number(b + "dual_venc_ratio2", "Dual-VENC ratio 2", -10, 10, visible=lambda v: dual),
+        ])]
+    if action == StepId.RECONSTRUCT_DUAL_VENC:
+        if not ws.uses_dual_venc_reconstruction():
+            return []
+        return [("Dual-VENC Reconstruction", [
+            number(b + "dual_venc_ratio1", "Ratio 1", -10, 10),
+            number(b + "dual_venc_ratio2", "Ratio 2", -10, 10),
         ])]
     if action == StepId.REMOVE_NOISE:
         n = "noise_removal_params."
@@ -134,6 +137,9 @@ def _action_sections(action, ws):
             number(n + "magnitude_fraction", "Magnitude fraction of maximum", 0, 1),
             number(n + "velocity_std_max", "Temporal SD fraction of maximum", 0, 1,
                    visible=lambda v: v[n + "method"] == "magnitude_temporal"),
+            flag(n + "coherence_enabled", "Coherence filter"),
+            option(n + "coherence_strength", "Strength", ("Medium", "medium"), ("Strong", "strong"),
+                   visible=lambda v: v[n + "coherence_enabled"]),
         ])]
     if action == StepId.UNWRAP_PHASE:
         methods = [("Laplacian 4D", "lap4D"), ("Graph-cut 3D", "gc3D"), ("NPRS", "nprs")]
@@ -1087,7 +1093,8 @@ class ActionSettingsMixin:
                         StepId.GENERATE_STREAMLINES: "Streamlines", StepId.PLANE_STREAMLINES: "Pathlines",
                         StepId.GENERATE_SKELETON: "Skeleton", StepId.GENERATE_GRAPH: "Graph",
                         StepId.GENERATE_PLANES: "Planes", StepId.BACKGROUND_CORRECTION: "Background",
-                        StepId.REMOVE_NOISE: "Noise", StepId.UNWRAP_PHASE: "Unwrap"}.get(key, key.label)
+                        StepId.REMOVE_NOISE: "Noise", StepId.UNWRAP_PHASE: "Unwrap",
+                        StepId.RECONSTRUCT_DUAL_VENC: "Dual-VENC"}.get(key, key.label)
                 pages = action_sections(key, self.workspace)
                 sections.extend((name + ("::" + title if len(pages) > 1 else ""), fields)
                                 for title, fields in pages)
@@ -1107,7 +1114,7 @@ class ActionSettingsMixin:
         if action == "run_all":
             stage = self._workflow_stage_key()
             action = {
-                "correction": (StepId.BACKGROUND_CORRECTION, StepId.REMOVE_NOISE, StepId.UNWRAP_PHASE),
+                "correction": (StepId.BACKGROUND_CORRECTION, StepId.UNWRAP_PHASE, StepId.RECONSTRUCT_DUAL_VENC, StepId.REMOVE_NOISE),
                 "centerline": (StepId.GENERATE_SKELETON, StepId.GENERATE_GRAPH, StepId.GENERATE_PLANES),
                 "hemodynamics": (StepId.COMPUTE_PLANE_METRICS, StepId.COMPUTE_DERIVED_METRICS, StepId.GENERATE_STREAMLINES, StepId.PLANE_STREAMLINES),
             }.get(stage, ())
@@ -1228,8 +1235,9 @@ class ActionSettingsMixin:
 
     def _mark_action_settings_pending(self, keys):
         dependencies = {
-            StepId.BACKGROUND_CORRECTION: (StepId.GENERATE_PCMRA, StepId.GENERATE_SKELETON, StepId.GENERATE_GRAPH, StepId.GENERATE_PLANES, StepId.COMPUTE_PLANE_METRICS, StepId.COMPUTE_DERIVED_METRICS, StepId.COMPUTE_PWV, StepId.GENERATE_STREAMLINES, StepId.PLANE_STREAMLINES),
-            StepId.UNWRAP_PHASE: (StepId.GENERATE_PCMRA, StepId.COMPUTE_PLANE_METRICS, StepId.COMPUTE_DERIVED_METRICS, StepId.COMPUTE_PWV, StepId.GENERATE_STREAMLINES, StepId.PLANE_STREAMLINES),
+            StepId.BACKGROUND_CORRECTION: (StepId.RECONSTRUCT_DUAL_VENC, StepId.GENERATE_PCMRA, StepId.GENERATE_SKELETON, StepId.GENERATE_GRAPH, StepId.GENERATE_PLANES, StepId.COMPUTE_PLANE_METRICS, StepId.COMPUTE_DERIVED_METRICS, StepId.COMPUTE_PWV, StepId.GENERATE_STREAMLINES, StepId.PLANE_STREAMLINES),
+            StepId.UNWRAP_PHASE: (StepId.RECONSTRUCT_DUAL_VENC, StepId.GENERATE_PCMRA, StepId.COMPUTE_PLANE_METRICS, StepId.COMPUTE_DERIVED_METRICS, StepId.COMPUTE_PWV, StepId.GENERATE_STREAMLINES, StepId.PLANE_STREAMLINES),
+            StepId.RECONSTRUCT_DUAL_VENC: (StepId.GENERATE_PCMRA, StepId.COMPUTE_PLANE_METRICS, StepId.COMPUTE_DERIVED_METRICS, StepId.COMPUTE_PWV, StepId.GENERATE_STREAMLINES, StepId.PLANE_STREAMLINES),
             StepId.GENERATE_SKELETON: (StepId.GENERATE_GRAPH, StepId.GENERATE_PLANES, StepId.COMPUTE_PLANE_METRICS, StepId.COMPUTE_PWV),
             StepId.GENERATE_GRAPH: (StepId.GENERATE_PLANES, StepId.COMPUTE_PLANE_METRICS, StepId.COMPUTE_PWV),
             StepId.GENERATE_PLANES: (StepId.COMPUTE_PLANE_METRICS, StepId.COMPUTE_PWV),
@@ -1240,6 +1248,8 @@ class ActionSettingsMixin:
         for key in keys:
             for step in (key,) + dependencies.get(key, ()):
                 if isinstance(step, StepId):
+                    if step == StepId.RECONSTRUCT_DUAL_VENC and not self.workspace.uses_dual_venc_reconstruction():
+                        continue
                     self.workspace.pipeline.completed.pop(step.value, None)
                     self.workspace.pipeline.skipped.pop(step.value, None)
                     pending.add(step.value)

@@ -1638,6 +1638,11 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         available = self._available_content_keys()
         self.btn_render_content.setEnabled(bool(available))
         combo = self.combo_content
+        prefix = "HV " if self.workspace.needs_dual_venc_reconstruction() else ""
+        self._content_labels[:3] = [f"{prefix}Flow {axis} (cm/s)" for axis in ("LR", "AP", "FH")]
+        self._content_labels[5] = f"{prefix}Speed (cm/s)"
+        for index in range(combo.count()):
+            combo.setItemText(index, self._content_labels[combo.itemData(index)])
         existing = [combo.itemData(index) for index in range(combo.count())]
         if existing == available:
             combo.setEnabled(bool(available))

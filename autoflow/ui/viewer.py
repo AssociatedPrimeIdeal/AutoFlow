@@ -1,5 +1,6 @@
 import numpy as np
 from ..config import METRIC_DATA_KEYS
+from ..algorithms.noise_removal import pcmra_display_frame
 from ..rendering.style import configured_metric_style, metric_colormap
 from ..rendering.datasets import metric_display_mesh
 import hashlib
@@ -229,7 +230,8 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
                     if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
                         return lo, hi
             if obj.data_key == "pcmra_volume" and self.workspace.pcmra_array is not None:
-                key = (id(self.workspace.pcmra_array), id(self.workspace.pcmra_render_mask), int(self.workspace.current_t))
+                key = (id(self.workspace.pcmra_array), id(self.workspace.pcmra_render_mask),
+                       id(self.workspace.pcmra_render_weight), int(self.workspace.current_t))
                 cached = self._volume_range_cache.get(key)
                 if cached is not None:
                     return cached
@@ -1849,17 +1851,12 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
             pcmra = np.asarray(ws.pcmra_array)
             if pcmra.ndim != 4 or pcmra.shape[3] == 0:
                 return None
-            cache_key = f"pcmra_volume_{id(ws.pcmra_array)}_{id(ws.pcmra_render_mask)}"
+            cache_key = f"pcmra_volume_{id(ws.pcmra_array)}_{id(ws.pcmra_render_mask)}_{id(ws.pcmra_render_weight)}"
             def _build_pcmra():
                 tidx = min(max(0, int(t)), pcmra.shape[3] - 1)
-                values = np.asarray(pcmra[..., tidx], dtype=np.float32)
-                if ws.pcmra_render_mask is not None:
-                    region = np.asarray(ws.pcmra_render_mask)
-                    if region.shape == pcmra.shape[:3]:
-                        values = np.where(region, values, 0.0)
-                    elif region.shape == pcmra.shape:
-                        values = np.where(region[..., tidx], values, 0.0)
-                range_key = (id(ws.pcmra_array), id(ws.pcmra_render_mask), int(t))
+                values = pcmra_display_frame(pcmra, tidx, mask=ws.pcmra_render_mask,
+                                             weight=ws.pcmra_render_weight)
+                range_key = (id(ws.pcmra_array), id(ws.pcmra_render_mask), id(ws.pcmra_render_weight), int(t))
                 self._volume_range_cache[range_key] = self._foreground_volume_range(values)
                 grid = self._voxel_centered_grid(values, "PC-MRA")
                 grid.field_data["PC-MRA display range"] = self._volume_range_cache[range_key]

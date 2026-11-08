@@ -173,7 +173,7 @@ DEFAULT_PLANE_LABEL_CFG = {
 }
 
 DEFAULT_PLANE_RENDER_CFG = {
-    "plane_size_mm": 10.0,
+    "plane_size_mm": 20.0,
     "selected_only": False,
     "default": {
         "plane_color": "yellow",
@@ -344,7 +344,8 @@ DEFAULT_CONFIG_BUNDLE: Dict[str, Dict[str, Any]] = {
         "dicom_h5_dir": "",
         "ignore_embedded_segmentation": False,
     },
-    "noise_removal": {"enabled": False, "method": "magnitude_temporal", "magnitude_fraction": 0.05, "velocity_std_max": 0.80},
+    "noise_removal": {"enabled": True, "method": "magnitude_temporal", "magnitude_fraction": 0.05, "velocity_std_max": 0.80,
+                      "coherence_enabled": True, "coherence_strength": "strong"},
     "phase_unwrapping": {
         "mask_source": "auto",
         "device": "auto",
@@ -1125,10 +1126,12 @@ def bundle_to_autoflow_kwargs(config_bundle: Dict[str, Dict[str, Any]]) -> Dict[
         "phase_unwrap_method": str(unwrap_cfg.get("method", "none") or "none"),
         "phase_unwrap_mask": str(unwrap_cfg.get("mask_source", "auto") or "auto"),
         "correction_all": bool(batch_cfg.get("correction_all", False)),
-        "noise_removal": bool(noise_cfg.get("enabled", False)),
+        "noise_removal": bool(noise_cfg.get("enabled", True)),
         "noise_removal_method": str(noise_cfg.get("method", "magnitude_temporal")),
         "noise_magnitude_fraction": float(noise_cfg.get("magnitude_fraction", 0.05)),
         "noise_velocity_std_max": float(noise_cfg.get("velocity_std_max", 0.80)),
+        "noise_coherence_enabled": bool(noise_cfg.get("coherence_enabled", True)),
+        "noise_coherence_strength": str(noise_cfg.get("coherence_strength", "strong")),
         "phase_unwrap_device": str(unwrap_cfg.get("device", "auto") or "auto"),
         "phase_unwrap_tfc": bool(unwrap_cfg.get("tfc", True)),
         "phase_unwrap_lap4d_ts": float(unwrap_cfg.get("lap4d_ts", 2.0)),

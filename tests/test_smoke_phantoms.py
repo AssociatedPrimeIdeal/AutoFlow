@@ -3756,6 +3756,7 @@ def test_interaction_render_phantom_mouse_preview_restores_quality_and_coordinat
         obj = scene.add_content_render(3)
         plotter.reset_camera()
         plotter.render()
+        plotter._capture_frame()  # Initialize VTK before testing render events.
         mapper = obj.actor.GetMapper()
         names = [name for name in ("SampleDistance", "ImageSampleDistance", "AutoAdjustSampleDistances",
                                   "InteractiveAdjustSampleDistances") if hasattr(mapper, "Get" + name)]
@@ -3780,7 +3781,21 @@ def test_interaction_render_phantom_mouse_preview_restores_quality_and_coordinat
         assert plotter.renderer.GetPass() is render_pass
         assert {name: getattr(mapper, "Get" + name)() for name in names} == before
         assert mapper.dataset is dataset
+        # Selection-on-top moves the only volume out of the interactive layer.
+        # Zooming into it must still update the shared camera's clipping range.
+        plotter.set_background("black")
+        scene.set_selected_layers([obj.uid])
+        assert not plotter.renderer.HasViewProp(obj.actor)
+        scene.reset_camera()
+        plotter.camera.Dolly(8.0)
+        plotter.renderer.ResetCameraClippingRange()
+        plotter.render()
+        assert plotter.camera.clipping_range[0] < plotter.camera.distance
+        pixels = plotter.screenshot(return_img=True)
+        h, w = pixels.shape[:2]
+        assert pixels[h//3:2*h//3, w//3:2*w//3, :3].mean() > 30
         scene.update_content_render(obj.uid, mode="slices")
+        scene.reset_camera()
         plotter.render()
         plotter._capture_frame()
         widget, rep, _ = scene._content_widgets[0]
@@ -4143,10 +4158,14 @@ def test_run_case_segmentation_only_stops_before_skeleton(tmp_path, monkeypatch)
         handle.create_dataset("SpatialOrder", data=np.asarray(["LR", "AP", "FH"], dtype="S4"))
         handle.create_dataset("VENCOrder", data=np.asarray(["LR", "AP", "FH"], dtype="S4"))
 
-    def fail_run_step(*_args, **_kwargs):
-        raise AssertionError("segmentation-only must stop before skeleton")
+    original_run_step = PipelineEngine.run_step
+    correction_steps = []
+    def correction_only(engine, workspace, step, *args, **kwargs):
+        assert step == StepId.REMOVE_NOISE, "segmentation-only must stop before skeleton"
+        correction_steps.append(step)
+        return original_run_step(engine, workspace, step, *args, **kwargs)
 
-    monkeypatch.setattr(PipelineEngine, "run_step", fail_run_step)
+    monkeypatch.setattr(PipelineEngine, "run_step", correction_only)
     from autoflow import processing
     original_save = processing.save_quality_report
     def slow_save(*args, **kwargs):
@@ -4160,10 +4179,12 @@ def test_run_case_segmentation_only_stops_before_skeleton(tmp_path, monkeypatch)
         output_dir=str(out_dir),
         config=AutoFlowConfig(segmentation_only=True),
     )
+    assert correction_steps == [StepId.REMOVE_NOISE]
+    assert summary["noise_removal"]["parameters"]["coherence_strength"] == "strong"
 
     assert summary["segmentation_only"] is True
     assert summary["segmentation_source"] == "original"
-    assert summary["stage_times_sec"].keys() == {"load", "analysis_report"}
+    assert summary["stage_times_sec"].keys() == {"load", "noise_removal", "analysis_report"}
     assert summary["quality_report"]["overall_status"] == "incomplete"
     assert summary["quality_report_file"] == str(out_dir / "quality_report.json")
     assert (out_dir / "summary.json").is_file()
@@ -4534,7 +4555,7 @@ def test_gui_load_saved_corr_and_recompute_from_source(monkeypatch, tmp_path, la
     engine.load_data(ws, lambda _: None, progress_callback=events.append, reuse_existing_corr=True)
     assert calls == []
     assert path.read_bytes() == original  # Opening applies a cache without writing H5.
-    expected = (phase - 0.05) * 100 / np.pi
+    expected = ((phase / 2 - 0.05) * 200 if layout == "dual" else (phase - 0.05) * 100) / np.pi
     np.testing.assert_allclose(ws.flow_raw, np.broadcast_to(expected, shape + (3,)), atol=2e-5)
     assert ws.correction_raw is not None
     if layout == "dual":
@@ -4570,7 +4591,7 @@ def test_gui_load_saved_corr_and_recompute_from_source(monkeypatch, tmp_path, la
         expected_phases.sort(key=lambda value: float(value[0]))
         np.testing.assert_allclose(source_phases, expected_phases, atol=2e-6)
         calls.clear()
-        expected = (phase - 0.1) * 100 / np.pi
+        expected = ((phase / 2 - 0.1) * 200 if layout == "dual" else (phase - 0.1) * 100) / np.pi
         np.testing.assert_allclose(ws.flow_raw, np.broadcast_to(expected, shape + (3,)), atol=2e-5)
         with h5py.File(path, "r") as handle:
             np.testing.assert_array_equal(handle[source_key][:], source)
@@ -6095,7 +6116,7 @@ def test_gui_run_all_scopes_steps_to_the_active_workflow_panel():
     from autoflow.ui.app import _workflow_run_all_steps
 
     assert _workflow_run_all_steps("correction") == [
-        StepId.BACKGROUND_CORRECTION, StepId.REMOVE_NOISE, StepId.UNWRAP_PHASE, StepId.GENERATE_PCMRA,
+        StepId.BACKGROUND_CORRECTION, StepId.UNWRAP_PHASE, StepId.REMOVE_NOISE, StepId.GENERATE_PCMRA,
     ]
     assert _workflow_run_all_steps("centerline") == [
         StepId.GENERATE_SKELETON,
@@ -6504,6 +6525,9 @@ def test_pcmra_phantom_phase_updates_preserve_window_opacity_and_actor(static_ma
     flow = np.zeros((5, 5, 5, 3, 3), dtype=np.float64)
     flow[..., 0, 0], flow[..., 1, 0], flow[..., 2, 0] = 1.0, 2.0, 4.0
     workspace = Workspace()
+    # This regression covers unfiltered window/actor updates; filtering has
+    # separate phantom and quantitative-immutability coverage.
+    workspace.noise_removal_params.enabled = False
     workspace.mag_raw = magnitude if static_magnitude else np.repeat(magnitude[..., None], 3, axis=3)
     workspace.flow_raw = flow
     workspace.data_loaded = True
@@ -6879,16 +6903,25 @@ def test_noise_removal_defaults_and_manual_configuration():
     from autoflow.processing import process_single
 
     defaults = NoiseRemovalConfig()
+    assert defaults.enabled and defaults.coherence_enabled
+    assert defaults.coherence_strength == "strong"
     assert defaults.magnitude_fraction == 0.05
     assert defaults.velocity_std_max == 0.80
     bundle = load_config_bundle()
     for resolved in (bundle_to_autoflow_kwargs(bundle), bundle_to_autoflow_kwargs({})):
+        assert resolved["noise_removal"] and resolved["noise_coherence_enabled"]
+        assert resolved["noise_coherence_strength"] == "strong"
         assert resolved["noise_magnitude_fraction"] == 0.05
         assert resolved["noise_velocity_std_max"] == 0.80
     api_config = AutoFlowConfig()
+    assert api_config.noise_removal and api_config.noise_coherence_enabled
+    assert api_config.noise_coherence_strength == "strong"
     assert api_config.noise_magnitude_fraction == 0.05
     assert api_config.noise_velocity_std_max == 0.80
     signature = inspect.signature(process_single)
+    assert signature.parameters["noise_removal"].default is True
+    assert signature.parameters["noise_coherence_enabled"].default is True
+    assert signature.parameters["noise_coherence_strength"].default == "strong"
     assert signature.parameters["noise_magnitude_fraction"].default == 0.05
     assert signature.parameters["noise_velocity_std_max"].default == 0.80
     assert Workspace().noise_removal_params == defaults
@@ -6903,6 +6936,12 @@ def test_noise_removal_defaults_and_manual_configuration():
     restored = Workspace()
     restored.restore_dict(workspace.snapshot_dict())
     assert restored.noise_removal_params == workspace.noise_removal_params
+    args = build_parser().parse_args(["case.h5", "--no-noise-coherence", "--noise-coherence-strength", "medium",
+                                     "--no-noise-removal"])
+    assert args.noise_coherence_enabled is False and args.noise_coherence_strength == "medium"
+    assert args.noise_removal is False
+    with pytest.raises(ValueError, match="coherence_strength"):
+        NoiseRemovalConfig(coherence_strength="invalid")
     for name in ("magnitude_fraction", "velocity_std_max"):
         for invalid in (-0.01, 1.01, np.nan, np.inf):
             with pytest.raises(ValueError):
@@ -6921,6 +6960,11 @@ def test_noise_removal_phantom_settings_hide_inactive_method_and_cancel(monkeypa
         key = "noise_removal_params."
         assert panel.controls[key + "magnitude_fraction"].value() == .05
         assert panel.controls[key + "velocity_std_max"].value() == .80
+        assert panel.controls[key + "coherence_enabled"].isChecked()
+        assert panel.controls[key + "coherence_strength"].currentData() == "strong"
+        panel.controls[key + "coherence_enabled"].setChecked(False)
+        assert panel.rows[key + "coherence_strength"].isHidden()
+        assert panel.values()[key + "coherence_strength"] == "strong"
         panel.controls[key + "magnitude_fraction"].setValue(.03)
         panel.controls[key + "velocity_std_max"].setValue(.90)
         method = panel.controls[key + "method"]
@@ -6931,6 +6975,7 @@ def test_noise_removal_phantom_settings_hide_inactive_method_and_cancel(monkeypa
         panel.reject()
         assert ws.noise_removal_params.magnitude_fraction == .05
         assert ws.noise_removal_params.velocity_std_max == .80
+        assert ws.noise_removal_params.coherence_enabled and ws.noise_removal_params.coherence_strength == "strong"
     finally:
         panel.close()
         panel.deleteLater()
@@ -6966,6 +7011,8 @@ def test_action_settings_phantom_context_save_run_and_conditional_rows(monkeypat
                 dialog = application.activeModalWidget()
                 assert isinstance(dialog, ActionSettingsDialog)
                 dialog.controls[key].setValue(.07)
+                strength = dialog.controls["noise_removal_params.coherence_strength"]
+                strength.setCurrentIndex(strength.findData("medium"))
                 dialog.reject() if cancel else dialog.accept()
             QtCore.QTimer.singleShot(0, edit)
             application.sendEvent(button, QtGui.QContextMenuEvent(
@@ -6973,9 +7020,14 @@ def test_action_settings_phantom_context_save_run_and_conditional_rows(monkeypat
 
         context_edit(True)
         assert ws.noise_removal_params.magnitude_fraction == .05
+        assert ws.noise_removal_params.coherence_strength == "strong"
         ws.pipeline.mark_done(StepId.REMOVE_NOISE)
         context_edit(False)
         assert ws.noise_removal_params.magnitude_fraction == .07
+        assert ws.noise_removal_params.coherence_strength == "medium"
+        restored = Workspace()
+        restored.restore_dict(ws.snapshot_dict())
+        assert restored.noise_removal_params.coherence_strength == "medium"
         assert not ws.pipeline.is_done(StepId.REMOVE_NOISE)
         assert "Settings changed" in button.toolTip()
 
@@ -7188,7 +7240,8 @@ def test_phase_segmask_requires_an_available_segmentation():
     assert not result.success and "segmask requires" in result.message
 
 
-def test_correction_cli_api_order_and_default_mask(monkeypatch, tmp_path):
+@pytest.mark.parametrize("dual", [False, True])
+def test_correction_cli_api_order_and_default_mask(monkeypatch, tmp_path, dual):
     from autoflow.core import pipeline as module
     from autoflow import processing
     from autoflow.case_types import LoadedCase, InputCase
@@ -7200,15 +7253,25 @@ def test_correction_cli_api_order_and_default_mask(monkeypatch, tmp_path):
         cfg = kwargs["correction_config"]
         enabled = cfg.get("enabled", False) if isinstance(cfg, dict) else cfg.enabled
         events.append("background" if enabled else "load")
+        metadata = {"background_phase_correction": {"applied": enabled}}
+        if dual:
+            metadata.update(dual_venc=dict(enabled=True, selected_mode="dv", lv_venc=[50]*3, hv_venc=[150]*3))
         return LoadedCase(mag=np.ones(shape, dtype=np.float32), flow=velocity * (2 if enabled else 1),
             resolution=np.ones(3), origin=np.zeros(3), venc=np.full(3, 150.0), rr=1000,
-            metadata={"background_phase_correction": {"applied": enabled}})
+            phase_wrapped_high=velocity if dual else None,
+            flow_low=velocity * 20 if dual else None, flow_high=velocity * 2 if dual else None,
+            metadata=metadata)
     monkeypatch.setattr(module, "load_input_data", load)
     original_noise = module.pcmra_render_mask
     def noise(*args, **kwargs):
         events.append("noise")
         return original_noise(*args, **kwargs)
     monkeypatch.setattr(module, "pcmra_render_mask", noise)
+    original_reconstruct = PipelineEngine._step_reconstruct_dual_venc
+    def reconstruct(engine, ws):
+        events.append("dv")
+        return original_reconstruct(engine, ws)
+    monkeypatch.setattr(PipelineEngine, "_step_reconstruct_dual_venc", reconstruct)
     original_generate = PipelineEngine._step_generate_pcmra
     def generate(engine, ws):
         events.append("pcmra")
@@ -7233,7 +7296,12 @@ def test_correction_cli_api_order_and_default_mask(monkeypatch, tmp_path):
     summary = run_case(InputCase(str(tmp_path / "case.h5"), "h5"), output_dir=str(tmp_path / "results"),
         config=AutoFlowConfig(correction_all=True, autoseg=True, segmentation_only=True,
                               background_phase_write_cache=False))
-    assert events == ["background", "noise", "unwrap", "pcmra", "segmentation"]
+    assert events == ["background", "unwrap"] + (["dv"] if dual else []) + ["noise", "pcmra", "segmentation"]
+    if dual:
+        assert summary["dual_venc"]["reconstructed"] and summary["phase_unwrap"]["target"] == "hv"
+        saved_unwrap = np.load(summary["phase_unwrap_file"])
+        assert saved_unwrap["target"].item() == "hv"
+        np.testing.assert_array_equal(saved_unwrap["phase_wrapped"], velocity)
     assert "load_and_background_correction" in summary["stage_times_sec"]
     assert summary["phase_unwrap"]["mask_source"] == "none"
     with np.load(summary["pcmra_file"]) as saved:
@@ -7244,6 +7312,102 @@ def test_correction_cli_api_order_and_default_mask(monkeypatch, tmp_path):
         assert saved["mask"].shape == shape[:3]
         np.testing.assert_allclose(saved["resolution"], 1)
 
+
+
+def test_noise_coherence_phantom_preserves_quantitative_fields_and_measurements():
+    import copy
+    from autoflow.algorithms.noise_removal import pcmra_coherence_weight, pcmra_display_frame
+    rng = np.random.default_rng(731)
+    shape = (13, 13, 13, 12)
+    magnitude = np.ones(shape, np.float32)
+    velocity = rng.normal(0, 30, shape + (3,)).astype(np.float32)
+    xyz = np.indices(shape[:3])
+    vessel = np.sum((xyz - 6) ** 2, axis=0) < 16
+    velocity[vessel] = 0
+    velocity[vessel, :, 2] = 30 + 10 * np.sin(np.arange(12) * np.pi / 6)
+    labels = np.broadcast_to(vessel[..., None], shape).astype(np.int16).copy()
+    ws = Workspace()
+    ws.data_loaded = True
+    ws.mag_raw, ws.flow_raw = magnitude, velocity
+    ws.segmask_raw = ws.segmask_labels = labels
+    ws.segmask_binary = labels > 0
+    ws.segmask_3d = vessel
+    ws.resolution = np.ones(3)
+    plane = PlaneData(np.array([6., 6., 6.]), np.array([0., 0., 1.]),
+                      label=1, segmentation_label=1, path_index=-1)
+    ws.planes = [plane]
+    baseline = compute_plane_metrics(velocity, labels > 0, ws.resolution, ws.origin, [plane],
+        RR=1000, segmentation_labels_4d=labels, flow_spacing=ws.resolution)
+    plane.metrics = copy.deepcopy(baseline[0])
+    original = [value.copy() for value in (magnitude, velocity, labels, ws.segmask_binary)]
+    magnitude.setflags(write=False); velocity.setflags(write=False); labels.setflags(write=False)
+    medium, _ = pcmra_coherence_weight(magnitude, velocity, strength="medium")
+    strong, report = pcmra_coherence_weight(magnitude, velocity, strength="strong")
+    assert np.all(strong <= medium + 1e-6)
+    assert strong[6, 6, 6] > .95 and np.mean(strong[0]) < .2
+    assert report["coherence_ramp"] == [.7, .98]
+    revision = ws.analysis_revision
+    engine = PipelineEngine()
+    assert engine.run_step(ws, StepId.REMOVE_NOISE, lambda _: None).success
+    np.testing.assert_allclose(ws.pcmra_render_weight, strong)
+    assert engine.run_step(ws, StepId.GENERATE_PCMRA, lambda _: None).success
+    np.testing.assert_allclose(ws.pcmra_array, magnitude * np.linalg.norm(velocity, axis=-1), rtol=1e-6)
+    stored = ws.pcmra_array.copy()
+    display = pcmra_display_frame(ws.pcmra_array, 0, mask=ws.pcmra_render_mask, weight=ws.pcmra_render_weight)
+    assert display[0].max() == 0 and display[6, 6, 6] > 29
+    for value, expected in zip((ws.mag_raw, ws.flow_raw, ws.segmask_raw, ws.segmask_binary), original):
+        np.testing.assert_array_equal(value, expected)
+    after = compute_plane_metrics(ws.flow_raw, ws.segmask_binary, ws.resolution, ws.origin, [plane],
+        RR=1000, segmentation_labels_4d=labels, flow_spacing=ws.resolution)
+    for key in ("flowrate_mL_s", "peakv_cm_s_t", "netflow_mL_beat", "meanv_cm_s"):
+        np.testing.assert_array_equal(after[0][key], baseline[0][key])
+    assert ws.analysis_revision == revision
+    np.testing.assert_equal(plane.metrics, baseline[0])
+    np.testing.assert_array_equal(ws.pcmra_array, stored)
+    restored = Workspace()
+    restored.restore_dict(ws.snapshot_dict())
+    np.testing.assert_array_equal(restored.pcmra_render_weight, strong)
+    ws.noise_removal_params.coherence_enabled = False
+    keep = ws.pcmra_render_mask.copy()
+    assert engine.run_step(ws, StepId.REMOVE_NOISE, lambda _: None).success
+    assert ws.pcmra_render_weight is None
+    np.testing.assert_array_equal(ws.pcmra_render_mask, keep)
+
+
+def test_noise_coherence_pcmra_gui_video_buffers_and_cache_are_isolated(tmp_path):
+    from contextlib import closing
+    import pyvista as pv
+    from autoflow.algorithms.noise_removal import pcmra_display_frame
+    from autoflow.rendering.qc_videos import _field_at
+    from autoflow.report_media import media_signature, register_report_videos, report_video_records
+    from autoflow.ui.viewer import SceneController
+    ws = Workspace()
+    ws.pcmra_array = np.full((5, 5, 5, 2), 8, np.float32)
+    ws.pcmra_render_mask = np.ones((5, 5, 5), bool)
+    ws.pcmra_render_mask[0] = False
+    ws.pcmra_render_weight = np.full((5, 5, 5), .25, np.float32)
+    ws.segmask_binary = np.zeros((5, 5, 5, 2), bool)
+    expected = pcmra_display_frame(ws.pcmra_array, 1, mask=ws.pcmra_render_mask, weight=ws.pcmra_render_weight)
+    np.testing.assert_array_equal(_field_at(ws, "pcmra", 1), expected)
+    with closing(pv.Plotter(off_screen=True)) as plotter:
+        scene = SceneController(plotter, ws, lambda _: None)
+        grid = scene._build_dataset("pcmra_volume")
+        displayed = grid.point_data["PC-MRA"].reshape((7, 7, 7), order="F")[1:-1, 1:-1, 1:-1]
+        np.testing.assert_array_equal(displayed, expected)
+        ws.pcmra_render_weight = np.full((5, 5, 5), .75, np.float32)
+        grid = scene._build_dataset("pcmra_volume")
+        assert grid.point_data["PC-MRA"].max() == 6
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"cached-video-placeholder")
+    register_report_videos(ws, {"plane": source, "pcmra": source}, {})
+    signature = media_signature(ws)
+    pcmra_signature = media_signature(ws, family="pcmra")
+    ws.pcmra_render_weight = np.ones((5, 5, 5), np.float32)
+    assert media_signature(ws) == signature
+    assert media_signature(ws, family="pcmra") != pcmra_signature
+    records = {row["family"]: row for row in report_video_records(ws)}
+    assert records["plane"]["validity"] == "current" and records["pcmra"]["validity"] == "stale"
+    np.testing.assert_array_equal(ws.pcmra_array, 8)
 
 
 def test_generated_pcmra_is_explicit_and_noise_region_is_renderable():
@@ -7704,6 +7868,9 @@ def test_manual_plane_phantom_handles_selection_lock_and_deferred_metrics(monkey
         assert window._plane_edit_enabled and window.scene._plane_selection_locked
         handles = window._plane_handles
         assert [widget.GetEnabled() for widget, _ in handles.handles] == [1]
+        assert len(handles.guides) == 3
+        assert [label.GetInput() for label in handles.axis_labels] == ["U", "V", "N"]
+        assert all(not actor.GetPickable() and not actor.GetUseBounds() for actor, _ in handles.guides)
         assert window.combo_plane_edit_mode.count() == 2
         assert not window.ortho_viewer.slice_views["axial"].view_box.plane_rotation_enabled
         assert all(window.ortho_viewer.slice_views[name].view_box.plane_rotation_enabled
@@ -7774,6 +7941,14 @@ def test_manual_plane_phantom_handles_selection_lock_and_deferred_metrics(monkey
             assert np.linalg.norm(plane.normal - before_normal) > 0.01
             np.testing.assert_allclose(np.dot(window._plane_axis_u, window._plane_axis_v), 0., atol=1e-10)
             np.testing.assert_allclose(np.cross(window._plane_axis_u, window._plane_axis_v), plane.normal, atol=1e-10)
+            for (actor, _), label, direction in zip(handles.guides, handles.axis_labels,
+                    (window._plane_axis_u, window._plane_axis_v, plane.normal)):
+                display_direction = window.scene.world_to_display_vector(direction)
+                matrix = actor.GetUserMatrix()
+                axis = np.array([matrix.GetElement(row, 0) for row in range(3)])
+                np.testing.assert_allclose(axis / np.linalg.norm(axis), display_direction, atol=1e-10)
+                center = window.scene.world_to_display_point(plane.center + ws.origin)
+                np.testing.assert_allclose(label.GetPosition(), center + display_direction * window._plane_widget_distance())
         assert "preview" in window.ortho_viewer.label_plane_metric.text().lower()
         window._toggle_selected_plane_edit()
         assert len(writes) == 1 and not recomputes  # A new plane has no existing metrics to refresh.
@@ -7950,6 +8125,7 @@ def test_browser_plane_phantom_display_controls_and_visibility_clicks(monkeypatc
         assert window.workspace_pages.currentWidget() is window.workspace_page
         assert window.slider_plane_size.parentWidget() is window.plane_display_controls
         assert window.spin_plane_size.parentWidget() is window.plane_display_controls
+        assert window.spin_plane_size.value() == 20.0
         assert window.chk_plane_selected_only.parentWidget() is window.plane_display_controls
         assert window.appearance_panel.isAncestorOf(window.slider_plane_size)
         assert window.appearance_panel.isAncestorOf(window.slider_render_window)
@@ -10366,8 +10542,15 @@ def test_generated_plane_phantom_locked_centers_translate_and_preserve_identity(
         window.check_plane_unlocked.setChecked(True)
         assert window._plane_edit_session and window._plane_edit_enabled
         assert not window.check_plane_path_locked.isChecked()
-        for name in ("axial", "coronal", "sagittal"):
+        for name in ("axial", "axial", "coronal", "coronal", "sagittal", "sagittal"):
             expected = center_drag(name)
+            view = window.ortho_viewer.slice_views[name]
+            # A release reslices at the new center. Visible and hittable
+            # centers/axes must coincide before the next mouse gesture.
+            np.testing.assert_allclose(view.plane_center_item.getData(), [[0.], [0.]])
+            assert view.vertical_line.value() == 0 and view.horizontal_line.value() == 0
+            for line in view.rotation_axes:
+                assert line.pos() == QtCore.QPointF(0, 0)
             np.testing.assert_allclose(ws.planes[0].center, expected, atol=1e-8)
             assert ws.planes[0].path_index == 0 and ws.planes[0].label == 1
             assert ws.planes[0].segmentation_label == 7 and ws.planes[0].group_name == "artery"
@@ -12355,6 +12538,37 @@ def test_lowest_flow_endpoint_phantom_uses_physical_z_not_path_number(reverse,pe
     assert all(p.placement[key]=='lowest_z' for p in planes)
 
 
+@pytest.mark.parametrize('reverse', [False, True])
+@pytest.mark.parametrize('inside_path', [False, True])
+@pytest.mark.parametrize('name,value', [('LCarotid',34), ('LVenousOutflow',36)])
+def test_lowest_endpoint_phantom_is_terminal_within_its_own_label(reverse, inside_path, name, value):
+    from autoflow.algorithms.label_planes import generate_label_planes
+    from autoflow.plane_rules import default_label_plane_rules
+    target=np.column_stack((np.arange(20.,51.),np.full(31,20.),np.full(31,10.)))
+    parent=np.column_stack((np.arange(5.,21.),np.full(16,20.),np.full(16,10.)))
+    sibling=np.column_stack((np.full(21,20.),np.arange(20.,41.),np.full(21,10.)))
+    if inside_path:
+        paths=[np.vstack((parent[:-1],target)),sibling]
+        values=[np.r_[np.full(15,3),np.full(31,value)],np.full(21,3)]
+        nodes=[(0,2),(1,3)]
+    else:
+        paths=[parent,sibling,target]
+        values=[np.full(16,3),np.full(21,3),np.full(31,value)]
+        nodes=[(0,1),(1,3),(1,2)]
+    signs=[1 if name=='LCarotid' else -1]*len(paths)
+    if reverse:
+        paths=[p[::-1] for p in paths];values=[v[::-1] for v in values]
+        nodes=[n[::-1] for n in nodes];signs=[-s for s in signs]
+    volume,infos=_landmark_phantom(paths,values,nodes,{name:value,'ARCH':3},[{'flow_sign':s} for s in signs])
+    planes,_,_,qc=generate_label_planes(paths,volume,{name:value,'ARCH':3},
+        {name:default_label_plane_rules()[name]},path_info=infos,smoothing_window=1,inter_time=1)
+    assert len(planes)==2
+    start=21. if inside_path else 20.
+    fractions=[.33,.66] if name=='LCarotid' else [1/3,2/3]
+    np.testing.assert_allclose([p.center[0] for p in planes],[start+(50.-start)*f for f in fractions])
+
+
+
 def test_lowest_inlet_phantom_does_not_promote_an_internal_label_fragment():
     from autoflow.algorithms.label_planes import generate_label_planes
     from autoflow.plane_rules import default_label_plane_rules
@@ -12843,8 +13057,8 @@ def test_match_random_position_phantom_draws_on_each_generation(monkeypatch):
     original = copy.deepcopy(rules)
     paths = [np.column_stack((np.arange(5., 56.), np.full(51, 20.), np.full(51, 10.))),
              np.column_stack((np.arange(5., 26.), np.full(21, 30.), np.full(21, 10.)))]
-    volume, infos = _landmark_phantom(paths, [np.full(len(path), 12) for path in paths],
-                                     [(0, 1), (2, 3)], {"LRA": 12})
+    volume, infos = _landmark_phantom(paths, [np.full(len(path), 1) for path in paths],
+                                     [(0, 1), (2, 3)], {"AAO": 1})
     draws = iter([.2, .8])
     class Generator:
         def uniform(self, lower, upper):
@@ -12853,7 +13067,7 @@ def test_match_random_position_phantom_draws_on_each_generation(monkeypatch):
     monkeypatch.setattr(landmark_planes.np.random, "default_rng", Generator)
     centers = []
     for fraction in (.2, .8):
-        planes, _, _, qc = generate_label_planes(paths, volume, {"LRA": 12}, {"LRA": rules["LRA"]},
+        planes, _, _, qc = generate_label_planes(paths, volume, {"AAO": 1}, {"AAO": rules["AAO"]},
             path_info=infos, smoothing_window=1, inter_time=1)
         assert len(planes) == 1 and planes[0].path_index == 0
         assert planes[0].placement["position"] == "random"
@@ -12889,3 +13103,165 @@ def test_random_position_phantom_plan_validation_and_gui_roundtrip():
         dialog.close()
         dialog.deleteLater()
         app.processEvents()
+
+@pytest.mark.parametrize("fraction", [.2, .8])
+def test_match_branch_position_phantom_retains_entry_before_longer_daughters(monkeypatch, fraction):
+    from autoflow.algorithms import landmark_planes
+    from autoflow.algorithms.label_planes import generate_label_planes
+    from autoflow.plane_rules import load_plane_rules_file
+    rules=load_plane_rules_file(DATA_DIR.parent/"configs/plane_plans/match.json")
+    paths=[np.column_stack((np.arange(5.,21.),np.full(16,20.),np.full(16,10.))),
+           np.column_stack((np.arange(20.,61.),np.full(41,20.),np.full(41,10.))),
+           np.column_stack((np.full(31,20.),np.arange(20.,51.),np.full(31,10.)))]
+    volume,infos=_landmark_phantom(paths,[np.full(len(p),34) for p in paths],
+        [(0,1),(1,2),(1,3)],{"LCarotid":34},[{"flow_sign":1}]*3)
+    class Generator:
+        def uniform(self,lo,hi):return fraction
+    monkeypatch.setattr(landmark_planes.np.random,"default_rng",Generator)
+    planes,_,_,_=generate_label_planes(paths,volume,{"LCarotid":34},{"LCarotid":rules["LCarotid"]},
+        path_info=infos,smoothing_window=1,inter_time=1)
+    assert len(planes)==1 and planes[0].path_index==0
+    assert planes[0].placement["anchor"]=="flow_inlet_branch"
+    np.testing.assert_allclose(planes[0].center,[5.+15.*fraction,20.,10.])
+
+
+@pytest.mark.parametrize("name", ["MPA","LVenousOutflow"])
+def test_random_branch_position_phantom_preserves_flow_reference_in_gui(name):
+    from PySide6 import QtWidgets
+    from autoflow.plane_rules import load_plane_rules_file
+    from autoflow.ui.landmark_editor import LandmarkPlanDialog
+    rule=load_plane_rules_file(DATA_DIR.parent/"configs/plane_plans/match.json")[name]
+    app=QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    dialog=LandmarkPlanDialog(name,rule)
+    try:
+        assert dialog.table.cellWidget(0,3).currentData()=="flow_end_random"
+        dialog.accept()
+        assert dialog.rule["placements"]==rule["placements"]
+    finally:
+        dialog.close();dialog.deleteLater();app.processEvents()
+
+
+@pytest.mark.parametrize("high_first", [False, True])
+@pytest.mark.parametrize("cache", ["missing", "both", "low_only"])
+def test_dual_venc_deferred_reconstruction_hv_unwrap_phantom(tmp_path, monkeypatch, high_first, cache):
+    from autoflow.core import pipeline as module
+    from autoflow.case_types import PhaseUnwrappingConfig
+    shape = (4, 3, 2, 2)
+    truth = np.broadcast_to(np.array([220., -210., 15.], np.float32), shape + (3,)).copy()
+    low_venc, high_venc = np.full(3, 50., np.float32), np.full(3, 150., np.float32)
+    low_phase = np.angle(np.exp(1j * np.pi * truth / low_venc)).astype(np.float32)
+    high_phase = np.angle(np.exp(1j * np.pi * truth / high_venc)).astype(np.float32)
+    groups = [high_phase, low_phase] if high_first else [low_phase, high_phase]
+    img = np.ones(shape + (7,), dtype=np.complex64)
+    img[..., 1:4], img[..., 4:7] = np.exp(1j * groups[0]), np.exp(1j * groups[1])
+    path = tmp_path / "dv.h5"
+    with h5py.File(path, "w") as handle:
+        handle["img"] = img
+        handle["VENC"] = np.r_[high_venc, low_venc] if high_first else np.r_[low_venc, high_venc]
+        handle["SpatialOrder"] = np.array(["LR", "AP", "FH"], dtype="S4")
+        handle["VENCOrder"] = np.array(["LR", "AP", "FH"], dtype="S4")
+        handle["Resolution"] = np.ones(3)
+        for name in (("corr_low", "corr_high") if cache == "both" else ("corr_low",) if cache == "low_only" else ()):
+            handle[name] = np.zeros(shape[:3] + (1, 3), dtype=np.float32)
+    original = path.read_bytes()
+    ws = Workspace(); ws.paths.flow_path = str(path)
+    engine = PipelineEngine()
+    engine.load_data(ws, lambda _: None, reuse_existing_corr=True)
+    low_before = ws.flow_low.copy()
+    high_before = ws.flow_high.copy()
+    np.testing.assert_allclose(ws.flow_raw, high_phase * high_venc / np.pi, atol=2e-5)
+    assert ws.needs_dual_venc_reconstruction()
+    before_noise = ws.flow_raw.copy()
+    rejected_noise = engine.run_step(ws, StepId.REMOVE_NOISE, lambda _: None)
+    assert not rejected_noise.success and "Dual-VENC Reconstruction" in rejected_noise.message
+    assert ws.pcmra_render_mask is None and ws.pcmra_render_weight is None
+    np.testing.assert_array_equal(ws.flow_raw, before_noise)
+    assert not engine.run_step(ws, StepId.GENERATE_PCMRA, lambda _: None).success
+    assert engine.run_step(ws, StepId.RECONSTRUCT_DUAL_VENC, lambda _: None).success
+    assert not np.allclose(ws.flow_raw, truth)  # HV is still wrapped.
+    assert not ws.needs_dual_venc_reconstruction()
+    recovered_high = truth + .25
+    def unwrap(phase, mask, venc, method, **kwargs):
+        np.testing.assert_allclose(phase, high_phase, atol=3e-7)
+        np.testing.assert_array_equal(venc, high_venc)
+        return dict(flow_unwrapped=recovered_high.copy(), phase_unwrapped=phase,
+                    flow_wrapped=high_before.copy(), mask_used=mask,
+                    wrap_count=np.ones_like(phase, dtype=np.int16), wrap_mask=np.ones_like(phase, dtype=bool),
+                    method=method, statistics={})
+    monkeypatch.setattr(module, "unwrap_phase", unwrap)
+    ws.phase_unwrap_params = PhaseUnwrappingConfig(method="lap4D", mask_source="none")
+    assert engine.run_step(ws, StepId.UNWRAP_PHASE, lambda _: None).success
+    assert ws.phase_unwrap_result["target"] == "hv"
+    np.testing.assert_array_equal(ws.flow_low, low_before)
+    np.testing.assert_array_equal(ws.flow_high, recovered_high)
+    assert ws.needs_dual_venc_reconstruction()
+    for _ in range(2):
+        assert engine.run_step(ws, StepId.RECONSTRUCT_DUAL_VENC, lambda _: None).success
+        np.testing.assert_allclose(ws.flow_raw, truth, atol=3e-5)
+        np.testing.assert_array_equal(ws.flow_high, recovered_high)
+    restored = Workspace(); restored.restore_dict(ws.snapshot_dict())
+    assert not restored.needs_dual_venc_reconstruction()
+    np.testing.assert_array_equal(restored.flow_low, low_before)
+    np.testing.assert_array_equal(restored.flow_high, recovered_high)
+    # A masked rerun after reconstruction preserves HV, not DV, outside the mask.
+    ws.segmask_raw = np.zeros(shape, dtype=np.int16); ws.segmask_raw[:2] = 1
+    ws.phase_unwrap_params.mask_source = "segmask"
+    previous_high = recovered_high.copy(); recovered_high = truth + 1.
+    assert engine.run_step(ws, StepId.UNWRAP_PHASE, lambda _: None).success
+    np.testing.assert_array_equal(ws.flow_high[2:], previous_high[2:])
+    np.testing.assert_array_equal(ws.flow_low, low_before)
+    assert ws.needs_dual_venc_reconstruction()
+    assert engine.revert_phase_unwrap(ws).success
+    np.testing.assert_array_equal(ws.flow_high, high_before)
+    assert ws.needs_dual_venc_reconstruction()
+    assert path.read_bytes() == original
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Linux SSH renderer")
+def test_dual_venc_correction_buttons_and_settings_phantom(monkeypatch):
+    application = _smoke_qt_application(monkeypatch)
+    monkeypatch.setenv("AUTOFLOW_SSH_RENDERING", "1")
+    from PySide6 import QtCore, QtWidgets
+    from autoflow.ui import app as ui_app
+    from autoflow.ui.remote_plotter import RemotePlotter
+    from autoflow.ui.action_settings import ActionSettingsDialog, action_sections
+    monkeypatch.setattr(ui_app, "RemotePlotter", RemotePlotter, raising=False)
+    window = ui_app.MainWindow()
+    try:
+        ws = window.workspace; ws.data_loaded = True
+        window.show(); window.workflow_tabs.setCurrentIndex(1)
+        for mode in ("dv", "lv", "hv", "dv"):
+            ws.input_state.metadata["dual_venc"] = dict(enabled=True, selected_mode=mode)
+            window._on_workflow_stage_changed(1)
+            application.processEvents()
+            dv_button = window.step_buttons[StepId.RECONSTRUCT_DUAL_VENC]
+            assert dv_button.isVisible() == (mode == "dv")
+            assert bool(action_sections(StepId.RECONSTRUCT_DUAL_VENC, ws)) == (mode == "dv")
+            bpc_fields = [field.key for _, fields in action_sections(StepId.BACKGROUND_CORRECTION, ws) for field in fields]
+            assert not any("dual_venc" in key for key in bpc_fields)
+            steps = ui_app._workflow_run_all_steps("correction", ws)
+            assert (StepId.RECONSTRUCT_DUAL_VENC in steps) == (mode == "dv")
+            assert steps == [StepId.BACKGROUND_CORRECTION, StepId.UNWRAP_PHASE] + (
+                [StepId.RECONSTRUCT_DUAL_VENC] if mode == "dv" else []) + [StepId.REMOVE_NOISE, StepId.GENERATE_PCMRA]
+            layout = window.steps_group.layout()
+            for index, step in enumerate(steps):
+                assert layout.getItemPosition(layout.indexOf(window.step_buttons[step])) == (index//2, index%2, 1, 1)
+            if mode == "dv":
+                assert layout.getItemPosition(layout.indexOf(dv_button)) == (1, 0, 1, 1)
+                assert layout.getItemPosition(layout.indexOf(window.btn_run_all)) == (2, 1, 1, 1)
+                assert len([b for b in window.step_buttons.values() if b.isVisible()]) == 5
+                assert abs(window.step_buttons[StepId.REMOVE_NOISE].width() - window.btn_run_all.width()) <= 1
+            else:
+                assert layout.getItemPosition(layout.indexOf(window.btn_run_all)) == (2, 0, 1, 2)
+        def change_ratio():
+            dialog = application.activeModalWidget()
+            assert isinstance(dialog, ActionSettingsDialog)
+            assert set(dialog.controls) == {"loader_params.background_phase_correction.dual_venc_ratio1",
+                                            "loader_params.background_phase_correction.dual_venc_ratio2"}
+            dialog.controls["loader_params.background_phase_correction.dual_venc_ratio1"].setValue(.2)
+            dialog.accept()
+        QtCore.QTimer.singleShot(0, change_ratio)
+        window._open_action_settings(StepId.RECONSTRUCT_DUAL_VENC)
+        assert ws.loader_params.background_phase_correction.dual_venc_ratio1 == .2
+    finally:
+        window.close(); window.deleteLater(); application.processEvents()

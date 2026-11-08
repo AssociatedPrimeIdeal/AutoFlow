@@ -119,6 +119,7 @@ nav:
           - Background phase correction: en/features/background-phase-correction.md
           - Noise removal: en/features/noise-removal.md
           - Phase unwrapping: en/features/phase-unwrapping.md
+          - Dual-VENC Reconstruction: en/features/dual-venc.md
           - Segmentation and review: en/features/segmentation.md
       - Vessel geometry:
           - Skeleton: en/features/skeleton.md

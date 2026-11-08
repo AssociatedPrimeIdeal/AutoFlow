@@ -72,10 +72,12 @@ class AutoFlowConfig:
     phase_unwrap_mask: str = "auto"
     correction_all: bool = False
     generate_pcmra: bool = False
-    noise_removal: bool = False
+    noise_removal: bool = True
     noise_removal_method: str = "magnitude_temporal"
     noise_magnitude_fraction: float = 0.05
     noise_velocity_std_max: float = 0.80
+    noise_coherence_enabled: bool = True
+    noise_coherence_strength: str = "strong"
     phase_unwrap_device: str = "auto"
     phase_unwrap_tfc: bool = True
     phase_unwrap_lap4d_ts: float = 2.0
@@ -248,7 +250,8 @@ def build_workspace(config: Optional[AutoFlowConfig] = None) -> Workspace:
     ws.phase_unwrap_params.mask_source = str(cfg.phase_unwrap_mask or "auto")
     from .case_types import NoiseRemovalConfig
     ws.noise_removal_params = NoiseRemovalConfig(enabled=cfg.noise_removal, method=cfg.noise_removal_method,
-        magnitude_fraction=cfg.noise_magnitude_fraction, velocity_std_max=cfg.noise_velocity_std_max)
+        magnitude_fraction=cfg.noise_magnitude_fraction, velocity_std_max=cfg.noise_velocity_std_max,
+        coherence_enabled=cfg.noise_coherence_enabled, coherence_strength=cfg.noise_coherence_strength)
     ws.phase_unwrap_params.device = str(cfg.phase_unwrap_device or "auto")
     ws.phase_unwrap_params.tfc = bool(cfg.phase_unwrap_tfc)
     ws.phase_unwrap_params.lap4d_ts = float(cfg.phase_unwrap_lap4d_ts)
@@ -393,6 +396,8 @@ def run_case(
         noise_removal_method=cfg.noise_removal_method,
         noise_magnitude_fraction=cfg.noise_magnitude_fraction,
         noise_velocity_std_max=cfg.noise_velocity_std_max,
+        noise_coherence_enabled=cfg.noise_coherence_enabled,
+        noise_coherence_strength=cfg.noise_coherence_strength,
         phase_unwrap_enabled=cfg.phase_unwrap_enabled,
         phase_unwrap_method=cfg.phase_unwrap_method,
         phase_unwrap_mask=cfg.phase_unwrap_mask,
@@ -590,6 +595,8 @@ def run_batch(config: AutoFlowConfig) -> Tuple[List[Dict[str, Any]], str]:
                 noise_removal_method=config.noise_removal_method,
                 noise_magnitude_fraction=config.noise_magnitude_fraction,
                 noise_velocity_std_max=config.noise_velocity_std_max,
+                noise_coherence_enabled=config.noise_coherence_enabled,
+                noise_coherence_strength=config.noise_coherence_strength,
                 requested_metrics=list(config.requested_metrics),
                 requested_videos=list(config.requested_videos),
                 fps=config.fps,

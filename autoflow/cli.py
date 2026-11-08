@@ -44,12 +44,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-pressure-gradient", action="store_true", help="Skip relative-pressure reconstruction, centerline pressure-drop outputs, and pressure-gradient-derived summaries.")
     parser.add_argument("--skip-plane-metrics", action="store_true", help="Skip plane metric export.")
     parser.add_argument("--single-thread", dest="use_multithread", action="store_false", help="Disable parallel plane metric calculation.")
-    parser.add_argument("--correction", action="store_true", help="Run background correction, noise masking, phase unwrapping, and PC-MRA generation before segmentation; defaults to lap4D with no mask.")
+    parser.add_argument("--correction", action="store_true", help="Run background correction, phase unwrapping, DV reconstruction when applicable, Noise Removal, then PC-MRA before segmentation; defaults to lap4D with no mask.")
     parser.add_argument("--generate-pcmra", action="store_true", default=None, help="Generate PC-MRA from current working velocity after requested correction steps.")
-    parser.add_argument("--noise-removal", action="store_true", default=None, help="Screen only the PC-MRA display region; preserve magnitude and velocity.")
+    parser.add_argument("--noise-removal", action=argparse.BooleanOptionalAction, default=None, help="Filter only PC-MRA display; enabled by default. Preserve magnitude, velocity and measurement ROI.")
     parser.add_argument("--noise-removal-method", choices=["magnitude_temporal", "magnitude"], default=None)
     parser.add_argument("--noise-magnitude-fraction", type=float, default=None, help="Fraction of maximum temporal-mean magnitude; default 0.05. 0 keeps all positive magnitude.")
     parser.add_argument("--noise-velocity-std-max", type=float, default=None, help="Fraction of maximum temporal speed SD; default 0.80. 0 disables temporal screening; not VENC-normalized.")
+    parser.add_argument("--noise-coherence", dest="noise_coherence_enabled", action=argparse.BooleanOptionalAction,
+                        default=None, help="Continuous PC-MRA display coherence weighting; enabled by default.")
+    parser.add_argument("--noise-coherence-strength", choices=["medium", "strong"], default=None,
+                        help="Display weighting strength; default strong. Does not change measured values.")
     parser.add_argument("--bgc", dest="background_phase_correction", action="store_true", help="Run background phase correction after loading, before segmentation.")
     parser.add_argument(
         "--bgc-method",
@@ -87,13 +91,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--dual-venc-ratio1",
         type=float,
         default=None,
-        help="Dual-venc alias threshold ratio1 used when loading legacy Nv=7 complex H5 inputs.",
+        help="Dual-venc alias threshold ratio1 used by the explicit reconstruction step for legacy Nv=7 complex H5 inputs.",
     )
     parser.add_argument(
         "--dual-venc-ratio2",
         type=float,
         default=None,
-        help="Dual-venc alias threshold ratio2 used when loading legacy Nv=7 complex H5 inputs.",
+        help="Dual-venc alias threshold ratio2 used by the explicit reconstruction step for legacy Nv=7 complex H5 inputs.",
     )
     parser.add_argument(
         "--force-recompute-corr",
@@ -296,6 +300,8 @@ def main() -> int:
         "noise_removal_method": args.noise_removal_method,
         "noise_magnitude_fraction": args.noise_magnitude_fraction,
         "noise_velocity_std_max": args.noise_velocity_std_max,
+        "noise_coherence_enabled": args.noise_coherence_enabled,
+        "noise_coherence_strength": args.noise_coherence_strength,
         "background_phase_method": args.bgc_method,
         "background_phase_corr_fit_order": args.background_phase_fit_order,
         "background_phase_threshold": args.background_phase_threshold,
@@ -422,7 +428,8 @@ def main() -> int:
     from .case_types import NoiseRemovalConfig
     try:
         NoiseRemovalConfig(method=config.noise_removal_method, magnitude_fraction=config.noise_magnitude_fraction,
-                           velocity_std_max=config.noise_velocity_std_max)
+                           velocity_std_max=config.noise_velocity_std_max, coherence_enabled=config.noise_coherence_enabled,
+                           coherence_strength=config.noise_coherence_strength)
     except ValueError as exc:
         parser.error(str(exc))
     results, _ = run_batch(config)
