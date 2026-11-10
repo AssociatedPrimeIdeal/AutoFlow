@@ -2,11 +2,11 @@
 
 ## Status
 
-Pushes to `main` or `dev` automatically publish a GitHub Release after the Linux/Windows regression matrix and Windows portable verification pass. Versions use `vMAJOR.MINOR.PATCH` and increase the patch number automatically. Every release includes the changes since its predecessor and a full comparison link; see [Changelog](changelog.md). PRs and manual CI runs build without publishing. The verified `AutoFlow-windows-x64` Actions artifact is also retained for 14 days. The portable build provides the full GUI, DICOM conversion, 3D and 4D nnUNet inference, segmentation review in SpatioTemporal Labeler, traditional and learned phase unwrapping, metrics, and video export. PUDIP-Flow and GUST-Flow retain their Experimental status. The supplied `build-check.json` records whether CUDA execution was tested on the build host.
+Automatic GitHub Windows builds and Releases are disabled. Pushes and pull requests run Linux regression tests only; no Windows Actions artifact or numbered release is generated automatically. Existing published packages remain downloadable, and local Windows builds remain supported. The portable build provides the full GUI, DICOM conversion, 3D and 4D nnUNet inference, segmentation review in SpatioTemporal Labeler, traditional and learned phase unwrapping, metrics, and video export. PUDIP-Flow and GUST-Flow retain their Experimental status. The supplied `build-check.json` records whether CUDA execution was tested on the build host.
 
 ## Download and launch
 
-1. Open [GitHub Releases](https://github.com/AssociatedPrimeIdeal/AutoFlow/releases) and download the latest portable ZIP or every archive part with the joiner and manifest. For PRs or manual builds, open a successful **Actions → CI** run and download `AutoFlow-windows-x64` from **Artifacts**, then extract that artifact download to obtain the ZIP or its parts. See [Windows build instructions](../developer/windows-packaging.md) for local builds.
+1. Open [GitHub Releases](https://github.com/AssociatedPrimeIdeal/AutoFlow/releases) and download the latest portable ZIP or every archive part with the joiner and manifest. See [Windows build instructions](../developer/windows-packaging.md) for local builds.
 2. Extract the complete ZIP to a writable, short **ASCII/English path**, for example `D:\AutoFlow`. Keep every extracted file and folder together. GUST's CUDA compiler cannot resolve its bundled headers through a Chinese/non-ASCII installation path.
 3. Double-click `AutoFlow.exe`. The portable package does not include documentation.
 

@@ -1,3 +1,4 @@
+# Automatic Windows builds and Releases are disabled; CI does not call this workflow.
 name: Windows portable build
 
 on:

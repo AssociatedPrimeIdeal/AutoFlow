@@ -31,7 +31,7 @@ PC-MRA [noise removal](docs/en/features/noise-removal.md) defaults to the **Stro
 
 ### Windows
 
-Pushes to `main` or `dev` automatically publish a numbered [GitHub Release](https://github.com/AssociatedPrimeIdeal/AutoFlow/releases) after Linux/Windows regression tests and Windows portable verification pass. Each release includes a changelog since the preceding version. Download the complete ZIP or all archive parts with the supplied joiner, extract to a short ASCII path, and double-click `AutoFlow.exe`. See [Windows download instructions](docs/en/user/windows-portable.md). PRs and manual CI runs provide the `AutoFlow-windows-x64` Actions artifact without publishing a release. The package includes the current application code and locked Linux segmentation models, without bundled documentation.
+Automatic Windows builds and GitHub Releases are disabled. CI runs Linux regression tests only. Existing packages remain available from [GitHub Releases](https://github.com/AssociatedPrimeIdeal/AutoFlow/releases). Download the complete ZIP or all archive parts with the supplied joiner, extract to a short ASCII path, and double-click `AutoFlow.exe`. See [Windows download instructions](docs/en/user/windows-portable.md) and [local build instructions](docs/en/developer/windows-packaging.md). The package includes the application code and locked Linux segmentation models, without bundled documentation.
 
 ### Python
 
