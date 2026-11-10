@@ -11792,6 +11792,31 @@ try:
     assert ready(pane)
     w._on_open_export_page()
     assert w.workspace_pages.currentWidget() is w._export_page
+    # Portable verification must generate QC for a fresh case. Navigation
+    # deliberately leaves a missing report ungenerated and shows the empty page.
+    from pathlib import Path
+    import h5py, numpy as np, runpy
+    directory = Path(sys.argv[1]).parent
+    case = directory / 'portable phantom.h5'
+    with h5py.File(case, 'w') as handle:
+        handle['mag'] = np.ones((6, 6, 6, 2), dtype=np.float32)
+        handle['flow'] = np.zeros((6, 6, 6, 2, 3), dtype=np.float32)
+        handle['segmask'] = np.ones((6, 6, 6, 2), dtype=np.int16)
+        handle['Resolution'] = np.ones(3)
+        handle['VENC'] = np.full(3, 150.)
+        handle['RR'] = 1000.
+    w.workspace.paths.output_dir = str(directory / 'portable-qc')
+    w.workspace.paths.flow_path = w.workspace.paths.segmask_path = str(case)
+    w.pipeline.load_data(w.workspace, lambda _: None,
+                        reuse_existing_corr=False, apply_background_correction=False)
+    report_path = Path(w.pipeline._output_dir(w.workspace)) / 'analysis_report.html'
+    assert not report_path.exists()
+    w._on_open_case_qc()
+    assert not report_path.exists() and w.qc_page.currentWidget() is w.qc_empty
+    verification = runpy.run_path('packaging/windows/portable_check.py')
+    verification['_verify_gui_qc'](w, timeout_s=10)
+    assert report_path.is_file()
+    assert w.qc_page.currentWidget() is w._html_document_panes['qc']
     print('HTML_SMOKE_OK')
 finally:
     w.close()

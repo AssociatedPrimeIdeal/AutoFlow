@@ -19,6 +19,33 @@ def _worker(value):
     return int(np.sum(np.arange(value)))
 
 
+def _verify_gui_qc(window, *, timeout_s=30):
+    """Generate fresh phantom QC explicitly before checking the HTML runtime."""
+    import time
+    from PySide6 import QtTest
+
+    window._generate_case_qc(show=False)
+    path = Path(window.pipeline._output_dir(window.workspace)) / "analysis_report.html"
+    if not path.is_file():
+        raise ValueError("Phantom QC report was not generated")
+    window._on_open_case_qc()
+    pane = getattr(window, "_html_document_panes", {}).get("qc")
+    if pane is None or window.qc_page.currentWidget() is not pane:
+        raise ValueError("Generated phantom QC page did not open")
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        answer = []
+        pane.view.page().runJavaScript(
+            "document.body && document.body.innerText.includes('Measurement')",
+            lambda value, result=answer: result.append(value))
+        while not answer and time.monotonic() < deadline:
+            QtTest.QTest.qWait(20)
+        if answer and answer[0]:
+            return
+        QtTest.QTest.qWait(100)
+    raise ValueError("Bundled QC HTML page did not load")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
@@ -240,19 +267,9 @@ def main():
             Image.fromarray(case_pixels).save(str(args.output.with_suffix(".case.png")))
         if args.output:
             window.grab().save(str(args.output.with_suffix(".gui.png")))
-        # Verify that the shipped Chromium helper/resources can load the QC page.
-        import time
-        def document_loaded(pane, token):
-            answer = []
-            deadline = time.monotonic() + 30
-            while time.monotonic() < deadline:
-                pane.view.page().runJavaScript("document.body && document.body.innerText.includes(" + json.dumps(token) + ")", lambda value: answer.append(value))
-                QtTest.QTest.qWait(100)
-                if any(answer):
-                    return True
-            raise ValueError("Bundled HTML tab did not load: " + token)
-        window._on_open_case_qc()
-        document_loaded(window._html_document_panes["qc"], "Measurement")
+        # Review navigation only opens existing reports; this fresh case needs
+        # explicit QC generation before checking Chromium's helper/resources.
+        _verify_gui_qc(window)
         window.close()
         temporary_case.cleanup()
         application.processEvents()

@@ -14,6 +14,13 @@ window with offscreen mode enabled, without the Linux SSH renderer. The portable
 builder separately checks nonempty rendered images and the QC page through
 `packaging/windows/portable_check.py --gui`.
 
+The fresh phantom has no saved QC report. Portable verification explicitly
+generates its QC before opening Review, then requires the generated report file,
+the active QC pane and a successful Chromium DOM query. Review navigation alone
+only opens existing evidence and does not generate missing reports. The retained
+HTML integration smoke also exercises this fresh-case sequence using the same
+verification helper; a missing report or unloaded page must still fail the build.
+
 `build-check.json` records `off_screen`, `interactor_available` and
 `render_window` in `checks.gui_render`. A successful offscreen check can have
 `interactor_available=false`; an interactive desktop check requires an interactor.
