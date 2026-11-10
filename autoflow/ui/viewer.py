@@ -23,6 +23,7 @@ from ..rendering.datasets import (tke_display_mesh, display_support_surface,
 from .content_rendering import ContentRenderingMixin
 from .interaction_rendering import InteractionRenderingMixin
 from .scene_layers import SceneLayersMixin
+from .scalar_bar_controls import ScalarBarControlsMixin
 from .orientation_marker import AnatomicalOrientationMarker
 from ..algorithms import (
     build_multilabel_surface_t,
@@ -102,7 +103,7 @@ def _pwv_planes_polydata(planes, origin, plane_size=25.0):
     return merged
 
 
-class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLayersMixin):
+class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLayersMixin, ScalarBarControlsMixin):
     def __init__(self, plotter, workspace, logger):
         self.plotter = plotter
         self.workspace = workspace
@@ -126,6 +127,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         self._playback_active = False
         self._highlight_plane_uid = None
         self._highlight_plane_actor = None
+        self._selected_plane_actors = {}
         self._highlight_path_uid = None
         self._highlight_path_actor = None
         self._context_path_actors = []
@@ -383,6 +385,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         self._ensure_interaction_rendering()
         self._ensure_plane_overlay_renderer()
         self._ensure_scene_layers()
+        self._ensure_scalar_bar_interaction()
         self._add_orientation_axes()
         self._ensure_volume_window_level_interaction()
         self._ensure_native_qt_mouse_bridge()
@@ -889,7 +892,8 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         if manager is not None and (prefix is None or str(prefix).startswith("streamlines")):
             manager.invalidate()
         self._content_source._cache.clear()
-        self._phase_lookup_cache.clear()
+        if prefix is None or str(prefix).startswith("segmask"):
+            self._phase_lookup_cache.clear()
         self._automatic_clim_cache.clear()
         self._volume_range_cache.clear()
         self._volume_scalar_range_cache.clear()
@@ -967,6 +971,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
                 self._render_object(obj, refresh_scalar_bar=False)
             else:
                 self._apply_basic_properties_only(obj)
+        self._refresh_secondary_plane_highlights()
         self._refresh_shared_scalar_bar(render=False)
         if not had_rendered_scene and self._tracked_actors:
             self.reset_camera(render=False)
@@ -1001,6 +1006,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
                 self._render_object(obj, refresh_scalar_bar=False)
             else:
                 self._apply_basic_properties_only(obj)
+        self._refresh_secondary_plane_highlights()
         self._refresh_shared_scalar_bar(render=False)
         if not had_rendered_scene and self._tracked_actors:
             self.reset_camera(render=False)
@@ -1080,7 +1086,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         if data is None:
             return False
         data = self._transform_display_dataset(data)
-        actors = [obj.actor]
+        actors = [obj.actor, self._selected_plane_actors.get(uid)]
         if self._highlight_plane_uid == uid:
             actors.append(self._highlight_plane_actor)
         updated = False
@@ -1173,10 +1179,12 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         if obj.kind == ObjectKind.PLANE:
             cfg = self.workspace.render_settings.get("plane_render_cfg", {}) or {}
             if cfg.get("selected_only", False):
-                return obj.uid == self._highlight_plane_uid
+                return obj.uid == self._highlight_plane_uid or obj.uid in self._selected_layer_uids
         return True
 
     def _sync_plane_highlight_visibility(self, obj):
+        if obj.uid in self._selected_plane_actors:
+            self._selected_plane_actors[obj.uid].SetVisibility(bool(obj.visible))
         if obj.uid == self._highlight_plane_uid and self._highlight_plane_actor is not None:
             self._highlight_plane_actor.SetVisibility(1 if self._object_visible_in_view(obj) else 0)
 
@@ -1205,9 +1213,39 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         if render:
             self.request_render()
 
+    def _refresh_secondary_plane_highlights(self):
+        wanted = {uid for uid in self._selected_layer_uids if uid != self._highlight_plane_uid
+                  and uid in self.workspace.scene_objects
+                  and self.workspace.scene_objects[uid].kind == ObjectKind.PLANE}
+        for uid in list(self._selected_plane_actors):
+            if uid not in wanted:
+                actor = self._selected_plane_actors.pop(uid)
+                self._forget_front_prop(actor)
+                if self._plane_overlay_renderer is not None:
+                    self._plane_overlay_renderer.RemoveActor(actor)
+                self.plotter.remove_actor(actor, render=False)
+        for uid in wanted:
+            obj = self.workspace.scene_objects[uid]
+            data = self._build_dataset(obj.data_key)
+            if data is None:
+                continue
+            data = self._transform_display_dataset(data)
+            actor = self._selected_plane_actors.get(uid)
+            if actor is None:
+                actor = self.plotter.add_mesh(data,
+                    color='cyan', line_width=6, style='wireframe', pickable=False,
+                    name=f'__plane_selected_{uid}', render=False)
+                self._selected_plane_actors[uid] = actor
+                self._promote_overlay_actor(actor)
+            else:
+                actor.GetMapper().dataset = data
+            actor.SetVisibility(bool(obj.visible))
+            self._place_selected_prop(actor, uid, self._ensure_plane_overlay_renderer())
+
     def highlight_plane(self, uid):
         self._remove_plane_highlight()
         self._highlight_plane_uid = uid
+        self._refresh_secondary_plane_highlights()
         self._refresh_plane_visibility()
         if uid is None:
             try:
@@ -1225,7 +1263,7 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
         data = self._transform_display_dataset(data)
         try:
             self._highlight_plane_actor = self.plotter.add_mesh(
-                data, color="magenta", opacity=0.9, line_width=4,
+                data, color="magenta", opacity=0.9, line_width=8,
                 style="wireframe", name="__plane_highlight__")
             self._promote_overlay_actor(self._highlight_plane_actor)
             self._sync_plane_highlight_visibility(obj)
@@ -1790,6 +1828,20 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
             return
         self._clear_shared_scalar_bar(render=False)
         try:
+            if self._is_volume_object(obj):
+                # A VTK volume can outlive its Python mapper wrapper and its
+                # private LUT. Build the legend from the actual transfer
+                # function, with opaque swatches and no volume-data copy.
+                transfer = obj.actor.GetProperty().GetRGBTransferFunction(0)
+                limits = self._volume_scalar_range(obj, self._build_dataset(obj.data_key))
+                lut = pv.LookupTable(n_values=256)
+                colors = np.array([transfer.GetColor(value) for value in np.linspace(*limits, 256)])
+                lut.values = np.column_stack((np.rint(colors * 255).astype(np.uint8), np.full(256, 255, np.uint8)))
+                lut.scalar_range = limits
+                mapper = pv.DataSetMapper()
+                mapper.lookup_table = lut
+                mapper.scalar_range = limits
+                self._scalar_bar_mapper = mapper
             bar = self.plotter.add_scalar_bar(mapper=mapper, render=False, **self._scalar_bar_args_for_object(obj))
             style_scalar_bar(bar)
             self._place_hud_scalar_bar(bar)
@@ -2070,21 +2122,83 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
 
         return None
 
+    def segmentation_cache(self):
+        """Snapshot bounded segmentation cache entries for a private worker."""
+        return {"meshes": [(key, value) for key, value in self._mesh_cache.items()
+                           if str(key[0]).startswith("segmask")],
+                "phases": list(self._phase_lookup_cache.items())}
+
+    def adopt_segmentation_cache(self, cache):
+        if cache:
+            for key, value in cache.get("meshes", []):
+                self._mesh_cache[key] = value
+            for key, value in cache.get("phases", []):
+                self._phase_lookup_cache[key] = value
+
+    @staticmethod
+    def prepare_segmentation_cache(workspace, seed=None):
+        """Build datasets without a plotter, Qt widgets, actors or OpenGL.
+
+        The caller publishes the returned cache only after its workspace task
+        succeeds. Existing immutable meshes can be retained by their owners.
+        """
+        from ..task_control import check_cancelled, report_progress, TaskCancelled
+        prepared = SceneController(None, workspace, lambda message: None)
+        prepared.adopt_segmentation_cache(seed)
+        keys = [obj.data_key for obj in workspace.scene_objects.values()
+                if obj.visible and str(obj.data_key).startswith("segmask")]
+        for index, key in enumerate(keys):
+            report_progress({"stage": "segmentation_view", "current": index, "total": len(keys),
+                             "message": "Preparing segmentation view…"})
+            try:
+                prepared._build_dataset(key)
+            except TaskCancelled:
+                raise
+            except Exception:
+                # Rendering preparation cannot discard completed numerical work;
+                # the normal GUI renderer retains its existing error handling.
+                continue
+            check_cancelled()
+        return prepared.segmentation_cache()
+
     def _cached(self, data_key, t, builder):
         ws = self.workspace
-        key = (data_key, t, int(ws.segmentation.revision), id(ws.flow_raw), id(ws.pcmra_array),
-               id(ws.derived.wss_volume), id(ws.derived.pressure_gradient_array),
-               id(ws.derived.relative_pressure_array))
+        if str(data_key).startswith("segmask_group_") or data_key == "segmask_3d_surface":
+            group = ws.multilabel_groups.get(str(data_key)[len("segmask_group_"):], {})
+            mask = group.get("geometry_mask_3d") if str(data_key).startswith("segmask_group_") else ws.segmentation_analysis_mask
+            # These masks are immutable prepared spatial inputs. Source edits
+            # replace them; exact topology comparisons may retain their owners.
+            # Velocity and derived-volume changes do not alter their surfaces.
+            key = (data_key, t, "spatial_mask", id(mask),
+                   tuple(ws.segmentation_spacing), tuple(ws.origin))
+        elif data_key in {"segmask_raw_surface", "segmask_pre_surface"}:
+            mask = (ws.segmentation_display_4d() if data_key == "segmask_raw_surface"
+                    else ws.segmentation_analysis_labels)
+            shape, strides = mask.shape, mask.strides
+            while isinstance(mask.base, np.ndarray):
+                mask = mask.base
+            key = (data_key, t, "temporal_mask", id(mask), shape, strides, int(ws.segmentation.revision),
+                   tuple(ws.segmentation_spacing), tuple(ws.origin))
+        else:
+            key = (data_key, t, int(ws.segmentation.revision), id(ws.flow_raw), id(ws.pcmra_array),
+                   id(ws.derived.wss_volume), id(ws.derived.pressure_gradient_array),
+                   id(ws.derived.relative_pressure_array))
+        spatial = len(key) > 2 and key[2] in {"spatial_mask", "temporal_mask"}
         if key in self._mesh_cache:
-            return self._mesh_cache[key]
+            entry = self._mesh_cache[key]
+            if not spatial:
+                return entry
+            if entry[0]() is mask:
+                return entry[1]
+            del self._mesh_cache[key]
         mesh = builder()
         if mesh is not None:
-            self._mesh_cache[key] = mesh
+            self._mesh_cache[key] = (weakref.ref(mask), mesh) if spatial else mesh
         return mesh
 
     def _representative_phase(self, array, t):
         arr = np.asarray(array)
-        if arr.ndim < 4 or arr.shape[3] <= 1:
+        if arr.ndim < 4 or arr.shape[3] <= 1 or arr.strides[3] == 0:
             return 0
         key = (id(array), tuple(int(x) for x in arr.shape), arr.dtype.str,
                int(self.workspace.segmentation.revision))
@@ -2419,94 +2533,19 @@ class SceneController(ContentRenderingMixin, InteractionRenderingMixin, SceneLay
                 best_uid, best_idx, best_dist = uid, pidx, d
         return (best_uid, best_idx) if best_dist <= 15.0 else (None, None)
 
-    def _ensure_shared_right_click_picking(self):
+    def _ensure_shared_click_picking(self):
         if self._shared_pick_obs_id is not None:
             return
-        try:
-            iren = self.plotter.iren
-        except Exception:
+        if not hasattr(self.plotter, 'installEventFilter') or self.plotter.iren is None:
             return
-        # QtInteractor deliberately has no mouse interactor in offscreen mode.
-        if iren is None:
-            return
-        picker = pv._vtk.vtkCellPicker()
-        picker.SetTolerance(0.005)
-
-        def _on_right_click(obj=None, ev=None):
-            if self._plane_selection_locked:
-                return
-            try:
-                x, y = iren.GetEventPosition()
-            except Exception:
-                return
-            ren = self.plotter.renderer
-            pos = None
-            # Test the full displayed plane before path actors. Thin outlines
-            # should not make an underlying path steal a plane-face click.
-            screen_plane_uid, screen_plane_idx = self._plane_uid_at_display_position(x, y)
-            if screen_plane_uid is not None and screen_plane_idx is not None:
-                if self._plane_pick_callback is not None:
-                    self._plane_pick_callback(screen_plane_uid, screen_plane_idx)
-                return
-            for overlay in (self._selection_renderer, self._plane_overlay_renderer):
-                if overlay is None:
-                    continue
-                overlay_ok = picker.Pick(float(x), float(y), 0.0, overlay)
-                picked_actor = picker.GetActor() if overlay_ok else None
-                picked_plane_uid = None
-                picked_plane_idx = None
-                for uid, plane in self.workspace.scene_objects.items():
-                    if plane.kind != ObjectKind.PLANE or plane.actor is None:
-                        continue
-                    if picked_actor is plane.actor or picked_actor == plane.actor:
-                        picked_plane_uid = uid
-                        picked_plane_idx = _parse_indexed_data_key(plane.data_key, "plane")
-                        break
-                if picked_plane_uid is not None and picked_plane_idx is not None:
-                    if self._plane_pick_callback is not None:
-                        self._plane_pick_callback(picked_plane_uid, picked_plane_idx)
-                    return
-                if overlay_ok and overlay is self._selection_renderer:
-                    pos = picker.GetPickPosition()
-                    path_uid, path_idx = self.find_path_uid_at_position(pos)
-                    if path_uid is not None and path_idx is not None and self._path_pick_callback is not None:
-                        self._path_pick_callback(path_uid, path_idx)
-                        return
-            if pos is None:
-                ok = picker.Pick(float(x), float(y), 0.0, ren)
-                pos = picker.GetPickPosition() if ok else None
-            plane_uid, plane_idx = self.find_plane_uid_at_position(pos) if pos is not None else (None, None)
-            if plane_uid is not None and plane_idx is not None:
-                if self._plane_pick_callback is not None:
-                    self._plane_pick_callback(plane_uid, plane_idx)
-                return
-            path_uid, path_idx = self.find_path_uid_at_position(pos) if pos is not None else (None, None)
-            if path_uid is not None and path_idx is not None:
-                if self._path_pick_callback is not None:
-                    self._path_pick_callback(path_uid, path_idx)
-                return
-            if self._plane_pick_callback is not None:
-                self._plane_pick_callback(None, None)
-            if self._path_pick_callback is not None:
-                self._path_pick_callback(None, None)
-
-        add_observer = getattr(iren, "AddObserver", None)
-        if add_observer is None:
-            add_observer = iren.add_observer
-        self._shared_pick_obs_id = add_observer("RightButtonPressEvent", _on_right_click)
-        self._plane_pick_obs_id = self._shared_pick_obs_id
-        self._path_pick_obs_id = self._shared_pick_obs_id
-        try:
-            self.plotter._autoflow_right_click_dispatch = lambda: _on_right_click(
-                iren, "RightButtonPressEvent"
-            )
-        except Exception:
-            pass
+        from .plane_picking import PlanePickingFilter
+        self._shared_pick_obs_id = PlanePickingFilter(self)
+        self.plotter.installEventFilter(self._shared_pick_obs_id)
 
     def enable_plane_picking(self, callback):
         self._plane_pick_callback = callback
-        self._ensure_shared_right_click_picking()
+        self._ensure_shared_click_picking()
 
     def enable_path_picking(self, callback):
         self._path_pick_callback = callback
-        self._ensure_shared_right_click_picking()
+        self._ensure_shared_click_picking()

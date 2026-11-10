@@ -2,18 +2,27 @@ name: Windows portable build
 
 on:
   workflow_call:
+    inputs:
+      publish:
+        type: boolean
+        default: false
+        description: Publish a numbered release after verification
 
 permissions:
   contents: read
 
 concurrency:
-  group: windows-portable-${{ github.ref }}
-  cancel-in-progress: true
+  group: windows-portable-${{ inputs.publish && 'release' || github.ref }}
+  cancel-in-progress: ${{ !inputs.publish }}
 
 jobs:
   build:
     runs-on: windows-2022
     timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     env:
       GH_TOKEN: ${{ github.token }}
       PYTHONUTF8: "1"
@@ -30,6 +39,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Select package version
+        id: version
+        shell: pwsh
+        env:
+          PUBLISH_RELEASE: ${{ inputs.publish }}
+        run: |
+          if ($env:PUBLISH_RELEASE -eq 'true') {
+            python packaging/windows/release.py plan --output $env:GITHUB_OUTPUT
+            if ($LASTEXITCODE -ne 0) { throw 'Release version selection failed' }
+          } else {
+            "version=dev-$($env:GITHUB_SHA.Substring(0,8))" >> $env:GITHUB_OUTPUT
+          }
       - name: Set up headless rendering for portable verification
         uses: pyvista/setup-headless-display-action@c103a2ff45650d38cb71684b5dc6cdfeb9442c79 # v5.1.0
         with:
@@ -47,10 +68,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Inference model download failed' }
       - name: Build and verify full portable folder
         shell: pwsh
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { 'dev-' + $env:GITHUB_SHA.Substring(0,8) }
           $lock = Get-Content packaging/windows/models.lock.json -Raw | ConvertFrom-Json
-          ./packaging/windows/build.ps1 -PythonBin python -EnvironmentDirectory "$env:RUNNER_TEMP/af-env" -OutputDirectory "$env:RUNNER_TEMP/af-release" -ModelsArchive "$env:RUNNER_TEMP/autoflow-models/$($lock.asset)" -Version $version
+          ./packaging/windows/build.ps1 -PythonBin python -EnvironmentDirectory "$env:RUNNER_TEMP/af-env" -OutputDirectory "$env:RUNNER_TEMP/af-release" -ModelsArchive "$env:RUNNER_TEMP/autoflow-models/$($lock.asset)" -Version $env:PACKAGE_VERSION
       - name: Upload portable verification diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -77,3 +99,27 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
+
+  publish:
+    if: inputs.publish
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PACKAGE_VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v4
+        with:
+          name: AutoFlow-windows-x64
+          path: ${{ runner.temp }}/af-artifacts
+      - name: Publish verified portable package
+        run: python packaging/windows/release.py publish --version "$PACKAGE_VERSION" --artifacts "$RUNNER_TEMP/af-artifacts"

@@ -21,7 +21,11 @@ def build_exclusion_checks(workspace, make_check):
     payload = {"segmentation_preprocess": preprocessing, "plane_layout": layout}
     checks = []
     labels = list(preprocessing.get("labels", []))
-    if preprocessing:
+    if preprocessing.get("status") == "not_generated":
+        checks.append(make_check("segmentation.preprocess_qc", "Segmentation", "not_run",
+            "Segmentation exclusion QC", "Full label/phase evidence has not been generated.",
+            action="Open Review QC and click Generate QC or Refresh QC."))
+    if preprocessing and preprocessing.get("status") != "not_generated":
         geometry = dict(preprocessing.get("skeleton_geometry", {}) or {})
         if geometry:
             spacing = " / ".join(f"{float(v):g}" for v in geometry.get("spacing_mm", []))

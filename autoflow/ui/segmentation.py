@@ -90,7 +90,7 @@ class SegmentationDock(QtWidgets.QWidget):
         )
         self.btn_external_editor.setProperty("role", "primary")
         self.btn_external_editor.setToolTip(
-            "Export magnitude, flow components, PC-MRA, and segmentation, then open the optional external editor."
+            "Open PC-MRA and the active segmentation. Right-click to choose additional cached images."
         )
         actions_layout.addWidget(self.btn_run_auto)
         actions_layout.addWidget(self.btn_external_editor)

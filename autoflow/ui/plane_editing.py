@@ -98,7 +98,7 @@ class PlaneEditingMixin:
         form.addRow("Movement", self.combo_plane_edit_mode)
         from .parameter_help import bind_help
         bind_help(form, self.combo_plane_edit_mode, "Drag a cyan 2D center or the 3D handle to move. "
-            "Drag orange axes in either lower 2D view to rotate. Along path constrains translation to the centreline; "
+            "Drag orange endpoints in either lower 2D view to rotate. Along path constrains translation to the centreline; "
             "Move freely retains the plane's vessel labels and path identity.")
         self.plane_center_controls, self.plane_normal_controls = [], []
         for caption, target, minimum, maximum in (
@@ -280,6 +280,7 @@ class PlaneEditingMixin:
             group = str(ws.path_info[index].get("group_name", "")) if index < len(ws.path_info) else ""
             plane = PlaneData(center=center, normal=normal/np.linalg.norm(normal), label=index+1,
                               path_index=index, distance=distance, group_name=group)
+        plane.placement["contour_source"] = "manual"
         ws.planes.append(plane)
         ws.derived.plane_metrics = [dict(p.metrics or {}) for p in ws.planes]
         self._start_plane_session(len(ws.planes)-1, "add", before)
@@ -382,8 +383,7 @@ class PlaneEditingMixin:
         viewer = self.ortho_viewer
         horizontal, vertical = viewer._plane_view_bases(plane.normal)[name]
         viewer._plane_rotation_reference = {"name": name,
-            "basis": (horizontal.copy(), vertical.copy()),
-            "geometry": viewer._plane_orthogonal_geometry(plane, self.workspace.current_t)}
+            "basis": (horizontal.copy(), vertical.copy())}
         self._plane_rotation_axis = np.cross(horizontal, vertical)
         self._plane_rotation_axis /= np.linalg.norm(self._plane_rotation_axis)
 
@@ -405,6 +405,30 @@ class PlaneEditingMixin:
         if reference and reference["name"] == name:
             self.ortho_viewer._plane_rotation_reference = None
             self._end_plane_gesture()
+
+    def _cancel_plane_2d_gesture(self):
+        viewer = self.ortho_viewer
+        if self._plane_gesture_before is None or not self._plane_edit_session or not (
+                viewer._plane_rotation_reference or viewer._plane_translation_reference):
+            return False
+        state = self._plane_gesture_before
+        index = self._plane_edit_session["index"]
+        self.workspace.planes[index] = state["plane"]
+        self._plane_axis_u, self._plane_axis_v = state["u"], state["v"]
+        self._plane_gesture_before = None
+        viewer._plane_gesture_active = False
+        self.scene.set_interaction_preview(False, render=False)
+        viewer._plane_rotation_reference = viewer._plane_translation_reference = None
+        for view in viewer.slice_views.values():
+            view.view_box.cancel_plane_gesture()
+            view.plane_controls.finish_angle()
+        self.scene.update_plane_geometry(self._find_uid_by_indexed_data_key("plane", index))
+        self._position_plane_handles()
+        self._sync_plane_numeric_controls()
+        self._plane_preview_timer.stop()
+        self._preview_plane_geometry()
+        self._refresh_plane_edit_controls()
+        return True
 
     def _snap_plane_to_path(self):
         if self._plane_edit_session and self._plane_edit_session["original"].path_index >= 0:
@@ -445,10 +469,14 @@ class PlaneEditingMixin:
         if self._play_timer.isActive():
             self._on_pause()
         if self._plane_edit_session:
+            self.ortho_viewer._plane_gesture_active = True
+            self.scene.set_interaction_preview(True, render=False)
             self._plane_gesture_before = {"plane": copy.deepcopy(self.workspace.planes[self._plane_edit_session["index"]]),
                 "u": copy.deepcopy(self._plane_axis_u), "v": copy.deepcopy(self._plane_axis_v)}
 
     def _end_plane_gesture(self):
+        self.ortho_viewer._plane_gesture_active = False
+        self.scene.set_interaction_preview(False, render=False)
         if self._plane_gesture_before is not None and self._plane_edit_session:
             plane = self.workspace.planes[self._plane_edit_session["index"]]
             if plane_signature(plane) != plane_signature(self._plane_gesture_before["plane"]):
@@ -458,6 +486,7 @@ class PlaneEditingMixin:
         self._plane_preview_timer.stop()
         self._preview_plane_geometry()
         self._refresh_plane_edit_controls()
+        self.scene.request_render()
 
     def _update_plane_from_drag(self, plane_idx, center=None, normal=None):
         self._legacy_update_plane_from_drag(plane_idx, center=center, normal=normal)
@@ -476,7 +505,7 @@ class PlaneEditingMixin:
                     float(np.dot(offset, u)), float(np.dot(offset, v)))
                 return  # Keep the slice image fixed under the center drag; reslice on release.
             self.ortho_viewer._draft_plane_basis = (self._plane_axis_u.copy(), self._plane_axis_v.copy())
-            self.ortho_viewer.set_selected_plane(self._plane_edit_session["index"])
+            self.ortho_viewer.set_selected_plane(self._plane_edit_session["index"], geometry_preview=True)
             self.ortho_viewer.label_plane_metric.setText("Plane preview · Apply to update measurements")
 
     def _apply_plane_numeric_controls(self):
@@ -526,7 +555,7 @@ class PlaneEditingMixin:
             self._update_plane_from_drag(index, normal=-self.workspace.planes[index].normal)
             self._end_plane_gesture()
 
-    def _finalize_plane_drag(self, plane_idx):
+    def _finalize_plane_drag(self, plane_idx, *, calculate=True):
         session = self._plane_edit_session
         if session is None:
             return self._legacy_finalize_plane_drag(plane_idx)
@@ -556,6 +585,14 @@ class PlaneEditingMixin:
                 for operation in operations:
                     if "polygon" in operation:
                         operation["polygon"] = converted(operation["polygon"])
+        geometry_changed = (not np.allclose(plane.center, old.center, rtol=0, atol=1e-10)
+                            or not np.allclose(plane.normal, old.normal, rtol=0, atol=1e-10))
+        cleared_roi = geometry_changed and bool(plane.roi_polygon_uv_mm or plane.roi_edit_operations)
+        if geometry_changed:
+            # A different physical cut needs its own contour: use the mask
+            # when present, or ask for a new explicit contour without a mask.
+            plane.roi_polygon_uv_mm = []
+            plane.roi_edit_operations = {}
         plane.placement.pop("_draft", None)
         changed = session["kind"] == "add" or plane_signature(plane) != plane_signature(old)
         self._legacy_clear_plane_drag_widgets()
@@ -563,14 +600,17 @@ class PlaneEditingMixin:
         self._plane_edit_session = None
         if changed:
             plane.placement["manual_geometry"] = True
-            invalidate_planes(self.workspace, [plane.plane_id], "Plane geometry changed", geometry=True)
+            invalidate_planes(self.workspace, [plane.plane_id], "Plane geometry changed", geometry=True, roi=cleared_roi)
             self._last_quality_report = None
             after = mutation_snapshot(self.workspace)
             self._plane_undo_stack.push(_PlaneCommand(self, session["before"], after,
                                                     "Add plane" if session["kind"] == "add" else "Edit plane"))
             self._persist_plane_outputs(include_pixelwise=False)
-            if session["had_metrics"]:
-                self._schedule_plane_calculation(session["index"])
+        if changed:
+            self.ortho_viewer._contour_display_override = None
+            self.ortho_viewer.refresh()
+        if calculate and (changed or selected_metric(self.workspace, session["index"]) is None):
+            self._schedule_plane_calculation(session["index"])
         self._refresh_plane_edit_controls()
         self._refresh_selection_info()
         self.scene.request_render()
@@ -667,22 +707,48 @@ class PlaneEditingMixin:
             self._preview_plane_geometry()
             self._refresh_plane_edit_controls()
 
+    def _commit_plane_edits_for_metrics(self):
+        if self._plane_edit_session is not None:
+            self._finalize_plane_drag(self._plane_edit_session["index"], calculate=False)
+            if self._plane_edit_session is not None:
+                return False
+        self._suspend_plane_calculation = True
+        try:
+            self.ortho_viewer._apply_plane_roi()
+        finally:
+            self._suspend_plane_calculation = False
+        self._plane_jobs.cancel()
+        return True
+
     def _schedule_plane_calculation(self, index):
         ws = self.workspace
-        if not 0 <= int(index) < len(ws.planes) or ws.flow_raw is None or ws.segmask_binary is None:
+        if getattr(self, "_suspend_plane_calculation", False):
+            return
+        if not 0 <= int(index) < len(ws.planes) or ws.flow_raw is None:
             return
         plane = ws.planes[int(index)]
+        from ..algorithms.geometry_grid import measurement_segmentation
+        geometry = measurement_segmentation(ws, manual_planes=[plane])
+        from ..core.plane_state import requires_manual_contour, has_manual_contour
+        if geometry.binary is None or (requires_manual_contour(plane) and not has_manual_contour(plane)):
+            message = f"Plane {index}: draw a contour and Apply ROI to calculate measurements."
+            self.log(message)
+            self.statusBar().showMessage(message, 8000)
+            return
         payload = {"plane": copy.deepcopy(plane), "signature": plane_signature(plane),
             "input_signature": workspace_signature(ws, include_analysis=False),
-            "data": {"flow": ws.flow_raw, "mask": ws.segmask_binary, "spacing": np.asarray(ws.resolution).copy(),
-                "origin": np.asarray(ws.origin).copy(), "rr": float(ws.rr), "branches": ws.branch_labels,
-                "labels3": ws.segmask_labels_3d, "labels4": ws.segmask_labels,
+            "data": {"flow": ws.flow_raw, "mask": geometry.binary, "spacing": geometry.spacing.copy(),
+                "source": geometry.source,
+                "origin": np.asarray(ws.origin).copy(), "rr": float(ws.rr), "branches": geometry.branches,
+                "labels3": geometry.labels_3d, "labels4": geometry.labels,
                 "paths": ws.centerline_paths_smooth or ws.centerline_paths,
                 "path_info": copy.deepcopy(ws.path_info), "forks": copy.deepcopy(ws.forks),
                 "tke": ws.derived.tke_array, "pg": ws.derived.pressure_gradient_array,
                 "pressure": ws.derived.relative_pressure_array, "wss": ws.derived.wss_surfaces,
                 "pressure_support": ws.derived.pressure_gradient_support_mask}}
         stale = set(ws.input_state.metadata.get("stale_metric_families", []))
+        if geometry.source == 'manual_contours':
+            stale.update(("wss", "tke", "pressure"))
         for family, keys in (("wss", ("wss",)), ("tke", ("tke",)), ("pressure", ("pg", "pressure", "pressure_support"))):
             if family in stale:
                 for key in keys:

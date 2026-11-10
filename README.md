@@ -9,6 +9,8 @@
 <p>
   <a href="https://github.com/AssociatedPrimeIdeal/AutoFlow/releases"><strong>Windows downloads</strong></a>
   &nbsp;·&nbsp;
+  <a href="docs/en/user/changelog.md">Changelog</a>
+  &nbsp;·&nbsp;
   <a href="#quick-start">Quick start</a>
 </p>
 
@@ -29,7 +31,7 @@ PC-MRA [noise removal](docs/en/features/noise-removal.md) defaults to the **Stro
 
 ### Windows
 
-CI automatically builds a Windows portable package after Linux and Windows regression tests pass on pushes and pull requests to `main` or `dev`. Download `AutoFlow-windows-x64` from the successful run's **Actions → CI → Artifacts**, extract the complete package to a short ASCII path, and double-click `AutoFlow.exe`. The package uses the current application code and locked Linux segmentation models, without bundled documentation. Builds do not publish application releases.
+Pushes to `main` or `dev` automatically publish a numbered [GitHub Release](https://github.com/AssociatedPrimeIdeal/AutoFlow/releases) after Linux/Windows regression tests and Windows portable verification pass. Each release includes a changelog since the preceding version. Download the complete ZIP or all archive parts with the supplied joiner, extract to a short ASCII path, and double-click `AutoFlow.exe`. See [Windows download instructions](docs/en/user/windows-portable.md). PRs and manual CI runs provide the `AutoFlow-windows-x64` Actions artifact without publishing a release. The package includes the current application code and locked Linux segmentation models, without bundled documentation.
 
 ### Python
 
@@ -41,3 +43,9 @@ cd AutoFlow
 pip install -e ".[all]"
 autoflow-gui
 ```
+
+
+In the GUI, full QC and its HTML report are generated explicitly from **Review QC →
+Generate QC / Refresh QC**. Existing H5 masks open in Labeler at their native
+resolution. See [GUI workflow](docs/en/user/gui.md) and
+[segmentation](docs/en/features/segmentation.md).

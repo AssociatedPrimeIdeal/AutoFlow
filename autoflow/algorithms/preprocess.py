@@ -45,7 +45,38 @@ def merge_segmask_to_3d(segmask_binary_4d):
     return np.any(seg, axis=3)
 
 
-def majority_vote_labels_3d(segmask_labels):
+def majority_vote_labels_3d(segmask_labels, *, backend="auto"):
+    """Exact temporal mode; CUDA for large inputs, with a CPU fallback.
+
+    Background participates and ties select the lowest numeric label. Both
+    paths return independent int16 arrays. Explicit cuda raises on failure;
+    auto retains the existing CPU result when CUDA is unavailable.
+    """
+    if backend not in {"auto", "cpu", "cuda"}:
+        raise ValueError("Temporal voting backend must be auto, cpu or cuda")
+    seg = np.asarray(segmask_labels, dtype=np.int16)
+    if seg.ndim == 3:
+        return seg.copy()
+    if seg.ndim != 4:
+        raise ValueError(f'segmentation labels must be 3D or 4D, got {seg.shape}')
+    if not seg.size:
+        raise ValueError('need at least one array to stack')
+    if seg.shape[3] == 1:
+        return seg[..., 0].copy()
+    if backend == "cuda" or (backend == "auto" and seg.size >= 262_144):
+        from ..task_control import TaskCancelled
+        try:
+            from .temporal_voting_cuda import vote_labels_cuda
+            return vote_labels_cuda(seg)
+        except TaskCancelled:
+            raise
+        except Exception:
+            if backend == "cuda":
+                raise
+    return _majority_vote_labels_cpu(seg)
+
+
+def _majority_vote_labels_cpu(segmask_labels):
     """Per-voxel mode with lowest-label ties and bounded spatial working memory.
 
     Stream the sorted label counts instead of retaining an X*Y*Z*labels
@@ -145,9 +176,20 @@ def filter_connected_components(mask_3d, resolution, mode="absolute", min_volume
     m = np.asarray(mask_3d, dtype=bool)
     if m.ndim != 3:
         raise ValueError(f"connected-component filtering expects a 3D mask, got {m.shape}")
-    lab, counts = _component_counts(m, connectivity=connectivity)
+    # A frame of an XYZT mask is strided. Read it once into a small private
+    # contiguous buffer, then label only its occupied spatial bounding box.
+    # Removing empty exterior cells preserves component order, ties and volume.
+    m = np.ascontiguousarray(m)
+    region = _component_bbox(m)
+    if region is None:
+        return np.zeros(m.shape, dtype=bool)
+    lab, counts = _component_counts(m[region], connectivity=connectivity)
     keep = _component_keep_mask(counts, resolution, mode, min_volume_mm3, rel_min_ratio)
-    return keep[lab]
+    if all(sl.start == 0 and sl.stop == size for sl, size in zip(region, m.shape)):
+        return keep[lab]
+    output = np.zeros(m.shape, dtype=bool)
+    output[region] = keep[lab]
+    return output
 
 
 def remove_small_cc_from_binary_mask(segmask_binary, resolution, min_cc_volume_mm3):
@@ -229,12 +271,12 @@ def filter_4d_labeled_components(segmask_labels_4d, resolution, mode="absolute",
 
 
 def _component_bbox(mask):
-    idx = np.argwhere(np.asarray(mask, dtype=bool))
-    if len(idx) == 0:
+    array = np.asarray(mask, dtype=bool)
+    extents = [np.flatnonzero(np.any(array, axis=axes))
+               for axes in ((1, 2), (0, 2), (0, 1))]
+    if not extents[0].size:
         return None
-    lo = idx.min(axis=0)
-    hi = idx.max(axis=0) + 1
-    return tuple(slice(int(lo[k]), int(hi[k])) for k in range(3))
+    return tuple(slice(int(indices[0]), int(indices[-1]) + 1) for indices in extents)
 
 
 def _preprocess_single_component(mask_3d, params):

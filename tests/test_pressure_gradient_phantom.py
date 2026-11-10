@@ -195,6 +195,62 @@ def test_plane_pressure_support_excludes_padding_and_preserves_true_zero(workers
         json.dumps(metric, allow_nan=False)
 
 
+def test_two_plane_pressure_difference_phantom_direction_gauges_and_missing_phases():
+    from autoflow.core.models import PlaneData
+    from autoflow.algorithms.metrics.plane_derived import augment_plane_metrics_with_derived
+    from autoflow.algorithms.metrics.plane_pressure import compute_plane_pressure_difference
+
+    origin = np.array([11., -7., 23.])
+    mask = np.zeros((9, 9, 9, 4), bool)
+    mask[1:8, 1:8, 1:8] = True
+    support = mask.copy()
+    support[:, :, 4, 1] = False  # independent pressure gauges
+    support[:, :, 6:, 2] = False  # second plane has no valid pressure
+    pressure = np.broadcast_to(np.arange(9)[None, None, :, None], mask.shape).astype(np.float32).copy()
+    pressure *= np.array([10., 20., 30., 0.])
+    planes = [PlaneData(center=np.array([4.5, 4.5, z]), normal=np.array([0., 0., 1.]))
+              for z in (2.5, 6.5)]
+    metrics, _ = augment_plane_metrics_with_derived([{}, {}], planes, mask, (1, 1, 1), origin,
+        relative_pressure_array=pressure, pressure_gradient_support_mask=support)
+    result = compute_plane_pressure_difference(planes, metrics, mask, (1, 1, 1), origin,
+                                               pressure, support)
+    assert result['pressure_difference_Pa_t'] == [-40., None, None, 0.]
+    assert result['valid_t'] == [True, False, False, True]
+    assert 'connected pressure reference' in result['reason_t'][1]
+    assert result['mean_Pa'] is None
+    assert result['peak_abs_Pa'] == 40.
+    reverse = compute_plane_pressure_difference(planes[::-1], metrics[::-1], mask, (1, 1, 1), origin,
+                                                pressure, support)
+    assert reverse['pressure_difference_Pa_t'] == [40., None, None, 0.]
+    json.dumps(result, allow_nan=False)
+
+    # A common phase-dependent pressure gauge cancels between the two means.
+    full_metrics, _ = augment_plane_metrics_with_derived([{}, {}], planes, mask, (1, 1, 1), origin,
+        relative_pressure_array=pressure + 1234, pressure_gradient_support_mask=mask)
+    full = compute_plane_pressure_difference(planes, full_metrics, mask, (1, 1, 1), origin,
+                                             pressure + 1234, mask)
+    assert full['pressure_difference_Pa_t'] == [-40., -80., -120., 0.]
+    assert full['mean_Pa'] == -60.
+
+
+def test_two_plane_pressure_difference_phantom_native_pressure_on_fine_roi_grid():
+    from autoflow.core.models import PlaneData
+    from autoflow.algorithms.metrics.plane_derived import augment_plane_metrics_with_derived
+    from autoflow.algorithms.metrics.plane_pressure import compute_plane_pressure_difference
+
+    mask = np.ones((17, 17, 17, 2), bool)
+    pressure = np.broadcast_to(np.arange(9)[None, None, :, None] * 10., (9, 9, 9, 2)).copy()
+    support = np.ones_like(pressure, bool)
+    origin = (11., -7., 23.)
+    planes = [PlaneData(center=np.array([8., 8., z]), normal=np.array([0., 0., 1.])) for z in (5., 13.)]
+    metrics, _ = augment_plane_metrics_with_derived([{}, {}], planes, mask, (1, 1, 1), origin,
+        relative_pressure_array=pressure, pressure_gradient_support_mask=support, field_spacing=(2, 2, 2))
+    result = compute_plane_pressure_difference(planes, metrics, mask, (1, 1, 1), origin,
+                                               pressure, support, field_spacing=(2, 2, 2))
+    assert result['pressure_difference_Pa_t'] == pytest.approx([-40., -40.])
+    assert result['mean_Pa'] == pytest.approx(-40.)
+
+
 @pytest.mark.parametrize("shape_index", range(6))
 def test_analytic_flow_phantom_closed_form_matches_independent_quadrature_and_wall_derivative(shape_index):
     from autoflow.algorithms.analytic_phantoms import SHAPES, analytical_solution

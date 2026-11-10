@@ -666,5 +666,6 @@ class GeometryEditingMixin:
         elif self.ortho_viewer._roi_transaction is not None:
             self.ortho_viewer._cancel_plane_roi()
         elif self._plane_edit_session is not None:
-            self._cancel_plane_edit()
+            if not self._cancel_plane_2d_gesture():
+                self._cancel_plane_edit()
 

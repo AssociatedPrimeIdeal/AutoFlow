@@ -10,7 +10,7 @@ def compact_action_sections(action, sections):
         StepId.GENERATE_PLANES: {'positions_file', 'import_mode', 'plane_mode', 'label_rules_file', 'label_rules', 'plane_count',
                                'anchor', 'direction', 'spacing_mode', 'spacing_ratio',
                                'cross_section_distance', 'anchor_offset_mm', 'start_distance', 'end_distance'},
-        StepId.COMPUTE_DERIVED_METRICS: {'pressure_method'},
+        StepId.COMPUTE_DERIVED_METRICS: {'selected_families', 'pressure_method'},
         StepId.COMPUTE_PWV: {'groups', 'plane_interval_mm', 'start_distance', 'end_distance',
                             'waveform_key', 'transit_time_method', 'foot_method'},
         StepId.PLANE_STREAMLINES: {'pathline_seed_region', 'pathline_grid_spacing_mm',

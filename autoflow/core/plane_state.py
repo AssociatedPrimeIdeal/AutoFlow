@@ -20,6 +20,20 @@ def ensure_plane_identity(plane):
             "roi_revision": int(getattr(plane, "roi_revision", 0))}
 
 
+def requires_manual_contour(plane):
+    placement = getattr(plane, "placement", {}) or {}
+    return (placement.get("contour_source") == "manual"
+            or (placement.get("manual_geometry", False) and int(plane.path_index) < 0
+                and placement.get("geometry_source") not in {"coordinates", "imported"}))
+
+
+def has_manual_contour(plane):
+    return (len(getattr(plane, "roi_polygon_uv_mm", []) or []) >= 3
+            or any(operation.get("mode") == "replace" and len(operation.get("polygon", [])) >= 3
+                   for operations in (getattr(plane, "roi_edit_operations", {}) or {}).values()
+                   for operation in operations))
+
+
 def plane_signature(plane):
     payload = {
         "plane_id": plane.plane_id,
@@ -30,6 +44,8 @@ def plane_signature(plane):
         "roi": plane.roi_polygon_uv_mm, "operations": plane.roi_edit_operations,
         "geometry_revision": int(plane.geometry_revision), "roi_revision": int(plane.roi_revision),
     }
+    if requires_manual_contour(plane):
+        payload["contour_source"] = "manual"
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"),
                                      default=lambda x: np.asarray(x).tolist()).encode()).hexdigest()
 
@@ -70,6 +86,8 @@ def stamp_metric(plane, metric, index=None):
 def metric_validity(plane, metric=None):
     if any((getattr(plane, "placement", {}) or {}).get(key) for key in ("_draft", "_roi_draft")):
         return "stale"
+    if requires_manual_contour(plane) and not has_manual_contour(plane):
+        return "missing"
     value = plane.metrics if metric is None else metric
     if not value:
         return "missing"

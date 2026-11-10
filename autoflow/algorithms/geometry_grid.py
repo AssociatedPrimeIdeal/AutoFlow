@@ -36,13 +36,16 @@ class MeasurementSegmentation:
     source: str
 
 
-def measurement_segmentation(ws):
+def measurement_segmentation(ws, *, manual_planes=None):
     """Use the active source's native labels for all quantitative ROIs.
 
     nnUNet already exports its prediction on the acquisition grid before
     classification. Its separate 1-mm cache serves topology/display only.
     Other sources use their input labels, including the bound native result
     of an explicitly imported or manually edited 1-mm label volume.
+    Passing manual_planes permits a dimension-only empty support canvas for
+    explicit replacement contours when no segmentation exists. Default calls
+    still require a real segmentation and never infer one from scalar images.
     """
     binary, labels, voted = ws.segmask_binary, ws.segmask_labels, ws.segmask_labels_3d
     if binary is None and ws.segmask_raw is not None:
@@ -54,6 +57,18 @@ def measurement_segmentation(ws):
         # Compatibility for manually constructed 1-mm workspaces.
         binary, labels, voted = (ws.segmentation_analysis_binary, ws.segmentation_analysis_labels,
                                  ws.segmentation_analysis_labels_3d)
+    if binary is None and ws.flow_raw is not None and manual_planes is not None:
+        # An explicit replacement contour defines its own ROI. This empty,
+        # broadcast support canvas supplies only acquisition-grid dimensions;
+        # it is never assigned to a workspace segmentation or used by WSS/PG.
+        explicit = any(
+            operation.get('mode') == 'replace' and len(operation.get('polygon', [])) >= 3
+            for plane in manual_planes
+            for operations in (getattr(plane, 'roi_edit_operations', {}) or {}).values()
+            for operation in operations)
+        if explicit:
+            return MeasurementSegmentation(np.broadcast_to(False, ws.flow_raw.shape[:4]),
+                None, None, None, np.asarray(ws.resolution, float), 'manual_contours')
     source = ('auto_native_labels' if ws.segmentation.active_source == 'auto'
               else 'input_native_labels')
     return MeasurementSegmentation(binary, labels, voted, ws.branch_labels,

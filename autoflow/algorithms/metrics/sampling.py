@@ -349,6 +349,14 @@ def _build_plane_slice_region(
         if candidate.ndim == 2 and candidate.shape[1] == 2 and len(candidate) >= 3:
             replacement_polygon = candidate
 
+    from ...core.plane_state import requires_manual_contour
+    if requires_manual_contour(plane) and replacement_polygon is None:
+        polygon = np.asarray(getattr(plane, "roi_polygon_uv_mm", []) or [], dtype=float)
+        if polygon.ndim == 2 and polygon.shape[1] == 2 and len(polygon) >= 3:
+            replacement_polygon = polygon
+        else:
+            return None  # A mask must not invent a contour for a user-placed plane.
+
     if replacement_polygon is None and support_mesh is None and not np.any(mask_xyz):
         return None
 

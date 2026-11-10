@@ -1017,6 +1017,7 @@ def _build_derived_metrics_config(config_bundle: Dict[str, Dict[str, Any]]) -> D
     shared_viscosity = float(fluid_cfg.get("viscosity", legacy_cfg.get("viscosity", 4.0)))
     shared_rho = float(fluid_cfg.get("rho", legacy_cfg.get("rho", 1060.0)))
     return {
+        "selected_families": legacy_cfg.get("selected_families", ["wss", "tke", "pressure", "vortex"]),
         "wss_smoothing_iteration": int(wss_cfg.get("smoothing_iteration", legacy_cfg.get("wss_smoothing_iteration", legacy_cfg.get("smoothing_iteration", 200)))),
         "wss_viscosity": float(wss_cfg.get("viscosity", legacy_cfg.get("wss_viscosity", shared_viscosity))),
         "wss_inward_distance": wss_cfg.get("inward_distance", legacy_cfg.get("wss_inward_distance", legacy_cfg.get("inward_distance", "auto"))),

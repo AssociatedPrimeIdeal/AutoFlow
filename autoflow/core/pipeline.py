@@ -26,7 +26,7 @@ from ..algorithms import (
 )
 from ..algorithms.phase_unwrapping import unwrap_phase, resolve_mask_source
 from ..algorithms.noise_removal import pcmra_render_mask, pcmra_coherence_weight
-from ..algorithms.data.venc import _dual_venc_correct_alias, _dual_alias_shift_unique_values
+from ..algorithms.data.venc import _reconstruct_dual_venc
 from ..algorithms.flow_seeding import volume_seed_domain
 from ..algorithms.flow_display import pathline_color_style
 from ..algorithms.geometry_grid import measurement_segmentation, QUANTITATIVE_POLICY
@@ -670,11 +670,14 @@ class PipelineEngine:
         log(msg)
         return msg
 
-    def preprocess(self, ws):
+    def preprocess(self, ws, *, generate_qc=None):
+        # CLI/API keep their existing eager evidence; GUI requests it explicitly
+        # from Review. Necessary masks and their cleanup are identical.
+        if generate_qc is None:
+            generate_qc = not ws._defer_preprocess_qc
         if ws.segmask_raw is None:
             raise ValueError("segmask_raw is None")
         from ..algorithms.preprocess import majority_vote_labels_3d, filter_connected_components, filter_4d_labeled_components
-        from ..algorithms.preprocess_qc import build_segmentation_preprocess_qc
         from ..algorithms.geometry_grid import prepare_segmentation_geometry, segmentation_geometry_data, labels_on_flow_grid
         geometry_labels, geometry_spacing, geometry_info = prepare_segmentation_geometry(ws)
         geometry_temporal = segmentation_geometry_data(ws)
@@ -696,6 +699,8 @@ class PipelineEngine:
             and ws.segmask_binary is not None
             and ws.segmask_3d is not None
         ):
+            if generate_qc and ws._preprocess_qc_inputs is not None:
+                self.generate_segmentation_preprocess_qc(ws)
             return False
 
         ws._video_union_surface_cache = {}
@@ -770,9 +775,6 @@ class PipelineEngine:
                 "geometry_binary": np.asarray(group_binary, dtype=bool),
                 "geometry_mask_3d": np.asarray(processed_mask_3d, dtype=bool),
                 "geometry_clean_mask_3d": np.asarray(group_mask_3d, dtype=bool),
-                "segmask_binary": labels_on_flow_grid(np.asarray(group_binary, dtype=bool), ws),
-                "segmask_3d": labels_on_flow_grid(np.asarray(processed_mask_3d, dtype=bool), ws),
-                "clean_mask_3d": labels_on_flow_grid(np.asarray(group_mask_3d, dtype=bool), ws),
                 "graph": previous_state.get("graph", GraphData()),
                 "branch_labels": previous_state.get("branch_labels"),
                 "geometry_branch_labels": previous_state.get("geometry_branch_labels"),
@@ -791,14 +793,22 @@ class PipelineEngine:
         ws.segmentation_analysis_labels_3d = retained_labels_3d
         ws.segmentation_analysis_binary = np.asarray(global_binary, dtype=bool)
         ws.segmentation_analysis_mask = np.asarray(global_mask_3d, dtype=bool)
-        ws.segmentation_preprocess_qc = build_segmentation_preprocess_qc(
-            geometry_temporal, geometry_filtered, voted_labels_3d, retained_labels_3d, global_mask_3d,
-            resolution=geometry_spacing, label_map=ws.skeleton_params.label_map,
-            label_groups=ws.skeleton_params.label_groups, group_specs=specs,
-            processed_groups={name: state["geometry_mask_3d"] for name, state in ws.multilabel_groups.items()},
-            temporal_group_mask=global_binary,
-            morphology_groups=morphology_groups,
-        )
+        ws._preprocess_qc_inputs = {
+            "arrays": (geometry_temporal, geometry_filtered, voted_labels_3d,
+                       retained_labels_3d, global_mask_3d),
+            "parameters": {
+                "resolution": np.asarray(geometry_spacing).copy(),
+                "label_map": copy.deepcopy(ws.skeleton_params.label_map),
+                "label_groups": copy.deepcopy(ws.skeleton_params.label_groups),
+                "group_specs": copy.deepcopy(specs),
+                "processed_groups": {name: state["geometry_mask_3d"]
+                                     for name, state in ws.multilabel_groups.items()},
+                "temporal_group_mask": global_binary,
+                "morphology_groups": morphology_groups,
+            },
+        }
+        ws.segmentation_preprocess_qc = {"schema": "autoflow.segmentation_preprocess_qc.v1",
+                                        "status": "not_generated"}
         ws.segmentation_preprocess_qc["preprocessing_order"] = [
             "merge_group_labels", "morphology_and_gaussian", "optional_special_contact_separation",
             "connected_component_filter", "skeleton", "graph"]
@@ -818,6 +828,15 @@ class PipelineEngine:
         native_vote = majority_vote_labels_3d(ws.segmask_raw)
         native_specs = self._build_group_specs(ws, native_vote)
         retain_native_measurement_masks(ws, native_specs, voted_labels=native_vote)
+        # Most groups just received their native masks. Only geometry-only
+        # groups need these adapters; do not build projections then overwrite
+        # all their frames with the native quantitative masks above.
+        for state in ws.multilabel_groups.values():
+            for target, source in (("segmask_binary", "geometry_binary"),
+                                   ("segmask_3d", "geometry_mask_3d"),
+                                   ("clean_mask_3d", "geometry_clean_mask_3d")):
+                if target not in state:
+                    state[target] = labels_on_flow_grid(state[source], ws)
         geometry_info['quantitative_source'] = measurement_segmentation(ws).source
         geometry_info['quantitative_policy'] = QUANTITATIVE_POLICY
         ws.segmentation_geometry.update(geometry_info)
@@ -840,7 +859,30 @@ class PipelineEngine:
             )
         check_cancelled()
         ws._preprocess_signature = signature
+        if generate_qc:
+            self.generate_segmentation_preprocess_qc(ws)
         return True
+
+    def generate_segmentation_preprocess_qc(self, ws):
+        """Generate full label/phase exclusion evidence only when requested.
+
+        A normal GUI analysis prepares masks and cheap provenance. Review's
+        Generate/Refresh QC action runs this on its private task workspace.
+        Cached complete evidence is reused until segmentation/config changes.
+        """
+        from ..algorithms.preprocess_qc import build_segmentation_preprocess_qc
+        self.preprocess(ws, generate_qc=False)
+        pending = ws._preprocess_qc_inputs
+        if pending is None:
+            return ws.segmentation_preprocess_qc
+        report_progress({"stage": "segmentation_qc", "message": "Generating segmentation QC evidence…"})
+        result = build_segmentation_preprocess_qc(*pending["arrays"], **pending["parameters"])
+        result.update({key: value for key, value in ws.segmentation_preprocess_qc.items()
+                       if key != "status"})
+        check_cancelled()
+        ws.segmentation_preprocess_qc = result
+        ws._preprocess_qc_inputs = None
+        return result
 
     def refresh_segmentation_dependents(self, ws):
         """Keep geometry only when its processed topology and configuration match."""
@@ -875,6 +917,13 @@ class PipelineEngine:
         if not topology_same:
             ws.reset_segmentation_results()
             return "reset"
+        # Exact equality above permits retaining immutable spatial owners,
+        # while the new temporal labels/masks and pending QC remain current.
+        ws.segmentation_analysis_labels_3d = previous_labels_3d
+        ws.segmentation_analysis_mask = previous_mask
+        for name in previous_order:
+            for key in ("geometry_mask_3d", "geometry_clean_mask_3d"):
+                ws.multilabel_groups[name][key] = previous_groups[name][key]
         if (np.array_equal(previous_labels, ws.segmentation_analysis_labels)
                 and np.array_equal(previous_binary, ws.segmentation_analysis_binary)
                 and np.array_equal(previous_native_labels, ws.segmask_labels)
@@ -1056,13 +1105,12 @@ class PipelineEngine:
         ratio2 = np.full(3, float(cfg.dual_venc_ratio2), dtype=np.float32)
         if not np.all(np.isfinite(np.r_[lv, ratio1, ratio2])) or np.any(lv <= 0):
             return StepResult(StepId.RECONSTRUCT_DUAL_VENC, False, False, "DV ratios must be finite and LV VENC positive")
-        result, shifts = _dual_venc_correct_alias(
-            np.transpose(low, (4, 3, 2, 1, 0)), np.transpose(high, (4, 3, 2, 1, 0)), lv, ratio1, ratio2)
+        result, shifts, backend = _reconstruct_dual_venc(low, high, lv, ratio1, ratio2)
         check_cancelled()
-        ws.flow_raw = np.transpose(result, (4, 3, 2, 1, 0)).astype(np.float32)
+        ws.flow_raw = result
         info.update(reconstructed=True, working_source="dv", ratio1=ratio1.astype(float).tolist(),
                     ratio2=ratio2.astype(float).tolist(),
-                    alias_shift_unique_cm_s=_dual_alias_shift_unique_values(shifts, lv),
+                    alias_shift_unique_cm_s=shifts, reconstruction_backend=backend,
                     unwrap_target="hv")
         self._mark_dual_venc_downstream_pending(ws)
         ws.pipeline.mark_done(StepId.RECONSTRUCT_DUAL_VENC)
@@ -1828,13 +1876,15 @@ class PipelineEngine:
     ):
         if not ws.has_flow():
             return [], {}, "Plane metrics skipped: no flow"
-        if ws.segmask_raw is None:
-            return [], {}, self._missing_segmentation_message(ws, "Plane metrics")
         previous_policy = ws.segmentation_geometry.get('quantitative_policy')
-        if (ws.segmentation_analysis_binary is None
+        if ws.segmask_raw is not None and (ws.segmentation_analysis_binary is None
                 or (previous_policy and previous_policy != QUANTITATIVE_POLICY)):
             self.preprocess(ws)
-        geometry = measurement_segmentation(ws)
+        geometry = measurement_segmentation(ws, manual_planes=ws.planes)
+        if geometry.binary is None:
+            return [], {}, "Plane metrics unavailable: add segmentation or draw a contour and Apply ROI."
+        if geometry.source == 'manual_contours':
+            include_derived = False
         if include_derived and ensure_derived:
             self._ensure_derived_metrics(
                 ws,
@@ -2455,10 +2505,10 @@ class PipelineEngine:
     def _step_compute_plane_metrics(self, ws, progress_callback=None):
         if not ws.has_flow():
             return StepResult(StepId.COMPUTE_PLANE_METRICS, True, True, "Plane metrics skipped: no flow")
-        if ws.segmask_raw is None:
+        if ws.segmask_raw is None and measurement_segmentation(ws, manual_planes=ws.planes).binary is None:
             return StepResult(
                 StepId.COMPUTE_PLANE_METRICS, True, True,
-                self._missing_segmentation_message(ws, "Plane metrics"),
+                "Plane metrics unavailable: add segmentation or draw a contour and Apply ROI.",
             )
         if len(ws.planes) == 0:
             plane_result = self._step_generate_planes(ws)
@@ -2485,6 +2535,9 @@ class PipelineEngine:
         return StepResult(StepId.COMPUTE_PLANE_METRICS, True, False, msg)
 
     def _step_compute_derived_metrics(self, ws):
+        selected = set(ws.derived_params.selected_families)
+        if not selected:
+            return StepResult(StepId.COMPUTE_DERIVED_METRICS, True, True, "Advanced Metrics skipped: no families selected")
         if not ws.has_flow():
             return StepResult(StepId.COMPUTE_DERIVED_METRICS, True, True, "Derived metrics skipped: no flow")
         if ws.segmask_raw is None:
@@ -2496,11 +2549,14 @@ class PipelineEngine:
             ws,
             save_pixelwise=False,
             refresh_scene_objects=True,
-            compute_vortex=True,
+            compute_wss="wss" in selected,
+            compute_tke="tke" in selected,
+            compute_pressure_gradient="pressure" in selected,
+            compute_vortex="vortex" in selected,
         )
         augmented_planes = 0
         geometry = measurement_segmentation(ws)
-        if len(ws.planes) > 0 and len(ws.derived.plane_metrics) == len(ws.planes):
+        if selected & {"wss", "tke", "pressure"} and len(ws.planes) > 0 and len(ws.derived.plane_metrics) == len(ws.planes):
             metrics, plane_pixelwise = augment_plane_metrics_with_derived(
                 ws.derived.plane_metrics,
                 ws.planes,
@@ -2510,11 +2566,11 @@ class PipelineEngine:
                 branch_labels_3d=geometry.branches,
                 segmentation_labels_3d=geometry.labels_3d,
                 segmentation_labels_4d=geometry.labels,
-                tke_array=ws.derived.tke_array,
-                pressure_gradient_array=ws.derived.pressure_gradient_array,
-                relative_pressure_array=ws.derived.relative_pressure_array,
-                pressure_gradient_support_mask=ws.derived.pressure_gradient_support_mask,
-                wss_surfaces=ws.derived.wss_surfaces,
+                tke_array=ws.derived.tke_array if "tke" in selected else None,
+                pressure_gradient_array=ws.derived.pressure_gradient_array if "pressure" in selected else None,
+                relative_pressure_array=ws.derived.relative_pressure_array if "pressure" in selected else None,
+                pressure_gradient_support_mask=ws.derived.pressure_gradient_support_mask if "pressure" in selected else None,
+                wss_surfaces=ws.derived.wss_surfaces if "wss" in selected else None,
 
                 field_spacing=ws.resolution,
             )
@@ -2538,10 +2594,10 @@ class PipelineEngine:
             self._save_planes_json(ws)
             augmented_planes = len(metrics)
         has_tke = ws.derived.tke_array is not None or ws.derived.tke_volume is not None
-        msg = f"Derived: Nt={len(ws.derived.wss_surfaces)}"
-        if not has_tke:
+        msg = "Advanced Metrics: " + ", ".join(sorted(selected))
+        if "tke" in selected and not has_tke:
             msg += " tke=unavailable"
-        if ws.derived.q_criterion_array is not None:
+        if "vortex" in selected and ws.derived.q_criterion_array is not None:
             msg += " vortex=ready"
         if augmented_planes:
             msg += f" plane_summaries={augmented_planes}"

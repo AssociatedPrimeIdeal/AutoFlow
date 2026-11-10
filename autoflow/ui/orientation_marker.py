@@ -7,7 +7,7 @@ from vtkmodules.vtkRenderingCore import vtkPropAssembly
 
 
 ASSET_DIRECTORY = Path(__file__).with_name('assets') / 'orientation'
-BUILTIN_MARKERS = {'penguin': 'Penguin', 'rabbit': 'Rabbit'}
+BUILTIN_MARKERS = {'penguin': 'Penguin', 'rabbit': 'Rabbit', 'frog': 'Frog', 'dinosaur': 'Dinosaur'}
 
 
 def read_marker_asset(path):

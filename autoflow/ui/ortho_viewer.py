@@ -138,9 +138,15 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         self._selected_plane_idx = None
         self._plane_rotation_enabled = False
         self._plane_rotation_reference = None
+        self._plane_reference_bases = None
+        self._plane_reference_fov = None
+        self._plane_reference_id = None
+        self._plane_gesture_active = False
         self._plane_translation_reference = None
         self._draft_plane_basis = None
         self._cache = {}
+        from .gpu_sampling import CudaSliceSampler
+        self._gpu_slice_sampler = CudaSliceSampler()
         self._axis_sample_cache = ByteLRUCache(64 * 1024 ** 2)
         self._overlay_rgba_cache = ByteLRUCache(64 * 1024 ** 2)
         self._playback_active = False
@@ -188,7 +194,10 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
     def _cached(self, group, key, builder, max_items=24):
         if group in {"plane_slices", "plane_overlays"}:
             max_items = max(max_items, int(self.workspace.time_count()))
-        bucket = self._cache.setdefault(group, {})
+        if group == "plane_basis_overlays":
+            bucket = self._cache.setdefault(group, ByteLRUCache(32 * 1024 ** 2))
+        else:
+            bucket = self._cache.setdefault(group, {})
         if key in bucket:
             return bucket[key]
         value = builder()
@@ -448,8 +457,12 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
     def set_plane_rotation_enabled(self, enabled):
         self._plane_rotation_enabled = bool(enabled)
         if not enabled:
+            self._plane_gesture_active = False
             self._plane_rotation_reference = None
             self._plane_translation_reference = None
+            self._plane_reference_bases = self._plane_reference_fov = self._plane_reference_id = None
+        else:
+            self._ensure_plane_edit_reference()
         for name, view in self.slice_views.items():
             view.set_plane_translation(enabled)
             view.set_plane_rotation(enabled and name != "axial")
@@ -457,10 +470,25 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
     def _plane_view_bases(self, normal):
         u, v = self._plane_axes(normal)
         bases = {"axial": (u, v), "coronal": (v, normal), "sagittal": (u, normal)}
-        reference = self._plane_rotation_reference
-        if reference:
-            bases[reference["name"]] = reference["basis"]
+        if self._plane_rotation_enabled and self._plane_reference_bases is not None:
+            bases.update(self._plane_reference_bases)
         return bases
+
+    def _ensure_plane_edit_reference(self):
+        index = self._selected_plane_idx
+        if not self._plane_rotation_enabled or index is None or not 0 <= index < len(self.workspace.planes):
+            return
+        plane = self.workspace.planes[index]
+        if self._plane_reference_id == plane.plane_id:
+            return
+        self._plane_reference_bases = self._plane_reference_fov = None
+        normal = np.asarray(plane.normal, dtype=float).copy()
+        normal /= np.linalg.norm(normal)
+        u, v = self._plane_axes(normal)
+        self._plane_reference_fov = self._plane_orthogonal_geometry(plane, self.workspace.current_t)[1]
+        self._plane_reference_bases = {"coronal": (v.copy(), normal.copy()),
+                                       "sagittal": (u.copy(), normal.copy())}
+        self._plane_reference_id = plane.plane_id
 
     def _on_slice_order_changed(self, order):
         if self._selected_plane_idx is not None and 0 <= int(self._selected_plane_idx) < len(self.workspace.planes):
@@ -549,7 +577,7 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         cursor[axis] = int(np.clip(cursor[axis] + int(delta), 0, shape[axis] - 1))
         self._set_cursor(*cursor)
 
-    def _set_cursor(self, x, y, z):
+    def _set_cursor(self, x, y, z, *, refresh=True):
         self.slider_x.blockSignals(True)
         self.slider_y.blockSignals(True)
         self.slider_z.blockSignals(True)
@@ -561,7 +589,8 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         self.slider_z.blockSignals(False)
         self._update_labels()
         self.workspace.ortho_cursor = np.array([int(x), int(y), int(z)], dtype=int)
-        self.refresh(update_plane=False)
+        if refresh:
+            self.refresh(update_plane=False)
 
     def _plane_intersection_for_slice(self, plane, fixed_axis, fixed_index, shape, resolution):
         normal = np.asarray(plane.normal, dtype=float).reshape(3).copy()
@@ -653,13 +682,15 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
 
         coords, axis = self._cached("basis_grids", grid_key, _build_grid, max_items=18)
         count = len(axis)
-        sampled = map_coordinates(volume, coords, order=int(order), mode="constant", cval=0.0)
+        sampled = self._gpu_slice_sampler.sample(volume, coords, order=int(order))
+        if sampled is None:
+            sampled = map_coordinates(volume, coords, order=int(order), mode="constant", cval=0.0)
         return sampled.reshape(count, count), axis
 
     def _plane_orthogonal_geometry(self, plane, frame_index):
-        if self._plane_rotation_reference:
-            return self._plane_rotation_reference["geometry"]
         center = np.asarray(plane.center, dtype=float).reshape(3)
+        if self._plane_rotation_enabled and self._plane_reference_fov is not None:
+            return center, self._plane_reference_fov
         shape = self._get_volume_shape()
         resolution = self._get_resolution()
         if shape is None or resolution.size < 3:
@@ -711,6 +742,9 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         )
 
     def _build_selected_plane_contours(self, plane, frame_index, fov_mm, sample_spacing_mm):
+        from ..core.plane_state import requires_manual_contour, has_manual_contour
+        if requires_manual_contour(plane) and not has_manual_contour(plane):
+            return []
         # A saved replace operation is already the exact user-authored metric
         # ROI. Do not rasterize it back through the 3-D mask and smooth it on
         # every refresh; that made the contour visibly change after Calculate
@@ -890,10 +924,10 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             bases = [(a, b, anatomical_plane_title(a, b)) for a, b in view_bases.values()]
             images = []
             for axis_u, axis_v, title in bases:
-                image, _ = self._resample_basis(
-                    vol, center, axis_u, axis_v, fov_mm, spacing_mm,
-                    order=1, cell_centered=False,
-                )
+                image_key = (key[1], key[2], tuple(axis_u), tuple(axis_v), key[4:8])
+                image = self._cached("plane_basis_images", image_key,
+                    lambda: self._resample_basis(vol, center, axis_u, axis_v, fov_mm, spacing_mm,
+                                                order=1, cell_centered=False)[0], max_items=12)
                 images.append((image, title, axis_u, axis_v))
             return images
 
@@ -901,28 +935,37 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         def content_token(value):
             if value is None:
                 return None
+            if self._plane_gesture_active:
+                # Input arrays are read-only during a geometry gesture. Do not
+                # copy/hash an entire 3D label volume for every pointer event.
+                return (self._array_cache_token(value), int(self.workspace.segmentation.revision))
             array = np.ascontiguousarray(value)
             return (array.shape, array.dtype.str,
                     hashlib.blake2b(array.view(np.uint8), digest_size=16).digest())
         # A content token also invalidates nearest-neighbour overlays after an
         # in-place label edit, without retaining a second copy of the volume.
-        overlay_key = ((key[0], key[2:8]), content_token(labels), content_token(noise_region))
+        label_token, noise_token = content_token(labels), content_token(noise_region)
+        overlay_key = ((key[0], key[2:8]), label_token, noise_token)
 
         def build_overlays():
             overlays = []
             for image, title, axis_u, axis_v in images:
-                overlay = noise_overlay = None
-                if labels is not None:
-                    sampled, _ = self._resample_basis(
-                        labels, center, axis_u, axis_v, fov_mm, spacing_mm,
-                        order=0, cell_centered=False, source_spacing=self.workspace.segmentation_spacing)
-                    overlay = np.rint(sampled).astype(np.int16)
-                if noise_region is not None:
-                    sampled_noise, _ = self._resample_basis(
-                        noise_region, center, axis_u, axis_v, fov_mm, spacing_mm,
-                        order=0, cell_centered=False)
-                    noise_overlay = sampled_noise >= 0.5
-                overlays.append((overlay, noise_overlay))
+                basis_key = (tuple(axis_u), tuple(axis_v), key[2], key[4:8],
+                             tuple(self.workspace.segmentation_spacing), label_token, noise_token)
+                def sample_overlay():
+                    overlay = noise_overlay = None
+                    if labels is not None:
+                        sampled, _ = self._resample_basis(
+                            labels, center, axis_u, axis_v, fov_mm, spacing_mm,
+                            order=0, cell_centered=False, source_spacing=self.workspace.segmentation_spacing)
+                        overlay = np.rint(sampled).astype(np.int16)
+                    if noise_region is not None:
+                        sampled_noise, _ = self._resample_basis(
+                            noise_region, center, axis_u, axis_v, fov_mm, spacing_mm,
+                            order=0, cell_centered=False)
+                        noise_overlay = sampled_noise >= 0.5
+                    return overlay, noise_overlay
+                overlays.append(self._cached("plane_basis_overlays", basis_key, sample_overlay, max_items=12))
             return overlays
 
         overlays = self._cached("plane_overlays", overlay_key, build_overlays)
@@ -1030,9 +1073,14 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
 
         plane = self.workspace.planes[int(plane_idx)]
         parent = self.window()
-        if getattr(parent, "_plane_edit_session", None) or getattr(getattr(parent, "_plane_jobs", None), "is_running", False):
-            self._stop_plane_roi_editor()
-            return
+        if getattr(parent, "_plane_edit_session", None):
+            parent._finalize_plane_drag(int(plane_idx), calculate=False)
+            if parent._plane_edit_session is not None:
+                self._stop_plane_roi_editor()
+                return
+        jobs = getattr(parent, "_plane_jobs", None)
+        if jobs is not None:
+            jobs.cancel()
         if self._roi_transaction is None:
             self.planeRoiEditStarted.emit(int(plane_idx))
             self._roi_transaction = (plane, copy.deepcopy(self._snapshot_plane_roi(plane)))
@@ -1678,10 +1726,16 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             view.setVisible(name == plane)
         self.colorbar_widget.hide()
 
-    def set_selected_plane(self, idx):
+    def set_selected_plane(self, idx, *, geometry_preview=False):
         self._sync_plane_roi_history()
+        if geometry_preview and idx == self._selected_plane_idx:
+            if not self._plane_gesture_active:
+                self._move_to_plane_center(idx, refresh=False)
+            self.refresh(update_plane=False)
+            return
         self._stop_plane_roi_editor()
         self._selected_plane_idx = idx
+        self._ensure_plane_edit_reference()
         has_plane = idx is not None and 0 <= int(idx) < len(self.workspace.planes)
         self._sync_plane_view_order()
         self.btn_edit_contour.setEnabled(has_plane)
@@ -1690,10 +1744,10 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         self._slice_keys.clear()
         for view in self.slice_views.values():
             view.plane_line.hide()
-        self._move_to_plane_center(idx)
-        self.refresh()
+        self._move_to_plane_center(idx, refresh=False)
+        self.refresh(update_plane=not geometry_preview)
 
-    def _move_to_plane_center(self, idx):
+    def _move_to_plane_center(self, idx, *, refresh=True):
         ws = self.workspace
         if idx is None or idx >= len(ws.planes):
             return
@@ -1707,6 +1761,7 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             int(np.clip(np.round(center_vox[0]), 0, shape[0] - 1)),
             int(np.clip(np.round(center_vox[1]), 0, shape[1] - 1)),
             int(np.clip(np.round(center_vox[2]), 0, shape[2] - 1)),
+            refresh=refresh,
         )
 
     def _get_resolution(self):
@@ -1939,7 +1994,8 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             # Drop sampled pixels and windows keyed by their memory addresses.
             self._axis_sample_cache.clear()
             self._overlay_rgba_cache.clear()
-            for group in ("image_levels", "image_fallback", "noise_region", "plane_slices", "plane_overlays"):
+            self._gpu_slice_sampler.clear()
+            for group in ("image_levels", "image_fallback", "noise_region", "plane_slices", "plane_basis_images", "plane_overlays", "plane_basis_overlays", "plane_analysis_segmentation"):
                 self._cache.pop(group, None)
         self._sync_plane_roi_history()
         self._sync_plane_view_order()
@@ -2085,7 +2141,9 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
                         selected_plane, spec.fixed_axis, fixed, shape, res
                     )
                 )
-                if not self._playback_active:
+                if self._plane_gesture_active:
+                    self.slice_views[plane].clear_contours()
+                elif not self._playback_active:
                     if mode == "plane" and plane == "axial":
                         self.slice_views[plane].set_contours(
                             self._selected_plane_contours(
@@ -2100,11 +2158,11 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
                 self._style_slice(plane)
                 rotating = self._plane_rotation_enabled and selected_plane is not None and plane != "axial"
                 angle = 0.0
-                reference = self._plane_rotation_reference
-                if rotating and reference and reference["name"] == plane:
-                    horizontal, vertical = reference["basis"]
-                    n = np.asarray(selected_plane.normal)
-                    angle = np.degrees(np.arctan2(-np.dot(n, horizontal), np.dot(n, vertical)))
+                if rotating:
+                    horizontal, vertical = self._plane_view_bases(selected_plane.normal)[plane]
+                    nh, nv = np.dot(selected_plane.normal, horizontal), np.dot(selected_plane.normal, vertical)
+                    rotating = np.hypot(nh, nv) > 1e-8
+                    angle = np.degrees(np.arctan2(-nh, nv))
                 self.slice_views[plane].set_plane_translation(self._plane_rotation_enabled and selected_plane is not None)
                 self.slice_views[plane].set_plane_rotation(rotating, angle)
                 seg_cfg = self.display_state(plane)["segmentation"]
@@ -2209,12 +2267,26 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
     def _analysis_segmentation_inputs(self):
         ws = self.workspace
         from ..algorithms.geometry_grid import measurement_segmentation
-        geometry = measurement_segmentation(ws)
+        arrays = (ws.segmask_binary, ws.segmask_labels, ws.segmask_raw, ws.segmask_labels_3d,
+                  ws.segmentation_analysis_binary, ws.segmentation_analysis_labels,
+                  ws.segmentation_analysis_labels_3d, ws.branch_labels)
+        key = (id(ws), int(ws.segmentation.revision), tuple(self._array_cache_token(array) for array in arrays),
+               tuple(ws.resolution), ws.segmentation.active_source)
+        geometry = self._cached("plane_analysis_segmentation", key,
+                                lambda: measurement_segmentation(ws), max_items=1)
         return geometry.binary, geometry.labels, geometry.branches, geometry.spacing
 
     def _effective_plane_region(self, plane, t, *, return_source=False):
+        from ..core.plane_state import requires_manual_contour, has_manual_contour
+        if requires_manual_contour(plane) and not has_manual_contour(plane):
+            return (None, None) if return_source else None
         ws = self.workspace
         mask, labels, branches, seg_spacing = self._analysis_segmentation_inputs()
+        manual_canvas = mask is None
+        if manual_canvas:
+            from ..algorithms.geometry_grid import measurement_segmentation
+            geometry = measurement_segmentation(ws, manual_planes=[plane])
+            mask, labels, branches, seg_spacing = geometry.binary, geometry.labels, geometry.branches, geometry.spacing
         if mask is None:
             return (None, None) if return_source else None
         mask = np.asarray(mask, dtype=bool)
@@ -2244,7 +2316,7 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
             return _build_plane_slice_region(
                 mask_t, plane, seg_spacing, ws.origin,
                 branch_grid=branch_grid, target_label=target,
-                select_connected=True, frame_index=frame, voxel_centered=ws.segmentation_analysis_binary is not None,
+                select_connected=True, frame_index=frame, voxel_centered=manual_canvas or ws.segmentation_analysis_binary is not None,
             )
 
         from ..algorithms.roi_time import interpolate_plane_regions
@@ -2252,7 +2324,7 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         region, source = _resolve_plane_roi_frame(history, plane, frame, build,
             time_count=max(1, ws.time_count()),
             interpolate=lambda a, b, w: interpolate_plane_regions(a, b, w, plane,
-                mask.shape[:3], seg_spacing, ws.origin, voxel_centered=ws.segmentation_analysis_binary is not None))
+                mask.shape[:3], seg_spacing, ws.origin, voxel_centered=manual_canvas or ws.segmentation_analysis_binary is not None))
         # An interpolated contour is displayed from its reconstructed mesh,
         # never as the manual polygon of just one endpoint.
         if history['_roi_frame_provenance'][frame]['mode'] == 'interpolated':
@@ -2848,6 +2920,7 @@ class OrthoViewer(OrthoDisplayMixin, QtWidgets.QWidget):
         self._selected_plane_idx = None
         self._sync_plane_view_order(force=True)
         self._cache.clear()
+        self._gpu_slice_sampler.clear()
         self._axis_sample_cache.clear()
         self._overlay_rgba_cache.clear()
         self._plane_region_surface_cache.clear()

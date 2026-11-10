@@ -123,7 +123,8 @@ def open_html_document(window, location, title, key):
             panes[key] = pane
             window.qc_page.addWidget(pane)
             actions = [('Inspect in 3D', window._inspect_qc_in_3d),
-                       ('Refresh QC' if key == 'qc' else 'Current case', window._on_open_case_qc),
+                       ('Refresh QC' if key == 'qc' else 'Current case',
+                        window._generate_case_qc if key == 'qc' else window._on_open_case_qc),
                        ('Open batch…', window._on_open_batch_qc),
                        ('Export', window._on_open_export_page)]
             for label, callback in actions:

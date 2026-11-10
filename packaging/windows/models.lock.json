@@ -1,8 +1,8 @@
 {
   "schema_version": 2,
-  "tag": "windows-models-20261106",
+  "tag": "v2.0.0",
   "asset": "autoflow-models.zip",
-  "url": "https://github.com/AssociatedPrimeIdeal/AutoFlow/releases/download/windows-models-20261106/autoflow-models.zip",
+  "url": "https://github.com/AssociatedPrimeIdeal/AutoFlow/releases/download/v2.0.0/autoflow-models.zip",
   "sha256": "943556060594672e4c8cfa4ad38abcf8ec4b6143f2d2aa70e26130579388ecfa",
   "parts": [
     {

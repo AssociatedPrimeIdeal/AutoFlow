@@ -34,16 +34,58 @@ class ReportActionsMixin:
         self.log(f'QC HTML saved: {path}')
         return str(path)
 
+    def _generate_case_qc(self, checked=False, *, show=True):
+        from ..report_snapshot import build_report_snapshot, save_report_html
+        if not self.workspace.data_loaded or self._pipeline_running_guard('generating QC'):
+            return
+        candidate = self.workspace.copy_for_task()
+        path = Path(self.pipeline._output_dir(candidate))/'analysis_report.html'
+        def generate(progress, log):
+            if candidate.segmask_raw is not None:
+                self.pipeline.generate_segmentation_preprocess_qc(candidate)
+            progress({'stage': 'report', 'message': 'Writing QC report…'})
+            snapshot = build_report_snapshot(candidate)
+            save_report_html(snapshot, path)
+            return snapshot
+        try:
+            self._run_modal_task('Generate QC', 'Generating QC evidence…', generate)
+        except TaskCancelled:
+            self.log('QC generation cancelled; previous evidence retained.')
+            return
+        except Exception as exc:
+            self.log(f'QC generation failed: {type(exc).__name__}: {exc}')
+            return
+        self.workspace.__dict__.update(vars(candidate))
+        self._last_quality_report = None
+        self._refresh_quality_panel()
+        self.log(f'QC HTML saved: {path}')
+        if show:
+            self._on_open_case_qc()
+        from ..report_media import media_signature
+        pane = getattr(self, '_html_document_panes', {}).get('qc')
+        if pane is not None:
+            pane.qc_signature = media_signature(self.workspace)
+            pane.set_stale(False)
+
     def _on_open_case_qc(self):
-        if not self.workspace.data_loaded:
-            self._select_workflow_page('review')
+        # Entering Review only displays existing evidence. Full QC requires
+        # its explicit Generate/Refresh button, never navigation or analysis.
+        from .html_view import open_html_document
+        self._select_workflow_page('review')
+        loaded = self.workspace.data_loaded
+        self.btn_generate_quality.setEnabled(bool(loaded))
+        self.qc_empty_label.setText('Click Generate QC to create the report.' if loaded
+                                   else 'Load a case to view its QC report.')
+        if not loaded:
             self.qc_page.setCurrentWidget(self.qc_empty)
             return
-        try:
-            self._save_current_case_html()
-        except Exception as exc:
-            self.log(f'QC VIEW ERROR: {type(exc).__name__}: {exc}')
-            QtWidgets.QMessageBox.warning(self, 'QC report', str(exc))
+        path = Path(self.pipeline._output_dir(self.workspace))/'analysis_report.html'
+        if not path.is_file():
+            self.qc_page.setCurrentWidget(self.qc_empty)
+            return
+        pane = open_html_document(self, path, 'QC', 'qc')
+        if self.workspace.segmentation_preprocess_qc.get('status') == 'not_generated':
+            pane.set_stale(True)
 
     def _on_open_batch_qc(self):
         from .html_view import open_html_document

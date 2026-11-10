@@ -4,6 +4,7 @@ from .measurement_summary import MeasurementSummary
 from .pinned_metrics import pinned_metric_keys, pinned_metric_rows
 from .content_controls import ContentRenderControls
 from .workspace_layout import WorkspaceLayoutMixin
+from .plane_selection import PlaneSelectionMixin
 from ..config import BACKGROUND_COLOR
 import hashlib
 import json
@@ -97,7 +98,7 @@ from ..rendering import (
 )
 from ..rendering.style import plane_display_size
 from .viewer import SceneController
-from .labeler_exchange import export_labeler_exchange
+from .labeler_exchange import export_labeler_exchange, labeler_features
 
 
 # Additional item data roles used by the Browser for non-object path nodes.
@@ -159,6 +160,7 @@ _ANALYSIS_MODE_ITEMS = [
     ("PWV", "pwv"),
     ("Plane Curve", "plane_curve"),
     ("Centerline Pressure", "centerline_pressure"),
+    ("Plane Pressure Difference", "plane_pressure_difference"),
 ]
 
 _BACKGROUND_PHASE_METHOD_ITEMS = [
@@ -470,11 +472,12 @@ class _PipelineTaskWorker(_TaskWorker):
     finished = QtCore.Signal(object)
     failed = QtCore.Signal(str)
 
-    def __init__(self, engine, workspace, steps):
+    def __init__(self, engine, workspace, steps, segmentation_cache=None):
         super().__init__()
         self._engine = engine
         self._workspace = workspace
         self._steps = list(steps)
+        self._segmentation_cache = segmentation_cache
         self.completed_steps = []
 
     @QtCore.Slot()
@@ -531,7 +534,9 @@ class _PipelineTaskWorker(_TaskWorker):
                 StepId.GENERATE_SKELETON, StepId.GENERATE_GRAPH, StepId.GENERATE_PLANES,
                 StepId.COMPUTE_PLANE_METRICS, StepId.COMPUTE_DERIVED_METRICS, StepId.COMPUTE_PWV,
             }
-            if report_steps.intersection(self.completed_steps):
+            if report_steps.intersection(self.completed_steps) and self._workspace._defer_preprocess_qc:
+                report_result = {"status": "deferred", "reason": "Generate QC from Review"}
+            elif report_steps.intersection(self.completed_steps):
                 self.progress.emit({"stage": "report", "current": len(self._steps),
                                     "total": len(self._steps), "message": "Writing single-case analysis HTML..."})
                 report_started = time.perf_counter()
@@ -547,10 +552,13 @@ class _PipelineTaskWorker(_TaskWorker):
                 except Exception as exc:
                     report_result = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
                 report_result["elapsed_sec"] = time.perf_counter() - report_started
+            prepared_scene = SceneController.prepare_segmentation_cache(
+                self._workspace, self._segmentation_cache)
             self.finished.emit({
                 "results": results,
                 "elapsed_sec": float(time.perf_counter() - started),
                 "analysis_report": report_result,
+                "segmentation_cache": prepared_scene,
             })
         except TaskCancelled:
             raise
@@ -628,7 +636,7 @@ class _PathlineTaskWorker(_TaskWorker):
         except Exception:
             self.failed.emit(traceback.format_exc())
 
-class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEditingMixin, ActionSettingsMixin, QtWidgets.QMainWindow):
+class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin, ReviewMixin, PlaneEditingMixin, ActionSettingsMixin, QtWidgets.QMainWindow):
     def __init__(self, config_dir=None):
         super().__init__()
         self.setWindowTitle("AutoFlow")
@@ -640,6 +648,7 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         apply_application_theme(QtWidgets.QApplication.instance(),
                                 self._config_bundle.get("ui", {}).get("theme", "dark"))
         self.workspace = Workspace()
+        self.workspace._defer_preprocess_qc = True
         apply_config_bundle_to_workspace(self.workspace, self._config_bundle)
         self.pipeline = PipelineEngine()
         self.scene = None
@@ -701,6 +710,8 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         self._plane_axis_u = None
         self._plane_axis_v = None
         self._selected_plane_index = -1
+        self._plane_selection_order = []
+        self._plane_pressure_result = None
         self._seg_edit_active = False
         self._seg_edit_history = []
         self._seg_edit_future = []
@@ -1145,7 +1156,7 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
 
         quality_buttons = QtWidgets.QHBoxLayout()
         self.btn_refresh_quality = QtWidgets.QPushButton("Refresh QC")
-        self.btn_refresh_quality.clicked.connect(self._refresh_quality_panel)
+        self.btn_refresh_quality.clicked.connect(lambda: self._generate_case_qc(show=False))
         self.btn_export_quality = QtWidgets.QPushButton("Export QC Report")
         self.btn_export_quality.clicked.connect(self._on_export_quality_report)
         quality_buttons.addWidget(self.btn_refresh_quality)
@@ -1404,7 +1415,7 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         plane_display_row.addWidget(self.spin_plane_size)
         parent.addLayout(plane_display_row)
         self.chk_plane_selected_only = QtWidgets.QCheckBox("Only selected plane")
-        self.chk_plane_selected_only.setToolTip("Select a plane in the Browser to show its outline; other outlines stay hidden")
+        self.chk_plane_selected_only.setToolTip("Show the selected planes; Ctrl-click plane names in the Browser to select more")
         parent.addWidget(self.chk_plane_selected_only)
         self.slider_plane_size.valueChanged.connect(lambda value: self._on_plane_display_size_changed(value / 10.0))
         self.spin_plane_size.valueChanged.connect(self._on_plane_display_size_changed)
@@ -1471,6 +1482,7 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         self.segmentation_panel.edit_active_name.editingFinished.connect(self._on_active_label_name_changed)
         self.segmentation_panel.btn_active_color.clicked.connect(self._on_active_label_color_clicked)
         self.segmentation_panel.btn_external_editor.clicked.connect(self._open_external_segmentation_editor)
+        self._attach_action_settings(self.segmentation_panel.btn_external_editor, "labeler", self._open_external_segmentation_editor)
         self.segmentation_panel.btn_apply_cleanup_4d.clicked.connect(self._on_apply_4d_cleanup)
 
     def _on_apply_4d_cleanup(self):
@@ -1536,6 +1548,7 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         self.combo_centerline_pressure_path.currentIndexChanged.connect(self._on_centerline_pressure_path_changed)
         pressure_row.addWidget(self.combo_centerline_pressure_path, 1)
         self.analysis_controls_stack.addWidget(pressure_controls)
+        self.analysis_controls_stack.addWidget(QtWidgets.QWidget(self))
 
         layout.addWidget(self.analysis_controls_stack)
 
@@ -1906,13 +1919,15 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
             self._plot_plane_curve()
         elif mode == "centerline_pressure":
             self._plot_centerline_pressure()
+        elif mode == "plane_pressure_difference":
+            self._plot_plane_pressure_difference()
         else:
             self._plot_plane_curve()
         plane_index, metric = self._selected_plane_metric()
         keys = pinned_metric_keys(self.workspace)
         rows = pinned_metric_rows(metric, keys) if mode == "plane_curve" or plane_index >= 0 else []
         heading = f"Plane {plane_index} · Cycle summary" if mode != "plane_curve" and plane_index >= 0 else "Cycle summary"
-        self.label_pwv_status.set_pinned_metrics(heading, rows)
+        self.label_pwv_status.set_pinned_metrics(heading, [] if mode == "plane_pressure_difference" else rows)
 
     def _refresh_pwv_plot(self):
         self._refresh_plane_curve_metric_options()
@@ -2335,6 +2350,7 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         self.scene.set_background(background)
         self.scene.initialize()
         self.scene.enable_plane_picking(self._on_3d_plane_picked)
+        self.scene._plane_context_callback = self._on_3d_plane_context
         self.scene.enable_path_picking(self._on_3d_path_picked)
 
     def _segmentation_object_name(self):
@@ -2608,10 +2624,14 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
             self.log(f"Segmentation source unavailable: {source}")
             return False
         candidate = ws.copy_for_task()
+        scene_seed = self.scene.segmentation_cache()
+        prepared_scene = {}
         def prepare(progress, log):
             candidate.activate_segmentation_source(source)
             progress({"stage": "segmentation_update", "message": "Checking segmentation topology…"})
-            return self.pipeline.refresh_segmentation_dependents(candidate)
+            reuse = self.pipeline.refresh_segmentation_dependents(candidate)
+            prepared_scene.update(SceneController.prepare_segmentation_cache(candidate, scene_seed))
+            return reuse
         try:
             reuse = self._run_modal_task("Update Segmentation", "Preparing segmentation…", prepare)
         except TaskCancelled:
@@ -2632,7 +2652,15 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         self._reset_segmentation_edit_history()
         self._ensure_segmentation_label_metadata(ws.segmentation_display_3d())
         self._sync_segmentation_scene_object()
-        self.scene.invalidate_cache()
+        if reuse in {"geometry", "unchanged"}:
+            # The worker compared every processed 3D group mask exactly.
+            # Temporal edits need fresh label frames, not rebuilt/smoothed
+            # centreline context and identical group surfaces on the UI thread.
+            self.scene.invalidate_cache("segmask_raw_surface")
+            self.scene.invalidate_cache("segmask_pre_surface")
+        else:
+            self.scene.invalidate_cache()
+        self.scene.adopt_segmentation_cache(prepared_scene)
         self.scene.sync_from_workspace()
         self._refresh_all()
         self.ortho_viewer.refresh()
@@ -2990,7 +3018,7 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
             "segmentation_shape": [int(v) for v in np.asarray(segmentation).shape],
             "resolution": [float(v) for v in np.asarray(ws.resolution, dtype=float).reshape(3)],
             "origin": [float(v) for v in np.asarray(ws.origin, dtype=float).reshape(3)],
-            "features": ["mag", "flow_x", "flow_y", "flow_z", "pcmra"],
+            "features": labeler_features(ws.input_state.metadata.get("labeler_extra_features", [])),
         }
 
     def _labeler_exchange_directory(self, metadata):
@@ -2999,7 +3027,7 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         source_stem = os.path.splitext(os.path.basename(source_id))[0] or "workspace"
         safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", source_stem).strip("._") or "workspace"
         source_hash = hashlib.sha1(source_id.encode("utf-8")).hexdigest()[:12]
-        return os.path.join(output_dir, "spatiotemporal_labeler", f"{safe_stem}_{source_hash}")
+        return os.path.abspath(os.path.join(output_dir, "spatiotemporal_labeler", f"{safe_stem}_{source_hash}"))
 
     def _open_external_segmentation_editor(self):
         """Prepare a reusable exchange directory, launch Labeler, and re-import on exit."""
@@ -3007,7 +3035,8 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
             self.log("SpatioTemporal Labeler export is already running.")
             return
         ws = self.workspace
-        segmentation = ws.segmentation_display_4d()
+        from .labeler_exchange import labeler_segmentation_grid
+        segmentation, editor_spacing, editor_grid = labeler_segmentation_grid(ws)
         if segmentation is None or ws.mag_raw is None or ws.flow_raw is None:
             self.log("SpatioTemporal Labeler requires magnitude, flow, and an active segmentation.")
             return
@@ -3035,21 +3064,28 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
             if mag.shape[3] != segmentation.shape[3] or flow.shape[3] != segmentation.shape[3] or flow.shape[-1] != 3:
                 raise ValueError("magnitude, flow and segmentation must have matching XYZT dimensions")
             metadata = self._labeler_exchange_metadata(segmentation)
+            metadata["resolution"] = editor_spacing.tolist()
             exchange_dir = self._labeler_exchange_directory(metadata)
             def export(progress, log):
                 from ..algorithms.geometry_grid import field_on_geometry_grid
-                mag_fine = field_on_geometry_grid(mag, ws, segmentation.shape[:3])
-                flow_fine = field_on_geometry_grid(flow, ws, segmentation.shape[:3])
+                if editor_grid == "native":
+                    mag_fine, flow_fine = mag, flow
+                else:
+                    mag_fine = field_on_geometry_grid(mag, ws, segmentation.shape[:3])
+                    flow_fine = field_on_geometry_grid(flow, ws, segmentation.shape[:3])
                 count = 0
+                total = len(metadata["features"]) + 1
                 progress({"stage": "labeler_digest", "message": "Checking image and segmentation files…"})
                 def written(name):
                     nonlocal count
                     count += 1
-                    progress({"stage": "labeler_export", "current": count, "total": 6,
-                              "message": f"Exported {name} ({count}/6)"})
-                result = export_labeler_exchange(exchange_dir, dict(metadata, grid="shared_1mm", image_sampling="temporary_linear_for_editor"), mag_fine, flow_fine, segmentation,
-                                                 ws.segmentation_spacing, ws.origin, written)
-                progress({"stage": "labeler_export", "current": 6, "total": 6,
+                    progress({"stage": "labeler_export", "current": count, "total": total,
+                              "message": f"Exported {name} ({count}/{total})"})
+                result = export_labeler_exchange(exchange_dir,
+                    dict(metadata, grid=editor_grid, image_sampling="native" if editor_grid == "native" else "temporary_linear_for_editor"),
+                    mag_fine, flow_fine, segmentation, editor_spacing, ws.origin,
+                    written, features=metadata["features"])
+                progress({"stage": "labeler_export", "current": total, "total": total,
                           "message": "Labeler features ready"})
                 return result
             exported = self._run_modal_task("Export Labeler Features", "Preparing SpatioTemporal Labeler…", export)
@@ -3102,15 +3138,12 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
             )
         process.setProcessEnvironment(environment)
         # Run the package installed beside AutoFlow, not an arbitrary executable
-        # found on PATH. The checked-out v0.4.7 source is selected above while
+        # found on PATH. The checked-out source is selected above while
         # the optional installed dependency supplies Labeler's runtime packages.
         program = sys.executable
         arguments = ["-m", "spatiotemporal_labeler"]
-        # Labeler activates the most recently loaded image.  Keep magnitude last
-        # so it is the initial editing feature while every image remains 4D.
-        launch_image_paths = [
-            feature_paths[1], feature_paths[2], feature_paths[3], feature_paths[4], feature_paths[0]
-        ]
+        # PC-MRA is last and becomes the initial feature; extras remain selectable.
+        launch_image_paths = feature_paths
         for image_path in launch_image_paths:
             arguments.extend(["--image", image_path])
         arguments.extend(["--mask", label_path])
@@ -3140,7 +3173,7 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
             return
         self._refresh_segmentation_ui()
         self.log(
-            f"Opened SpatioTemporal Labeler v0.4.7 ({'reused' if reuse_exchange else 'exported'} workspace): {exchange_dir}. "
+            f"Opened SpatioTemporal Labeler ({'reused' if reuse_exchange else 'exported'} workspace): {exchange_dir}. "
             "Use Save/Ctrl+S before closing to return the edited segmentation to AutoFlow."
         )
 
@@ -3473,34 +3506,8 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         self._reset_segmentation_edit_history()
         self._refresh_segmentation_preview()
 
-    def _on_3d_plane_picked(self, uid, plane_idx):
-        if self._edit_mode is not None or self._plane_edit_enabled:
-            return
-        if uid is None or plane_idx is None:
-            self.workspace.selected_path_index = -1
-            self._selected_plane_index = -1
-            self._clear_plane_drag_widgets()
-            self.scene.highlight_plane(None)
-            self.scene.highlight_path(None)
-            self.scene.show_forks_for_path(-1)
-            self.ortho_viewer.set_selected_plane(None)
-            self._clear_browser_selection()
-            self._set_plane_info_text("")
-            self._set_path_info_text("")
-            self._refresh_analysis_panel()
-            return
-        self.workspace.selected_path_index = -1
-        self._selected_plane_index = int(plane_idx)
-        self.scene.highlight_path(None)
-        self.scene.show_forks_for_path(-1)
-        self.scene.highlight_plane(uid)
-        self.ortho_viewer.set_selected_plane(int(plane_idx))
-        self._select_browser_item_by_uid(uid)
-        self._clear_plane_drag_widgets()
-        self._set_path_info_text("")
-        self._log_selected_plane_metric(int(plane_idx))
-        self.selection_tabs.setCurrentIndex(0)
-        self._refresh_analysis_panel()
+    def _on_3d_plane_picked(self, uid, plane_idx, additive=False):
+        self._select_view_plane(uid, additive=additive)
 
     def _on_3d_path_picked(self, uid, path_idx):
         if self._edit_mode is not None or self._plane_edit_enabled:
@@ -3919,7 +3926,7 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         return [leaf.data(0, QtCore.Qt.UserRole) for leaf in self._iter_browser_leaf_items(item) if leaf.data(0, QtCore.Qt.UserRole) is not None]
 
     def _plane_widget_distance(self):
-        return max(2.0, plane_display_size(self.workspace) * 0.45)
+        return max(4.0, plane_display_size(self.workspace) * 0.9)
 
     def _refresh_plane_edit_controls(self):
         geometry_editing = self._edit_mode in {"skeleton", "graph"}
@@ -4198,29 +4205,10 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         self._selected_plane_index = int(plane_idx)
         self._plane_drag_index = int(plane_idx)
         self._plane_drag_metrics_dirty = True
-        # A newly generated plane may not have metrics yet. Editing its
-        # contour only changes the saved ROI definition; defer all metric
-        # work until the user explicitly runs the plane-metrics step.
-        metrics = self.workspace.derived.plane_metrics
-        has_selected_metric = (
-            len(metrics) == len(self.workspace.planes)
-            and bool(metrics[int(plane_idx)])
-        )
-        if not has_selected_metric:
-            self._persist_plane_outputs(include_pixelwise=False)
-            self.ortho_viewer._selected_plane_idx = int(plane_idx)
-            self.ortho_viewer.refresh_plane_contours()
-            self._plane_drag_metrics_dirty = False
-            self.log(f"Plane {int(plane_idx)} contour saved; metric calculation deferred")
-            return
-        # Recalculate this plane's time series when later frames may depend
-        # on the edited contour. Fully observed contours keep the fast path.
-        metric = metrics[int(plane_idx)]
-        frame = int(self.workspace.current_t)
-        # A new/deleted observation can alter both neighboring gaps, including
-        # the cycle boundary, even if the previous result was fully observed.
+        self._persist_plane_outputs(include_pixelwise=False)
+        self.ortho_viewer._selected_plane_idx = int(plane_idx)
+        self.ortho_viewer.refresh_plane_contours()
         self._recompute_dragged_plane_metrics(persist=True, frame_only=False)
-        self.log(f"Plane {int(plane_idx)} metric ROI updated")
 
     def _legacy_activate_plane_drag_widgets(self, plane_idx):
         if self._edit_mode is not None or not (0 <= int(plane_idx) < len(self.workspace.planes)):
@@ -4834,7 +4822,9 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         self.console.append(str(text))
 
     def _create_progress_dialog(self, title, label_text):
-        self._on_pause()
+        if (self._play_timer.isActive() or self.ortho_viewer._playback_active
+                or getattr(self.scene, "_playback_active", False)):
+            self._on_pause()
         self._timeline_scrub_timer.stop()
         self._pending_timeline_value = None
         self._seg_surface_rebuild_timer.stop()
@@ -5391,7 +5381,7 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         self._refresh_browser_opacity_control()
         self._refresh_render_range_control()
         items = self.tree_objects.selectedItems()
-        item = items[0] if items else None
+        item = self._sync_plane_selection_order()
         uid = item.data(0, QtCore.Qt.UserRole) if item is not None else None
         node_type = item.data(0, _BROWSER_NODE_ROLE) if item is not None else None
         if self.selection_tabs.currentIndex() != 2:
@@ -5516,6 +5506,10 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         if not item.isSelected():
             self.tree_objects.setCurrentItem(item)
         uid = item.data(0, QtCore.Qt.UserRole)
+        obj = self.workspace.scene_objects.get(uid)
+        if obj is not None and obj.kind == ObjectKind.PLANE:
+            self._show_plane_context_menu(uid, self.tree_objects.viewport().mapToGlobal(pos))
+            return
         menu = QtWidgets.QMenu(self)
         if uid is None:
             node_type = item.data(0, _BROWSER_NODE_ROLE)
@@ -5556,15 +5550,8 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
             act_reset_window_level = None
             act_del = menu.addAction("Delete")
             obj = self.workspace.scene_objects.get(uid)
-            act_plane_sl = None
-            act_selected_sl = None
             act_pathline_color = None
             pathline_idx = _parse_pathline_index(obj.data_key) if obj else None
-            if obj and obj.kind == ObjectKind.PLANE:
-                act_plane_sl = menu.addAction("Generate Pathlines for This Plane")
-                selected_plane_indices = self._selected_plane_indices()
-                if len(selected_plane_indices) > 1:
-                    act_selected_sl = menu.addAction(f"Generate Pathlines for Selected Planes ({len(selected_plane_indices)})")
             if obj and str(getattr(obj, "data_key", "")) == "pcmra_volume":
                 act_reset_window_level = menu.addAction("Reset PC-MRA Window/Level")
             if pathline_idx is not None:
@@ -5595,16 +5582,6 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
                 self.scene.reset_volume_window_level()
             elif action == act_del:
                 self._on_delete_object()
-            elif act_plane_sl is not None and action == act_plane_sl:
-                pidx = _parse_plane_index(obj.data_key)
-                if pidx is not None:
-                    self._trigger_pathlines(plane_indices=[pidx], selected_plane_idx=pidx)
-            elif act_selected_sl is not None and action == act_selected_sl:
-                selected_plane_indices = self._selected_plane_indices()
-                self._trigger_pathlines(
-                    plane_indices=selected_plane_indices,
-                    selected_plane_idx=selected_plane_indices[0] if selected_plane_indices else None,
-                )
             elif act_pathline_color is not None and action == act_pathline_color and pathline_idx is not None:
                 self._choose_pathline_color(pathline_idx)
 
@@ -6098,6 +6075,7 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
             resolved = resolve_input_case(case)
             previous = self.workspace
             pending = Workspace()
+            pending._defer_preprocess_qc = True
             apply_config_bundle_to_workspace(pending, self._config_bundle)
             # Carry processing settings, but retain source metadata and review
             # arrays in the previous case until the load succeeds.
@@ -6114,9 +6092,11 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
             if configured_out:
                 pending.paths.output_dir = os.path.join(configured_out, resolved.output_name or Path(resolved.input_path).stem)
 
+            prepared_scene = {}
             def load(progress, log):
                 self.pipeline.load_data(pending, log, input_source=resolved, progress_callback=progress,
                                         reuse_existing_corr=True, parameter_overrides=parameter_overrides)
+                prepared_scene.update(SceneController.prepare_segmentation_cache(pending))
                 return pending
 
             self._run_modal_task("Load Input", f"Loading {resolved.display_name or resolved.input_path}…", load)
@@ -6137,6 +6117,7 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
             self.ortho_viewer.update_slider_ranges()
             self.scene.reset_display_reference()
             self.scene.reset_scene()
+            self.scene.adopt_segmentation_cache(prepared_scene)
             self._refresh_all()
             self.log(f"Loaded input: {resolved.display_name or resolved.input_path}. Saved corr applied when available; Background Correction recomputes from source.")
             self._input_signature = self._current_input_signature()
@@ -6636,14 +6617,14 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         self._refresh_all()
         self.log("Workspace cleared")
 
-    def _pipeline_running_guard(self, action_text):
+    def _pipeline_running_guard(self, action_text, *, allow_plane_drafts=False):
         if getattr(self, "_scene_export_running", False):
             self.log("Current-view video export is running; cancel or wait before " + action_text + ".")
             return True
-        if getattr(self.ortho_viewer, "_roi_transaction", None) is not None:
+        if not allow_plane_drafts and getattr(self.ortho_viewer, "_roi_transaction", None) is not None:
             self.log("Apply or cancel the ROI draft before " + action_text + ".")
             return True
-        if self._plane_edit_session is not None and action_text not in {"editing a plane", "adding a plane"}:
+        if not allow_plane_drafts and self._plane_edit_session is not None and action_text not in {"editing a plane", "adding a plane"}:
             self.log("Apply or cancel the plane draft before " + action_text + ".")
             return True
         if self._plane_jobs.is_running and action_text not in {"editing a plane", "adding a plane"}:
@@ -6663,7 +6644,6 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         steps = list(steps)
         if not steps:
             return False
-        self._on_pause()
         self._pipeline_task_label = str(task_label)
         self._pipeline_task_steps = list(steps)
         self._pipeline_progress_dialog = self._create_progress_dialog(
@@ -6673,7 +6653,8 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         self._pipeline_progress_dialog.setRange(0, len(steps))
         self._pipeline_progress_dialog.setValue(0)
         self._pipeline_thread = QtCore.QThread(self)
-        self._pipeline_worker = _PipelineTaskWorker(self.pipeline, self.workspace, steps)
+        self._pipeline_worker = _PipelineTaskWorker(
+            self.pipeline, self.workspace, steps, self.scene.segmentation_cache())
         self._bind_task_progress(self._pipeline_progress_dialog, self._pipeline_worker)
         self._pipeline_worker.moveToThread(self._pipeline_thread)
         self._pipeline_thread.started.connect(self._pipeline_worker.run)
@@ -6702,7 +6683,7 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
                 f"{data.get('result_message', '')}"
             )
 
-    def _finish_pipeline_scene_refresh(self, steps):
+    def _finish_pipeline_scene_refresh(self, steps, *, segmentation_cache=None):
         if self._pipeline_progress_dialog is not None and self._pipeline_progress_dialog.isVisible():
             self._pipeline_progress_dialog.setLabelText("Refreshing views...")
         steps = set(steps or [])
@@ -6742,6 +6723,8 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
             self.ortho_viewer.set_selected_plane(None)
         for prefix in rebuild_prefixes:
             self.scene.invalidate_cache(prefix)
+        if segmentation_cache is not None:
+            self.scene.adopt_segmentation_cache(segmentation_cache)
         self._sync_segmentation_scene_object()
         self.scene.sync_from_workspace(rebuild_prefixes=rebuild_prefixes)
         self._refresh_browser()
@@ -6773,7 +6756,8 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
         data = dict(payload or {})
         try:
             completed_steps = [item[0] for item in data.get("results", []) if item]
-            self._finish_pipeline_scene_refresh(completed_steps)
+            self._finish_pipeline_scene_refresh(completed_steps,
+                segmentation_cache=data.get("segmentation_cache"))
             elapsed = float(data.get("elapsed_sec", 0.0))
             self.log(f"[{self._pipeline_task_label}] Completed in {elapsed:.2f}s")
             report = data.get("analysis_report") or {}
@@ -6839,7 +6823,8 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
             return
         if self._pathline_running_guard("running pipeline steps"):
             return
-        if self._pipeline_running_guard("running another pipeline step"):
+        if self._pipeline_running_guard("running another pipeline step",
+                                        allow_plane_drafts=step == StepId.COMPUTE_PLANE_METRICS):
             return
         if not self.workspace.data_loaded:
             self.log("No data loaded. Use File > Load H5 or File > Load DICOM.")
@@ -6863,6 +6848,8 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
             if step == StepId.COMPUTE_PWV:
                 self.workspace.pwv_params.enabled = True
                 self._show_measurements("pwv")
+            if step == StepId.COMPUTE_PLANE_METRICS and not self._commit_plane_edits_for_metrics():
+                return
             self._clear_plane_drag_widgets()
             if step == StepId.EDIT_SKELETON:
                 self._start_skeleton_interactive_edit()
@@ -6903,7 +6890,8 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
             return
         if self._pathline_running_guard("running the full pipeline"):
             return
-        if self._pipeline_running_guard("running the full pipeline"):
+        if self._pipeline_running_guard("running the full pipeline",
+                                        allow_plane_drafts=self._workflow_stage_key() == "hemodynamics"):
             return
         if not self.workspace.data_loaded:
             self.log("No data loaded. Use File > Load H5 or File > Load DICOM.")
@@ -6912,8 +6900,10 @@ class MainWindow(GeometryEditingMixin, WorkspaceLayoutMixin, ReportActionsMixin,
             self.log("Finish current interactive edit first.")
             return
         self._sync_params_to_ws()
-        self._clear_plane_drag_widgets()
         stage_key = self._workflow_stage_key()
+        if stage_key == "hemodynamics" and not self._commit_plane_edits_for_metrics():
+            return
+        self._clear_plane_drag_widgets()
         if stage_key != "correction" and self.workspace.needs_dual_venc_reconstruction():
             self.log("Run Dual-VENC Reconstruction before analysis.")
             return

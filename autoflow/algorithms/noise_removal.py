@@ -15,10 +15,12 @@ import numpy as np
 COHERENCE_RAMPS = {"medium": (0.55, 0.92), "strong": (0.70, 0.98)}
 
 
-def pcmra_coherence_weight(mag, flow, *, strength="strong"):
+def pcmra_coherence_weight(mag, flow, *, strength="strong", backend="auto"):
     """Return a static XYZ display weight, leaving all input buffers intact."""
-    from scipy.ndimage import uniform_filter, gaussian_filter
-    from ..task_control import check_cancelled, report_progress
+    from scipy.ndimage import gaussian_filter
+    from ..task_control import check_cancelled, TaskCancelled
+    if backend not in {"auto", "cpu", "cuda"}:
+        raise ValueError("Coherence backend must be auto, cpu or cuda")
     strength = str(strength).strip().lower()
     if strength not in COHERENCE_RAMPS:
         raise ValueError("coherence strength must be medium or strong")
@@ -30,6 +32,38 @@ def pcmra_coherence_weight(mag, flow, *, strength="strong"):
         magnitude = magnitude[..., None]
     if magnitude.ndim != 4 or magnitude.shape[:3] != velocity.shape[:3] or magnitude.shape[3] not in (1, velocity.shape[3]):
         raise ValueError("mag must match flow spatial dimensions and have 1 or T frames")
+    check_cancelled()
+    score = None
+    used_backend = "cpu"
+    if backend == "cuda" or (backend == "auto" and velocity.size >= 262_144):
+        try:
+            from .flow_cuda import coherence_score_cuda
+            score = coherence_score_cuda(magnitude, velocity)
+            used_backend = "cuda"
+        except TaskCancelled:
+            raise
+        except Exception:
+            if backend == "cuda":
+                raise
+    if score is None:
+        score = _coherence_score_cpu(magnitude, velocity)
+    check_cancelled()
+    score = gaussian_filter(score, sigma=0.6, mode="reflect")
+    low, high = COHERENCE_RAMPS[strength]
+    ramp = np.clip((score - low) / (high - low), 0, 1)
+    weight = np.asarray(ramp * ramp * (3 - 2 * ramp), dtype=np.float32)
+    return weight, {"coherence_enabled": True, "coherence_strength": strength,
+                    "coherence_ramp": [low, high], "coherence_spatial_window_voxels": 3,
+                    "coherence_temporal_window_phases": 3, "coherence_temporal_percentile": 90,
+                    "coherence_smoothing_sigma_voxels": 0.6, "coherence_time_boundary": "cyclic",
+                    "coherence_mean_display_weight": float(np.mean(weight)),
+                    "coherence_backend": used_backend,
+                    "coherence_scope": "pcmra_rendering_only"}
+
+
+def _coherence_score_cpu(magnitude, velocity):
+    from scipy.ndimage import uniform_filter
+    from ..task_control import check_cancelled, report_progress
     # Sanitizing uses private arrays: readonly acquired arrays are valid inputs.
     v = np.nan_to_num(velocity, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
     m = np.maximum(np.nan_to_num(magnitude, nan=0.0, posinf=0.0, neginf=0.0), 0).astype(np.float32, copy=False)
@@ -46,17 +80,7 @@ def pcmra_coherence_weight(mag, flow, *, strength="strong"):
     score = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator > 1e-12)
     np.clip(score, 0, 1, out=score)
     check_cancelled()
-    score = np.percentile(score, 90, axis=3, overwrite_input=True).astype(np.float32)
-    score = gaussian_filter(score, sigma=0.6, mode="reflect")
-    low, high = COHERENCE_RAMPS[strength]
-    ramp = np.clip((score - low) / (high - low), 0, 1)
-    weight = np.asarray(ramp * ramp * (3 - 2 * ramp), dtype=np.float32)
-    return weight, {"coherence_enabled": True, "coherence_strength": strength,
-                    "coherence_ramp": [low, high], "coherence_spatial_window_voxels": 3,
-                    "coherence_temporal_window_phases": 3, "coherence_temporal_percentile": 90,
-                    "coherence_smoothing_sigma_voxels": 0.6, "coherence_time_boundary": "cyclic",
-                    "coherence_mean_display_weight": float(np.mean(weight)),
-                    "coherence_scope": "pcmra_rendering_only"}
+    return np.percentile(score, 90, axis=3, overwrite_input=True).astype(np.float32)
 
 
 def pcmra_display_frame(pcmra, phase=0, *, mask=None, weight=None):

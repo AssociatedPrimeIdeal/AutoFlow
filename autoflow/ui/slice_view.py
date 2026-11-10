@@ -203,6 +203,8 @@ class SliceViewBox(pg.ViewBox):
         self._translating_plane = False
         self._rotating_plane = False
         self._rotation_angle = 0.0
+        self._plane_drag_cancelled = False
+        self.rotation_hit_test = lambda position: False
         self.spacing = (1.0, 1.0)
         self._image_shape = (0, 0)
         self._sample_origin = (0.0, 0.0)
@@ -270,15 +272,21 @@ class SliceViewBox(pg.ViewBox):
         event.ignore()
 
     def _rotation_hit(self, scene_position):
-        point = self.mapSceneToView(scene_position)
-        center = self.mapViewToScene(QtCore.QPointF(0, 0))
-        horizontal = self.mapViewToScene(QtCore.QPointF(point.x(), 0))
-        vertical = self.mapViewToScene(QtCore.QPointF(0, point.y()))
-        radius = np.hypot(scene_position.x()-center.x(), scene_position.y()-center.y())
-        return radius > 18 and min(abs(scene_position.y()-horizontal.y()),
-                                  abs(scene_position.x()-vertical.x())) <= 10
+        return self.rotation_hit_test(scene_position)
+
+    def cancel_plane_gesture(self):
+        self._plane_drag_cancelled = self._rotating_plane or self._translating_plane
+        self._rotating_plane = self._translating_plane = False
 
     def mouseDragEvent(self, event, axis=None):
+        if self._plane_drag_cancelled:
+            if event.isStart():
+                self._plane_drag_cancelled = False
+            else:
+                if event.isFinish():
+                    self._plane_drag_cancelled = False
+                event.accept()
+                return
         if (self._translating_plane or (self.plane_translation_enabled and not self.contour_editable
                 and not self.editable and event.button() == QtCore.Qt.MouseButton.LeftButton
                 and not event.modifiers())):
@@ -513,15 +521,8 @@ class SliceView(QtWidgets.QFrame):
         self.plane_center_item.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
         self.plane_center_item.hide()
         self.view_box.addItem(self.plane_center_item, ignoreBounds=True)
-        self.rotation_axes = []
-        for angle in (0, 90):
-            line = pg.InfiniteLine(pos=(0, 0), angle=angle, movable=False,
-                                   pen=pg.mkPen("#ffb347", width=2))
-            line.setZValue(38)
-            line.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
-            line.hide()
-            self.view_box.addItem(line, ignoreBounds=True)
-            self.rotation_axes.append(line)
+        from .plane_slice_controls import PlaneSliceControls
+        self.plane_controls = PlaneSliceControls(self)
 
         self.brush_item = QtWidgets.QGraphicsEllipseItem()
         self.brush_item.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
@@ -595,25 +596,21 @@ class SliceView(QtWidgets.QFrame):
         self.plane_center_item.setData([horizontal], [vertical])
         self.vertical_line.setPos(horizontal)
         self.horizontal_line.setPos(vertical)
-        for line in self.rotation_axes:
-            line.setPos((horizontal, vertical))
+        self.plane_controls.set_center(horizontal, vertical)
 
     def set_plane_rotation(self, enabled, angle=0.0):
-        state = (bool(enabled), float(angle), self.view_box.plane_translation_enabled)
-        if getattr(self, "_plane_rotation_state", None) == state:
-            return
-        self._plane_rotation_state = state
         self.view_box.plane_rotation_enabled = bool(enabled)
-        for offset, line in zip((0, 90), self.rotation_axes):
-            line.setAngle(float(angle)+offset)
-            line.setVisible(bool(enabled))
-        if not enabled:
+        self.plane_controls.set_geometry(enabled, angle)
+        if enabled:
+            self.vertical_line.hide()
+            self.horizontal_line.hide()
+        else:
             self.view_box._rotating_plane = False
         if self.view_box.plane_translation_enabled:
-            hint = "Drag the cyan center to move the plane. "
+            hint = "Drag the cyan center to move. "
             if enabled:
-                hint += "Drag an orange axis away from the center to rotate. "
-            self.plot.setToolTip(hint+"Shift+drag pans; right-drag zooms.")
+                hint += "Drag either orange endpoint to rotate around the center. "
+            self.plot.setToolTip(hint + "Shift+drag pans; right-drag zooms.")
         else:
             self.plot.setToolTip("")
 

@@ -109,3 +109,32 @@ def _dual_alias_shift_unique_values(alias_corr, lv_triplet):
             if np.any(rounded == candidate):
                 values.add(candidate)
     return sorted(values)
+
+
+
+def _reconstruct_dual_venc(low, high, venc, ratio1, ratio2, *, backend="auto"):
+    """Reconstruct canonical XYZT3 velocity with an exact optional CUDA path."""
+    from ...task_control import check_cancelled, TaskCancelled
+    if backend not in {"auto", "cpu", "cuda"}:
+        raise ValueError("Dual-VENC backend must be auto, cpu or cuda")
+    low, high = np.asarray(low, np.float32), np.asarray(high, np.float32)
+    if low.shape != high.shape or low.ndim != 5 or low.shape[-1] != 3:
+        raise ValueError("LV/HV velocity must have matching XYZT3 dimensions")
+    venc, ratio1, ratio2 = (np.asarray(value, np.float32).reshape(3)
+                            for value in (venc, ratio1, ratio2))
+    check_cancelled()
+    if backend == "cuda" or (backend == "auto" and low.size >= 262_144):
+        try:
+            from ..flow_cuda import reconstruct_dual_venc_cuda
+            result, shifts = reconstruct_dual_venc_cuda(low, high, venc, ratio1, ratio2)
+            check_cancelled()
+            return result, _dual_alias_shift_unique_values(shifts, venc), "cuda"
+        except TaskCancelled:
+            raise
+        except Exception:
+            if backend == "cuda":
+                raise
+    result, shifts = _dual_venc_correct_alias(
+        low.transpose(4, 3, 2, 1, 0), high.transpose(4, 3, 2, 1, 0), venc, ratio1, ratio2)
+    check_cancelled()
+    return result.transpose(4, 3, 2, 1, 0), _dual_alias_shift_unique_values(shifts, venc), "cpu"

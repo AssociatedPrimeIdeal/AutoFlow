@@ -73,6 +73,8 @@ class SceneLayersMixin:
         for obj in self.workspace.scene_objects.values():
             self._place_selected_object(obj)
         self._place_selected_highlights()
+        self._refresh_secondary_plane_highlights()
+        self._refresh_plane_visibility()
         self._sync_content_widgets()
         if render:
             self.plotter.render()

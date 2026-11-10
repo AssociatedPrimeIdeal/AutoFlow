@@ -2,6 +2,7 @@
 
 from collections import OrderedDict
 import copy
+import numpy as np
 
 from PySide6 import QtCore
 
@@ -17,21 +18,26 @@ def calculate_plane(payload):
     data = payload["data"]
     context = PlaneSamplingContext(data["mask"], data["spacing"], data["origin"], [plane],
         branch_labels_3d=data["branches"], segmentation_labels_3d=data["labels3"],
-        segmentation_labels_4d=data["labels4"])
+        segmentation_labels_4d=data["labels4"], voxel_centered=True)
     try:
         metrics = compute_plane_metrics(data["flow"], data["mask"], data["spacing"], data["origin"],
             [plane], RR=data["rr"], branch_labels_3d=data["branches"],
             segmentation_labels_3d=data["labels3"], segmentation_labels_4d=data["labels4"],
             path_info=data["path_info"], forks=data["forks"], paths=data["paths"],
-            sampling_context=context)
+            sampling_context=context, flow_spacing=data["spacing"])
         if any(data.get(key) is not None for key in ("tke", "pg", "pressure")) or data.get("wss"):
             metrics, _ = augment_plane_metrics_with_derived(metrics, [plane], data["mask"],
                 data["spacing"], data["origin"], branch_labels_3d=data["branches"],
                 segmentation_labels_3d=data["labels3"], segmentation_labels_4d=data["labels4"],
                 tke_array=data["tke"], pressure_gradient_array=data["pg"],
                 relative_pressure_array=data["pressure"], wss_surfaces=data["wss"],
-                pressure_gradient_support_mask=data.get("pressure_support"), sampling_context=context)
-        return {"request": payload, "metric": metrics[0] if metrics else {}}
+                pressure_gradient_support_mask=data.get("pressure_support"), sampling_context=context, field_spacing=data["spacing"])
+        from ..algorithms.geometry_grid import QUANTITATIVE_POLICY
+        metric = dict(metrics[0]) if metrics else {}
+        if metric:
+            metric.update(roi_geometry_source=data["source"],
+                roi_spacing_mm=np.asarray(data["spacing"]).tolist(), roi_geometry_policy=QUANTITATIVE_POLICY)
+        return {"request": payload, "metric": metric}
     finally:
         context.close()
 

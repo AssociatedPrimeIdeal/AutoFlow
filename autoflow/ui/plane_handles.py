@@ -21,7 +21,7 @@ class PlaneDragHandles:
         for callback in callbacks:
             color, text = "cyan", "Move"
             rep = vtkSphereHandleRepresentation()
-            rep.SetHandleSize(18)
+            rep.SetHandleSize(8)
             rep.SetTolerance(12)
             rep.SetRenderer(self.renderer)
             rep.GetProperty().SetColor(pv.Color(color).float_rgb)
@@ -71,7 +71,7 @@ class PlaneDragHandles:
             self.renderer.AddActor(label)
             self.axis_labels.append(label)
         self.help = vtkTextActor()
-        self.help.SetInput("Drag a cyan center to move\nRotate in the lower 2D views\nApply Plane to save | Esc to cancel")
+        self.help.SetInput("Drag a cyan center to move\nDrag orange endpoints in the lower 2D views to rotate\nApply Plane to save | Esc to cancel")
         self.help.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
         self.help.SetPosition(0.02, 0.97)
         prop = self.help.GetTextProperty()

@@ -77,7 +77,7 @@ class StepId(Enum):
             StepId.GENERATE_STREAMLINES: "Generate Streamlines",
             StepId.PLANE_STREAMLINES: "Pathlines",
             StepId.COMPUTE_PLANE_METRICS: "Calculate && Save Metrics",
-            StepId.COMPUTE_DERIVED_METRICS: "WSS / TKE / Pressure / Vortex",
+            StepId.COMPUTE_DERIVED_METRICS: "Advanced Metrics",
         }[self]
 
     @staticmethod
@@ -672,6 +672,7 @@ class StreamlineParams:
 
 @dataclass
 class DerivedMetricsParams:
+    selected_families: List[str] = field(default_factory=lambda: ["wss", "tke", "pressure", "vortex"])
     wss_smoothing_iteration: int = 200
     wss_viscosity: float = 4.0
     wss_inward_distance: Optional[float] = None
@@ -694,6 +695,7 @@ class DerivedMetricsParams:
 
     def to_dict(self):
         return {
+            "selected_families": list(self.selected_families),
             "wss_smoothing_iteration": self.wss_smoothing_iteration,
             "wss_viscosity": self.wss_viscosity,
             "wss_inward_distance": self.wss_inward_distance,
@@ -718,6 +720,9 @@ class DerivedMetricsParams:
     @staticmethod
     def from_dict(d):
         payload = dict(d or {})
+        selected = payload.get("selected_families", ["wss", "tke", "pressure", "vortex"])
+        if not isinstance(selected, (list, tuple)) or any(key not in {"wss", "tke", "pressure", "vortex"} for key in selected):
+            raise ValueError("selected_families must list wss, tke, pressure and/or vortex")
         inward_distance = payload.get("wss_inward_distance", payload.get("inward_distance", None))
         if isinstance(inward_distance, str):
             token = inward_distance.strip().lower()
@@ -734,6 +739,7 @@ class DerivedMetricsParams:
         else:
             pressure_method = "ppe"
         return DerivedMetricsParams(
+            selected_families=list(dict.fromkeys(selected)),
             wss_smoothing_iteration=int(payload.get("wss_smoothing_iteration", payload.get("smoothing_iteration", 200))),
             wss_viscosity=float(payload.get("wss_viscosity", legacy_viscosity)),
             wss_inward_distance=inward_distance,
@@ -1392,6 +1398,9 @@ class Workspace:
     segmentation_geometry: Dict[str, Any] = field(default_factory=dict)
     geometry_branch_labels: Optional[np.ndarray] = None
     segmentation_preprocess_qc: Dict[str, Any] = field(default_factory=dict)
+    # GUI-only scheduling policy; transient evidence retains existing read-only arrays.
+    _defer_preprocess_qc: bool = field(default=False, repr=False)
+    _preprocess_qc_inputs: Optional[Dict[str, Any]] = field(default=None, repr=False)
     group_order: List[str] = field(default_factory=list)
     multilabel_groups: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # Optional runtime topology overlay. It overlaps source labels and is
@@ -1671,6 +1680,7 @@ class Workspace:
                      'segmentation_analysis_binary', 'segmentation_analysis_mask', 'geometry_branch_labels'):
             setattr(self, name, None)
         self.segmentation_preprocess_qc = {}
+        self._preprocess_qc_inputs = None
         for attr in [
             "segmask_labels",
             "segmask_labels_3d",
@@ -1745,6 +1755,7 @@ class Workspace:
             setattr(self, attr, default)
         self.resolution = np.array([1., 1., 1.])
         self.segmentation_preprocess_qc = {}
+        self._preprocess_qc_inputs = None
         self.segmentation_geometry = {}
         self._segmentation_geometry_cache = None
         self._segmentation_preview_grid_cache = None
@@ -1984,6 +1995,7 @@ class Workspace:
         self.segmask_3d = None if d.get("segmask_3d") is None else np.asarray(d["segmask_3d"], dtype=bool)
         self.segmask_labels_3d = nparr("segmask_labels_3d", np.int16)
         self.segmentation_preprocess_qc = copy.deepcopy(d.get("segmentation_preprocess_qc", {}))
+        self._preprocess_qc_inputs = None
         self.group_order = [str(x) for x in d.get("group_order", [])]
         self.multilabel_groups = {}
         for group_name, state in dict(d.get("multilabel_groups", {})).items():

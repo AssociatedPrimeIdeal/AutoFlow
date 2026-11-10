@@ -94,4 +94,8 @@ jobs:
   windows-portable:
     name: Build Windows portable application
     needs: test
+    permissions:
+      contents: write
     uses: ./.github/workflows/windows-portable.yml
+    with:
+      publish: ${{ github.event_name == 'push' }}

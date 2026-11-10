@@ -91,6 +91,10 @@ def _action_sections(action, ws):
     d = "derived_params."
     u = "phase_unwrap_params."
     w = "pwv_params."
+    if action == "labeler":
+        return [("Images", [Field("input_state.metadata.labeler_extra_features", "Additional images", "checklist",
+            choices=(("Magnitude", "mag"), ("Flow X", "flow_x"), ("Flow Y", "flow_y"), ("Flow Z", "flow_z")),
+            default=[], help="PC-MRA and the current segmentation are always included. Check extra images to cache and open. Unchecked image caches are removed after a successful export; saved masks are retained.")])]
     if action == "measurements":
         field = number("render_settings.measurements.flowrate_spline_order", "Flowrate spline order", 1, 3, integer=True)
         field.default = 3
@@ -224,6 +228,10 @@ def _action_sections(action, ws):
         return [("Plane metrics", [flag(d + "use_multithread", "Parallel plane metrics")])] + _action_sections("measurements", ws)
     if action == StepId.COMPUTE_DERIVED_METRICS:
         return [
+            ("Metrics", [Field(d + "selected_families", "Calculate", "checklist",
+                choices=(("WSS", "wss"), ("TKE", "tke"),
+                         ("Pressure gradient + relative pressure", "pressure"), ("Vortex", "vortex")),
+                help="Calculate only checked families. Existing cached fields are retained. TKE is skipped when source data are unavailable.")]),
             ("Fluid", [number(d + "viscosity", "Viscosity (mPa·s)"), number(d + "rho", "Density (kg/m³)", 1)]),
             ("WSS", [number(d + "smoothing_iteration", "Surface smoothing iterations", 0, 100000, integer=True),
                      Field(d + "inward_distance", "Inward distance (mm or auto)", "optional_positive"),
@@ -1130,7 +1138,7 @@ class ActionSettingsMixin:
             defaults.spatial_order = self.workspace.spatial_order
             defaults.venc_order = self.workspace.venc_order
         title = action.label.replace("&&", "&") if isinstance(action, StepId) else {
-            "input": "Reload input", "segmentation": "Automatic segmentation", "render": "3D colorbar layout", "measurements": "Measurements",
+            "input": "Reload input", "segmentation": "Automatic segmentation", "render": "3D colorbar layout", "measurements": "Measurements", "labeler": "Labeler images",
         }.get(action if isinstance(action, str) else "", "Run all")
         auxiliary = (("Reset noise mask", "reset_noise"),) if action == StepId.REMOVE_NOISE else (
             (("Revert unwrapping", "revert_unwrap"),) if action == StepId.UNWRAP_PHASE else ())
@@ -1149,7 +1157,7 @@ class ActionSettingsMixin:
             values = dialog.values()
             changed_keys = {key for key, value in values.items() if value != dialog._initial[key]}
             changed = bool(changed_keys)
-            computation_changed = any(not (_flow_display_setting(key) or key.startswith("render_settings.measurements.")) for key in changed_keys)
+            computation_changed = action != "labeler" and any(not (_flow_display_setting(key) or key.startswith("render_settings.measurements.")) for key in changed_keys)
             self._publish_action_settings(values)
             if "phase_unwrap_params.method" in values:
                 method = values["phase_unwrap_params.method"]

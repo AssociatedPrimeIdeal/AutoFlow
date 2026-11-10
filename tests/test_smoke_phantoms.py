@@ -5150,7 +5150,7 @@ def test_nnunet4d_auto_profile_uses_best_checkpoint_and_keeps_frames(monkeypatch
     assert provenance["checkpoint"] == "checkpoint_best.pth"
 
 
-def test_labeler_exchange_preserves_edits_and_refreshes_changed_seed(tmp_path):
+def test_labeler_exchange_preserves_edits_and_refreshes_changed_seed(tmp_path, monkeypatch):
     from autoflow.algorithms.segmentation import load_segmentation_file, save_segmentation_file
     from autoflow.ui.labeler_exchange import export_labeler_exchange
 
@@ -5159,8 +5159,16 @@ def test_labeler_exchange_preserves_edits_and_refreshes_changed_seed(tmp_path):
     seed = np.ones(mag.shape, dtype=np.int16)
     metadata = {"source_id": "phantom", "resolution": [1.0, 2.0, 3.0]}
     spacing, origin = (1.0, 2.0, 3.0), (4.0, 5.0, 6.0)
-    first = export_labeler_exchange(tmp_path, metadata, mag, flow, seed, spacing, origin)
-    assert first["written_files"] == 6
+    monkeypatch.chdir(tmp_path.parent)
+    first = export_labeler_exchange(Path(tmp_path.name), metadata, mag, flow, seed, spacing, origin)
+    assert first["written_files"] == 2
+    assert Path(first["feature_paths"][0]).name == "pcmra.seq.nrrd"
+    assert all(Path(path).is_absolute() and Path(path).is_file()
+               for path in first["feature_paths"] + [first["label_path"]])
+    # Labeler starts in the exchange directory; absolute launch paths must
+    # still resolve there without duplicating the relative results prefix.
+    monkeypatch.chdir(tmp_path)
+    assert all(Path(path).is_file() for path in first["feature_paths"])
     feature_stats = [Path(path).stat().st_mtime_ns for path in first["feature_paths"]]
     edited = seed.copy()
     edited[0, 0, 0, 0] = 2
@@ -5185,12 +5193,12 @@ def test_labeler_exchange_preserves_edits_and_refreshes_changed_seed(tmp_path):
     changed_mag = mag.copy()
     changed_mag[0, 0, 0, 0] += 1
     changed = export_labeler_exchange(tmp_path, metadata, changed_mag, flow, next_seed, spacing, origin)
-    assert changed["written_files"] == 5
+    assert changed["written_files"] == 1
     # Older manifests cannot identify their seed: preserve edited work before migration.
     manifest = tmp_path / "exchange.json"
     legacy_metadata = json.loads(manifest.read_text(encoding="utf-8"))
     legacy_metadata["schema_version"] = 2
-    legacy_metadata.pop("image_digest")
+    legacy_metadata.pop("image_digests")
     legacy_metadata.pop("seed_digest")
     manifest.write_text(json.dumps(legacy_metadata), encoding="utf-8")
     legacy_edit = next_seed.copy()
@@ -5199,7 +5207,7 @@ def test_labeler_exchange_preserves_edits_and_refreshes_changed_seed(tmp_path):
     migrated = export_labeler_exchange(tmp_path, metadata, changed_mag, flow, next_seed, spacing, origin)
     previous, _ = load_segmentation_file(migrated["previous_label_path"], spatial_shape=seed.shape[:3], time_count=2)
     assert np.array_equal(previous, legacy_edit)
-    assert migrated["written_files"] == 6
+    assert migrated["written_files"] == 2
 
 
 def test_nnunet_runtime_keeps_cpu_and_allocation_failure_fallbacks():
@@ -7810,7 +7818,7 @@ _qt_smoke_application = None
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Linux SSH renderer; native Windows GUI is verified by portable_check.py --gui")
 @pytest.mark.parametrize("mirrored", [False, True])
-def test_manual_plane_phantom_handles_selection_lock_and_deferred_metrics(monkeypatch, tmp_path, mirrored):
+def test_manual_plane_phantom_handles_selection_lock_and_automatic_metrics(monkeypatch, tmp_path, mirrored):
     app = _smoke_qt_application(monkeypatch)
     monkeypatch.setenv("AUTOFLOW_SSH_RENDERING", "1")
     from PySide6 import QtCore, QtTest
@@ -7879,6 +7887,7 @@ def test_manual_plane_phantom_handles_selection_lock_and_deferred_metrics(monkey
         writes, recomputes = [], []
         monkeypatch.setattr(window, "_persist_plane_outputs", lambda **kw: writes.append(kw))
         monkeypatch.setattr(window, "_recompute_dragged_plane_metrics", lambda **kw: recomputes.append(kw))
+        monkeypatch.setattr(window, "_schedule_plane_calculation", recomputes.append)
         window._on_3d_plane_picked(None, None)
         window._on_3d_path_picked("accidental path", 0)
         assert window._selected_plane_index == 1 and window._plane_handles is handles
@@ -7915,11 +7924,13 @@ def test_manual_plane_phantom_handles_selection_lock_and_deferred_metrics(monkey
         def rotate_2d(name):
             view = window.ortho_viewer.slice_views[name]
             viewport = view.plot.viewport()
-            radius = (view.view_box.viewRange()[0][1]-view.view_box.viewRange()[0][0])*.22
+            point = view.plane_controls.endpoints[1]
+            angle = np.radians(12.)
+            rotated = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]) @ point
             def screen(x, y):
                 return view.plot.mapFromScene(view.view_box.mapViewToScene(QtCore.QPointF(x, y)))
-            start = screen(radius, 0)
-            finish = screen(radius*.866, radius*.5)
+            start = screen(*point)
+            finish = screen(*rotated)
             QtTest.QTest.mouseMove(viewport, start)
             QtTest.QTest.mousePress(viewport, QtCore.Qt.LeftButton, pos=start)
             QtTest.QTest.qWait(25)  # Respect pyqtgraph's scene mouse rate limit.
@@ -7951,7 +7962,8 @@ def test_manual_plane_phantom_handles_selection_lock_and_deferred_metrics(monkey
                 np.testing.assert_allclose(label.GetPosition(), center + display_direction * window._plane_widget_distance())
         assert "preview" in window.ortho_viewer.label_plane_metric.text().lower()
         window._toggle_selected_plane_edit()
-        assert len(writes) == 1 and not recomputes  # A new plane has no existing metrics to refresh.
+        assert len(writes) == 1 and recomputes == [1]
+        recomputes.clear()
         assert not window.scene._plane_selection_locked and window._plane_handles is None
         assert not window.scene._hud_renderer.HasViewProp(handles.help)
 
@@ -8039,6 +8051,11 @@ def test_orientation_icon_phantom_vtp_import_menu_and_scene_directions(monkeypat
         icons = marker._menu.actions()[0].menu()
         next(a for a in icons.actions() if a.text() == 'Rabbit').trigger()
         assert marker.selection == 'rabbit'
+        for title, key in (('Frog', 'frog'), ('Dinosaur', 'dinosaur'), ('Rabbit', 'rabbit')):
+            next(a for a in icons.actions() if a.text() == title).trigger()
+            assert marker.selection == key
+            assert marker.actor.GetParts().GetNumberOfItems() > 1
+            np.testing.assert_allclose(tuple(plotter.camera_position), original_camera)
         sizes = next(a.menu() for a in marker._menu.actions() if a.text() == 'Size')
         size_control = sizes.findChild(QtWidgets.QSpinBox)
         size_control.setValue(150)
@@ -8085,6 +8102,12 @@ def test_orientation_icon_phantom_vtp_import_menu_and_scene_directions(monkeypat
         scene._add_orientation_axes()
         assert scene._orientation_marker.selection == 'rabbit'
         assert scene._orientation_marker.size_percent == 150
+        for key in ('frog', 'dinosaur'):
+            scene._orientation_marker.set_asset(key)
+            scene._add_orientation_axes()
+            assert scene._orientation_marker.selection == key
+            assert scene._orientation_marker.size_percent == 150
+            assert scene.display_axis_directions() == ('RL', 'AP', 'FH')
     finally:
         scene._orientation_marker.close()
         plotter.shutdown()
@@ -8709,6 +8732,8 @@ def test_contour_edit_phantom_updates_dependent_carried_frames(sources, carried,
     ws.derived.plane_metrics = [{"roi_source_frame_t": sources, "roi_carried_forward_t": carried}]
     calls = []
     window = SimpleNamespace(workspace=ws, log=lambda *_: None,
+                             _persist_plane_outputs=lambda **kwargs: None,
+                             ortho_viewer=SimpleNamespace(refresh_plane_contours=lambda: None),
                              _recompute_dragged_plane_metrics=lambda **kwargs: calls.append(kwargs))
     MainWindow._on_plane_roi_changed(window, 0)
     assert calls == [{"persist": True, "frame_only": frame_only}]
@@ -8953,8 +8978,8 @@ def test_group_segmentation_phantom_keeps_preview_after_metrics(monkeypatch, tmp
         assert not failures, failures
         assert len(finished) == 1 and len(ws.derived.plane_metrics) == 1
         assert (tmp_path / "plane_metrics.json").is_file()
-        assert finished[0]["analysis_report"]["status"] == "complete"
-        assert (tmp_path / "analysis_report.html").is_file()
+        assert finished[0]["analysis_report"]["status"] == "deferred"
+        assert not (tmp_path / "analysis_report.html").exists()
         window._finish_pipeline_scene_refresh([StepId.COMPUTE_PLANE_METRICS])
         app.processEvents()
         for original, visible in zip(groups, (True, False)):
@@ -9460,7 +9485,8 @@ def test_plane_transaction_phantom_cancel_and_undo_preserve_results(monkeypatch,
         assert metric_validity(ws.planes[0]) == "current"
         window._redo_plane_change()
         np.testing.assert_array_equal(ws.planes[0].center, original + [1, 0, 0])
-        assert metric_validity(ws.planes[0]) == "stale"
+        # The moved user plane requires a new drawing, even with a mask.
+        assert metric_validity(ws.planes[0]) == "missing"
     finally:
         window.close()
         window.deleteLater()
@@ -10549,8 +10575,7 @@ def test_generated_plane_phantom_locked_centers_translate_and_preserve_identity(
             # centers/axes must coincide before the next mouse gesture.
             np.testing.assert_allclose(view.plane_center_item.getData(), [[0.], [0.]])
             assert view.vertical_line.value() == 0 and view.horizontal_line.value() == 0
-            for line in view.rotation_axes:
-                assert line.pos() == QtCore.QPointF(0, 0)
+            np.testing.assert_allclose(view.plane_controls.center, [0., 0.])
             np.testing.assert_allclose(ws.planes[0].center, expected, atol=1e-8)
             assert ws.planes[0].path_index == 0 and ws.planes[0].label == 1
             assert ws.planes[0].segmentation_label == 7 and ws.planes[0].group_name == "artery"
@@ -11135,8 +11160,11 @@ def test_source_1mm_segmentation_phantom_routes_pipeline_and_gui_to_native_veloc
     np.testing.assert_array_equal(metric['roi_spacing_mm'],ws.resolution)
     np.testing.assert_array_equal(ws.flow_raw,flow_copy)
     from autoflow.ui.ortho_viewer import OrthoViewer
-    from types import SimpleNamespace
-    inputs = OrthoViewer._analysis_segmentation_inputs(SimpleNamespace(workspace=ws))
+    from types import SimpleNamespace, MethodType
+    viewer = SimpleNamespace(workspace=ws, _cache={},
+                             _array_cache_token=OrthoViewer._array_cache_token)
+    viewer._cached = MethodType(OrthoViewer._cached, viewer)
+    inputs = OrthoViewer._analysis_segmentation_inputs(viewer)
     assert inputs[0] is geometry.binary
     np.testing.assert_array_equal(inputs[3],geometry.spacing)
 
@@ -13265,3 +13293,965 @@ def test_dual_venc_correction_buttons_and_settings_phantom(monkeypatch):
         assert ws.loader_params.background_phase_correction.dual_venc_ratio1 == .2
     finally:
         window.close(); window.deleteLater(); application.processEvents()
+
+
+def test_manual_contour_metrics_phantom_without_segmentation_matches_batch_and_worker(tmp_path):
+    from autoflow.algorithms.geometry_grid import measurement_segmentation
+    from autoflow.ui.plane_tasks import calculate_plane
+    ws = Workspace()
+    ws.data_loaded = True
+    ws.resolution = np.array([1., 1.5, 2.])
+    ws.origin = np.array([10., -7., 23.])
+    ws.paths.output_dir = str(tmp_path)
+    ws.flow_raw = np.zeros((16, 18, 14, 3, 3), np.float32)
+    speeds = np.array([10., 20., -5.])
+    ws.flow_raw[..., 2] = speeds
+    plane = PlaneData(center=np.array([8., 12., 12.]), normal=np.array([0., 0., 1.]), path_index=-1)
+    plane.roi_edit_operations = {'0': [{'mode': 'replace',
+        'polygon': [[-3.75, -2.5], [3.75, -2.5], [3.75, 2.5], [-3.75, 2.5]]}]}
+    ws.planes = [plane]
+    geometry = measurement_segmentation(ws, manual_planes=ws.planes)
+    assert geometry.source == 'manual_contours' and not np.any(geometry.binary)
+    result = PipelineEngine().run_step(ws, StepId.COMPUTE_PLANE_METRICS, lambda _: None)
+    assert result.success and not result.skipped
+    metric = ws.planes[0].metrics
+    assert metric['sampling_status'] == 'complete' and metric['roi_geometry_source'] == 'manual_contours'
+    np.testing.assert_allclose(metric['area_mm2'], 37.5, atol=1e-8)
+    np.testing.assert_allclose(metric['flowrate_mL_s'], speeds * 37.5 / 100, atol=1e-8)
+    payload = {'plane': plane, 'data': {'flow': ws.flow_raw, 'mask': geometry.binary,
+        'spacing': ws.resolution, 'origin': ws.origin, 'rr': ws.rr,
+        'branches': None, 'labels3': None, 'labels4': None, 'paths': [], 'path_info': [],
+        'forks': [], 'tke': None, 'pg': None, 'pressure': None, 'wss': [], 'source': geometry.source}}
+    worker = calculate_plane(payload)['metric']
+    for key in ('area_mm2', 'flowrate_mL_s', 'meanv_cm_s_t'):
+        np.testing.assert_allclose(worker[key], metric[key], atol=1e-8)
+    assert ws.segmask_raw is None and ws.segmask_binary is None
+    assert ws.derived.tke_array is None and not ws.derived.wss_surfaces
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Linux SSH renderer phantom")
+@pytest.mark.parametrize('with_mask', [False, True])
+def test_manual_plane_metrics_phantom_mask_and_contour_commit_workflows(monkeypatch, tmp_path, with_mask):
+    app = _smoke_qt_application(monkeypatch)
+    monkeypatch.setenv('AUTOFLOW_SSH_RENDERING', '1')
+    from PySide6 import QtCore, QtTest
+    import autoflow.ui.app as ui_app
+    from autoflow.core.plane_state import selected_metric
+    from autoflow.ui.remote_plotter import RemotePlotter
+    monkeypatch.setattr(ui_app, 'RemotePlotter', RemotePlotter, raising=False)
+    window = ui_app.MainWindow()
+    try:
+        ws = window.workspace
+        ws.paths.output_dir = str(tmp_path)
+        ws.data_loaded = True
+        ws.mag_raw = np.ones((16, 16, 16, 3), np.float32)
+        ws.pcmra_array = ws.mag_raw.copy()
+        ws.flow_raw = np.zeros((16, 16, 16, 3, 3), np.float32)
+        ws.flow_raw[..., 2] = 10.
+        ws.ortho_cursor = np.array([8, 8, 8])
+        if with_mask:
+            labels = np.zeros((16, 16, 16, 3), np.uint8)
+            labels[6:11, 6:11, :, :] = 1
+            ws.segmask_raw = ws.segmask_labels = labels
+            ws.segmask_binary = labels > 0
+            ws.segmask_labels_3d = labels[..., 0]
+            ws.segmentation_analysis_binary = ws.segmask_binary
+        window.ortho_viewer.update_slider_ranges()
+        window.show()
+        app.processEvents()
+        def settle(condition):
+            timer = QtCore.QElapsedTimer(); timer.start()
+            while not condition() and timer.elapsed() < 15000:
+                app.processEvents(); QtTest.QTest.qWait(10)
+            assert condition(), window.statusBar().currentMessage()
+        window._add_manual_plane()
+        window._update_plane_from_drag(0, center=np.array([8., 8., 8.]), normal=np.array([0., 0., 1.]))
+        handles = window._plane_handles
+        assert handles.handles[0][1].GetHandleSize() == 8
+        assert window._plane_widget_distance() == pytest.approx(18.)
+        window._finalize_plane_drag(0)
+        assert selected_metric(ws, 0) is None and not window._plane_jobs.is_running
+        assert window.ortho_viewer._effective_plane_region(ws.planes[0], 0) is None
+        polygon = np.array([[-1.5, -1.5], [1.5, -1.5], [1.5, 1.5], [-1.5, 1.5]])
+        viewer = window.ortho_viewer
+        viewer.set_selected_plane(0)
+        viewer.btn_edit_contour.setChecked(True)
+        if with_mask:
+            viewer.check_roi_all_frames.setChecked(True)
+        viewer._commit_contour(polygon, 'phantom')
+        assert viewer._roi_transaction is not None and not window._plane_jobs.is_running
+        viewer._apply_plane_roi()
+        settle(lambda: not window._plane_jobs.is_running and selected_metric(ws, 0) is not None)
+        np.testing.assert_allclose(ws.planes[0].metrics['area_mm2'], 9.)
+        assert viewer._effective_plane_region(ws.planes[0], 0) is not None
+        window._activate_plane_drag_widgets(0)
+        window._update_plane_from_drag(0, center=np.array([9., 8., 9.]))
+        window._finalize_plane_drag(0)
+        assert not ws.planes[0].roi_edit_operations
+        assert viewer._contour_display_override is None
+        assert selected_metric(ws, 0) is None and not window._plane_jobs.is_running
+        assert viewer._effective_plane_region(ws.planes[0], 0) is None
+        window._activate_plane_drag_widgets(0)
+        window._update_plane_from_drag(0, normal=np.array([0., 1., 0.]))
+        window._finalize_plane_drag(0)
+        assert selected_metric(ws, 0) is None and not window._plane_jobs.is_running
+        window._activate_plane_drag_widgets(0)
+        window._update_plane_from_drag(0, normal=np.array([0., 0., 1.]))
+        window._finalize_plane_drag(0)
+        # Starting a contour commits pending geometry; Calculate commits the
+        # contour draft instead of discarding the plane or edited region.
+        window._activate_plane_drag_widgets(0)
+        viewer.btn_edit_contour.setChecked(True)
+        assert window._plane_edit_session is None and viewer._roi_transaction is not None
+        assert viewer.btn_edit_contour.isChecked()
+        viewer._commit_contour(polygon, 'phantom')
+        results = []
+        def batch(steps, label):
+            results.append(window.pipeline.run_step(ws, steps[0], window.log))
+            return True
+        monkeypatch.setattr(window, '_start_pipeline_task', batch)
+        window._run_single_step(StepId.COMPUTE_PLANE_METRICS)
+        assert results and results[0].success and not results[0].skipped
+        assert len(ws.planes) == 1 and viewer._roi_transaction is None
+        np.testing.assert_allclose(ws.planes[0].metrics['area_mm2'], 9.)
+        np.testing.assert_allclose(ws.planes[0].metrics['flowrate_mL_s'], .9)
+        # The calculation action must retain a newly added plane draft too.
+        window._add_manual_plane()
+        added_id = ws.planes[1].plane_id
+        window._run_single_step(StepId.COMPUTE_PLANE_METRICS)
+        assert len(ws.planes) == 2 and ws.planes[1].plane_id == added_id
+        assert ws.planes[1].metrics['plane_id'] == added_id
+        assert ws.planes[1].metrics['sampling_status'] == 'not_assessable'
+        assert selected_metric(ws, 1) is None
+        if not with_mask:
+            assert ws.segmask_raw is None and ws.segmask_binary is None
+    finally:
+        window.close(); window.deleteLater(); app.processEvents()
+
+
+def test_manual_plane_contour_policy_phantom_never_falls_back_to_mask():
+    from autoflow.algorithms.metrics.planes import compute_plane_metrics
+    from autoflow.core.plane_state import requires_manual_contour
+    flow = np.zeros((12, 12, 12, 2, 3), np.float32); flow[..., 2] = 10
+    mask = np.ones(flow.shape[:4], bool)
+    auto = PlaneData(center=np.array([6., 6., 6.]), normal=np.array([0., 0., 1.]))
+    manual = PlaneData(center=auto.center.copy(), normal=auto.normal.copy(), path_index=0,
+                       placement={'contour_source': 'manual'})
+    values = compute_plane_metrics(flow, mask, [1, 1, 1], [0, 0, 0], [auto, manual], flow_spacing=[1, 1, 1])
+    assert values[0]['sampling_status'] == 'complete'
+    assert values[1]['sampling_status'] == 'not_assessable'
+    manual.roi_edit_operations = {'0': [{'mode': 'replace', 'polygon': [[-1.5, -1.5], [1.5, -1.5], [1.5, 1.5], [-1.5, 1.5]]}]}
+    measured = compute_plane_metrics(flow, mask, [1, 1, 1], [0, 0, 0], [manual], flow_spacing=[1, 1, 1])[0]
+    np.testing.assert_allclose(measured['area_mm2'], 9)
+    assert measured['roi_resolution_t'][1] == 'single_source_hold'
+    saved = Workspace(); saved.planes = [manual]
+    restored = Workspace(); restored.restore_dict(saved.snapshot_dict())
+    assert requires_manual_contour(restored.planes[0])
+
+
+@pytest.mark.parametrize('families', [['wss'], ['tke'], ['pressure'], ['vortex'], []])
+def test_advanced_metrics_selection_phantom_dispatches_only_selected_families(monkeypatch, families):
+    from autoflow.core.models import DerivedMetricsParams
+    ws = Workspace(); ws.flow_raw = np.zeros((4, 4, 4, 2, 3), np.float32)
+    ws.segmask_raw = np.ones((4, 4, 4, 2), np.uint8)
+    ws.derived_params.selected_families = families
+    calls = []
+    engine = PipelineEngine()
+    monkeypatch.setattr(engine, '_ensure_derived_metrics', lambda workspace, **kwargs: calls.append(kwargs))
+    result = engine._step_compute_derived_metrics(ws)
+    assert result.success and result.skipped == (not families)
+    if families:
+        assert len(calls) == 1
+        for family, flag in [('wss', 'compute_wss'), ('tke', 'compute_tke'),
+                             ('pressure', 'compute_pressure_gradient'), ('vortex', 'compute_vortex')]:
+            assert calls[0][flag] == (family in families)
+    else:
+        assert not calls
+    assert DerivedMetricsParams.from_dict(ws.derived_params.to_dict()).selected_families == families
+
+
+def test_advanced_metrics_selection_dialog_phantom_checks_and_cancel(monkeypatch):
+    app = _smoke_qt_application(monkeypatch)
+    from PySide6 import QtCore
+    from autoflow.ui.action_settings import ActionSettingsDialog, action_sections
+    ws = Workspace()
+    dialog = ActionSettingsDialog('Advanced Metrics', action_sections(StepId.COMPUTE_DERIVED_METRICS, ws), ws, ws)
+    try:
+        assert StepId.COMPUTE_DERIVED_METRICS.label == 'Advanced Metrics'
+        assert dialog.tabs.tabText(0) == 'Basic'
+        choices = dialog.controls['derived_params.selected_families']
+        for i in range(choices.count()):
+            item = choices.item(i)
+            item.setCheckState(QtCore.Qt.Checked if item.data(QtCore.Qt.UserRole) == 'vortex' else QtCore.Qt.Unchecked)
+        assert dialog.values()['derived_params.selected_families'] == ['vortex']
+        dialog.reject()
+        assert ws.derived_params.selected_families == ['wss', 'tke', 'pressure', 'vortex']
+    finally:
+        dialog.close(); dialog.deleteLater(); app.processEvents()
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='Linux SSH renderer phantom')
+def test_scalar_bar_clim_phantom_right_click_changes_only_legend_owner(monkeypatch):
+    app = _smoke_qt_application(monkeypatch)
+    from PySide6 import QtCore, QtWidgets, QtTest
+    from autoflow.ui.remote_plotter import RemotePlotter
+    from autoflow.ui.viewer import SceneController
+    ws = Workspace()
+    ws.mag_raw = np.arange(1, 961, dtype=np.float32).reshape(8, 10, 6, 2)
+    ws.pcmra_array = np.ones((8, 10, 6, 2), np.float32) * 7
+    raw = ws.mag_raw.copy()
+    plotter = RemotePlotter(); plotter.resize(800, 600); plotter.show(); app.processEvents()
+    errors = []
+    scene = SceneController(plotter, ws, errors.append); scene.initialize()
+    try:
+        first, other = scene.add_content_render(3), scene.add_content_render(4)
+        first.show_scalar_bar = other.show_scalar_bar = True
+        scene._refresh_shared_scalar_bar(preferred_uid=first.uid)
+        plotter.render(); plotter._capture_frame()
+        assert scene._hud_props, errors
+        bar = scene._hud_props[0]
+        x, y = bar.GetPosition()
+        point = QtCore.QPoint(round((x + bar.GetWidth()/2)*plotter.width()),
+                             round((1-y-bar.GetHeight()/2)*plotter.height()))
+        assert scene._scalar_bar_object_at(point.x(), point.y()) is first
+        menus = []
+        original_menu = scene._show_scalar_bar_menu
+        monkeypatch.setattr(scene, '_show_scalar_bar_menu', lambda uid, pos: menus.append(uid))
+        camera = np.asarray(tuple(plotter.camera_position))
+        QtTest.QTest.mouseClick(plotter, QtCore.Qt.RightButton, pos=point)
+        assert menus == [first.uid]
+        np.testing.assert_allclose(tuple(plotter.camera_position), camera)
+        original_menu(first.uid, plotter.mapToGlobal(point))
+        menu = scene._scalar_bar_menu
+        assert [action.text() for action in menu.actions()] == ['Color limits…', 'Reset to automatic']
+        menu.close()
+        def enter_limits():
+            dialog = app.activeModalWidget()
+            dialog.findChild(QtWidgets.QLineEdit, 'climMinimum').setText('2')
+            dialog.findChild(QtWidgets.QLineEdit, 'climMaximum').setText('8')
+            dialog.findChild(QtWidgets.QDialogButtonBox).button(QtWidgets.QDialogButtonBox.Ok).click()
+        QtCore.QTimer.singleShot(0, enter_limits)
+        menu.actions()[0].trigger()
+        assert first.clim == (2., 8.) and other.clim is None
+        np.testing.assert_allclose(first.actor.GetProperty().GetRGBTransferFunction(0).GetRange(), [2., 8.])
+        scene.update_time(1)
+        np.testing.assert_allclose(first.actor.GetProperty().GetRGBTransferFunction(0).GetRange(), [2., 8.])
+        saved = Workspace(); saved.restore_dict(ws.snapshot_dict())
+        assert tuple(saved.scene_objects[first.uid].clim) == (2., 8.)
+        with pytest.raises(ValueError): scene._set_scalar_bar_clim(first.uid, [8, 2])
+        QtCore.QTimer.singleShot(0, lambda: app.activeModalWidget().reject())
+        scene._edit_scalar_bar_clim(first.uid)
+        assert first.clim == (2., 8.)
+        menu.actions()[1].trigger()
+        assert first.clim is None
+        np.testing.assert_array_equal(ws.mag_raw, raw)
+    finally:
+        scene._close_interaction_rendering(); plotter.close(); plotter.deleteLater(); app.processEvents()
+
+
+def test_labeler_return_phantom_confirms_import_for_original_case_only(monkeypatch):
+    app = _smoke_qt_application(monkeypatch)
+    from PySide6 import QtWidgets
+    from autoflow.ui.app import MainWindow
+    ws = Workspace(); imports = []
+    window = SimpleNamespace(workspace=ws, log=lambda message: None,
+                             _import_segmentation_path=imports.append)
+    monkeypatch.setattr(QtWidgets.QMessageBox, 'question', lambda *args: QtWidgets.QMessageBox.Yes)
+    MainWindow._offer_labeler_import(window, 'edited-mask.nii', ws)
+    assert imports == ['edited-mask.nii']
+    MainWindow._offer_labeler_import(window, 'another-case.nii', Workspace())
+    assert imports == ['edited-mask.nii']
+    monkeypatch.setattr(QtWidgets.QMessageBox, 'question', lambda *args: QtWidgets.QMessageBox.No)
+    MainWindow._offer_labeler_import(window, 'declined-mask.nii', ws)
+    assert imports == ['edited-mask.nii']
+
+
+def test_labeler_cache_selection_phantom_incremental_images_and_saved_mask(tmp_path):
+    from autoflow.ui.labeler_exchange import export_labeler_exchange
+    from autoflow.algorithms.segmentation import save_segmentation_file, load_segmentation_file
+    mag = np.arange(120, dtype=np.float32).reshape(3, 4, 5, 2)
+    flow = np.stack((mag, -mag, mag * 2), axis=-1)
+    seed = np.ones(mag.shape, np.int16)
+    metadata = {"source_id": "selected-cache-phantom"}
+    spacing, origin = [1.5, 2., 3.], [-4., 5., 6.]
+    first = export_labeler_exchange(tmp_path, metadata, mag, flow, seed, spacing, origin)
+    pcmra = Path(first['feature_paths'][0]); before = pcmra.stat().st_mtime_ns
+    edited = seed.copy(); edited[0, 0, 0, 0] = 7
+    save_segmentation_file(first['label_path'], edited, resolution=spacing, origin=origin)
+    expanded = export_labeler_exchange(tmp_path, metadata, mag, flow, seed, spacing, origin,
+                                       features=['flow_x', 'flow_y'])
+    assert expanded['written_files'] == 2 and expanded['reused_labels']
+    assert pcmra.stat().st_mtime_ns == before
+    assert [Path(path).name for path in expanded['feature_paths']] == ['flow_x.seq.nrrd', 'flow_y.seq.nrrd', 'pcmra.seq.nrrd']
+    # Independent reader of the raw sequence checks channel, XYZT order and metadata.
+    header, raw = Path(expanded['feature_paths'][0]).read_bytes().split(b'\n\n', 1)
+    np.testing.assert_array_equal(np.frombuffer(raw, dtype='<f4').reshape(mag.shape, order='F'), flow[..., 0])
+    assert b'space directions: (1.5,0,0) (0,2,0) (0,0,3) none' in header
+    assert b'space origin: (-4,5,6)' in header
+    reduced = export_labeler_exchange(tmp_path, metadata, mag, flow, seed, spacing, origin)
+    assert reduced['written_files'] == 0 and reduced['reused_labels']
+    assert not (tmp_path / 'flow_x.seq.nrrd').exists() and not (tmp_path / 'flow_y.seq.nrrd').exists()
+    actual, _ = load_segmentation_file(reduced['label_path'], spatial_shape=seed.shape[:3], time_count=2)
+    np.testing.assert_array_equal(actual, edited)
+    assert len(list(tmp_path.glob('*.seq.nrrd'))) == 1
+
+
+def test_labeler_cache_selection_dialog_phantom_defaults_and_workspace(monkeypatch):
+    app = _smoke_qt_application(monkeypatch)
+    from PySide6 import QtCore
+    from autoflow.ui.action_settings import ActionSettingsDialog, action_sections, _set
+    from autoflow.ui.app import MainWindow
+    ws = Workspace()
+    dialog = ActionSettingsDialog('Labeler images', action_sections('labeler', ws), ws, Workspace())
+    key = 'input_state.metadata.labeler_extra_features'
+    try:
+        assert dialog.values()[key] == []
+        choices = dialog.controls[key]
+        assert choices.count() == 4
+        for index in range(choices.count()):
+            item = choices.item(index)
+            item.setCheckState(QtCore.Qt.Checked if item.data(QtCore.Qt.UserRole) == 'flow_x' else QtCore.Qt.Unchecked)
+        assert dialog.values()[key] == ['flow_x']
+        _set(ws, key, dialog.values()[key])
+        restored = Workspace(); restored.restore_dict(ws.snapshot_dict())
+        assert restored.input_state.metadata['labeler_extra_features'] == ['flow_x']
+        window = SimpleNamespace(workspace=restored, _active_input_case=None, _input_signature='phantom')
+        result = MainWindow._labeler_exchange_metadata(window, np.ones((2, 2, 2, 2), np.int16))
+        assert result['features'] == ['flow_x', 'pcmra']
+    finally:
+        dialog.close(); dialog.deleteLater(); app.processEvents()
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='Linux renderer integration; standalone 2D controls also checked on Windows')
+def test_plane_2d_rotation_phantom_fixed_images_handles_undo_and_escape(monkeypatch, tmp_path):
+    app = _smoke_qt_application(monkeypatch)
+    monkeypatch.setenv('AUTOFLOW_SSH_RENDERING', '1')
+    from PySide6 import QtCore, QtGui, QtWidgets, QtTest
+    import autoflow.ui.app as ui_app
+    from autoflow.ui.remote_plotter import RemotePlotter
+    monkeypatch.setattr(ui_app, 'RemotePlotter', RemotePlotter, raising=False)
+    window = ui_app.MainWindow()
+    try:
+        ws = window.workspace
+        ws.data_loaded = True; ws.paths.output_dir = str(tmp_path)
+        x, y, z = np.indices((24, 24, 24))
+        volume = (x+5*y+17*z).astype(np.float32)
+        ws.mag_raw = np.repeat(volume[..., None], 2, axis=3)
+        ws.flow_raw = np.zeros(ws.mag_raw.shape + (3,), np.float32)
+        ws.resolution = np.array([1., 1.5, 2.])
+        ws.origin = np.array([-4., 7., 13.])
+        normal = np.array([.2, .3, 1.]); normal /= np.linalg.norm(normal)
+        ws.planes = [PlaneData(np.array([12., 18., 24.]), normal.copy(), path_index=-1,
+                               placement={'contour_source': 'manual'})]
+        window._rebuild_plane_objects()
+        window._selected_plane_index = 0
+        window.ortho_viewer.set_selected_plane(0)
+        window.show(); app.processEvents()
+        window._activate_plane_drag_widgets(0)
+        viewer = window.ortho_viewer
+        QtTest.QTest.qWait(60)
+        frozen = {name: tuple(axis.copy() for axis in viewer._plane_view_bases(normal)[name])
+                  for name in ('coronal', 'sagittal')}
+        images = {name: viewer.slice_views[name].image_item.image.copy() for name in frozen}
+        top = viewer.slice_views['axial'].image_item.image.copy()
+        center = ws.planes[0].center.copy()
+        def assert_references():
+            for name in frozen:
+                actual = viewer._plane_view_bases(ws.planes[0].normal)[name]
+                np.testing.assert_allclose(actual, frozen[name], atol=1e-12)
+                np.testing.assert_array_equal(viewer.slice_views[name].image_item.image, images[name])
+        def drag(name, degrees, endpoint=1, cancel=False):
+            view = viewer.slice_views[name]; box = view.view_box
+            controls = view.plane_controls; viewport = view.plot.viewport()
+            before = ws.planes[0].normal.copy()
+            count = len(window._plane_draft_undo)
+            point = controls.endpoints[endpoint].copy()
+            angle = np.radians(degrees)
+            rotated = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]) @ point
+            def screen(point):
+                return view.plot.mapFromScene(box.mapViewToScene(QtCore.QPointF(*point)))
+            start, finish = screen(point), screen(rotated)
+            assert box._rotation_hit(box.mapViewToScene(QtCore.QPointF(*point)))
+            assert not box._rotation_hit(box.mapViewToScene(QtCore.QPointF(0, 0)))
+            assert not box._rotation_hit(box.mapViewToScene(QtCore.QPointF(*(point*.5))))
+            QtTest.QTest.mouseMove(viewport, start)
+            QtTest.QTest.mousePress(viewport, QtCore.Qt.LeftButton, pos=start)
+            QtTest.QTest.qWait(25)
+            event = QtGui.QMouseEvent(QtCore.QEvent.MouseMove, QtCore.QPointF(finish),
+                QtCore.QPointF(viewport.mapToGlobal(finish)), QtCore.Qt.NoButton,
+                QtCore.Qt.LeftButton, QtCore.Qt.NoModifier)
+            QtWidgets.QApplication.sendEvent(viewport, event)
+            QtTest.QTest.qWait(50)
+            assert box._rotating_plane
+            assert viewer._plane_gesture_active and window.scene._interaction_preview_active
+            assert controls.angle_label.isVisible()
+            assert abs(float(controls.angle_label.toPlainText().rstrip('°')) - degrees) < 1.5
+            np.testing.assert_allclose(ws.planes[0].center, center)
+            assert_references()
+            if cancel:
+                QtTest.QTest.keyClick(viewport, QtCore.Qt.Key_Escape)
+                assert window._plane_edit_session is not None
+                assert not box._rotating_plane and not controls.angle_label.isVisible()
+                np.testing.assert_allclose(ws.planes[0].normal, before)
+            QtTest.QTest.mouseRelease(viewport, QtCore.Qt.LeftButton, pos=finish)
+            QtTest.QTest.qWait(45)
+            assert viewer._plane_rotation_reference is None
+            assert not viewer._plane_gesture_active and not window.scene._interaction_preview_active
+            assert len(window._plane_draft_undo) == count + (not cancel)
+            assert_references()
+            return before
+        drag('coronal', 18.)
+        after = ws.planes[0].normal.copy()
+        assert np.linalg.norm(after-normal) > .1
+        assert not np.array_equal(viewer.slice_views['axial'].image_item.image, top)
+        view = viewer.slice_views['coronal']
+        assert abs(view.plane_controls.angle) > 10
+        assert not view.vertical_line.isVisible() and not view.horizontal_line.isVisible()
+        line = view.plane_controls.endpoints
+        horizontal, vertical = frozen['coronal']
+        projected = line[:, :1]*horizontal + line[:, 1:]*vertical
+        np.testing.assert_allclose(projected @ after, 0, atol=1e-8)
+        window._undo_plane_change(); np.testing.assert_allclose(ws.planes[0].normal, normal)
+        window._redo_plane_change(); np.testing.assert_allclose(ws.planes[0].normal, after)
+        assert_references()
+        drag('sagittal', -12., endpoint=0)
+        drag('coronal', 8., cancel=True)
+        drag('coronal', -7.)
+        # The intersecting line has no unique direction if the plane is parallel
+        # to a reference slice; the other reference remains usable.
+        window._begin_plane_gesture()
+        window._update_plane_from_drag(0, normal=np.cross(*frozen['coronal']))
+        window._end_plane_gesture()
+        assert not viewer.slice_views['coronal'].view_box.plane_rotation_enabled
+        assert not viewer.slice_views['coronal'].plane_controls.line.isVisible()
+        assert viewer.slice_views['sagittal'].view_box.plane_rotation_enabled
+        window._force_exit_edit()
+        assert window._plane_edit_session is None and viewer._plane_reference_bases is None
+        np.testing.assert_allclose(ws.planes[0].normal, normal)
+    finally:
+        window.close(); window.deleteLater(); app.processEvents()
+
+
+def test_plane_preview_phantom_one_refresh_no_roi_and_segmentation_cache(monkeypatch):
+    app = _smoke_qt_application(monkeypatch)
+    from autoflow.ui.ortho_viewer import OrthoViewer
+    import autoflow.algorithms.geometry_grid as geometry_grid
+    ws = Workspace(); ws.data_loaded = True
+    ws.mag_raw = np.arange(9*10*11*3, dtype=np.float32).reshape(9, 10, 11, 3) + 1
+    ws.flow_raw = np.zeros(ws.mag_raw.shape+(3,), np.float32)
+    ws.segmask_raw = np.ones(ws.mag_raw.shape, np.int16)
+    plane = PlaneData(np.array([4., 5., 5.]), np.array([0., 0., 1.]), path_index=-1,
+                      placement={'contour_source': 'manual'})
+    ws.planes = [plane]
+    viewer = OrthoViewer(ws)
+    try:
+        viewer.set_selected_plane(0)
+        # A user plane with no drawn ROI must not inspect the whole 4D mask.
+        with monkeypatch.context() as patch:
+            def forbidden():
+                raise AssertionError('Unexpected quantitative mask work for an undrawn manual plane')
+            patch.setattr(viewer, '_analysis_segmentation_inputs', forbidden)
+            assert viewer._effective_plane_region(plane, 0) is None
+            assert viewer._build_selected_plane_contours(plane, 0, 20., 1.) == []
+        calls = []
+        original = geometry_grid.measurement_segmentation
+        def measured(workspace, **kwargs):
+            calls.append(True)
+            return original(workspace, **kwargs)
+        monkeypatch.setattr(geometry_grid, 'measurement_segmentation', measured)
+        first = viewer._analysis_segmentation_inputs()
+        second = viewer._analysis_segmentation_inputs()
+        assert first[0] is second[0] and len(calls) == 1
+        contour_calls = []
+        with monkeypatch.context() as patch:
+            actual_refresh = viewer.refresh
+            refreshes = []
+            def refresh(*args, **kwargs):
+                refreshes.append(True)
+                return actual_refresh(*args, **kwargs)
+            patch.setattr(viewer, 'refresh', refresh)
+            patch.setattr(viewer, '_selected_plane_contours', lambda *args: contour_calls.append(True) or [])
+            viewer._plane_gesture_active = True
+            plane.normal = np.array([.2, 0., 1.]); plane.normal /= np.linalg.norm(plane.normal)
+            viewer.set_selected_plane(0, geometry_preview=True)
+            assert len(refreshes) == 1 and not contour_calls
+            viewer._plane_gesture_active = False
+            viewer.set_selected_plane(0, geometry_preview=True)
+            assert len(refreshes) == 2 and len(contour_calls) == 1
+        # Full data refresh invalidates reused quantitative inputs, including
+        # an in-place change whose ndarray pointer and dimensions are unchanged.
+        ws.segmask_raw[0, 0, 0, :] = 0
+        viewer.refresh(update_plane=True)
+        refreshed = viewer._analysis_segmentation_inputs()
+        assert len(calls) == 2 and not refreshed[0][0, 0, 0, 0]
+        np.testing.assert_array_equal(refreshed[1], ws.segmask_raw)
+    finally:
+        viewer.close(); viewer.deleteLater(); app.processEvents()
+
+
+def test_temporal_voting_phantom_auto_cuda_failure_keeps_cpu_and_cancellation(monkeypatch):
+    from autoflow.algorithms.preprocess import majority_vote_labels_3d
+    import autoflow.algorithms.temporal_voting_cuda as cuda
+    from autoflow.task_control import TaskCancelled
+    rng = np.random.default_rng(405)
+    labels = rng.integers(-2, 5, (37, 29, 31, 9), dtype=np.int16)
+    expected = majority_vote_labels_3d(labels, backend='cpu')
+    def failed(_labels):
+        raise RuntimeError('simulated CUDA unavailability')
+    monkeypatch.setattr(cuda, 'vote_labels_cuda', failed)
+    np.testing.assert_array_equal(majority_vote_labels_3d(labels), expected)
+    with pytest.raises(RuntimeError, match='CUDA unavailability'):
+        majority_vote_labels_3d(labels, backend='cuda')
+    def cancelled(_labels):
+        raise TaskCancelled('cancelled')
+    monkeypatch.setattr(cuda, 'vote_labels_cuda', cancelled)
+    with pytest.raises(TaskCancelled):
+        majority_vote_labels_3d(labels)
+
+
+@pytest.mark.parametrize('frames', [2, 7, 20])
+def test_temporal_voting_cuda_phantom_exact_ties_signed_labels_and_chunks(frames):
+    cp = pytest.importorskip('cupy')
+    try:
+        available = cp.cuda.runtime.getDeviceCount() > 0
+    except Exception:
+        available = False
+    if not available:
+        pytest.skip('CUDA unavailable')
+    from autoflow.algorithms.preprocess import majority_vote_labels_3d
+    from autoflow.algorithms.temporal_voting_cuda import vote_labels_cuda
+    rng = np.random.default_rng(410 + frames)
+    labels = rng.choice(np.array([-32768, -3, 0, 1, 17, 32767], np.int16), (24, 23, 22, frames))
+    labels[0, 0, 0] = 32767
+    labels = labels[::-1, ::2, :, ::-1]
+    original = labels.copy()
+    expected = majority_vote_labels_3d(labels, backend='cpu')
+    np.testing.assert_array_equal(majority_vote_labels_3d(labels, backend='cuda'), expected)
+    np.testing.assert_array_equal(vote_labels_cuda(labels, chunk_bytes=4096), expected)
+    np.testing.assert_array_equal(labels, original)
+
+
+def test_oblique_cuda_sampling_phantom_pixels_cache_limits_and_full_refresh(monkeypatch):
+    cp = pytest.importorskip('cupy')
+    try:
+        available = cp.cuda.runtime.getDeviceCount() > 0
+    except Exception:
+        available = False
+    if not available:
+        pytest.skip('CUDA unavailable')
+    app = _smoke_qt_application(monkeypatch)
+    from scipy.ndimage import map_coordinates
+    from autoflow.ui.ortho_viewer import OrthoViewer
+    from autoflow.ui.gpu_sampling import CudaSliceSampler
+    rng = np.random.default_rng(901)
+    source = rng.normal(size=(140, 60, 120)).astype(np.float32)
+    ws = Workspace(); ws.mag_raw = source[..., None]
+    ws.resolution = np.array([1.1, 1.7, .9]); ws.origin = np.array([3., -7., 11.])
+    viewer = OrthoViewer(ws)
+    try:
+        center = np.asarray(source.shape)*ws.resolution/2
+        normal = np.array([.2, .3, 1.]); normal /= np.linalg.norm(normal)
+        u, v = viewer._plane_axes(normal)
+        gpu, axis = viewer._resample_basis(source, center, u, v, 80., .8, cell_centered=False)
+        sampler = viewer._gpu_slice_sampler
+        assert sampler.backend == 'cupy_cuda' and sampler.gpu_calls == 1
+        uploads = sampler.uploads
+        viewer._resample_basis(source, center, u, v, 80., .8, cell_centered=False)
+        assert sampler.uploads == uploads
+        with monkeypatch.context() as patch:
+            patch.setattr(sampler, 'sample', lambda *args, **kwargs: None)
+            expected, _ = viewer._resample_basis(source, center, u, v, 80., .8, cell_centered=False)
+        np.testing.assert_allclose(gpu, expected, rtol=2e-6, atol=2e-6)
+        # Nearest-neighbour labels and boundary/half-voxel decisions stay exact.
+        labels = rng.integers(0, 8, source.shape, dtype=np.int16)
+        coords = rng.uniform(-1., 145., (3, 4000))
+        coords[:, :3] = np.array([[0., .5, 139.], [0., 1.5, 59.], [0., 2.5, 119.]])
+        sampler.min_samples = 0
+        actual = sampler.sample(labels, coords, order=0)
+        reference = map_coordinates(labels, coords, order=0, mode='constant', cval=0.)
+        np.testing.assert_array_equal(actual, reference)
+        assert sampler.bytes_used <= sampler.max_bytes
+        # Constant-mode footprints must retain SciPy's NaN/Inf semantics,
+        # including zero-weight neighbours at the last in-bounds voxel.
+        edges = CudaSliceSampler(min_source_size=0, min_samples=0)
+        edge_coords = np.array([[0., .25, .5, 1., 1.5, 2., np.nan, np.inf],
+                                [0., .25, .5, 1., 1.5, 2., 1., 1.],
+                                [0., .25, .5, 1., 1.5, 2., 1., 1.]])
+        for value in (np.nan, np.inf, -np.inf):
+            for dtype in (np.float32, np.float64):
+                field = np.ones((3, 3, 3), dtype=dtype)
+                field[1, 1, 1] = value
+                reference = map_coordinates(field, edge_coords, order=1, mode='constant', cval=0.)
+                actual = edges.sample(field, edge_coords, order=1)
+                assert actual is not None, edges.fallback_reason
+                np.testing.assert_allclose(actual, reference, equal_nan=True)
+        tiny = CudaSliceSampler(max_bytes=1024, min_source_size=0, min_samples=0)
+        assert tiny.sample(source, coords) is None and tiny.bytes_used == 0
+        source *= 2
+        viewer.refresh(update_plane=True)
+        updated, _ = viewer._resample_basis(source, center, u, v, 80., .8, cell_centered=False)
+        assert sampler.uploads > uploads
+        np.testing.assert_allclose(updated, expected*2, rtol=2e-6, atol=2e-6)
+    finally:
+        viewer.close(); viewer.deleteLater(); app.processEvents()
+
+
+def test_deferred_segmentation_qc_phantom_masks_unchanged_and_explicit_generation(monkeypatch):
+    import copy
+    from autoflow.quality import build_quality_report
+    import autoflow.algorithms.preprocess_qc as qc_module
+    raw = np.zeros((8, 9, 10, 3), np.int16)
+    raw[2:6, 2:7, 2:8] = 1
+    raw[1, 1, 1] = [2, 0, 0]
+    def workspace(defer):
+        ws = Workspace(); ws.data_loaded = True
+        ws.segmask_raw = raw.copy(); ws.flow_raw = np.zeros(raw.shape+(3,), np.float32)
+        ws.skeleton_params.remove_small_cc = False
+        ws._defer_preprocess_qc = defer
+        return ws
+    eager, deferred = workspace(False), workspace(True)
+    engine = PipelineEngine()
+    engine.preprocess(eager)
+    calls = []
+    actual = qc_module.build_segmentation_preprocess_qc
+    def recorded(*args, **kwargs):
+        calls.append(True)
+        return actual(*args, **kwargs)
+    monkeypatch.setattr(qc_module, 'build_segmentation_preprocess_qc', recorded)
+    engine.preprocess(deferred)
+    assert not calls and deferred.segmentation_preprocess_qc['status'] == 'not_generated'
+    for name in ('segmask_binary', 'segmask_labels', 'segmask_labels_3d', 'segmentation_analysis_binary'):
+        np.testing.assert_array_equal(getattr(deferred, name), getattr(eager, name))
+    report = build_quality_report(deferred)
+    assert any(item['id'] == 'segmentation.preprocess_qc' and item['status'] == 'not_run'
+               for item in report['checks'])
+    engine.generate_segmentation_preprocess_qc(deferred)
+    assert len(calls) == 1
+    assert deferred.segmentation_preprocess_qc == eager.segmentation_preprocess_qc
+    engine.generate_segmentation_preprocess_qc(deferred)
+    assert len(calls) == 1 and deferred._preprocess_qc_inputs is None
+    deferred.segmask_raw = deferred.segmask_raw.copy()
+    deferred.segmask_raw[1, 1, 1] = 0
+    engine.preprocess(deferred)
+    assert deferred.segmentation_preprocess_qc['status'] == 'not_generated' and len(calls) == 1
+    deferred.reset_segmentation_results()
+    assert deferred._preprocess_qc_inputs is None
+
+
+def test_review_qc_phantom_navigation_does_not_generate_and_button_does(monkeypatch, tmp_path):
+    app = _smoke_qt_application(monkeypatch)
+    monkeypatch.setenv('AUTOFLOW_SSH_RENDERING', '1')
+    import autoflow.ui.app as ui_app
+    from autoflow.ui.remote_plotter import RemotePlotter
+    monkeypatch.setattr(ui_app, 'RemotePlotter', RemotePlotter, raising=False)
+    window = ui_app.MainWindow()
+    try:
+        ws = window.workspace
+        assert ws._defer_preprocess_qc
+        ws.data_loaded = True; ws.paths.output_dir = str(tmp_path)
+        ws.segmask_raw = np.ones((6, 7, 8, 2), np.int16)
+        ws.mag_raw = np.ones(ws.segmask_raw.shape, np.float32)
+        ws.flow_raw = np.ones(ws.segmask_raw.shape+(3,), np.float32)
+        calls = []
+        def task(title, message, function):
+            calls.append(title)
+            return function(lambda message: None, lambda message: None)
+        monkeypatch.setattr(window, '_run_modal_task', task)
+        window._on_open_case_qc(); app.processEvents()
+        assert not calls and window.qc_page.currentWidget() is window.qc_empty
+        assert window.btn_generate_quality.isEnabled()
+        # Showing task feedback must not rebuild a view that is already paused.
+        pauses = []
+        with monkeypatch.context() as patch:
+            patch.setattr(window, '_on_pause', lambda: pauses.append(True))
+            dialog = window._create_progress_dialog('Phantom', 'Ready')
+            window._close_progress_dialog(dialog)
+            assert not pauses
+            window.ortho_viewer._playback_active = True
+            dialog = window._create_progress_dialog('Phantom', 'Ready')
+            window._close_progress_dialog(dialog)
+            assert pauses == [True]
+            window.ortho_viewer._playback_active = False
+        window._generate_case_qc(show=False)
+        assert calls == ['Generate QC']
+        assert 'labels' in ws.segmentation_preprocess_qc
+        assert (tmp_path/'analysis_report.html').is_file()
+    finally:
+        window.close(); window.deleteLater(); app.processEvents()
+
+
+def test_labeler_native_grid_phantom_preserves_voxels_spacing_and_existing_fine_edits(monkeypatch):
+    from autoflow.ui.labeler_exchange import labeler_segmentation_grid
+    ws = Workspace(); ws.resolution = np.array([2., 2.5, 3.])
+    raw = np.arange(4*5*6*2, dtype=np.int16).reshape(4, 5, 6, 2)
+    ws.flow_raw = np.zeros(raw.shape+(3,), np.float32)
+    ws.set_segmentation_source('original', raw)
+    ws.activate_segmentation_source('original')
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Native Labeler inputs must not build a 1-mm preview')
+    monkeypatch.setattr(ws, 'segmentation_geometry_data', forbidden)
+    labels, spacing, grid = labeler_segmentation_grid(ws)
+    assert grid == 'native' and np.shares_memory(labels, ws.get_active_segmentation())
+    np.testing.assert_array_equal(labels, raw)
+    np.testing.assert_array_equal(spacing, ws.resolution)
+    edited = np.full((7, 11, 16, 2), 23, np.int16)
+    ws.segmentation.working_labels_4d = edited
+    labels, spacing, grid = labeler_segmentation_grid(ws)
+    assert labels is edited and grid == 'shared_1mm'
+    np.testing.assert_array_equal(spacing, [1., 1., 1.])
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='Linux EGL renderer integration')
+def test_labeler_return_phantom_reuses_identical_group_surface_and_updates_native_labels(monkeypatch, tmp_path):
+    app = _smoke_qt_application(monkeypatch)
+    monkeypatch.setenv('AUTOFLOW_SSH_RENDERING', '1')
+    import autoflow.ui.app as ui_app
+    from autoflow.ui.remote_plotter import RemotePlotter
+    monkeypatch.setattr(ui_app, 'RemotePlotter', RemotePlotter, raising=False)
+    window = ui_app.MainWindow()
+    try:
+        ws = window.workspace; ws.data_loaded = True; ws.paths.output_dir = str(tmp_path)
+        raw = np.zeros((16, 17, 18, 3), np.int16); raw[4:12, 4:12, 4:12] = 1
+        ws.mag_raw = np.ones(raw.shape, np.float32)
+        ws.flow_raw = np.ones(raw.shape+(3,), np.float32)
+        ws.set_segmentation_source('original', raw); ws.activate_segmentation_source('original')
+        window.pipeline.preprocess(ws)
+        window.scene.sync_from_workspace()
+        keys = [obj.data_key for obj in ws.scene_objects.values() if obj.data_key.startswith('segmask_group_')]
+        before = {key: window.scene._build_dataset(key) for key in keys}
+        assert before and all(value is not None for value in before.values())
+        updated = raw.copy(); updated[3, 7, 7, 0] = 1
+        ws.set_segmentation_source('imported', updated)
+        invalidated = []
+        invalidate = window.scene.invalidate_cache
+        def observed(prefix=None):
+            invalidated.append(prefix); return invalidate(prefix)
+        monkeypatch.setattr(window.scene, 'invalidate_cache', observed)
+        assert window._commit_segmentation_source_change('imported')
+        assert None not in invalidated and 'segmask_raw_surface' in invalidated
+        assert all(window.scene._build_dataset(key) is value for key, value in before.items())
+        np.testing.assert_array_equal(ws.get_active_segmentation(), updated)
+        assert ws.segmentation_preprocess_qc['status'] == 'not_generated'
+    finally:
+        window.close(); window.deleteLater(); app.processEvents()
+
+
+
+def test_sparse_components_phantom_crop_preserves_thresholds_and_ties():
+    from autoflow.algorithms.preprocess import filter_connected_components, _component_counts, _component_keep_mask
+    rng = np.random.default_rng(119)
+    source = np.zeros((51, 42, 39, 2), bool)
+    source[8:16, 12:20, 4:12, 0] = rng.random((8, 8, 8)) > .5
+    source[25:29, 25:29, 24:28, 0] = True
+    source[36:40, 31:35, 30:34, 0] = True
+    source[0, 0, 0, 1] = source[-1, -1, -1, 1] = True
+    for frame in (source[..., 0], source[..., 1], source[..., 0][::-1], np.zeros((3, 4, 5), bool)):
+        for connectivity in (1, 2):
+            for mode in ("absolute", "relative", "hybrid", "largest"):
+                labels, counts = _component_counts(frame, connectivity)
+                expected = _component_keep_mask(counts, [1., 1.5, 2.], mode, 10., .25)[labels]
+                actual = filter_connected_components(frame, [1., 1.5, 2.], mode, 10., .25, connectivity)
+                np.testing.assert_array_equal(actual, expected)
+                assert not np.shares_memory(actual, frame)
+
+
+def test_flow_cuda_phantom_fallback_and_cancellation(monkeypatch):
+    from autoflow.algorithms.data.venc import _reconstruct_dual_venc
+    from autoflow.algorithms.noise_removal import pcmra_coherence_weight
+    from autoflow.algorithms import flow_cuda
+    from autoflow.task_control import TaskCancelled
+    low = np.zeros((20, 20, 20, 12, 3), np.float32)
+    high = np.full_like(low, 110.)
+    venc, ratios = np.full(3, 30., np.float32), np.zeros(3, np.float32)
+    magnitude = np.ones(low.shape[:4], np.float32)
+    expected, shifts, _ = _reconstruct_dual_venc(low, high, venc, ratios, ratios, backend="cpu")
+    weight, _ = pcmra_coherence_weight(magnitude, high, backend="cpu")
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("no CUDA runtime or insufficient memory")
+    monkeypatch.setattr(flow_cuda, "reconstruct_dual_venc_cuda", unavailable)
+    monkeypatch.setattr(flow_cuda, "coherence_score_cuda", unavailable)
+    actual, actual_shifts, backend = _reconstruct_dual_venc(low, high, venc, ratios, ratios)
+    np.testing.assert_array_equal(actual, expected)
+    assert actual_shifts == shifts and backend == "cpu"
+    actual_weight, report = pcmra_coherence_weight(magnitude, high)
+    np.testing.assert_array_equal(actual_weight, weight)
+    assert report["coherence_backend"] == "cpu"
+    with pytest.raises(RuntimeError, match="no CUDA"):
+        _reconstruct_dual_venc(low, high, venc, ratios, ratios, backend="cuda")
+    def cancelled(*args, **kwargs):
+        raise TaskCancelled("cancelled")
+    monkeypatch.setattr(flow_cuda, "reconstruct_dual_venc_cuda", cancelled)
+    monkeypatch.setattr(flow_cuda, "coherence_score_cuda", cancelled)
+    with pytest.raises(TaskCancelled):
+        _reconstruct_dual_venc(low, high, venc, ratios, ratios)
+    with pytest.raises(TaskCancelled):
+        pcmra_coherence_weight(magnitude, high)
+
+
+
+def test_segmentation_scene_phantom_worker_cache_and_velocity_independence():
+    from autoflow.ui.viewer import SceneController
+    from autoflow.core.models import ObjectKind
+    ws = Workspace()
+    labels = np.zeros((9, 9, 9), np.int16)
+    labels[2:7, 2:7, 2:7] = 1
+    ws.set_segmentation_source("original", labels)
+    ws.activate_segmentation_source("original")
+    ws.flow_raw = np.zeros(labels.shape + (3, 3), np.float32)
+    ws.mag_raw = np.ones(labels.shape + (3,), np.float32)
+    ws.data_loaded = True
+    ws.resolution = np.ones(3)
+    ws.add_object(name="Segmentation", kind=ObjectKind.SEGMENTATION,
+                  data_key="segmask_raw_surface", visible=True)
+    prepared = SceneController.prepare_segmentation_cache(ws)
+    assert prepared["meshes"]
+    scene = SceneController(None, ws, lambda message: None)
+    scene.adopt_segmentation_cache(prepared)
+    mesh = scene._build_dataset("segmask_raw_surface")
+    assert mesh is not None and mesh.n_points
+    ws.flow_raw = ws.flow_raw.copy()
+    ws.pcmra_array = ws.mag_raw.copy()
+    ws.derived.pressure_gradient_array = ws.flow_raw.copy()
+    scene.invalidate_cache("pcmra_volume")
+    assert scene._build_dataset("segmask_raw_surface") is mesh
+    # A source revision must replace the dataset, even if velocity is unchanged.
+    labels[1, 1, 1] = 2
+    ws.set_segmentation_source("original", labels)
+    ws.activate_segmentation_source("original")
+    changed = scene._build_dataset("segmask_raw_surface")
+    assert changed is not mesh
+    assert 2 in changed.cell_data["label"]
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='SSH rendering phantom runs on Linux')
+def test_plane_multiselect_pressure_menu_phantom_click_drag_and_active_plane(monkeypatch, tmp_path):
+    app = _smoke_qt_application(monkeypatch)
+    monkeypatch.setenv('AUTOFLOW_SSH_RENDERING', '1')
+    from PySide6 import QtCore, QtGui, QtTest
+    from autoflow.core.plane_state import stamp_metric
+    import autoflow.ui.app as ui_app
+    from autoflow.ui.remote_plotter import RemotePlotter
+    monkeypatch.setattr(ui_app, 'RemotePlotter', RemotePlotter, raising=False)
+    window = ui_app.MainWindow()
+    try:
+        ws = window.workspace
+        ws.paths.output_dir = str(tmp_path)
+        ws.data_loaded = True
+        ws.mag_raw = np.ones((20, 20, 20, 2), np.float32)
+        ws.flow_raw = np.zeros((20, 20, 20, 2, 3), np.float32)
+        ws.segmask_binary = np.ones((20, 20, 20, 2), bool)
+        ws.derived.relative_pressure_array = np.zeros((20, 20, 20, 2), np.float32)
+        ws.derived.pressure_gradient_support_mask = ws.segmask_binary.copy()
+        ws.planes = [PlaneData(center=np.array([x, 10., 10.]), normal=np.array([1., 0., 0.]))
+                     for x in (5., 10., 15.)]
+        for i, plane in enumerate(ws.planes):
+            plane.metrics = stamp_metric(plane, {'relative_pressure_mean_Pa_t': [10.*i, 20.*i],
+                                               'flowrate_mL_s': [i+1., i+2.]}, i)
+        window._rebuild_plane_objects()
+        window.scene.set_plane_display_settings(size_mm=3)
+        window.resize(1500, 900)
+        window.show()
+        app.processEvents()
+        window.plotter.camera.position = (40., -45., 40.)
+        window.plotter.camera.focal_point = (10., 10., 10.)
+        window.plotter.camera.up = (0., 0., 1.)
+        window.scene.reset_camera()
+        window.plotter.camera.parallel_projection = True
+        window.plotter.camera.parallel_scale = 15
+        window.plotter.render()
+        app.processEvents()
+
+        def point(i):
+            world = window.scene.world_to_display_points([ws.planes[i].center + ws.origin])[0]
+            renderer = window.plotter.renderer
+            renderer.SetWorldPoint(*world, 1.)
+            renderer.WorldToDisplay()
+            x, y, _ = renderer.GetDisplayPoint()
+            rw, rh = window.plotter.render_window.GetSize()
+            return QtCore.QPoint(round(x*window.plotter.width()/rw),
+                                 round((rh-1-y)*window.plotter.height()/rh))
+
+        def click(i, control=False, button=QtCore.Qt.LeftButton):
+            QtTest.QTest.mouseClick(window.plotter, button,
+                QtCore.Qt.ControlModifier if control else QtCore.Qt.NoModifier, point(i))
+            app.processEvents()
+
+        def pressure_action(menu):
+            return next(a for a in menu.actions() if a.text() == 'Calculate Pressure Difference')
+
+        click(1)
+        assert window._selected_plane_index == 1
+        click(0, True)
+        assert window._pressure_pair_indices() == [1, 0]
+        assert window._selected_plane_index == 0
+        assert len(window.tree_objects.selectedItems()) == 2
+        assert len(window.scene._selected_plane_actors) == 1
+        click(0, button=QtCore.Qt.RightButton)
+        menu = window._plane_context_menu
+        assert pressure_action(menu).isEnabled()
+        assert window._pressure_pair_indices() == [1, 0]
+        assert 'Edit Plane' in [a.text() for a in menu.actions()]
+        menu.close()
+        pressure_action(menu).trigger()
+        app.processEvents()
+        assert window._analysis_mode() == 'plane_pressure_difference'
+        assert window._plane_pressure_result['pressure_difference_Pa_t'] == [10., 20.]
+        ws.current_t = 1
+        window._refresh_analysis_panel()
+        assert window.label_pwv_status.value.text() == '20'
+
+        click(2, True)
+        assert len(window.tree_objects.selectedItems()) == 3
+        assert window._selected_plane_index == 2
+        assert window._analysis_mode() == 'plane_curve'
+        assert window._plane_pressure_result is None
+        menu = window._show_plane_context_menu(window._plane_selection_order[-1], point(2))
+        assert not pressure_action(menu).isEnabled()
+        menu.close()
+        click(2, True)
+        assert window._pressure_pair_indices() == [1, 0]
+        assert window._selected_plane_index == 0
+
+        # Motion is a camera gesture, not a new selection.
+        selection = list(window._plane_selection_order)
+        camera = np.asarray(tuple(window.plotter.camera_position))
+        start = point(1)
+        end = start + QtCore.QPoint(65, 35)
+        QtTest.QTest.mousePress(window.plotter, QtCore.Qt.LeftButton, pos=start)
+        event = QtGui.QMouseEvent(QtCore.QEvent.MouseMove, end, window.plotter.mapToGlobal(end),
+                                 QtCore.Qt.NoButton, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier)
+        QtCore.QCoreApplication.sendEvent(window.plotter, event)
+        QtTest.QTest.mouseRelease(window.plotter, QtCore.Qt.LeftButton, pos=end)
+        app.processEvents()
+        assert window._plane_selection_order == selection
+        assert not np.allclose(tuple(window.plotter.camera_position), camera)
+
+        # Right drag keeps zoom and never opens the plane context menu.
+        scale = window.plotter.camera.parallel_scale
+        previous_menu = window._plane_context_menu
+        start = point(1)
+        end = start + QtCore.QPoint(0, 45)
+        QtTest.QTest.mousePress(window.plotter, QtCore.Qt.RightButton, pos=start)
+        event = QtGui.QMouseEvent(QtCore.QEvent.MouseMove, end, window.plotter.mapToGlobal(end),
+                                 QtCore.Qt.NoButton, QtCore.Qt.RightButton, QtCore.Qt.NoModifier)
+        QtCore.QCoreApplication.sendEvent(window.plotter, event)
+        QtTest.QTest.mouseRelease(window.plotter, QtCore.Qt.RightButton, pos=end)
+        app.processEvents()
+        assert window._plane_selection_order == selection
+        assert window._plane_context_menu is previous_menu and not previous_menu.isVisible()
+        assert window.plotter.camera.parallel_scale != pytest.approx(scale)
+
+        uid = window._find_uid_by_indexed_data_key('plane', 1)
+        menu = window._show_plane_context_menu(uid, window.plotter.mapToGlobal(point(1)))
+        menu.close()
+        next(a for a in menu.actions() if a.text() == 'Edit Plane').trigger()
+        assert window._selected_plane_index == 1 and window._plane_edit_enabled
+        assert window.scene._plane_selection_locked
+        window._on_3d_plane_picked(None, None)
+        assert window._selected_plane_index == 1
+        window._cancel_plane_edit()
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+

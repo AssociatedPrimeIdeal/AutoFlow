@@ -103,6 +103,7 @@ nav:
   - Start:
       - Quickstart: en/user/quickstart.md
       - Windows portable application: en/user/windows-portable.md
+      - Changelog: en/user/changelog.md
       - Worked example: en/user/demo-case.md
       - End-to-end workflow: en/user/workflow.md
       - GUI workflow: en/user/gui.md

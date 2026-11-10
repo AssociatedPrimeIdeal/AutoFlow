@@ -28,7 +28,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dicom = [
-  "dicom2h5 @ git+https://github.com/AssociatedPrimeIdeal/4DFlow_Dicom2H5.git@d13d0a49e1debd08bb659d447de1a51c32cf6920",
+  "dicom2h5 @ git+https://github.com/AssociatedPrimeIdeal/4DFlow_Dicom2H5.git@8a5b82ebd223dad61c9cf18d211e70ba9b818521",
 ]
 docs = [
   "mkdocs-material>=9.5,<10",
@@ -49,14 +49,14 @@ gui = [
   "nibabel",
 ]
 labeler = [
-  "spatiotemporal-labeler @ git+https://github.com/AssociatedPrimeIdeal/SpatioTemporalLabeler.git@da9fd467264df9cc432f8222f82e175e5a89b641",
+  "spatiotemporal-labeler @ git+https://github.com/AssociatedPrimeIdeal/SpatioTemporalLabeler.git@4a8ef1b3b950a6b22e3d7e3f21dd46da1a6f23a1",
 ]
 pu = [
   "pudipflow @ git+https://github.com/AssociatedPrimeIdeal/PUDIP-Flow.git@1b2b97e7344ee25cac3a2dd0c46513650b94d39e",
   "gustflow @ git+https://github.com/AssociatedPrimeIdeal/GUST-Flow.git@e68d90deb083a6fdf772fdc7cdcbe8dc71370c25 ; python_version >= '3.10'",
 ]
 all = [
-  "dicom2h5 @ git+https://github.com/AssociatedPrimeIdeal/4DFlow_Dicom2H5.git@d13d0a49e1debd08bb659d447de1a51c32cf6920",
+  "dicom2h5 @ git+https://github.com/AssociatedPrimeIdeal/4DFlow_Dicom2H5.git@8a5b82ebd223dad61c9cf18d211e70ba9b818521",
   "mkdocs-material>=9.5,<10",
   "pytest",
   "imageio-ffmpeg>=0.6,<1",
@@ -66,7 +66,7 @@ all = [
   "matplotlib",
   "nnunetv2==2.5.2",
   "nibabel",
-  "spatiotemporal-labeler @ git+https://github.com/AssociatedPrimeIdeal/SpatioTemporalLabeler.git@da9fd467264df9cc432f8222f82e175e5a89b641",
+  "spatiotemporal-labeler @ git+https://github.com/AssociatedPrimeIdeal/SpatioTemporalLabeler.git@4a8ef1b3b950a6b22e3d7e3f21dd46da1a6f23a1",
   "pudipflow @ git+https://github.com/AssociatedPrimeIdeal/PUDIP-Flow.git@1b2b97e7344ee25cac3a2dd0c46513650b94d39e",
   "gustflow @ git+https://github.com/AssociatedPrimeIdeal/GUST-Flow.git@e68d90deb083a6fdf772fdc7cdcbe8dc71370c25 ; python_version >= '3.10'",
 ]

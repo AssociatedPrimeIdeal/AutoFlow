@@ -32,7 +32,7 @@ def make_manual_plane(ws, center, *, coordinate_system="local", normal=(1.0, 0.0
         raise ValueError("Plane normal must be finite and nonzero.")
     normal = normal / np.max(np.abs(normal))
     return PlaneData(center=center, normal=normal / np.linalg.norm(normal), label=0, path_index=-1,
-                     placement={"manual_geometry": True})
+                     placement={"manual_geometry": True, "geometry_source": "coordinates"})
 
 
 def _normalize(v):
