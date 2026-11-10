@@ -1,3 +1,5 @@
+from .theme import semantic_button, semantic_question
+from .theme import SemanticButtonBox
 from .selection_info import SelectionInfoPanel, consistency_rows
 from .browser import BrowserTree, ContextStack, INLINE_ROLE
 from .measurement_summary import MeasurementSummary
@@ -169,32 +171,10 @@ _BACKGROUND_PHASE_METHOD_ITEMS = [
 ]
 
 
-_PLANE_CURVE_SERIES_OPTIONS = [
-    ("flowrate_mL_s", "Flowrate (mL/s)"),
-    ("flowrate_forward_mL_s", "Forward Flowrate (mL/s)"),
-    ("flowrate_reverse_mL_s", "Reverse Flowrate (mL/s)"),
-    ("flowrate_signed_mL_s", "Signed Flowrate (mL/s)"),
-    ("area_mm2", "Area (mm^2)"),
-    ("meanv_cm_s_t", "Mean Velocity (cm/s)"),
-    ("meanv_forward_cm_s_t", "Forward Mean Velocity (cm/s)"),
-    ("meanv_reverse_cm_s_t", "Reverse Mean Velocity (cm/s)"),
-    ("meanv_signed_cm_s_t", "Signed Mean Velocity (cm/s)"),
-    ("tke_mean_J_m3_t", "TKE Mean (J/m^3)"),
-    ("tke_peak_J_m3_t", "TKE Peak (J/m^3)"),
-    ("tke_p95_J_m3_t", "TKE P95 (J/m^3)"),
-    ("pressure_gradient_mag_mean_Pa_m_t", "Pressure Gradient Mean (Pa/m)"),
-    ("pressure_gradient_mag_peak_Pa_m_t", "Pressure Gradient Peak (Pa/m)"),
-    ("pressure_gradient_mag_p95_Pa_m_t", "Pressure Gradient P95 (Pa/m)"),
-    ("pressure_gradient_normal_mean_Pa_m_t", "Pressure Gradient Normal Mean (Pa/m)"),
-    ("pressure_gradient_normal_peak_Pa_m_t", "Pressure Gradient Normal Peak (Pa/m)"),
-    ("pressure_gradient_normal_p95_Pa_m_t", "Pressure Gradient Normal P95 (Pa/m)"),
-    ("relative_pressure_mean_Pa_t", "Relative Pressure Mean (Pa)"),
-    ("relative_pressure_peak_Pa_t", "Relative Pressure Peak (Pa)"),
-    ("relative_pressure_p95_Pa_t", "Relative Pressure P95 (Pa)"),
-    ("wss_wall_mean_Pa_t", "WSS Mean (Pa)"),
-    ("wss_wall_peak_Pa_t", "WSS Peak (Pa)"),
-    ("wss_wall_p95_Pa_t", "WSS P95 (Pa)"),
-]
+from .plane_measurements import (
+    _PLANE_CURVE_SERIES_OPTIONS, PLANE_CYCLE_OPTIONS,
+    measurement_options, measurement_unavailable_reason,
+)
 
 
 def _flowrate_display_curve(values, order=3):
@@ -892,6 +872,7 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
         right_lay.setContentsMargins(0, 0, 0, 0)
         self.ortho_viewer = OrthoViewer(self.workspace, self)
         self.ortho_viewer.contentRenderRequested.connect(self._on_content_render_requested)
+        self.ortho_viewer.planeStepRequested.connect(self._step_plane_from_2d)
         self.ortho_viewer.planeTranslationStarted.connect(self._begin_plane_2d_translation)
         self.ortho_viewer.planeTranslationChanged.connect(self._move_plane_from_2d)
         self.ortho_viewer.planeTranslationFinished.connect(self._finish_plane_2d_translation)
@@ -1384,7 +1365,7 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
         self.btn_add_plane = QtWidgets.QPushButton('Add Plane', self._browser_parking)
         self.btn_add_plane.clicked.connect(self._add_manual_plane)
         self.btn_add_plane.hide()
-        self.btn_edit_plane = QtWidgets.QPushButton('Apply plane')
+        self.btn_edit_plane = semantic_button(QtWidgets.QPushButton('Apply plane'), "apply")
         self.btn_edit_plane.clicked.connect(self._toggle_selected_plane_edit)
         plane_actions.addWidget(self.btn_edit_plane)
         parent.addLayout(plane_actions)
@@ -1722,24 +1703,11 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
         return plane_idx, dict(metric)
 
     def _available_plane_curve_series(self, metric):
-        options = []
-        payload = dict(metric or {})
-        for key, label in _PLANE_CURVE_SERIES_OPTIONS:
-            values = payload.get(key)
-            if values is None:
-                continue
-            try:
-                arr = np.asarray(values, dtype=float).reshape(-1)
-            except Exception:
-                continue
-            if arr.size == 0:
-                continue
-            options.append((key, label))
-        return options
+        return measurement_options(metric)
 
     def _refresh_plane_curve_metric_options(self):
         current_key = self.combo_plane_curve_metric.currentData() if hasattr(self, "combo_plane_curve_metric") else None
-        _plane_idx, metric = self._selected_plane_metric()
+        plane_idx, metric = self._selected_plane_metric()
         options = self._available_plane_curve_series(metric)
         if not hasattr(self, "combo_plane_curve_metric"):
             return options
@@ -1747,6 +1715,8 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
         self.combo_plane_curve_metric.clear()
         for key, label in options:
             self.combo_plane_curve_metric.addItem(label, key)
+            reason = measurement_unavailable_reason(self.workspace, plane_idx, metric, key)
+            self.combo_plane_curve_metric.setItemData(self.combo_plane_curve_metric.count()-1, reason or label, QtCore.Qt.ToolTipRole)
         self.combo_plane_curve_metric.setEnabled(bool(options))
         if options:
             target_idx = 0
@@ -1759,7 +1729,9 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
         return options
 
     def _clear_pwv_axes(self, message="No analysis available.", title="Analysis"):
-        token = (str(message), str(title))
+        from textwrap import fill
+        width = max(26, min(64, int(self.canvas_pwv.width()/7.5)))
+        token = (str(message), str(title), width)
         if getattr(self, "_empty_analysis_token", None) == token and len(self.fig_pwv.axes) == 1 and not self.fig_pwv.axes[0].lines:
             return
         self._empty_analysis_token = token
@@ -1768,7 +1740,8 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
         ax.set_title(str(title))
         ax.set_xticks([])
         ax.set_yticks([])
-        ax.text(0.5, 0.5, str(message), ha="center", va="center", transform=ax.transAxes)
+        wrapped = "\n".join(fill(line, width=width) for line in str(message).splitlines())
+        ax.text(0.5, 0.5, wrapped, ha="center", va="center", transform=ax.transAxes)
         style_analysis_figure(self)
         self.canvas_pwv.draw_idle()
 
@@ -1827,7 +1800,7 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
 
     def _plot_plane_curve(self):
         plane_idx, metric = self._selected_plane_metric()
-        if metric is None:
+        if plane_idx < 0:
             self.label_pwv_status.setText("No plane selected.")
             self._clear_pwv_axes("Select a plane to inspect a cardiac-phase curve.", title="Plane Curve")
             return
@@ -1837,12 +1810,20 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
             self._clear_pwv_axes("Run plane metrics to populate plane curves.", title="Plane Curve")
             return
         series_key = self.combo_plane_curve_metric.currentData()
-        label_map = {key: label for key, label in _PLANE_CURVE_SERIES_OPTIONS}
+        label_map = dict(options)
         series_label = label_map.get(str(series_key), str(series_key or "Metric"))
-        values = np.asarray(metric.get(series_key, []), dtype=float).reshape(-1)
-        if values.size == 0 or not np.any(np.isfinite(values)):
-            self.label_pwv_status.setText(f"Plane {int(plane_idx)} has no valid samples for {series_label}.")
-            self._clear_pwv_axes("Selected metric is not available for this plane.", title="Plane Curve")
+        reason = measurement_unavailable_reason(self.workspace, plane_idx, metric, series_key)
+        if reason:
+            self.label_pwv_status.setText(f"Plane {int(plane_idx)} · {series_label}\n{reason}")
+            self._clear_pwv_axes(reason, title=series_label)
+            return
+        if series_key in dict(PLANE_CYCLE_OPTIONS):
+            value = float(metric[series_key])
+            unit = 'mL/beat' if series_key.endswith('_mL_beat') else ''
+            self.label_pwv_status.set_measurement(f"Plane {int(plane_idx)}", series_label,
+                f'{value:.4g}', unit, [], notes='Cardiac-cycle summary',
+                plain_text=f'Plane {plane_idx}\n{series_label}: {value:.4g} {unit}')
+            self._clear_pwv_axes(f'{value:.4g} {unit}', title=series_label)
             return
         values = update_plane_curve(self, int(plane_idx), metric, series_key, series_label, _flowrate_display_curve)
         current_t = int(np.clip(self.workspace.current_t, 0, max(0, values.size-1)))
@@ -1857,7 +1838,7 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
         finite = values[np.isfinite(values)]
         def display_number(value):
             return "—" if value is None or not np.isfinite(float(value)) else f"{float(value):.4g}"
-        complete = not metric.get("sample_valid_t") or all(metric["sample_valid_t"])
+        complete = bool(np.all(np.isfinite(values)))
         parts = series_label.rsplit(" (", 1)
         unit = parts[1].rstrip(")") if len(parts) == 2 else ""
         context = f"Path {path_idx}" + (f" · {path_dir}" if path_dir else "")
@@ -2350,7 +2331,6 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
         self.scene.set_background(background)
         self.scene.initialize()
         self.scene.enable_plane_picking(self._on_3d_plane_picked)
-        self.scene._plane_context_callback = self._on_3d_plane_context
         self.scene.enable_path_picking(self._on_3d_path_picked)
 
     def _segmentation_object_name(self):
@@ -3021,13 +3001,35 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
             "features": labeler_features(ws.input_state.metadata.get("labeler_extra_features", [])),
         }
 
+    def _labeler_case_change_blocked(self):
+        process = getattr(self, '_labeler_process', None)
+        if getattr(self, '_labeler_export_running', False) or (process is not None and
+                process.state() != QtCore.QProcess.ProcessState.NotRunning):
+            self.log("Save and close SpatioTemporal Labeler before closing or switching the case.")
+            return True
+        return False
+
+    def _cleanup_labeler_exchange(self):
+        self._labeler_case_generation = getattr(self, "_labeler_case_generation", 0) + 1
+        cache = getattr(self, '_labeler_exchange_cache', None)
+        if cache is not None:
+            try:
+                cache.cleanup()
+            except OSError as exc:
+                self.log(f"Could not clear Labeler exchange cache: {exc}")
+                return
+            self._labeler_exchange_cache = None
+        self._labeler_exchange_key = None
+
     def _labeler_exchange_directory(self, metadata):
+        from .labeler_exchange import LabelerExchangeSession
         output_dir = self.workspace.paths.output_dir or os.path.join(os.getcwd(), "autoflow_out")
-        source_id = str(metadata["source_id"])
-        source_stem = os.path.splitext(os.path.basename(source_id))[0] or "workspace"
-        safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", source_stem).strip("._") or "workspace"
-        source_hash = hashlib.sha1(source_id.encode("utf-8")).hexdigest()[:12]
-        return os.path.abspath(os.path.join(output_dir, "spatiotemporal_labeler", f"{safe_stem}_{source_hash}"))
+        key = (str(metadata['source_id']), str(metadata['input_signature']), os.path.abspath(output_dir))
+        if getattr(self, '_labeler_exchange_key', None) != key:
+            self._cleanup_labeler_exchange()
+            self._labeler_exchange_cache = LabelerExchangeSession(output_dir, metadata['source_id'])
+            self._labeler_exchange_key = key
+        return str(self._labeler_exchange_cache.path)
 
     def _open_external_segmentation_editor(self):
         """Prepare a reusable exchange directory, launch Labeler, and re-import on exit."""
@@ -3154,6 +3156,7 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
         process.readyReadStandardError.connect(self._on_external_segmentation_editor_stderr)
         self._labeler_process = process
         self._labeler_origin_workspace = self.workspace
+        self._labeler_origin_generation = getattr(self, "_labeler_case_generation", 0)
         self._labeler_segmentation_path = label_path
         self._labeler_segmentation_mtime_ns = os.stat(label_path).st_mtime_ns
         if removed_render_variables:
@@ -3241,17 +3244,17 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
         if not changed:
             self.log("Labeler segmentation was not saved; the active AutoFlow segmentation is unchanged.")
             return
-        self._offer_labeler_import(label_path, origin_workspace)
+        self._offer_labeler_import(label_path, origin_workspace, getattr(self, "_labeler_origin_generation", None))
 
-    def _offer_labeler_import(self, label_path, origin_workspace):
-        if self.workspace is not origin_workspace:
+    def _offer_labeler_import(self, label_path, origin_workspace, generation=None):
+        if self.workspace is not origin_workspace or (generation is not None and generation != getattr(self, "_labeler_case_generation", 0)):
             self.log(f"Labeler result saved for the previous case: {label_path}")
             return
         app = QtWidgets.QApplication.instance()
         if app.activeModalWidget() is not None:
-            QtCore.QTimer.singleShot(250, lambda: self._offer_labeler_import(label_path, origin_workspace))
+            QtCore.QTimer.singleShot(250, lambda: self._offer_labeler_import(label_path, origin_workspace, generation))
             return
-        choice = QtWidgets.QMessageBox.question(
+        choice = semantic_question(
             self,
             "Apply Labeler Segmentation",
             "SpatioTemporal Labeler saved a modified segmentation. Apply it as the imported source?",
@@ -6069,7 +6072,7 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
             self.log(f"VIEW ERROR: {type(e).__name__}: {e}")
 
     def _load_selected_input_case(self, case, parameter_overrides=None):
-        if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
+        if self._labeler_case_change_blocked() or self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
             return
         try:
             resolved = resolve_input_case(case)
@@ -6106,6 +6109,7 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
             self._seg_surface_rebuild_timer.stop()
             self._seg_edit_active = False
             self._reset_segmentation_edit_history()
+            self._cleanup_labeler_exchange()
             self.workspace = pending
             self._plane_undo_stack.clear()
             self._active_input_case = resolved
@@ -6231,7 +6235,7 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
         if path is None:
             event.ignore()
             return
-        if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
+        if self._labeler_case_change_blocked() or self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
             event.ignore()
             self.statusBar().showMessage("Cannot switch cases yet. Finish or cancel the active task or edit; see Log.", 8000)
             return
@@ -6242,7 +6246,7 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
         QtCore.QTimer.singleShot(0, lambda: loader(path))
 
     def _on_load_h5(self):
-        if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
+        if self._labeler_case_change_blocked() or self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
             return
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load H5", "", "H5 (*.h5 *.hdf5);;All (*)")
         if not path:
@@ -6250,7 +6254,7 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
         self._load_h5_path(path)
 
     def _load_h5_path(self, path):
-        if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
+        if self._labeler_case_change_blocked() or self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
             return
         try:
             cases = discover_h5_input_cases(path)
@@ -6279,7 +6283,7 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
         if getattr(self, "_dicom_conversion_thread", None) is not None:
             self.statusBar().showMessage("DICOM conversion is already running.", 8000)
             return
-        if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
+        if self._labeler_case_change_blocked() or self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
             return
         options = QtWidgets.QFileDialog.Option.DontUseNativeDialog
         root = QtWidgets.QFileDialog.getExistingDirectory(self, "Load DICOM", "", options=options)
@@ -6289,7 +6293,7 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
         self._load_dicom_directory(root)
 
     def _load_dicom_directory(self, root):
-        if self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
+        if self._labeler_case_change_blocked() or self._pipeline_running_guard("loading another case") or self._autoseg_running_guard("loading another case"):
             return
         options = QtWidgets.QFileDialog.Option.DontUseNativeDialog
         self.statusBar().showMessage("DICOM directory selected. Choose a new H5 destination in Save Converted H5.")
@@ -6510,7 +6514,7 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons = SemanticButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         layout.addWidget(buttons)
 
         def _browse_dir():
@@ -6593,6 +6597,8 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
             self.log(traceback.format_exc())
 
     def _on_close_workspace(self):
+        if self._labeler_case_change_blocked():
+            return
         if self._autoseg_thread is not None:
             self.log("Auto segmentation is running. Wait for it to finish before clearing the workspace.")
             return
@@ -6605,6 +6611,7 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
         self._seg_surface_rebuild_timer.stop()
         self._seg_edit_active = False
         self._reset_segmentation_edit_history()
+        self._cleanup_labeler_exchange()
         self.workspace.reset_all()
         self._plane_undo_stack.clear()
         self._last_quality_report = None
@@ -7098,6 +7105,7 @@ class MainWindow(PlaneSelectionMixin, GeometryEditingMixin, WorkspaceLayoutMixin
             self._clear_plane_drag_widgets()
         except Exception:
             pass
+        self._cleanup_labeler_exchange()
         self.scene._clear_content_widgets()
         self.scene._close_interaction_rendering()
         if hasattr(self, "_qc_overlay"):

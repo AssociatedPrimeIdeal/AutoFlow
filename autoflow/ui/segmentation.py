@@ -1,3 +1,4 @@
+from .theme import semantic_button
 from PySide6 import QtCore, QtWidgets
 
 
@@ -35,7 +36,7 @@ class SegmentationDock(QtWidgets.QWidget):
         source_actions_layout.setContentsMargins(0, 0, 0, 0)
         source_actions_layout.setSpacing(4)
         self.btn_import = QtWidgets.QPushButton("Import...")
-        self.btn_save = QtWidgets.QPushButton("Save...")
+        self.btn_save = semantic_button(QtWidgets.QPushButton("Save..."), "apply")
         self.btn_import.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogOpenButton)
         )
@@ -106,7 +107,7 @@ class SegmentationDock(QtWidgets.QWidget):
         self.spin_cleanup_4d_volume.setRange(0.0, 1e9)
         self.spin_cleanup_4d_volume.setDecimals(2)
         self.spin_cleanup_4d_volume.setSuffix(" mm^3")
-        self.btn_apply_cleanup_4d = QtWidgets.QPushButton("Apply / Rebuild")
+        self.btn_apply_cleanup_4d = semantic_button(QtWidgets.QPushButton("Apply / Rebuild"), "apply")
         cleanup_form.addRow("Mode", self.combo_cleanup_4d_mode)
         cleanup_form.addRow("Minimum volume", self.spin_cleanup_4d_volume)
         cleanup_form.addRow("", self.check_cleanup_4d)

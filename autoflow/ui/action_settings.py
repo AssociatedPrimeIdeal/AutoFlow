@@ -1,5 +1,6 @@
 """Transactional action settings, with method-dependent form rows."""
 
+from .theme import SemanticButtonBox
 import copy
 import json
 import math
@@ -460,7 +461,7 @@ class ActionSettingsDialog(QtWidgets.QDialog):
                 button.clicked.connect(lambda checked=False, op=operation: self._choose_operation(op))
                 row.addWidget(button)
             layout.addLayout(row)
-        buttons = QtWidgets.QDialogButtonBox()
+        buttons = SemanticButtonBox()
         self.defaults_button = buttons.addButton("Restore applied values" if self._input_settings else "Restore defaults", QtWidgets.QDialogButtonBox.ResetRole)
         self.defaults_button.clicked.connect(lambda: self.set_values(self._defaults))
         buttons.addButton(QtWidgets.QDialogButtonBox.Cancel).clicked.connect(self.reject)

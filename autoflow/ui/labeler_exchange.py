@@ -18,6 +18,23 @@ from ..algorithms.segmentation import (
 )
 
 
+class LabelerExchangeSession:
+    """Own regenerable editor files for one live case, never a saved source."""
+
+    def __init__(self, output_directory, source_id):
+        parent = Path(output_directory).expanduser().resolve() / 'spatiotemporal_labeler'
+        parent.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(str(source_id).encode('utf-8')).hexdigest()[:12]
+        self._parent = parent
+        self._temporary = tempfile.TemporaryDirectory(prefix=f'case_{digest}_', dir=parent)
+        self.path = Path(self._temporary.name).resolve()
+
+    def cleanup(self):
+        if self.path.parent != self._parent or not self.path.name.startswith('case_'):
+            raise ValueError('Labeler exchange directory escaped its managed cache root')
+        self._temporary.cleanup()
+
+
 LABELER_FEATURES = ("mag", "flow_x", "flow_y", "flow_z", "pcmra")
 
 

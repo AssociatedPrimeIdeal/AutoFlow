@@ -1,4 +1,5 @@
 """Compact in-place Skeleton/Graph editing in the existing 3-D workspace."""
+from .theme import semantic_button
 import copy
 import numpy as np
 import pyvista as pv
@@ -247,12 +248,12 @@ class GeometryEditingMixin:
         self._geometry_redo.setAccessibleName('Redo')
         self._geometry_redo.clicked.connect(lambda: self._geometry_history(True))
         row.addWidget(self._geometry_redo)
-        self._edit_btn_cancel = QtWidgets.QPushButton('Cancel')
+        self._edit_btn_cancel = semantic_button(QtWidgets.QPushButton('Cancel'), "cancel")
         self._edit_btn_cancel.setFlat(True)
         self._edit_btn_cancel.setToolTip('Discard this editing session')
         self._edit_btn_cancel.clicked.connect(lambda: self._exit_interactive_edit(False))
         row.addWidget(self._edit_btn_cancel)
-        self._edit_btn_save = QtWidgets.QPushButton('Done')
+        self._edit_btn_save = semantic_button(QtWidgets.QPushButton('Done'), "apply")
         self._edit_btn_save.setProperty('role', 'primary')
         self._edit_btn_save.setToolTip('Apply changes and update centerlines')
         self._edit_btn_save.clicked.connect(lambda: self._exit_interactive_edit(True))

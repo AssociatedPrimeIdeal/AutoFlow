@@ -170,7 +170,7 @@
           "anchor": "label_reference_branch",
           "path_selection": "longest",
           "position": "near",
-          "offset_mm": 15.0,
+          "offset_mm": 10.0,
           "connection_fallback": "flow_endpoint"
         }
       ]
@@ -183,7 +183,7 @@
           "anchor": "label_reference_branch",
           "path_selection": "longest",
           "position": "near",
-          "offset_mm": 15.0,
+          "offset_mm": 10.0,
           "connection_fallback": "flow_endpoint"
         }
       ]

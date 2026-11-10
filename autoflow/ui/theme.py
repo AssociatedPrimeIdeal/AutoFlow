@@ -10,6 +10,8 @@ THEMES = {
         "accent_hover": "#2485e6", "selection": "#263d59", "hover": "#343b46",
         "disabled_bg": "#292b30", "disabled_text": "#727984", "scrollbar": "#555c67",
         "danger": "#f19aa5", "danger_border": "#64424c", "tooltip": "#363940",
+        "accept_bg": "#247b53", "accept_hover": "#2e9465",
+        "cancel_bg": "#99414d", "cancel_hover": "#b6505d",
         "on_accent": "#ffffff", "curve": "#62a8fa", "cursor": "#7e96b4",
         "grid": "#414650", "spine": "#4b515c", "title": "#e1e7ef",
         "detail_label": "#dbe3ef", "detail_unit": "#c9d5e5", "detail_value": "#9dccff",
@@ -21,6 +23,8 @@ THEMES = {
         "accent_hover": "#2c88e8", "selection": "#e8f0fb", "hover": "#f0f3f8",
         "disabled_bg": "#ebedf1", "disabled_text": "#9aa1ac", "scrollbar": "#bec5cd",
         "danger": "#b7475c", "danger_border": "#e0b9c2", "tooltip": "#ffffff",
+        "accept_bg": "#247b53", "accept_hover": "#2e9465",
+        "cancel_bg": "#99414d", "cancel_hover": "#b6505d",
         "on_accent": "#ffffff", "curve": "#1678df", "cursor": "#8b9caf",
         "grid": "#e3e7ed", "spine": "#c7ced8", "title": "#3d4653",
         "detail_label": "#46546a", "detail_unit": "#52627a", "detail_value": "#145fa6",
@@ -401,6 +405,72 @@ QTabBar::tab {
 }
 """
 
+
+
+
+def semantic_button(button, action):
+    """Color an explicit commit or discard action in both themes."""
+    button.setProperty('actionSemantic', action)
+    button.style().unpolish(button)
+    button.style().polish(button)
+    button.update()
+    return button
+
+
+class SemanticButtonBox(QtWidgets.QDialogButtonBox):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._style_actions()
+
+    def addButton(self, *args):
+        button = super().addButton(*args)
+        self._style_actions()
+        return button
+
+    def _style_actions(self):
+        for button in self.buttons():
+            standard = self.standardButton(button)
+            role = self.buttonRole(button)
+            if standard == self.StandardButton.Close:
+                continue
+            if role in (self.ButtonRole.RejectRole, self.ButtonRole.DestructiveRole, self.ButtonRole.NoRole):
+                semantic_button(button, 'cancel')
+            elif role in (self.ButtonRole.AcceptRole, self.ButtonRole.ApplyRole, self.ButtonRole.YesRole) or button.text().lower().startswith(('save', 'apply')):
+                semantic_button(button, 'apply')
+
+
+_APP_STYLESHEET += """
+QPushButton[actionSemantic="apply"], QToolButton[actionSemantic="apply"] {
+    background: @accept_bg; border: 1px solid @accept_bg; color: @on_accent; font-weight: 600;
+}
+QPushButton[actionSemantic="apply"]:enabled:hover, QToolButton[actionSemantic="apply"]:enabled:hover {
+    background: @accept_hover; border-color: @accept_hover;
+}
+QPushButton[actionSemantic="cancel"], QToolButton[actionSemantic="cancel"] {
+    background: @cancel_bg; border: 1px solid @cancel_bg; color: @on_accent; font-weight: 600;
+}
+QPushButton[actionSemantic="cancel"]:enabled:hover, QToolButton[actionSemantic="cancel"]:enabled:hover {
+    background: @cancel_hover; border-color: @cancel_hover;
+}
+QPushButton[actionSemantic="apply"]:disabled, QToolButton[actionSemantic="apply"]:disabled,
+QPushButton[actionSemantic="cancel"]:disabled, QToolButton[actionSemantic="cancel"]:disabled {
+    background: @disabled_bg; border-color: @border; color: @disabled_text;
+}
+"""
+
+
+def semantic_question(parent, title, text,
+                      buttons=QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                      defaultButton=QtWidgets.QMessageBox.NoButton):
+    """Show a commit/discard question without installing a global Qt filter."""
+    dialog = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Question, title, text, buttons, parent)
+    if defaultButton != QtWidgets.QMessageBox.NoButton:
+        dialog.setDefaultButton(defaultButton)
+    SemanticButtonBox._style_actions(dialog)
+    try:
+        return QtWidgets.QMessageBox.StandardButton(dialog.exec())
+    finally:
+        dialog.deleteLater()
 
 
 def configure_high_dpi():

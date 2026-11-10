@@ -1,6 +1,7 @@
 [CmdletBinding()]
-param([string]$Destination = $PSScriptRoot)
+param([string]$Destination = "")
 $ErrorActionPreference = "Stop"
+if ([string]::IsNullOrWhiteSpace($Destination)) { $Destination = $PSScriptRoot }
 $Manifest = Get-Content -LiteralPath (Join-Path $PSScriptRoot "release-manifest.json") -Raw | ConvertFrom-Json
 if (-not $Manifest.parts.Count) { Write-Host "This release already contains a complete ZIP."; exit 0 }
 $Archive = Join-Path $Destination ([IO.Path]::GetFileName($Manifest.archive))

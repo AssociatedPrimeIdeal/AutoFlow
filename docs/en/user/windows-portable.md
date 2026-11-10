@@ -15,8 +15,10 @@ Python, Conda, Git, and a system-wide CUDA Toolkit are not required on the desti
 If the package is split into `.zip.part001`, `.zip.part002`, etc., download **every** part, `release-manifest.json`, and `Join-Portable.ps1` into the same folder, then run:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\Join-Portable.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\Join-Portable.ps1 -Destination .
 ```
+
+An explicit `-Destination .` writes the ZIP to the current folder and also works around the empty default-directory error in the original v2.0.1 joiner on Windows PowerShell 5.1. Updated joiners resolve their default directory after parameter binding and use the script folder.
 
 The joiner verifies each part and the reconstructed ZIP. Extract the ZIP normally, then double-click the executable. A complete ZIP is also produced by local builds.
 

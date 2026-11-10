@@ -1,5 +1,6 @@
 """Live, reversible layout controls for the shared 3D colorbar."""
 
+from .theme import SemanticButtonBox
 import copy
 from PySide6 import QtCore, QtWidgets
 from ..config import DEFAULT_SCALAR_BAR_STYLE
@@ -85,7 +86,7 @@ class ColorbarLayoutDialog(QtWidgets.QDialog):
         self._populate()
         self.presets.currentIndexChanged.connect(self._preset)
         self.orientation.currentIndexChanged.connect(self._orientation)
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok |
+        buttons = SemanticButtonBox(QtWidgets.QDialogButtonBox.Ok |
             QtWidgets.QDialogButtonBox.Cancel | QtWidgets.QDialogButtonBox.RestoreDefaults)
         buttons.button(QtWidgets.QDialogButtonBox.Ok).setText('Apply')
         buttons.accepted.connect(self.accept)

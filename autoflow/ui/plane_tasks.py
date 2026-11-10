@@ -24,14 +24,14 @@ def calculate_plane(payload):
             [plane], RR=data["rr"], branch_labels_3d=data["branches"],
             segmentation_labels_3d=data["labels3"], segmentation_labels_4d=data["labels4"],
             path_info=data["path_info"], forks=data["forks"], paths=data["paths"],
-            sampling_context=context, flow_spacing=data["spacing"])
+            sampling_context=context, flow_spacing=data.get("field_spacing", data["spacing"]))
         if any(data.get(key) is not None for key in ("tke", "pg", "pressure")) or data.get("wss"):
             metrics, _ = augment_plane_metrics_with_derived(metrics, [plane], data["mask"],
                 data["spacing"], data["origin"], branch_labels_3d=data["branches"],
                 segmentation_labels_3d=data["labels3"], segmentation_labels_4d=data["labels4"],
                 tke_array=data["tke"], pressure_gradient_array=data["pg"],
                 relative_pressure_array=data["pressure"], wss_surfaces=data["wss"],
-                pressure_gradient_support_mask=data.get("pressure_support"), sampling_context=context, field_spacing=data["spacing"])
+                pressure_gradient_support_mask=data.get("pressure_support"), sampling_context=context, field_spacing=data.get("field_spacing", data["spacing"]))
         from ..algorithms.geometry_grid import QUANTITATIVE_POLICY
         metric = dict(metrics[0]) if metrics else {}
         if metric:

@@ -1,5 +1,6 @@
 """Shared, serializable controls for slice display."""
 
+from .theme import semantic_button
 import copy
 import json
 
@@ -100,7 +101,7 @@ class DisplaySettingsPanel(QtWidgets.QWidget):
         layout.addWidget(self.validation)
         buttons = QtWidgets.QHBoxLayout()
         reset = QtWidgets.QPushButton("Restore defaults")
-        save = QtWidgets.QPushButton("Save defaults")
+        save = semantic_button(QtWidgets.QPushButton("Save defaults"), "apply")
         reset.clicked.connect(self._reset)
         save.clicked.connect(self._save)
         buttons.addWidget(reset)

@@ -48,7 +48,21 @@ def compute_plane_pressure_difference(planes, metrics, mask, spacing, origin, pr
     differences, reasons = [], []
     for t in range(nt):
         check_cancelled()
-        difference, reason = None, 'Pressure samples unavailable'
+        missing = []
+        for i, metric in enumerate(metrics):
+            if np.isfinite(means[i][t]):
+                continue
+            index = metric.get('plane_index', i)
+            valid = metric.get('sample_valid_t', [])
+            counts = metric.get('relative_pressure_valid_cell_count_t', [])
+            if len(valid) > t and not valid[t]:
+                detail = 'ROI is empty or has no finite velocity samples in this phase'
+            elif len(counts) > t and not counts[t]:
+                detail = 'ROI has no valid pressure support in this phase'
+            else:
+                detail = 'relative-pressure samples are unavailable; update plane metrics'
+            missing.append(f'Plane {index}: {detail}')
+        difference, reason = None, '; '.join(missing) or 'No comparable supported pressure samples'
         if np.isfinite(means[0][t]) and np.isfinite(means[1][t]):
             valid_support = support[..., min(t, support.shape[3]-1)] & np.isfinite(pressure[..., t])
             components, _ = label(valid_support, structure=generate_binary_structure(3, 1))

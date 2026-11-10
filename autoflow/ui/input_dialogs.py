@@ -1,5 +1,6 @@
 """Case-group and dual-VENC selection for H5 inputs."""
 
+from .theme import SemanticButtonBox
 from PySide6 import QtCore, QtWidgets
 
 
@@ -44,7 +45,7 @@ class H5CaseSelectDialog(QtWidgets.QDialog):
         splitter.addWidget(info_group)
         splitter.setSizes([380, 480])
 
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons = SemanticButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -124,7 +125,7 @@ class DualVencSelectDialog(QtWidgets.QDialog):
             label.setWordWrap(True)
             layout.addWidget(label)
 
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons = SemanticButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)

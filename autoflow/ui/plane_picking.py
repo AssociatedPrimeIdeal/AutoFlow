@@ -41,7 +41,7 @@ class PlanePickingFilter(QtCore.QObject):
         kind = event.type()
         if kind == QtCore.QEvent.Type.MouseButtonPress:
             self.press = None
-            if (event.button() not in (QtCore.Qt.LeftButton, QtCore.Qt.RightButton)
+            if (event.button() != QtCore.Qt.RightButton
                     or self._blocked() or self._reserved(event.position())
                     or event.modifiers() & (QtCore.Qt.ShiftModifier | QtCore.Qt.AltModifier)):
                 return False
@@ -58,25 +58,16 @@ class PlanePickingFilter(QtCore.QObject):
                     >= QtWidgets.QApplication.startDragDistance()):
                 return False
             x, y = self._vtk_position(event.position())
-            global_position = event.globalPosition().toPoint()
             additive = bool(modifiers & QtCore.Qt.ControlModifier)
-            # Let the widget finish VTK's button-up first. A menu must never
-            # leave the interactor in its camera-drag state.
-            QtCore.QTimer.singleShot(0, self, lambda: self._click(x, y, button, additive, global_position))
+            # Finish VTK's camera gesture before changing the active plane.
+            QtCore.QTimer.singleShot(0, self, lambda: self._click(x, y, additive))
         return False
 
-    def _click(self, x, y, button, additive, position):
+    def _click(self, x, y, additive):
         scene = self.scene
         if self._blocked():
             return
         kind, uid, index = pick_plane_or_path(scene, x, y)
-        if button == QtCore.Qt.RightButton:
-            callback = getattr(scene, '_plane_context_callback', None)
-            if kind == 'plane' and callback is not None:
-                callback(uid, index, position)
-            elif kind == 'path' and scene._path_pick_callback is not None:
-                scene._path_pick_callback(uid, index)
-            return
         if kind == 'plane' and scene._plane_pick_callback is not None:
             if additive:
                 scene._plane_pick_callback(uid, index, additive=True)

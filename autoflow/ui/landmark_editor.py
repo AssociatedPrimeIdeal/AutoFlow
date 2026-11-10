@@ -1,5 +1,6 @@
 """Structured anatomical placement controls shared by the plane settings table."""
 
+from .theme import SemanticButtonBox
 import copy
 
 from PySide6 import QtCore, QtWidgets
@@ -162,7 +163,7 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
         self.error.setWordWrap(True)
         self.error.setStyleSheet("color: #b42318")
         layout.addWidget(self.error)
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons = SemanticButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -275,7 +276,7 @@ class LandmarkPlanDialog(QtWidgets.QDialog):
         from .parameter_help import bind_help
         bind_help(form, labels, "Use the selected L level only when all listed labels connect in the same physical component. Leave blank to always use this level.")
         bind_help(form, other, "Label-local level used when the required connected labels are absent.")
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons = SemanticButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject); form.addRow(buttons)
         try:
             if dialog.exec() == QtWidgets.QDialog.Accepted:

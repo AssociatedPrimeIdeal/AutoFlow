@@ -1,5 +1,6 @@
 """Native QC inspection and report export actions."""
 
+from .theme import SemanticButtonBox
 import html
 import copy
 import os
@@ -88,7 +89,7 @@ class ReviewMixin:
             box.setChecked(True)
             layout.addWidget(box)
             options[key] = box
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        buttons = SemanticButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)

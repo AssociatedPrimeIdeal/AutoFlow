@@ -96,7 +96,7 @@ def default_label_placements(name):
     if name in {'LTS','RTS','SSS','StrS'}:return reference(fractions=[.1])
     if name in {'RBCT','CCA','LBCT','BCT','LSA'}:return reference(offset=10.)
     if name in {'SMV','SV'}:
-        rules=reference();rules[0]['connection_fallback']='flow_endpoint';return rules
+        rules=reference(offset=10.);rules[0]['connection_fallback']='flow_endpoint';return rules
     if name in {'ACA','LMCA','RMCA','LPCA','RPCA'}:return reference(fractions=[.1],all_origins=name=='ACA')
     return reference(offset=5.)
 

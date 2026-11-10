@@ -217,6 +217,7 @@ def test_two_plane_pressure_difference_phantom_direction_gauges_and_missing_phas
     assert result['pressure_difference_Pa_t'] == [-40., None, None, 0.]
     assert result['valid_t'] == [True, False, False, True]
     assert 'connected pressure reference' in result['reason_t'][1]
+    assert 'no valid pressure support' in result['reason_t'][2]
     assert result['mean_Pa'] is None
     assert result['peak_abs_Pa'] == 40.
     reverse = compute_plane_pressure_difference(planes[::-1], metrics[::-1], mask, (1, 1, 1), origin,

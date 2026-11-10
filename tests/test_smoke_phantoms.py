@@ -1416,7 +1416,7 @@ def test_label_plane_phantom_unified_defaults_and_qc_omissions():
                     else [.1] if name in {"LTS", "RTS"} else [.9] if name in {"SSS", "StrS"}
                     else [.7] if name == "MPA" else [.5] if name in {"LPA", "RPA"}
                     else [2 / 3, 1 / 3] if name in {"LVenousOutflow", "RVenousOutflow"}
-                    else [.3, .5] if name in {"LVA", "RVA"} else [.33, .66] if name in {"LCarotid", "RICA"} else [.5])
+                    else [.3, .5] if name in {"LVA", "RVA"} else [.33, .66] if name in {"LCarotid", "RICA"} else [2 / 3] if name in {"SMV", "SV"} else [.5])
         assert len(selected) == len(expected) == count
         assert [p.distance / 30 for p in selected] == pytest.approx(expected)
         assert all(np.allclose(p.normal, [1, 0, 0]) for p in selected)
@@ -1523,7 +1523,7 @@ def test_connection_default_phantom_positions_stay_inside_short_label(name, leng
         # A PV branch now requires the actual SMV/SV/PV confluence.
         assert not planes and qc[0]["selection_warnings"] == ["portal_confluence_not_found"]
         return
-    distance = 10. if name in {"RBCT", "CCA", "LBCT", "BCT", "LSA"} else 15.
+    distance = 10.
     if length < distance:
         assert not planes and qc[0]["omitted_positions"][0]["reason"] == "offset_exceeds_interval"
         return
@@ -9675,7 +9675,8 @@ def test_roi_scope_phantom_current_all_toggle_cancel_and_undo(monkeypatch, tmp_p
         monkeypatch.setattr(window, "_persist_plane_outputs", lambda **kw: writes.append(kw))
         monkeypatch.setattr(window, "_schedule_plane_calculation", calculations.append)
         polygon = np.array([[-2.2, -2.2], [2.2, -2.2], [2.2, 2.2], [-2.2, 2.2]])
-        assert not viewer.check_roi_all_frames.isChecked()
+        assert viewer.check_roi_all_frames.isChecked()
+        viewer.check_roi_all_frames.setChecked(False)
         viewer.btn_edit_contour.setChecked(True)
         viewer._commit_contour(polygon, "phantom")
         frame_only = copy.deepcopy(plane.roi_edit_operations)
@@ -12647,7 +12648,7 @@ def test_portal_flow_endpoint_fallback_phantom_preserves_direction_and_missing_f
     if sign is None:
         assert not planes and 'flow_direction_unavailable' in qc[0]['selection_warnings']
         return
-    expected=([15.,30.,45.] if sign==1 else [45.,30.,15.]) if name=='PV' else [40. if sign==1 else 20.]
+    expected=([15.,30.,45.] if sign==1 else [45.,30.,15.]) if name=='PV' else [45. if sign==1 else 15.]
     np.testing.assert_allclose([p.center[0] for p in planes],expected)
     assert all(p.placement['connection_fallback'] for p in planes)
     assert all(p.placement['fallback_endpoint']==('flow_start' if name=='PV' else 'flow_end') for p in planes)
@@ -13578,15 +13579,19 @@ def test_labeler_return_phantom_confirms_import_for_original_case_only(monkeypat
     app = _smoke_qt_application(monkeypatch)
     from PySide6 import QtWidgets
     from autoflow.ui.app import MainWindow
+    import autoflow.ui.app as ui_app
     ws = Workspace(); imports = []
     window = SimpleNamespace(workspace=ws, log=lambda message: None,
                              _import_segmentation_path=imports.append)
-    monkeypatch.setattr(QtWidgets.QMessageBox, 'question', lambda *args: QtWidgets.QMessageBox.Yes)
+    monkeypatch.setattr(ui_app, 'semantic_question', lambda *args: QtWidgets.QMessageBox.Yes)
     MainWindow._offer_labeler_import(window, 'edited-mask.nii', ws)
     assert imports == ['edited-mask.nii']
     MainWindow._offer_labeler_import(window, 'another-case.nii', Workspace())
     assert imports == ['edited-mask.nii']
-    monkeypatch.setattr(QtWidgets.QMessageBox, 'question', lambda *args: QtWidgets.QMessageBox.No)
+    window._labeler_case_generation = 2
+    MainWindow._offer_labeler_import(window, 'closed-case.nii', ws, generation=1)
+    assert imports == ['edited-mask.nii']
+    monkeypatch.setattr(ui_app, 'semantic_question', lambda *args: QtWidgets.QMessageBox.No)
     MainWindow._offer_labeler_import(window, 'declined-mask.nii', ws)
     assert imports == ['edited-mask.nii']
 
@@ -14196,7 +14201,7 @@ def test_plane_multiselect_pressure_menu_phantom_click_drag_and_active_plane(mon
             return QtCore.QPoint(round(x*window.plotter.width()/rw),
                                  round((rh-1-y)*window.plotter.height()/rh))
 
-        def click(i, control=False, button=QtCore.Qt.LeftButton):
+        def click(i, control=False, button=QtCore.Qt.RightButton):
             QtTest.QTest.mouseClick(window.plotter, button,
                 QtCore.Qt.ControlModifier if control else QtCore.Qt.NoModifier, point(i))
             app.processEvents()
@@ -14204,6 +14209,8 @@ def test_plane_multiselect_pressure_menu_phantom_click_drag_and_active_plane(mon
         def pressure_action(menu):
             return next(a for a in menu.actions() if a.text() == 'Calculate Pressure Difference')
 
+        click(1, button=QtCore.Qt.LeftButton)
+        assert window._selected_plane_index == -1
         click(1)
         assert window._selected_plane_index == 1
         click(0, True)
@@ -14211,7 +14218,10 @@ def test_plane_multiselect_pressure_menu_phantom_click_drag_and_active_plane(mon
         assert window._selected_plane_index == 0
         assert len(window.tree_objects.selectedItems()) == 2
         assert len(window.scene._selected_plane_actors) == 1
-        click(0, button=QtCore.Qt.RightButton)
+        assert getattr(window, '_plane_context_menu', None) is None
+        uid = window._plane_selection_order[-1]
+        item = window._find_browser_item_by_uid(uid)
+        window._on_browser_ctx_menu(window.tree_objects.visualItemRect(item).center())
         menu = window._plane_context_menu
         assert pressure_action(menu).isEnabled()
         assert window._pressure_pair_indices() == [1, 0]
@@ -14280,3 +14290,201 @@ def test_plane_multiselect_pressure_menu_phantom_click_drag_and_active_plane(mon
         window.deleteLater()
         app.processEvents()
 
+
+
+@pytest.mark.parametrize('shell', ['powershell', 'pwsh'])
+@pytest.mark.parametrize('explicit_destination', [False, True])
+def test_portable_joiner_phantom_script_directory_default(tmp_path, shell, explicit_destination):
+    import hashlib
+    import io
+    import shutil
+    import subprocess
+    import zipfile
+
+    executable = shutil.which(shell)
+    if executable is None:
+        pytest.skip(shell + ' is unavailable')
+    bundle = tmp_path / 'download folder'
+    caller = tmp_path / 'caller'
+    output = tmp_path / 'output'
+    for directory in (bundle, caller, output):
+        directory.mkdir()
+    script = bundle / 'Join-Portable.ps1'
+    shutil.copy2(Path(__file__).resolve().parents[1] / 'packaging/windows/Join-Portable.ps1', script)
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, 'w') as archive:
+        archive.writestr('AutoFlow/hello.txt', 'portable join phantom')
+    payload = stream.getvalue()
+    manifest = {'archive': 'portable.zip', 'bytes': len(payload),
+                'sha256': hashlib.sha256(payload).hexdigest(), 'parts': []}
+    cut = len(payload) // 2
+    for index, data in enumerate((payload[:cut], payload[cut:]), 1):
+        name = f'portable.zip.part{index:03d}'
+        (bundle / name).write_bytes(data)
+        manifest['parts'].append({'file': name, 'bytes': len(data),
+                                  'sha256': hashlib.sha256(data).hexdigest()})
+    (bundle / 'release-manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+    command = [executable, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(script)]
+    if explicit_destination:
+        command.extend(['-Destination', str(output)])
+    result = subprocess.run(command, cwd=caller, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    joined = (output if explicit_destination else bundle) / 'portable.zip'
+    assert joined.read_bytes() == payload
+    assert not (caller / 'portable.zip').exists()
+    assert not joined.with_name(joined.name + '.assembling').exists()
+    with zipfile.ZipFile(joined) as archive:
+        assert archive.read('AutoFlow/hello.txt') == b'portable join phantom'
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='SSH rendering phantom runs on Linux')
+def test_plane_review_phantom_all_metrics_wheel_drafts_and_case_cache(monkeypatch, tmp_path):
+    app = _smoke_qt_application(monkeypatch)
+    monkeypatch.setenv('AUTOFLOW_SSH_RENDERING', '1')
+    from PySide6 import QtCore, QtGui, QtTest, QtWidgets
+    from autoflow.core.plane_state import stamp_metric
+    from autoflow.algorithms.surfaces import create_uniform_field_grid
+    from autoflow.ui.theme import SemanticButtonBox, apply_application_theme, semantic_question
+    import autoflow.ui.app as ui_app
+    from autoflow.ui.remote_plotter import RemotePlotter
+    monkeypatch.setattr(ui_app, 'RemotePlotter', RemotePlotter, raising=False)
+    window = ui_app.MainWindow()
+    try:
+        ws = window.workspace
+        ws.data_loaded = True
+        ws.paths.output_dir = str(tmp_path)
+        ws.resolution = np.array([1., 1.5, 2.])
+        ws.origin = np.array([-4., 7., 13.])
+        x, y, z = np.indices((20, 20, 20))
+        ws.mag_raw = np.repeat((x+5*y+17*z).astype(np.float32)[..., None], 2, axis=3)
+        ws.flow_raw = np.zeros(ws.mag_raw.shape+(3,), np.float32)
+        ws.flow_raw[..., 2] = 10.
+        ws.segmask_binary = np.zeros(ws.mag_raw.shape, bool)
+        ws.segmask_binary[4:16, 4:16, 2:18] = True
+        ws.derived.tke_array = np.ones(ws.mag_raw.shape, np.float32)*2
+        ws.derived.pressure_gradient_array = np.zeros(ws.flow_raw.shape, np.float32)
+        ws.derived.pressure_gradient_array[..., 2] = 300.
+        ws.derived.relative_pressure_array = np.ones(ws.mag_raw.shape, np.float32)*4
+        ws.derived.pressure_gradient_support_mask = ws.segmask_binary.copy()
+        wall = create_uniform_field_grid(ws.segmask_binary[..., 0].astype(np.uint8),
+            ws.resolution, origin=ws.origin, name='mask').threshold(.5, scalars='mask').extract_surface(algorithm='dataset_surface')
+        wall.point_data['wss'] = np.ones(wall.n_points)*3
+        ws.derived.wss_surfaces = [wall, wall]
+        plane = PlaneData(np.array([10., 15., 20.]), np.array([0., 0., 1.]), path_index=-1)
+        ws.planes = [plane]
+        window._rebuild_plane_objects()
+        window._selected_plane_index = 0
+        viewer = window.ortho_viewer
+        viewer.set_selected_plane(0)
+        window.show(); app.processEvents()
+        assert viewer.check_roi_all_frames.isChecked()
+        window._on_plane_roi_changed(0)
+        for _ in range(300):
+            app.processEvents()
+            if not window._plane_jobs.is_running:
+                break
+            QtTest.QTest.qWait(10)
+        assert not window._plane_jobs.is_running
+        metric = ws.planes[0].metrics
+        for key, expected in [('tke_mean_J_m3_t', 2.), ('pressure_gradient_mag_mean_Pa_m_t', 300.),
+                              ('relative_pressure_mean_Pa_t', 4.), ('wss_wall_mean_Pa_t', 3.)]:
+            np.testing.assert_allclose(metric[key], expected, rtol=1e-5)
+        window._show_measurements('plane_curve')
+        combo = window.combo_plane_curve_metric
+        for key in ('wss_wall_mean_Pa_t', 'tke_peak_J_m3_t', 'pressure_gradient_normal_mean_Pa_m_t',
+                    'relative_pressure_mean_Pa_t', 'peakv_cm_s_t', 'netflow_forward_mL_beat'):
+            index = combo.findData(key)
+            assert index >= 0
+            combo.setCurrentIndex(index)
+            window._plot_plane_curve()
+            assert 'unavailable' not in window.label_pwv_status.text().lower()
+        current = ws.planes[0]
+        original = current.center.copy()
+        normal = current.normal.copy()
+        # Locked-plane browsing shifts only the hovered slice and its samples.
+        before_image = viewer.slice_views['coronal'].image_item.image.copy()
+        other_image = viewer.slice_views['axial'].image_item.image.copy()
+        viewer._on_slice_step_requested('coronal', 1)
+        np.testing.assert_allclose(current.center, original)
+        assert not np.array_equal(viewer.slice_views['coronal'].image_item.image, before_image)
+        np.testing.assert_array_equal(viewer.slice_views['axial'].image_item.image, other_image)
+        assert viewer._plane_browse_offsets['coronal'] != 0
+        viewer.btn_edit_contour.setChecked(True)
+        assert not any(viewer._plane_browse_offsets.values())
+        viewer._cancel_plane_roi()
+        window._activate_plane_drag_widgets(0)
+        scheduled = []
+        monkeypatch.setattr(window, '_schedule_plane_calculation', scheduled.append)
+        # Each hovered basis has its own normal; gestures are undoable drafts.
+        for name in ('axial', 'coronal', 'sagittal'):
+            before = ws.planes[0].center.copy()
+            direction = viewer._view_slice_direction(name)
+            step = 1 / np.linalg.norm(direction/ws.resolution)
+            viewer._on_slice_step_requested(name, 1)
+            np.testing.assert_allclose(ws.planes[0].center, before+step*direction)
+            np.testing.assert_allclose(ws.planes[0].normal, normal)
+            window._undo_plane_change()
+            np.testing.assert_allclose(ws.planes[0].center, before)
+            window._redo_plane_change()
+        assert not scheduled
+        window._cancel_plane_edit()
+        np.testing.assert_allclose(ws.planes[0].center, original)
+        window._activate_plane_drag_widgets(0)
+        viewer._on_slice_step_requested('coronal', 1)
+        committed = ws.planes[0].center.copy()
+        window._finalize_plane_drag(0)
+        assert scheduled == [0]
+        np.testing.assert_allclose(ws.planes[0].center, committed)
+
+        # Every known family remains discoverable when missing or stale.
+        ws.planes[0].roi_polygon_uv_mm = [[-2., -2.], [2., -2.], [2., 2.], [-2., 2.]]
+        metric = ws.planes[0].metrics = stamp_metric(ws.planes[0], {'flowrate_mL_s': [1., 2.]}, 0)
+        ws.derived.relative_pressure_array = None
+        combo.setCurrentIndex(combo.findData('relative_pressure_mean_Pa_t'))
+        window._plot_plane_curve()
+        assert 'Advanced Metrics' in window.label_pwv_status.text()
+        metric.update(relative_pressure_mean_Pa_t=[None, None], relative_pressure_valid_cell_count_t=[0, 0])
+        window._plot_plane_curve()
+        assert 'no valid pressure support' in window.label_pwv_status.text()
+
+        monkeypatch.setattr(window, '_pressure_comparison_signature', lambda: 'phantom')
+        window._plane_pressure_result = {'signature': 'phantom', 'indices': [0, 1],
+            'pressure_difference_Pa_t': [None, None], 'valid_t': [False, False],
+            'reason_t': ['Plane 0: ROI has no valid pressure support']*2,
+            'mean_Pa': None, 'peak_abs_Pa': None}
+        window._plot_plane_pressure_difference()
+        assert not window.fig_pwv.axes[0].lines
+        assert 'no valid pressure support' in window.label_pwv_status.text()
+
+        # Cache is reused only in this live case; close removes generated files.
+        metadata = {'source_id': '/phantom/same.h5', 'input_signature': 'phase-A'}
+        cache = Path(window._labeler_exchange_directory(metadata))
+        (cache/'segmentation.nii').write_bytes(b'generated editor working mask')
+        saved = tmp_path/'saved-segmentation.nii'
+        saved.write_bytes(b'explicit user output')
+        assert Path(window._labeler_exchange_directory(metadata)) == cache
+        window._on_close_workspace()
+        assert not cache.exists() and saved.read_bytes() == b'explicit user output'
+        next_cache = Path(window._labeler_exchange_directory(metadata))
+        assert next_cache != cache and not (next_cache/'segmentation.nii').exists()
+
+        # Explicit commit/discard roles work in both themes, including tool buttons.
+        for theme in ('dark', 'light'):
+            apply_application_theme(app, theme)
+            box = SemanticButtonBox(QtWidgets.QDialogButtonBox.Apply | QtWidgets.QDialogButtonBox.Cancel)
+            assert box.button(QtWidgets.QDialogButtonBox.Apply).property('actionSemantic') == 'apply'
+            assert box.button(QtWidgets.QDialogButtonBox.Cancel).property('actionSemantic') == 'cancel'
+            assert viewer.btn_apply_plane_roi.property('actionSemantic') == 'apply'
+            assert viewer.btn_cancel_plane_roi.property('actionSemantic') == 'cancel'
+            semantics = []
+            def answer_question():
+                message = app.activeModalWidget()
+                semantics.extend([message.button(QtWidgets.QMessageBox.Yes).property('actionSemantic'),
+                                  message.button(QtWidgets.QMessageBox.No).property('actionSemantic')])
+                message.button(QtWidgets.QMessageBox.Yes).click()
+            QtCore.QTimer.singleShot(0, answer_question)
+            assert semantic_question(window, 'Commit', 'Apply?') == QtWidgets.QMessageBox.Yes
+            assert semantics == ['apply', 'cancel']
+            box.deleteLater()
+    finally:
+        window.close(); window.deleteLater(); app.processEvents()

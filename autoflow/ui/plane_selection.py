@@ -78,16 +78,6 @@ class PlaneSelectionMixin:
             tree.blockSignals(previous)
         self._on_browser_select()
 
-    def _on_3d_plane_context(self, uid, index, position):
-        if self._edit_mode is not None or self._plane_edit_enabled:
-            return
-        item = self._find_browser_item_by_uid(uid)
-        if item is None:
-            return
-        if not item.isSelected():
-            self._select_view_plane(uid)
-        self._show_plane_context_menu(uid, position)
-
     def _show_plane_context_menu(self, uid, position):
         obj = self.workspace.scene_objects.get(uid)
         if obj is None or obj.kind != ObjectKind.PLANE:
@@ -167,7 +157,7 @@ class PlaneSelectionMixin:
             return
         from ..algorithms.geometry_grid import measurement_segmentation
         from ..algorithms.metrics.plane_pressure import compute_plane_pressure_difference
-        geometry = measurement_segmentation(ws)
+        geometry = measurement_segmentation(ws, manual_planes=[ws.planes[i] for i in indices])
         if geometry.binary is None:
             QtWidgets.QMessageBox.information(self, 'Pressure Difference', 'Segmentation is required for pressure sampling.')
             return
@@ -195,7 +185,7 @@ class PlaneSelectionMixin:
     def _plot_plane_pressure_difference(self):
         result = getattr(self, '_plane_pressure_result', None)
         if result is None or result['signature'] != self._pressure_comparison_signature():
-            message = ('Select two planes, then right-click → Calculate Pressure Difference.' if result is None
+            message = ('Select two planes, then right-click in Browser → Calculate Pressure Difference.' if result is None
                        else 'Pressure inputs or plane geometry changed. Recalculate pressure difference.')
             self.label_pwv_status.setText(message)
             self._clear_pwv_axes(message, title='Plane Pressure Difference')
@@ -204,21 +194,27 @@ class PlaneSelectionMixin:
         current = int(np.clip(self.workspace.current_t, 0, max(0, values.size - 1)))
         first, last = result['indices']
         title = f'Plane {first} − Plane {last}'
-        self.fig_pwv.clear()
-        axes = self.fig_pwv.add_subplot(111)
-        axes.plot(np.arange(values.size), values, color=analysis_palette(self)['curve'], marker='o', markersize=3)
-        axes.axhline(0, color=analysis_palette(self)['spine'], linewidth=.7)
-        axes.axvline(current, color=analysis_palette(self)['cursor'], linestyle='--', linewidth=.8)
-        if values.size and np.isfinite(values[current]):
-            axes.scatter([current], [values[current]], color=analysis_palette(self)['curve'], s=28)
-        axes.set(title=title, xlabel='Cardiac Phase', ylabel='Pressure Difference (Pa)')
-        style_analysis_figure(self)
-        self.canvas_pwv.draw_idle()
+        if np.any(np.isfinite(values)):
+            self.fig_pwv.clear()
+            axes = self.fig_pwv.add_subplot(111)
+            axes.plot(np.arange(values.size), values, color=analysis_palette(self)['curve'], marker='o', markersize=3)
+            axes.axhline(0, color=analysis_palette(self)['spine'], linewidth=.7)
+            axes.axvline(current, color=analysis_palette(self)['cursor'], linestyle='--', linewidth=.8)
+            if values.size and np.isfinite(values[current]):
+                axes.scatter([current], [values[current]], color=analysis_palette(self)['curve'], s=28)
+            axes.set(title=title, xlabel='Cardiac Phase', ylabel='Pressure Difference (Pa)')
+            style_analysis_figure(self)
+            self.canvas_pwv.draw_idle()
+        else:
+            reasons = list(dict.fromkeys(reason for reason in result['reason_t'] if reason))
+            self._clear_pwv_axes('\n'.join(reasons) or 'No valid pressure samples.', title=title)
         def number(value):
             return '—' if value is None or not np.isfinite(value) else f'{float(value):.4g}'
         valid_count = int(np.count_nonzero(result['valid_t']))
         reason = result['reason_t'][current] if values.size else ''
-        notes = reason or (f'{valid_count}/{values.size} phases available' if valid_count < values.size else '')
+        notes = f'{valid_count}/{values.size} phases available'
+        if reason:
+            notes += '\n' + reason
         self.label_pwv_status.set_measurement(title, f'Phase {current}', number(values[current]), 'Pa',
             [('Cycle mean', number(result['mean_Pa'])), ('Peak |Δp|', number(result['peak_abs_Pa']))],
             notes=notes, plain_text=f'{title}\nPhase {current}: {number(values[current])} Pa\n{notes}')

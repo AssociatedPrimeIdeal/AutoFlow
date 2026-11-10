@@ -1,5 +1,6 @@
 """Current-view movie resolution controls and real VTK rendering at that size."""
 
+from .theme import SemanticButtonBox
 import numpy as np
 from PySide6 import QtWidgets
 from .parameter_help import bind_help
@@ -82,7 +83,7 @@ class CurrentViewVideoDialog(QtWidgets.QDialog):
         self.dimensions.setEnabled(False)
         self.resolution.currentIndexChanged.connect(
             lambda _: self.dimensions.setEnabled(self.resolution.currentData() == 'custom'))
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons = SemanticButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)

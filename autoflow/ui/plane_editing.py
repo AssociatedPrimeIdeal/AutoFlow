@@ -1,5 +1,7 @@
 """Plane edit transactions inside the existing Selection panel."""
 
+from .theme import semantic_button
+from .theme import SemanticButtonBox
 import copy
 import re
 
@@ -132,7 +134,7 @@ class PlaneEditingMixin:
         form.addRow(self.check_plane_path_locked, self.spin_plane_distance)
         self.btn_flip_plane_normal = QtWidgets.QPushButton("Flip normal")
         self.btn_flip_plane_normal.clicked.connect(self._flip_plane_normal)
-        self.btn_cancel_plane_edit = QtWidgets.QPushButton("Cancel / Esc")
+        self.btn_cancel_plane_edit = semantic_button(QtWidgets.QPushButton("Cancel / Esc"), "cancel")
         self.btn_cancel_plane_edit.clicked.connect(self._cancel_plane_edit)
         row = QtWidgets.QHBoxLayout()
         row.addWidget(self.btn_flip_plane_normal)
@@ -160,7 +162,7 @@ class PlaneEditingMixin:
         row.addWidget(self.btn_undo_plane)
         row.addWidget(self.btn_redo_plane)
         layout.addLayout(row)
-        self.btn_cancel_plane_calculation = QtWidgets.QPushButton("Cancel plane calculation")
+        self.btn_cancel_plane_calculation = semantic_button(QtWidgets.QPushButton("Cancel plane calculation"), "cancel")
         self.btn_cancel_plane_calculation.clicked.connect(self._plane_jobs.cancel)
         layout.addWidget(self.btn_cancel_plane_calculation)
         self.btn_cancel_plane_calculation.hide()
@@ -224,7 +226,7 @@ class PlaneEditingMixin:
                 field.setValue(field.value() + (offset if index else -offset))
 
         frame.currentIndexChanged.connect(change_frame)
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons = SemanticButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         buttons.button(QtWidgets.QDialogButtonBox.Ok).setText("Preview")
         plane = None
 
@@ -345,6 +347,22 @@ class PlaneEditingMixin:
         elif self._plane_edit_session:
             self._finalize_plane_drag(self._plane_edit_session["index"])
         self._refresh_plane_edit_controls()
+
+    def _step_plane_from_2d(self, name, delta):
+        if not self._plane_edit_session or self._plane_gesture_before is not None:
+            return
+        viewer = self.ortho_viewer
+        direction = viewer._view_slice_direction(name)
+        step = 1.0 / max(float(np.linalg.norm(direction / viewer._get_resolution())), 1e-12)
+        index = self._plane_edit_session["index"]
+        plane = self.workspace.planes[index]
+        center = np.asarray(plane.center, float) + int(delta)*step*direction
+        shape = viewer._get_volume_shape()
+        if shape is not None:
+            center = np.clip(center, 0, (np.asarray(shape[:3])-1)*viewer._get_resolution())
+        self._begin_plane_gesture()
+        self._update_plane_from_drag(index, center=center)
+        self._end_plane_gesture()
 
     def _begin_plane_2d_translation(self, name):
         if not self._plane_edit_session:
@@ -738,7 +756,7 @@ class PlaneEditingMixin:
         payload = {"plane": copy.deepcopy(plane), "signature": plane_signature(plane),
             "input_signature": workspace_signature(ws, include_analysis=False),
             "data": {"flow": ws.flow_raw, "mask": geometry.binary, "spacing": geometry.spacing.copy(),
-                "source": geometry.source,
+                "source": geometry.source, "field_spacing": np.asarray(ws.resolution).copy(),
                 "origin": np.asarray(ws.origin).copy(), "rr": float(ws.rr), "branches": geometry.branches,
                 "labels3": geometry.labels_3d, "labels4": geometry.labels,
                 "paths": ws.centerline_paths_smooth or ws.centerline_paths,

@@ -1,5 +1,6 @@
 """Qt context menu for the continuous colorbar in native and remote 3D views."""
 
+from .theme import SemanticButtonBox
 import math
 
 from PySide6 import QtCore, QtWidgets
@@ -99,7 +100,7 @@ class ScalarBarControlsMixin:
         form.addRow("Maximum", high)
         error = QtWidgets.QLabel()
         form.addRow(error)
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons = SemanticButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         form.addRow(buttons)
 
         def apply():
